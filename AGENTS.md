@@ -11,7 +11,7 @@
 - 初始化：`python -m venv .venv`；安装锁定开发依赖：`python -m pip install -r requirements-dev.txt`；登记两个包：`python -m pip install --no-deps -e .`（保留默认构建隔离）。
 - 格式检查：`python -m ruff format --check src integrations tests scripts`；静态检查：`python -m ruff check src integrations tests scripts`；语法：`python -m compileall -q src integrations tests scripts`。
 - 调度定向：`python -m pytest tests/test_core.py tests/test_edges.py -q`；边界定向：`python -m pytest tests/test_boundaries.py tests/test_gateway.py tests/test_bootstrap.py -q`；完整组件套件：`python -m pytest -q`。
-- 短期上下文定向：`python -m pytest tests/test_short_context.py -q`；改变共享状态/来源读取时同时验证调度套件。
+- 短期上下文定向：`python -m pytest tests/test_short_context.py tests/test_continuation_revision.py -q`；改变共享状态/来源读取时同时验证调度套件。
 - 合成持久轨迹：`python tests/trace_scenario.py --output .runtime/local-trace.json`。
 - 回环 HTTP 进程启动/关闭检查：`python tests/smoke_server.py`（不加载外部服务配置）。
 - 本地启动：`python -m uvicorn tianshu_companion.app:create_app --factory --host 127.0.0.1 --port 8765 --workers 1`；未配置业务请求返回 503。

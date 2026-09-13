@@ -216,6 +216,7 @@ class Core:
                         for c in self.store.list("collections", cid)
                         if c["collection_key"] == collection_key
                         and c.get("possibly_incomplete")
+                        and c.get("source_context_revision") == conv.get("context_revision", 1)
                         and not c.get("continued_by")
                         and c["scope"]["actor_id"] == ctx["allowed_scope"]["actor_id"]
                         and c["scope"]["person_id"] == person
@@ -225,6 +226,9 @@ class Core:
                         conversation_id=cid,
                         collection_key=collection_key,
                         state="collecting",
+                        # Immutable provenance of the first accepted input, including
+                        # fragments that close as observed without model generation.
+                        source_context_revision=conv.get("context_revision", 1),
                         revision=0,
                         started=now,
                         deadline=now,
@@ -806,13 +810,18 @@ class Core:
 
     def _continuation_messages(self, turn):
         fragments, seen = [], set()
+        revision = current_revision(self.store, turn)
         continuation_id = turn["bundle"]["continuation_of"]
         while continuation_id:
             if continuation_id in seen or len(seen) >= 32:
                 raise Fault("budget_exceeded")
             seen.add(continuation_id)
             collection = self.store.get("collections", continuation_id)
-            if collection["scope"] != turn["scope"] or collection["state"] == "cancelled":
+            if (
+                collection["scope"] != turn["scope"]
+                or collection["state"] == "cancelled"
+                or collection.get("source_context_revision") != revision
+            ):
                 raise Fault("scope_changed")
             previous = self.store.get("turns", collection["turn_id"])
             if previous["scope_version"] != turn["scope_version"]:
