@@ -16,6 +16,7 @@ from .clients import Gateway, JsonService, Memory, Origins, Sender, uid
 from .contracts import Contracts, Fault
 from .core import Core, Policy
 from .store import Store
+from .short_context import ShortContextPolicy
 
 LOG = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ def build_runtime(config):
         roles=config.get("roles", {}),
         config_version=config.get("config_version"),
         policy=Policy(**config.get("policy", {})),
+        short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
     )
     return core, incoming, clients
 

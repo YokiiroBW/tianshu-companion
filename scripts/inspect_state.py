@@ -45,7 +45,8 @@ try:
         result["outbox"].append({k: item.get(k) for k in ["id", "state", "attempts", "last_error"]})
     if args.include_context:
         result["contexts"] = [
-            {k: turn.get(k) for k in ["id", "bundle", "preparation", "role"]} for turn in turns
+            {k: turn.get(k) for k in ["id", "bundle", "preparation", "role", "short_context"]}
+            for turn in turns
         ]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 finally:

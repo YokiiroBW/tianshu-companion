@@ -2,6 +2,7 @@
   "contracts_path": "../../../contracts/text-dialogue/v1",
   "database_path": ".runtime/companion.db",
   "config_version": null,
+  "short_context": {"max_turns": 4, "max_bytes": 8192, "max_age_seconds": 1800},
   "policy": {
     "silence_ms": 5000,
     "max_wait_ms": null,

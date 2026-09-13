@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import json
 import logging
 import re
 import time
@@ -9,6 +10,7 @@ from dataclasses import asdict, dataclass
 
 from .clients import command, epoch, uid, utc
 from .contracts import Fault, canonical, digest
+from .short_context import ShortContextPolicy, current_revision, select_recent, sources_current
 
 TERMINAL = {"sent", "failed", "cancelled", "observed", "closed_unknown"}
 ACTIVE = {
@@ -49,6 +51,7 @@ class Core:
         policy=None,
         clock=time.time,
         model_slots=4,
+        short_context_policy=None,
     ):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
@@ -57,6 +60,7 @@ class Core:
         contracts.check("conversation#policy", asdict(self.policy))
         self.models = asyncio.Semaphore(model_slots)
         self.jobs, self.send_jobs = {}, {}
+        self.short_context_policy = short_context_policy or ShortContextPolicy()
 
     def _save_turn(self, turn):
         turn["version"] += 1
@@ -171,8 +175,7 @@ class Core:
             if ctx["allowed_scope"]["conversation_id"] not in (None, cid):
                 raise Fault("forbidden")
             base = digest({k: v for k, v in request["message_key"].items() if k != "revision"})
-            previous = [i for i in self.store.list("inbox", cid) if i["base"] == base]
-            latest = max(previous, key=lambda i: i["revision"]) if previous else None
+            latest = self.store.latest_source(cid, base)
             if latest and latest["request"]["author"] != author:
                 raise Fault("forbidden")
             if request["kind"] != "message" and latest is None:
@@ -333,6 +336,9 @@ class Core:
                 stored = self.store.get("conversations", conv_key)
                 if stored:
                     conv["turn_sequence"] = stored["turn_sequence"]
+                    conv["context_revision"] = stored.get("context_revision", 1)
+                if not stale and request["kind"] in {"edit", "retract"}:
+                    conv["context_revision"] = conv.get("context_revision", 1) + 1
                 self.store.put("conversations", conv)
                 self._remember_command(cmd_key, signature, result)
                 self._seal_due(now, cid)
@@ -491,6 +497,11 @@ class Core:
         return result
 
     def _cancel_turn(self, turn, reason):
+        if reason in {"source_retracted", "source_edited", "permission_revoked"}:
+            channel = turn["bundle"]["collection_key"]["channel"]
+            conversation = self.store.get("conversations", digest(channel))
+            conversation["context_revision"] = conversation.get("context_revision", 1) + 1
+            self.store.put("conversations", conversation)
         if turn["phase"] in TERMINAL:
             return "too_late"
         turn.update(cancelled=True, failure=reason)
@@ -509,11 +520,7 @@ class Core:
         return "partially_cancelled" if partial else "cancelled"
 
     def _replies(self, turn):
-        return [
-            r
-            for r in self.store.list("replies", turn["conversation_id"])
-            if r["turn_id"] == turn["id"]
-        ]
+        return self.store.turn_replies(turn["id"])
 
     def _finish(self, turn, phase, delivery):
         if turn["phase"] in TERMINAL:
@@ -661,11 +668,7 @@ class Core:
                 turn["bootstrap_mapping"] = False
                 turn["preparation"] = selection
                 turn["timings"]["memory_ms"] = (self.clock() - start) * 1000
-                older = [
-                    t
-                    for t in self.store.list("turns", turn["conversation_id"])
-                    if t["sequence"] < turn["sequence"]
-                ]
+                older = self.store.recent_turns(turn["conversation_id"], turn["sequence"], 1)
                 if older and re.search(
                     r"按你.*方案|刚才.*方案|照你.*说|your (?:plan|proposal)", text, re.I
                 ):
@@ -683,11 +686,7 @@ class Core:
                         turn["phase"] = "waiting_dependency"
                         self._save_turn(turn)
                     return
-                if (
-                    previous["result_version"] != item["result_version"]
-                    or previous["phase"] != "sent"
-                ):
-                    raise Fault("scope_changed")
+                self._check_dependency(turn, item, previous)
                 item["state"] = "stable"
                 dependencies.extend(
                     dict(
@@ -731,6 +730,7 @@ class Core:
                             dependency_groups=turn["preparation"]["dependency_groups"],
                             earlier_fragment=continuation,
                             delivered_dependencies=dependencies,
+                            recent_dialogue=[],
                         )
                     ),
                 ),
@@ -745,7 +745,17 @@ class Core:
                 turn = self.store.get("turns", turn_id)
                 if turn["cancelled"] or turn["phase"] in TERMINAL:
                     return
+                recent, context_metadata = select_recent(
+                    self.store, turn, self.short_context_policy, self.clock()
+                )
+                prompt = json.loads(messages[1]["content"])
+                prompt["recent_dialogue"] = recent
+                messages[1]["content"] = canonical(prompt)
+                if len(canonical(messages).encode()) > 524288:
+                    raise Fault("budget_exceeded")
                 with self.store.transaction():
+                    turn["context_revision"] = context_metadata["context_revision"]
+                    turn["short_context"] = context_metadata
                     turn["phase"] = "generating"
                     turn["model_calls"] += 1
                     turn["timings"]["model_started_at"] = utc(self.clock())
@@ -804,21 +814,48 @@ class Core:
             collection = self.store.get("collections", continuation_id)
             if collection["scope"] != turn["scope"] or collection["state"] == "cancelled":
                 raise Fault("scope_changed")
+            previous = self.store.get("turns", collection["turn_id"])
+            if previous["scope_version"] != turn["scope_version"]:
+                raise Fault("scope_changed")
             fragments = collection["messages"] + fragments
             continuation_id = collection["continuation_of"]
         return fragments
 
+    def _check_dependency(self, turn, dependency, previous):
+        if (
+            previous["phase"] != "sent"
+            or previous["result_version"] != dependency["result_version"]
+            or previous["scope"] != turn["scope"]
+            or previous["scope_version"] != turn["scope_version"]
+            or previous.get("context_revision") != current_revision(self.store, turn)
+            or not sources_current(self.store, previous)
+        ):
+            raise Fault("scope_changed")
+
     def _check_input_versions(self, turn):
+        for dependency in turn["bundle"]["dependencies"]:
+            self._check_dependency(turn, dependency, self.store.get("turns", dependency["turn_id"]))
         inputs = turn["bundle"]["messages"] + self._continuation_messages(turn)
-        current = self.store.list("inbox", turn["conversation_id"])
         for message in inputs:
             base = digest({k: v for k, v in message["message_key"].items() if k != "revision"})
-            latest = max((i for i in current if i["base"] == base), key=lambda i: i["revision"])
+            latest = self.store.latest_source(turn["conversation_id"], base)
             if (
-                latest["revision"] != message["message_key"]["revision"]
+                latest is None
+                or latest["revision"] != message["message_key"]["revision"]
                 or latest["request"]["kind"] == "retract"
             ):
                 raise Fault("scope_changed")
+        context = turn.get("short_context")
+        if (
+            context
+            and context["turn_ids"]
+            and (
+                context["context_revision"] != current_revision(self.store, turn)
+                or context["scope_version"] != turn["scope_version"]
+                or context["valid_until"] <= self.clock()
+            )
+        ):
+            raise Fault("scope_changed")
 
     async def _preflight(self, turn):
         self._check_input_versions(turn)

@@ -50,6 +50,17 @@ class Store:
                 f"CREATE INDEX IF NOT EXISTS {table}_queue ON "
                 f"{table}(conversation_id,status,position)"
             )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS turns_recent ON turns(conversation_id,position)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS inbox_source ON inbox(conversation_id,"
+            "json_extract(body,'$.base'),json_extract(body,'$.revision') DESC)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS replies_turn ON replies("
+            "json_extract(body,'$.turn_id'),status,position)"
+        )
         self.db.execute("PRAGMA user_version=1")
 
     @contextmanager
@@ -100,3 +111,26 @@ class Store:
         self.db.close()
         if self._lock:
             self._lock.close()
+
+    def recent_turns(self, conversation_id, before_sequence, limit):
+        rows = self.db.execute(
+            "SELECT body FROM turns WHERE conversation_id=? AND position<? "
+            "ORDER BY position DESC LIMIT ?",
+            (conversation_id, before_sequence, limit),
+        )
+        return [json.loads(row[0]) for row in rows]
+
+    def latest_source(self, conversation_id, base):
+        row = self.db.execute(
+            "SELECT body FROM inbox WHERE conversation_id=? AND json_extract(body,'$.base')=? "
+            "ORDER BY json_extract(body,'$.revision') DESC LIMIT 1",
+            (conversation_id, base),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def turn_replies(self, turn_id, state=None):
+        sql, args = "SELECT body FROM replies WHERE json_extract(body,'$.turn_id')=?", [turn_id]
+        if state is not None:
+            sql += " AND status=?"
+            args.append(state)
+        return [json.loads(row[0]) for row in self.db.execute(sql + " ORDER BY position", args)]
