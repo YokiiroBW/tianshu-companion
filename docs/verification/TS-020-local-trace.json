@@ -1,0 +1,411 @@
+{
+  "evidence_level": "local_modules_with_test_only_dependencies",
+  "contract_version": "1.0.0",
+  "real_channel": "not_run",
+  "real_memory": "not_run",
+  "real_gateway": "not_run",
+  "snapshots": [
+    {
+      "step": "T1 generating, T2 prepared, T3 queued",
+      "turns": [
+        {
+          "sequence": 1,
+          "phase": "generating",
+          "version": 4,
+          "model_calls": 1,
+          "delivery": "not_started"
+        },
+        {
+          "sequence": 2,
+          "phase": "ready_to_send",
+          "version": 5,
+          "model_calls": 1,
+          "delivery": "not_started"
+        },
+        {
+          "sequence": 3,
+          "phase": "queued",
+          "version": 1,
+          "model_calls": 0,
+          "delivery": "not_started"
+        }
+      ],
+      "replies": [
+        {
+          "sequence": 201,
+          "state": "pending"
+        },
+        {
+          "sequence": 202,
+          "state": "pending"
+        }
+      ],
+      "outbox": [],
+      "native_submissions": 0
+    },
+    {
+      "step": "T1 partial/unknown, no later submission",
+      "turns": [
+        {
+          "sequence": 1,
+          "phase": "reconciling",
+          "version": 9,
+          "model_calls": 1,
+          "delivery": "unknown"
+        },
+        {
+          "sequence": 2,
+          "phase": "ready_to_send",
+          "version": 5,
+          "model_calls": 1,
+          "delivery": "not_started"
+        },
+        {
+          "sequence": 3,
+          "phase": "queued",
+          "version": 1,
+          "model_calls": 0,
+          "delivery": "not_started"
+        }
+      ],
+      "replies": [
+        {
+          "sequence": 101,
+          "state": "sent"
+        },
+        {
+          "sequence": 102,
+          "state": "unknown"
+        },
+        {
+          "sequence": 201,
+          "state": "pending"
+        },
+        {
+          "sequence": 202,
+          "state": "pending"
+        }
+      ],
+      "outbox": [],
+      "native_submissions": 2
+    },
+    {
+      "step": "database reopened, unknown retained",
+      "turns": [
+        {
+          "sequence": 1,
+          "phase": "reconciling",
+          "version": 10,
+          "model_calls": 1,
+          "delivery": "unknown"
+        },
+        {
+          "sequence": 2,
+          "phase": "ready_to_send",
+          "version": 5,
+          "model_calls": 1,
+          "delivery": "not_started"
+        },
+        {
+          "sequence": 3,
+          "phase": "queued",
+          "version": 1,
+          "model_calls": 0,
+          "delivery": "not_started"
+        }
+      ],
+      "replies": [
+        {
+          "sequence": 101,
+          "state": "sent"
+        },
+        {
+          "sequence": 102,
+          "state": "unknown"
+        },
+        {
+          "sequence": 201,
+          "state": "pending"
+        },
+        {
+          "sequence": 202,
+          "state": "pending"
+        }
+      ],
+      "outbox": [],
+      "native_submissions": 2
+    },
+    {
+      "step": "reconciliation timeout releases slot and later turns send",
+      "turns": [
+        {
+          "sequence": 1,
+          "phase": "closed_unknown",
+          "version": 11,
+          "model_calls": 1,
+          "delivery": "unknown"
+        },
+        {
+          "sequence": 2,
+          "phase": "sent",
+          "version": 9,
+          "model_calls": 1,
+          "delivery": "sent"
+        },
+        {
+          "sequence": 3,
+          "phase": "sent",
+          "version": 9,
+          "model_calls": 1,
+          "delivery": "sent"
+        }
+      ],
+      "replies": [
+        {
+          "sequence": 101,
+          "state": "sent"
+        },
+        {
+          "sequence": 102,
+          "state": "unknown"
+        },
+        {
+          "sequence": 201,
+          "state": "sent"
+        },
+        {
+          "sequence": 202,
+          "state": "sent"
+        },
+        {
+          "sequence": 301,
+          "state": "sent"
+        },
+        {
+          "sequence": 302,
+          "state": "sent"
+        }
+      ],
+      "outbox": [
+        {
+          "state": "pending",
+          "attempts": 0
+        },
+        {
+          "state": "pending",
+          "attempts": 0
+        },
+        {
+          "state": "pending",
+          "attempts": 0
+        }
+      ],
+      "native_submissions": 6
+    },
+    {
+      "step": "outbox dependency unavailable; persisted pending",
+      "turns": [
+        {
+          "sequence": 1,
+          "phase": "closed_unknown",
+          "version": 11,
+          "model_calls": 1,
+          "delivery": "unknown"
+        },
+        {
+          "sequence": 2,
+          "phase": "sent",
+          "version": 9,
+          "model_calls": 1,
+          "delivery": "sent"
+        },
+        {
+          "sequence": 3,
+          "phase": "sent",
+          "version": 9,
+          "model_calls": 1,
+          "delivery": "sent"
+        }
+      ],
+      "replies": [
+        {
+          "sequence": 101,
+          "state": "sent"
+        },
+        {
+          "sequence": 102,
+          "state": "unknown"
+        },
+        {
+          "sequence": 201,
+          "state": "sent"
+        },
+        {
+          "sequence": 202,
+          "state": "sent"
+        },
+        {
+          "sequence": 301,
+          "state": "sent"
+        },
+        {
+          "sequence": 302,
+          "state": "sent"
+        }
+      ],
+      "outbox": [
+        {
+          "state": "pending",
+          "attempts": 1
+        },
+        {
+          "state": "pending",
+          "attempts": 1
+        },
+        {
+          "state": "pending",
+          "attempts": 1
+        }
+      ],
+      "native_submissions": 6
+    },
+    {
+      "step": "outbox accepted by test consumer",
+      "turns": [
+        {
+          "sequence": 1,
+          "phase": "closed_unknown",
+          "version": 11,
+          "model_calls": 1,
+          "delivery": "unknown"
+        },
+        {
+          "sequence": 2,
+          "phase": "sent",
+          "version": 9,
+          "model_calls": 1,
+          "delivery": "sent"
+        },
+        {
+          "sequence": 3,
+          "phase": "sent",
+          "version": 9,
+          "model_calls": 1,
+          "delivery": "sent"
+        }
+      ],
+      "replies": [
+        {
+          "sequence": 101,
+          "state": "sent"
+        },
+        {
+          "sequence": 102,
+          "state": "unknown"
+        },
+        {
+          "sequence": 201,
+          "state": "sent"
+        },
+        {
+          "sequence": 202,
+          "state": "sent"
+        },
+        {
+          "sequence": 301,
+          "state": "sent"
+        },
+        {
+          "sequence": 302,
+          "state": "sent"
+        }
+      ],
+      "outbox": [
+        {
+          "state": "delivered",
+          "attempts": 2
+        },
+        {
+          "state": "delivered",
+          "attempts": 2
+        },
+        {
+          "state": "delivered",
+          "attempts": 2
+        }
+      ],
+      "native_submissions": 6
+    },
+    {
+      "step": "late sent fact updates projection without another memory commit",
+      "turns": [
+        {
+          "sequence": 1,
+          "phase": "closed_unknown",
+          "version": 12,
+          "model_calls": 1,
+          "delivery": "unknown"
+        },
+        {
+          "sequence": 2,
+          "phase": "sent",
+          "version": 9,
+          "model_calls": 1,
+          "delivery": "sent"
+        },
+        {
+          "sequence": 3,
+          "phase": "sent",
+          "version": 9,
+          "model_calls": 1,
+          "delivery": "sent"
+        }
+      ],
+      "replies": [
+        {
+          "sequence": 101,
+          "state": "sent"
+        },
+        {
+          "sequence": 102,
+          "state": "sent"
+        },
+        {
+          "sequence": 201,
+          "state": "sent"
+        },
+        {
+          "sequence": 202,
+          "state": "sent"
+        },
+        {
+          "sequence": 301,
+          "state": "sent"
+        },
+        {
+          "sequence": 302,
+          "state": "sent"
+        }
+      ],
+      "outbox": [
+        {
+          "state": "local_projection",
+          "attempts": null
+        },
+        {
+          "state": "delivered",
+          "attempts": 2
+        },
+        {
+          "state": "delivered",
+          "attempts": 2
+        },
+        {
+          "state": "delivered",
+          "attempts": 2
+        }
+      ],
+      "native_submissions": 6
+    }
+  ]
+}

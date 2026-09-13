@@ -1,0 +1,19 @@
+{
+  "contracts_path": "../../../contracts/text-dialogue/v1",
+  "database_path": ".runtime/companion.db",
+  "config_version": null,
+  "policy": {
+    "silence_ms": 5000,
+    "max_wait_ms": null,
+    "max_queued_turns": 8,
+    "max_collection_messages": 256,
+    "max_collection_bytes": 262144,
+    "delivery_reconcile_timeout_ms": 30000
+  },
+  "roles": {
+    "actor:companion": {"version": 1, "persona": "温和、简洁。没有来源时坦诚说明无法核对往事。"}
+  },
+  "bindings": {},
+  "callers": {},
+  "services": {}
+}
