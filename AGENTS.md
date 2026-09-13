@@ -12,11 +12,14 @@
 - 格式检查：`python -m ruff format --check src integrations tests scripts`；静态检查：`python -m ruff check src integrations tests scripts`；语法：`python -m compileall -q src integrations tests scripts`。
 - 调度定向：`python -m pytest tests/test_core.py tests/test_edges.py -q`；边界定向：`python -m pytest tests/test_boundaries.py tests/test_gateway.py tests/test_bootstrap.py -q`；完整组件套件：`python -m pytest -q`。
 - 短期上下文定向：`python -m pytest tests/test_short_context.py tests/test_continuation_revision.py -q`；改变共享状态/来源读取时同时验证调度套件。
+- 画像定向：`python -m pytest tests/test_profile_context.py tests/test_short_context.py tests/test_continuation_revision.py -q`。联合用例先显式设置 `TIANSHU_MEMORY_REPO` 为 Memory 仓库，再运行 `python -m pytest tests/test_profile_joint.py -q`；只读固定提交69b29f3，使用ASGI与合成来源，未设置时跳过，不能称完整联合验证通过。
 - 合成持久轨迹：`python tests/trace_scenario.py --output .runtime/local-trace.json`。
 - 回环 HTTP 进程启动/关闭检查：`python tests/smoke_server.py`（不加载外部服务配置）。
 - 本地启动：`python -m uvicorn tianshu_companion.app:create_app --factory --host 127.0.0.1 --port 8765 --workers 1`；未配置业务请求返回 503。
 - 本地状态检查：`python scripts/inspect_state.py .runtime/companion.db`；`--include-context` 仅供明确需要内容的本机调试。
 
 测试通过 `TIANSHU_CONTRACTS` 或本任务 `.runtime/workspace-context.json` 查找协调仓库合同。主合同验证器不是产品测试。变更稳定后先审查完整 diff，再跑相关检查；已通过且输入未变的检查无需重复。
+
+合同部署须同时保留 `contracts/text-dialogue/v1` 与同根的 `contracts/profile-memory/v1` 发布包；路径配置仍指向文字包，不复制schema到产品。
 
 本地隔离开发和提交用于审查；不自动推送、部署或操作真实设备。交付短记录 docs/handoffs/<任务编号>.md，含实际变更、验证、风险及下一步。
