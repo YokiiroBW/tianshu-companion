@@ -183,6 +183,73 @@ class Memory:
                 raise Fault("forbidden")
         return response
 
+    async def profiles(self, origin, scope, target, text, selection, budget, known_version=None):
+        request = dict(
+            query=query(origin),
+            requester_scope=scope,
+            target=target,
+            query_text=text,
+            selection=selection,
+            known_scope_version=known_version,
+            budget=budget,
+        )
+        self.contracts.check("profiles#select_request", request)
+        if target["kind"] == "group" and (
+            scope["audience"] != "group" or target["conversation_id"] != scope["conversation_id"]
+        ):
+            raise Fault("forbidden")
+        response = await self.client.call("/internal/v1/memory/profiles/select", request)
+        self.contracts.check("profiles#select_response", response)
+        if (
+            response["request_id"] != request["query"]["request_id"]
+            or response["requester_scope"] != scope
+            or response["target"] != target
+        ):
+            raise Fault("forbidden")
+        if (known_version is not None and response["scope_version"] != known_version) or epoch(
+            response["valid_until"]
+        ) <= time.time():
+            raise Fault("scope_changed")
+        units, groups = response["selected_units"], response["dependency_groups"]
+        ids = {u["record_id"] for u in units}
+        if len(ids) != len(units) or len({g["semantic_group_id"] for g in groups}) != len(groups):
+            raise Fault("invalid_input")
+        grouped = set()
+        for group in groups:
+            members = {
+                u["record_id"]
+                for u in units
+                if u["semantic_group_id"] == group["semantic_group_id"]
+            }
+            if (
+                not members
+                or members != set(group["record_ids"])
+                or len(members) != len(group["record_ids"])
+            ):
+                raise Fault("invalid_input")
+            grouped.update(members)
+        if grouped != ids:
+            raise Fault("invalid_input")
+        for unit in units:
+            if (
+                unit["subject"] != target
+                or unit["category"] not in selection
+                or (unit["sharing"] == "group_only" and scope["audience"] != "group")
+            ):
+                raise Fault("forbidden")
+        # Same conservative accounting as the producer, including dependency metadata.
+        size = (
+            len(canonical(dict(selected_units=units, dependency_groups=groups)).encode())
+            if units
+            else 0
+        )
+        if any(
+            response["budget_used"][k] > budget[k] or response["budget_used"][k] < size
+            for k in budget
+        ):
+            raise Fault("budget_exceeded")
+        return response
+
     async def commit(self, event):
         value = await self.client.call("/internal/v1/memory/turn-commits", event)
         self.contracts.check("identity-memory#consume_receipt", value)

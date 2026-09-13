@@ -54,6 +54,8 @@ class FakeMemory:
         self.scope_version = 1
         self.unavailable = False
         self.fail_commit = False
+        self.profile_selections = []
+        self.profile_version = 1
 
     async def identity(self, origin, account, now):
         if self.unavailable:
@@ -74,6 +76,37 @@ class FakeMemory:
             request_id=uid("req"),
             effective_scope=scope,
             scope_version=self.scope_version,
+            verified_at=utc(self.clock()),
+            valid_until=utc(self.clock() + 3600),
+            selected_units=[],
+            dependency_groups=[],
+            budget_used=dict(tokens=0, bytes=0),
+            omissions=["no_match"],
+        )
+
+    async def profiles(self, origin, scope, target, text, selection, budget, known_version=None):
+        if self.unavailable:
+            raise Fault("dependency_unavailable")
+        if known_version is not None and known_version != self.profile_version:
+            raise Fault("scope_changed")
+        self.profile_selections.append(
+            dict(
+                origin=origin,
+                scope=scope,
+                target=target,
+                text=text,
+                selection=selection,
+                budget=budget,
+                known_version=known_version,
+            )
+        )
+        return dict(
+            schema_version=1,
+            version_domain="profile-memory/v1",
+            request_id=uid("req"),
+            requester_scope=scope,
+            target=target,
+            scope_version=self.profile_version,
             verified_at=utc(self.clock()),
             valid_until=utc(self.clock() + 3600),
             selected_units=[],

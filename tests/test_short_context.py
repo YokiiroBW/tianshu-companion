@@ -81,7 +81,10 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.prompt()["recent_dialogue"])
         await self.say("群成员A资料", group=True, channel="group:shared", account="a")
         await self.say("我是群成员B", group=True, channel="group:shared", account="b")
-        self.assertEqual([], self.prompt()["recent_dialogue"])
+        recent = self.prompt()["recent_dialogue"]
+        self.assertEqual("a", recent[0]["author"]["immutable_account_id"])
+        self.assertIn("群成员A资料", canonical(recent))
+        self.assertNotIn("只在这里知道的名字", canonical(recent))
 
     async def test_t2_uses_t1_input_without_waiting_for_or_reading_its_draft(self):
         h = self.h

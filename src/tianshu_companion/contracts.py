@@ -8,6 +8,8 @@ from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 
 MANIFEST_HASH = "81e6cc4ddef7c6f82e055d4cb04b090db036dd5c52763473ce697aa02db478a1"
+PROFILE_MANIFEST_HASH = "488d05438dd5b5abaa43a66a7eab0eb5cf615d5af01a964a7286cd23e68f7eb7"
+PROFILE_DOMAIN = "profile-memory/v1"
 
 
 class Fault(Exception):
@@ -75,6 +77,27 @@ class Contracts:
         self.registry = Registry().with_resources(
             (s["$id"], Resource.from_contents(s)) for s in self.schemas.values()
         )
+        profile_root = root.parent.parent / PROFILE_DOMAIN
+        manifest = read(profile_root / "manifest.json")
+        if hashlib.sha256(manifest).hexdigest() != PROFILE_MANIFEST_HASH:
+            raise ValueError("Unrecognized profile contract release")
+        release = json.loads(manifest)
+        if (
+            release["version"] != "1.0.0"
+            or release["version_domain"] != PROFILE_DOMAIN
+            or release["dependency"]["manifest_sha256"] != MANIFEST_HASH
+        ):
+            raise ValueError("Unsupported profile contract version")
+        for name, expected in release["sha256"].items():
+            path = (profile_root / name).resolve()
+            if (
+                not path.is_relative_to(profile_root)
+                or hashlib.sha256(read(path)).hexdigest() != expected
+            ):
+                raise ValueError(f"Profile contract content mismatch: {name}")
+        schema = json.loads(read(profile_root / "schemas/profiles.json"))
+        self.schemas["profiles"] = schema
+        self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
 
     def check(self, name, value):
         file, definition = name.split("#")

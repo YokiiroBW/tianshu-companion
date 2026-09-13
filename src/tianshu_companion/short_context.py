@@ -62,12 +62,26 @@ def select_recent(store, turn, policy, now):
         expiry = epoch(previous["bundle"]["sealed_at"]) + policy.max_age_seconds
         if expiry <= now:
             break
+        same_person = previous["scope"] == turn["scope"]
+        same_boundary = (
+            all(
+                previous["scope"][k] == turn["scope"][k]
+                for k in ("actor_id", "audience", "conversation_id")
+            )
+            and previous["bundle"]["collection_key"]["channel"]
+            == turn["bundle"]["collection_key"]["channel"]
+        )
         if (
-            previous["scope"] != turn["scope"]
-            or previous["scope_version"] != turn["scope_version"]
+            not same_boundary
+            or (turn["scope"]["audience"] != "group" and not same_person)
+            or previous["scope_version"] is None
+            or (same_person and previous["scope_version"] != turn["scope_version"])
             or previous.get("context_revision") != revision
-            or previous["binding_version"] != turn["binding_version"]
-            or previous["bundle"]["collection_key"] != turn["bundle"]["collection_key"]
+            or (same_person and previous["binding_version"] != turn["binding_version"])
+            or (
+                turn["scope"]["audience"] != "group"
+                and previous["bundle"]["collection_key"] != turn["bundle"]["collection_key"]
+            )
             or previous["bundle"]["possibly_incomplete"]
             or previous["bundle"]["continuation_of"]
             or previous["cancelled"]
@@ -89,6 +103,8 @@ def select_recent(store, turn, policy, now):
             collection_id=previous["bundle"]["collection_id"],
             input_revision=previous["bundle"]["collection_revision"],
             actor_id=previous["scope"]["actor_id"],
+            person_id=previous["scope"]["person_id"],
+            author=previous["bundle"]["collection_key"]["author"],
             phase=previous["phase"],
             delivery_state=previous["delivery_state"],
             messages=previous["bundle"]["messages"],
