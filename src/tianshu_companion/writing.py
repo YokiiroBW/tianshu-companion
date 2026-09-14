@@ -67,6 +67,8 @@ CANCELLABLE = {
     "interrupted",
 }
 LIVE = {"queued", "generating"}
+# Request states in which an attempt may still legitimately own the chapter.
+LIVE_REQUEST = {"reserved", "submitted", "cancel_requested"}
 
 
 class Writing:
@@ -425,6 +427,8 @@ class Writing:
             current_revision=item["current_revision"],
             published_revision=item["published_revision"],
             published_at=item["published_at"],
+            publication_pending=item["published_revision"] is not None
+            and item["published_revision"] != item["current_revision"],
             review_required=list(item["review_required"]),
             basis=item.get("basis"),
             material_bytes=item.get("material_bytes"),
@@ -441,6 +445,11 @@ class Writing:
                 reviewer=review["reviewer"],
                 decision=review["decision"],
                 reviewed_at=review["created_at"],
+                material_version=review.get("material_version"),
+                acknowledged=review.get("acknowledged", False),
+                acknowledged_drift=list(review.get("acknowledged_drift", [])),
+                matches_basis=review.get("material_version")
+                == (item.get("basis") or {}).get("material_version"),
             ),
             publications=len(self.publications(item["id"])),
             fictional=item.get("fictional", True),
@@ -611,6 +620,21 @@ class Writing:
     def _material_id(self, chapter_id, material_version):
         return digest([chapter_id, material_version])
 
+    def _pin_material(self, chapter_id, entries, material_version, material_bytes):
+        self.store.put(
+            "write_materials",
+            dict(
+                id=self._material_id(chapter_id, material_version),
+                conversation_id=chapter_id,
+                material=entries,
+                material_version=material_version,
+                material_bytes=material_bytes,
+                state="pinned",
+                fictional=True,
+                real_user_sources="excluded",
+            ),
+        )
+
     def _available(self):
         # Independent writing switch only; never the chat config_version fallback.
         return self.life.writing_available()
@@ -622,30 +646,35 @@ class Writing:
         prior = [c for c in self._ordered(work["id"]) if c["order"] < item["order"]]
         return digest(self._bundle(item, work, prior))
 
-    def _recheck(self, item, work, recipe):
+    def _drift(self, item, work, recipe):
+        """Dependency reasons only, computed without writing anything.
+
+        A stale pin is never tolerated silently: named reasons come first and anything else
+        that reaches the material is reported as material_changed.
+        """
+        if not item.get("basis"):
+            return []
+        if item["basis"].get("material_version") == self._material_digest(item, work):
+            return []
         reasons = []
-        if item.get("basis"):
-            if item["basis"].get("material_version") != self._material_digest(item, work):
-                # Named reasons first; anything else that reaches the material is still
-                # reported, so a dependency can never change unnoticed.
-                current = self._current(item, work, recipe)
-                for key in PINNED:
-                    if item["basis"].get(key) != current[key] and REASON[key] not in reasons:
-                        reasons.append(REASON[key])
-                if not reasons:
-                    reasons.append("material_changed")
-        if item["published_revision"] is not None and (
-            item["current_revision"] != item["published_revision"]
-        ):
-            reasons.append("unpublished_revision")
+        current = self._current(item, work, recipe)
+        for key in PINNED:
+            if item["basis"].get(key) != current[key] and REASON[key] not in reasons:
+                reasons.append(REASON[key])
+        return reasons or ["material_changed"]
+
+    def _recheck(self, item, work, recipe):
+        reasons = self._drift(item, work, recipe)
         previous, state = item["state"], item["state"]
         if item["current_revision"] is not None:
-            if item["published_revision"] == item["current_revision"] and not reasons:
-                state = "published"
+            if reasons:
+                state = "needs_review"
             else:
-                # Either the canon moved under this text, or a newer draft sits over a
-                # published revision. Both are review signals; published text never changes.
-                state = "needs_review" if reasons else "draft"
+                state = (
+                    "published"
+                    if item["published_revision"] == item["current_revision"]
+                    else "draft"
+                )
         elif previous in LIVE and reasons:
             # A pending attempt whose pinned basis no longer matches is explicitly void.
             state = "invalidated"
@@ -653,8 +682,9 @@ class Writing:
             return reasons
         item.update(state=state, review_required=reasons)
         self._save_chapter(item)
-        if previous in LIVE and state == "invalidated":
-            self._invalidate_attempt(item, "superseded_by_dependency_change")
+        if previous in LIVE and state != previous:
+            # A pending attempt never survives a state the worker will no longer pick up.
+            self._invalidate_attempt(item, "voided_by_" + state)
         return reasons
 
     def _invalidate_attempt(self, item, reason):
@@ -705,19 +735,7 @@ class Writing:
         state = overflow or ("queued" if self._available() else "unavailable")
         now = self.life.clock()
         with self.store.transaction():
-            self.store.put(
-                "write_materials",
-                dict(
-                    id=self._material_id(chapter_id, basis["material_version"]),
-                    conversation_id=chapter_id,
-                    material=entries,
-                    material_version=basis["material_version"],
-                    material_bytes=material_bytes,
-                    state="pinned",
-                    fictional=True,
-                    real_user_sources="excluded",
-                ),
-            )
+            self._pin_material(chapter_id, entries, basis["material_version"], material_bytes)
             self.store.put(
                 "write_requests",
                 dict(
@@ -743,9 +761,9 @@ class Writing:
                 cancel_requested=False,
                 material_bytes=material_bytes,
             )
-            if item["current_revision"] is None:
-                # Nothing authored yet, so the fresh attempt re-pins the current canon.
-                item["review_required"] = []
+            # The chapter's pins were just taken from the current canon, so nothing is
+            # outstanding; later drift is recomputed from those pins.
+            item["review_required"] = self._drift(item, work, recipe)
             self._save_chapter(item, expected)
         return self.chapter_metadata(chapter_id)
 
@@ -797,8 +815,11 @@ class Writing:
                 return
             work = self._work(item["work_id"])
             recipe = self._recipe(work["recipe"])
+            # The attempt's own pins decide the material and the config; a later re-pin of the
+            # chapter never rewrites what an already submitted attempt was built from.
+            basis = request["basis"]
             material = self.store.get(
-                "write_materials", self._material_id(item["id"], item["basis"]["material_version"])
+                "write_materials", self._material_id(item["id"], basis["material_version"])
             )
             if material is None:
                 item.update(state="failed", failure="missing_material")
@@ -824,7 +845,7 @@ class Writing:
                         self.life.gateway.generate(
                             dict(
                                 id="chapter:" + request["id"],
-                                config_version=item["basis"]["config_version"],
+                                config_version=basis["config_version"],
                             ),
                             messages,
                         ),
@@ -834,7 +855,11 @@ class Writing:
                 text(content, recipe["max_chars"])
                 with self.store.transaction():
                     fresh = self._get("chapters", item["id"])
-                    if fresh["cancel_requested"] or fresh["state"] == "cancelled":
+                    if not self._owns(fresh, request):
+                        # The chapter moved on while the call was in flight: this text belongs
+                        # to a superseded attempt and is never persisted as chapter content.
+                        self._discard(request, fresh, response_received=True)
+                    elif fresh["cancel_requested"] or fresh["state"] == "cancelled":
                         self._settle(
                             fresh, request, "cancelled", failure="cancelled_before_persist"
                         )
@@ -845,9 +870,10 @@ class Writing:
                             dict(
                                 kind="gateway",
                                 receipt=receipt,
-                                config_version=fresh["basis"]["config_version"],
+                                config_version=basis["config_version"],
                                 recipe_version=recipe["version"],
                             ),
+                            basis,
                             request,
                         )
                 self._recheck_work(item["work_id"])
@@ -857,22 +883,50 @@ class Writing:
                 if fresh["cancel_requested"]:
                     self._settle(fresh, request, "cancelled", failure="cancelled_task")
                 else:
-                    self._settle(item, request, "interrupted", failure="cancelled_task")
+                    self._settle(fresh, request, "interrupted", failure="cancelled_task")
                 raise
             except Exception as exc:
                 unavailable = isinstance(exc, Fault) and exc.code == "dependency_unavailable"
+                fresh = self._get("chapters", item["id"])
                 state = "unavailable" if unavailable else "failed"
-                if self._get("chapters", item["id"])["cancel_requested"]:
+                if fresh["cancel_requested"]:
                     state = "cancelled"
-                self._settle(item, request, state, failure=type(exc).__name__)
+                self._settle(fresh, request, state, failure=type(exc).__name__)
 
-    def _settle(self, item, request, state, *, failure=None):
-        item.update(state=state, failure=failure, cancel_requested=False)
-        self._save_chapter(item)
+    @staticmethod
+    def _owns(chapter, request):
+        """True only while this exact attempt is still the chapter's live attempt."""
+        return (
+            chapter.get("attempt") == request["id"]
+            and chapter["state"] in LIVE
+            and request["state"] in LIVE_REQUEST
+        )
+
+    def _settle(self, chapter, request, state, *, failure=None):
+        """Settle one attempt. A superseded attempt only ever records its own outcome."""
+        if not self._owns(chapter, request):
+            return self._discard(request, chapter, failure=failure)
+        chapter.update(state=state, failure=failure, cancel_requested=False)
+        self._save_chapter(chapter)
         request.update(state=state, failure=failure, settled_at=self.life.clock())
         self._save("requests", request)
+        return request
 
-    def _revision(self, item, content, source, request):
+    def _discard(self, request, chapter, *, failure=None, response_received=False):
+        """Never let a superseded attempt write chapter state or chapter content."""
+        request.update(
+            state="superseded",
+            failure=request.get("failure") or failure or "superseded_attempt",
+            stale=True,
+            response_received=bool(response_received),
+            superseded_by=chapter.get("attempt"),
+            revision=None,
+            settled_at=self.life.clock(),
+        )
+        self._save("requests", request)
+        return request
+
+    def _revision(self, item, content, source, basis, request=None):
         revision_id = digest([item["id"], item["version"], content, source])
         prior = self.store.get("write_revisions", revision_id)
         record = dict(
@@ -884,7 +938,7 @@ class Writing:
             content=content,
             source=source,
             parent=item["current_revision"],
-            basis=item["basis"],
+            basis=basis,
             fictional=True,
             canon_effect="none",
             created_at=self.life.clock(),
@@ -933,21 +987,9 @@ class Writing:
             source["addresses_review"] = addresses_review
         with self.store.transaction():
             basis, entries, material_bytes = self._pin(item, work, recipe)
-            self.store.put(
-                "write_materials",
-                dict(
-                    id=self._material_id(chapter_id, basis["material_version"]),
-                    conversation_id=chapter_id,
-                    material=entries,
-                    material_version=basis["material_version"],
-                    material_bytes=material_bytes,
-                    state="pinned",
-                    fictional=True,
-                    real_user_sources="excluded",
-                ),
-            )
+            self._pin_material(chapter_id, entries, basis["material_version"], material_bytes)
             item.update(basis=basis, material_bytes=material_bytes)
-            revision = self._revision(item, content, source, None)
+            revision = self._revision(item, content, source, basis)
         self._recheck_work(item["work_id"])
         return revision
 
@@ -961,8 +1003,26 @@ class Writing:
         ]
         return rows[-1] if rows else None
 
-    def review_chapter(self, chapter_id, revision_id, *, reviewer, decision, notes, expected):
+    def review_chapter(
+        self,
+        chapter_id,
+        revision_id,
+        *,
+        reviewer,
+        decision,
+        notes,
+        expected,
+        acknowledge_drift=False,
+    ):
+        """Record one review opinion bound to the revision AND the material it saw.
+
+        `acknowledge_drift=True` is the explicit re-review path: an approving review may
+        re-pin the chapter to the current canon, recording exactly which drift it cleared.
+        It never rewrites chapter text or publication history.
+        """
         expected_version(expected)
+        if type(acknowledge_drift) is not bool:
+            raise ValueError("acknowledge_drift must be boolean")
         item = self._get("chapters", chapter_id)
         if item["version"] != expected:
             raise ValueError("Stale version")
@@ -971,8 +1031,25 @@ class Writing:
         revision = self._get("revisions", revision_id)
         if revision["chapter_id"] != chapter_id or revision_id != item["current_revision"]:
             raise ValueError("Review must target the current revision of this chapter")
+        if not item.get("basis"):
+            raise ValueError("Chapter has no pinned material to review against")
         notes = text(notes, 2000)
         reviewer = text(reviewer, 128)
+        acknowledged = []
+        if acknowledge_drift:
+            if decision != "approved":
+                raise ValueError("Only an approving review may acknowledge dependency drift")
+            if item["state"] in LIVE:
+                raise ValueError("Cancel the pending attempt before re-reviewing")
+            work = self._work(item["work_id"])
+            recipe = self._recipe(work["recipe"])
+            acknowledged = self._drift(item, work, recipe)
+            with self.store.transaction():
+                basis, entries, material_bytes = self._pin(item, work, recipe)
+                self._pin_material(chapter_id, entries, basis["material_version"], material_bytes)
+                item.update(basis=basis, material_bytes=material_bytes)
+                self._save_chapter(item, expected)
+            self._recheck_work(item["work_id"])
         now = self.life.clock()
         review = dict(
             id=digest([chapter_id, revision_id, reviewer, decision, notes, item["version"], now]),
@@ -984,6 +1061,10 @@ class Writing:
             reviewer=reviewer,
             decision=decision,
             notes=notes,
+            material_version=item["basis"]["material_version"],
+            drift=acknowledged,
+            acknowledged=bool(acknowledged) or acknowledge_drift,
+            acknowledged_drift=acknowledged,
             created_at=now,
             version=1,
         )
@@ -1003,9 +1084,20 @@ class Writing:
             raise ValueError("Missing current draft")
         if item["published_revision"] == current:
             return current  # one publication row per published revision
+        if item["state"] in LIVE:
+            raise ValueError("Cancel the pending attempt before publishing")
+        if not item.get("basis"):
+            raise ValueError("Chapter has no pinned material to publish against")
+        work = self._work(item["work_id"])
+        drift = self._drift(item, work, self._recipe(work["recipe"]))
+        if drift:
+            raise ValueError("Dependencies changed; revise or re-review before publishing")
         review = self._latest_review(chapter_id, current)
         if review is None or review["decision"] != "approved":
             raise ValueError("Approving review of the current revision required")
+        if review.get("material_version") != item["basis"]["material_version"]:
+            # An approval given before the chapter was re-pinned never authorises a new release.
+            raise ValueError("Approval predates the current pinned material")
         with self.store.transaction():
             self.store.put(
                 "write_publications",

@@ -36,4 +36,4 @@ TS-071：数据库现为user_version=3；v2结构升级前SQLite backup至pre-li
 
 TS-072：数据库现为user_version=4，v3升级前pre-images-v4随机备份；图像/衣橱可信内部端口、原工作流只读审阅与候选见docs/images.md。定向：python -m pytest tests/test_images.py tests/test_life.py -q；迁移/生命周期改动后跑完整组件套件。禁止把合成HTTP测试称为真实GPU验证。
 
-TS-073：数据库现为user_version=5，v4升级前pre-writing-v5随机备份；作品/章节顺序/版本化大纲与人物设定/不可变章节修订、审校与发布历史见docs/writing.md。定向：python -m pytest tests/test_writing.py tests/test_writing_chain.py -q；写作复用独立life_writing与life_config_version及现有网关，未配置明确不可生成，不回退聊天模型；生成前固定素材/前章引用/配方/模型配置版本，依赖变化只标needs_review且不改写已发布正文，unknown不自动重发。迁移/生命周期改动后跑完整组件套件。
+TS-073：数据库现为user_version=5，v4升级前pre-writing-v5随机备份；作品/章节顺序/版本化大纲与人物设定/不可变章节修订、审校与发布历史见docs/writing.md。定向：python -m pytest tests/test_writing.py tests/test_writing_chain.py -q；写作复用独立life_writing与life_config_version及现有网关，未配置明确不可生成，不回退聊天模型；生成前固定素材/前章引用/配方/模型配置版本，回包按attempt归属（旧回包/失败/取消只落旧请求，不写新稿），依赖变化只标needs_review/invalidated且不改写已发布正文，unknown不自动重发；审校绑定所审阅修订与固定素材，发布要求无漂移且批准覆盖当前基准，重审需显式acknowledge_drift。迁移/生命周期改动后跑完整组件套件。

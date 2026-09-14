@@ -45,7 +45,15 @@ def draft(port, model, chapter="work:1", output=None, request="req:1"):
     return port.chapter_metadata(chapter)
 
 
-def review(port, chapter, *, decision="approved", reviewer="admin", notes="Synthetic opinion."):
+def review(
+    port,
+    chapter,
+    *,
+    decision="approved",
+    reviewer="admin",
+    notes="Synthetic opinion.",
+    acknowledge_drift=False,
+):
     meta = port.chapter_metadata(chapter)
     return port.review_chapter(
         chapter,
@@ -54,6 +62,7 @@ def review(port, chapter, *, decision="approved", reviewer="admin", notes="Synth
         decision=decision,
         notes=notes,
         expected=meta["version"],
+        acknowledge_drift=acknowledge_drift,
     )
 
 
@@ -234,7 +243,13 @@ def test_material_digest_detects_changes_without_a_named_version_field(env):
     assert flagged["review_required"] == ["material_changed"]
     assert port.admin_read_revision(second["current_revision"])["content"] == "Chapter two text."
     # Publishing the prior chapter flips its standing from draft_basis to canon.
-    approve_publish(port, "work:1")
+    first = port.chapter_metadata("work:1")
+    with pytest.raises(ValueError):
+        # Its own goal was edited, so the existing text needs an explicit re-review first.
+        port.publish_chapter("work:1", reviewer="admin", expected=first["version"])
+    review(port, "work:1", acknowledge_drift=True)
+    rechecked = port.chapter_metadata("work:1")
+    port.publish_chapter("work:1", reviewer="admin", expected=rechecked["version"])
     still = port.chapter_metadata("work:2")
     assert still["state"] == "needs_review"
     assert still["review_required"] == ["material_changed"]
@@ -246,6 +261,302 @@ def test_material_digest_detects_changes_without_a_named_version_field(env):
     prior = [e for e in entries if e["kind"] == "prior_chapter"][0]
     assert prior["standing"] == "canon" and prior["title"] == "The salt plain"
     assert prior["source"]["revision_id"] == port.chapter_metadata("work:1")["current_revision"]
+
+
+def test_stale_success_response_is_discarded_and_the_new_attempt_survives(env):
+    """A response for a superseded attempt never writes chapter content or new state."""
+    port, _, _, model = env
+    original = model.generate
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def gated(turn, messages):
+            started.set()
+            await release.wait()
+            return await original(turn, messages)
+
+        model.generate = gated
+        meta = port.chapter_metadata("work:1")
+        port.request_chapter("work:1", request_id="old", expected=meta["version"])
+        task = asyncio.create_task(port.work())
+        await started.wait()
+        port.update_outline(
+            "work",
+            "CHANGED outline while the old attempt was in flight.",
+            author="admin",
+            expected=port.work_metadata("work")["version"],
+        )
+        assert port.chapter_metadata("work:1")["state"] == "invalidated"
+        port.request_chapter(
+            "work:1", request_id="new", expected=port.chapter_metadata("work:1")["version"]
+        )
+        release.set()
+        await task
+
+        chapter = port.chapter_metadata("work:1")
+        assert chapter["state"] == "queued" and chapter["attempt"] == "new"
+        assert chapter["current_revision"] is None
+        assert chapter["review_required"] == []
+        assert port.store.list("write_revisions") == []
+        old = port.store.get("write_requests", "old")
+        assert old["state"] == "superseded" and old["stale"] is True
+        assert old["response_received"] is True and old["revision"] is None
+        assert old["superseded_by"] == "new"
+        assert old["basis"] != port.store.get("write_requests", "new")["basis"]
+        new = port.store.get("write_requests", "new")
+        assert new["state"] == "reserved" and new["submitted"] is False
+        # The surviving attempt still runs and its text carries its own pinned basis.
+        model.generate = original
+        model.output = "New attempt prose."
+        await port.work()
+        final = port.chapter_metadata("work:1")
+        assert final["state"] == "draft"
+        revision = port.admin_read_revision(final["current_revision"])
+        assert revision["content"] == "New attempt prose."
+        assert revision["basis"] == new["basis"] != old["basis"]
+        assert port.store.get("write_requests", "new")["state"] == "draft"
+        assert port.store.get("write_requests", "old")["revision"] is None
+        # The discarded call carried the superseded material; the surviving call did not.
+        assert "CHANGED outline" in model.calls[-1][1][-1]["content"]
+        assert "Canon outline version one." in model.calls[0][1][-1]["content"]
+
+    asyncio.run(scenario())
+
+
+def test_stale_failure_never_fails_the_new_attempt(env):
+    port, _, _, model = env
+    original = model.generate
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def gated(turn, messages):
+            started.set()
+            await release.wait()
+            raise RuntimeError("synthetic upstream failure")
+
+        model.generate = gated
+        meta = port.chapter_metadata("work:1")
+        port.request_chapter("work:1", request_id="old", expected=meta["version"])
+        task = asyncio.create_task(port.work())
+        await started.wait()
+        port.update_outline(
+            "work", "Changed again.", author="admin", expected=port.work_metadata("work")["version"]
+        )
+        port.request_chapter(
+            "work:1", request_id="new", expected=port.chapter_metadata("work:1")["version"]
+        )
+        release.set()
+        await task
+
+        chapter = port.chapter_metadata("work:1")
+        assert chapter["state"] == "queued" and chapter["attempt"] == "new"
+        assert chapter["failure"] is None and chapter["current_revision"] is None
+        old = port.store.get("write_requests", "old")
+        assert old["state"] == "superseded" and old["failure"] == "RuntimeError"
+        assert port.store.get("write_requests", "new")["state"] == "reserved"
+        # The surviving attempt is still able to produce the chapter.
+        model.generate = original
+        await port.work()
+        assert port.chapter_metadata("work:1")["state"] == "draft"
+
+    asyncio.run(scenario())
+
+
+def test_stale_task_cancellation_never_interrupts_the_new_attempt(env):
+    port, _, _, model = env
+    original = model.generate
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def gated(turn, messages):
+            started.set()
+            await release.wait()
+            return await original(turn, messages)
+
+        model.generate = gated
+        meta = port.chapter_metadata("work:1")
+        port.request_chapter("work:1", request_id="old", expected=meta["version"])
+        task = asyncio.create_task(port.work())
+        await started.wait()
+        port.update_outline(
+            "work",
+            "Changed before shutdown.",
+            author="admin",
+            expected=port.work_metadata("work")["version"],
+        )
+        port.request_chapter(
+            "work:1", request_id="new", expected=port.chapter_metadata("work:1")["version"]
+        )
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        chapter = port.chapter_metadata("work:1")
+        assert chapter["state"] == "queued" and chapter["attempt"] == "new"
+        assert chapter["current_revision"] is None
+        old = port.store.get("write_requests", "old")
+        assert old["state"] == "superseded" and old["stale"] is True
+        assert old["response_received"] is False and old["revision"] is None
+        assert port.store.get("write_requests", "new")["state"] == "reserved"
+        model.generate = original
+        await port.work()
+        assert port.chapter_metadata("work:1")["state"] == "draft"
+
+    asyncio.run(scenario())
+
+
+def test_stale_response_never_revives_a_cancelled_new_attempt(env):
+    port, _, _, model = env
+    original = model.generate
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def gated(turn, messages):
+            started.set()
+            await release.wait()
+            return await original(turn, messages)
+
+        model.generate = gated
+        meta = port.chapter_metadata("work:1")
+        port.request_chapter("work:1", request_id="old", expected=meta["version"])
+        task = asyncio.create_task(port.work())
+        await started.wait()
+        port.update_outline(
+            "work",
+            "Changed once more.",
+            author="admin",
+            expected=port.work_metadata("work")["version"],
+        )
+        port.request_chapter(
+            "work:1", request_id="new", expected=port.chapter_metadata("work:1")["version"]
+        )
+        cancelled = port.cancel_chapter(
+            "work:1", expected=port.chapter_metadata("work:1")["version"]
+        )
+        assert cancelled["state"] == "cancelled" and cancelled["current_revision"] is None
+        release.set()
+        await task
+        final = port.chapter_metadata("work:1")
+        assert final["state"] == "cancelled" and final["current_revision"] is None
+        assert port.store.list("write_revisions") == []
+        assert port.store.get("write_requests", "old")["state"] == "superseded"
+        assert port.store.get("write_requests", "old")["revision"] is None
+        assert port.store.get("write_requests", "new")["state"] == "cancelled"
+        await port.work()  # nothing queued: the cancelled attempt is never resurrected
+        assert port.chapter_metadata("work:1")["state"] == "cancelled"
+        assert model.calls  # the discarded upstream call did happen
+
+    asyncio.run(scenario())
+
+
+def test_publish_is_refused_after_outline_change_until_explicit_re_review(env):
+    port, _, _, model = env
+    draft(port, model)
+    review(port, "work:1")
+    approved = port.chapter_metadata("work:1")
+    assert approved["review"]["decision"] == "approved"
+    assert approved["review"]["matches_basis"] is True
+    port.update_outline("work", "New contradictory canon", author="admin", expected=1)
+    flagged = port.chapter_metadata("work:1")
+    assert flagged["state"] == "needs_review" and flagged["review_required"] == ["outline_changed"]
+    assert flagged["review"]["material_version"] == flagged["basis"]["material_version"]
+    with pytest.raises(ValueError):
+        port.publish_chapter("work:1", reviewer="admin", expected=flagged["version"])
+    assert port.publications("work:1") == []
+    assert port.chapter_metadata("work:1")["state"] == "needs_review"
+    # Explicit re-review against the current dependencies is the only approval that publishes.
+    stale = port.reviews("work:1")[-1]
+    acknowledged = review(
+        port, "work:1", acknowledge_drift=True, notes="Checked against new canon."
+    )
+    assert acknowledged["acknowledged_drift"] == ["outline_changed"]
+    assert acknowledged["material_version"] != stale["material_version"]
+    refreshed = port.chapter_metadata("work:1")
+    assert refreshed["state"] == "draft" and refreshed["review_required"] == []
+    assert refreshed["review"]["matches_basis"] is True
+    published = port.publish_chapter("work:1", reviewer="admin", expected=refreshed["version"])
+    assert published == refreshed["current_revision"]
+    assert [p["revision_id"] for p in port.publications("work:1")] == [published]
+    assert port.chapter_metadata("work:1")["state"] == "published"
+    with pytest.raises(ValueError):
+        port.review_chapter(
+            "work:1",
+            refreshed["current_revision"],
+            reviewer="admin",
+            decision="changes_requested",
+            notes="n",
+            expected=port.chapter_metadata("work:1")["version"],
+            acknowledge_drift=True,
+        )
+
+
+def test_prior_chapter_change_invalidates_the_approval_until_re_review(env):
+    port, _, _, model = env
+    draft(port, model, "work:1", output="Chapter one text.")
+    draft(port, model, "work:2", request="req:2", output="Chapter two text.")
+    review(port, "work:2")
+    approved = port.chapter_metadata("work:2")
+    assert approved["review"]["matches_basis"] is True
+    port.revise_chapter(
+        "work:1",
+        "Chapter one, human revised.",
+        editor="admin",
+        reason="Continuity repair.",
+        expected=port.chapter_metadata("work:1")["version"],
+    )
+    flagged = port.chapter_metadata("work:2")
+    assert flagged["state"] == "needs_review"
+    assert flagged["review_required"] == ["prior_chapter_changed"]
+    with pytest.raises(ValueError):
+        port.publish_chapter("work:2", reviewer="admin", expected=flagged["version"])
+    assert port.publications("work:2") == []
+    review(port, "work:2", acknowledge_drift=True)
+    refreshed = port.chapter_metadata("work:2")
+    assert refreshed["review_required"] == [] and refreshed["review"]["matches_basis"] is True
+    assert port.publish_chapter("work:2", reviewer="admin", expected=refreshed["version"])
+    assert port.admin_read_revision(approved["current_revision"])["content"] == "Chapter two text."
+
+
+def test_approval_is_bound_to_the_pinned_material_across_a_retry(env):
+    port, _, _, model = env
+    draft(port, model, "work:1", output="Chapter one text.")
+    review(port, "work:1")
+    port.update_outline("work", "Canon changed after the review", author="admin", expected=1)
+    flagged = port.chapter_metadata("work:1")
+    with pytest.raises(ValueError):
+        port.publish_chapter("work:1", reviewer="admin", expected=flagged["version"])
+    # A retry re-pins the material, so the earlier approval no longer authorises a release.
+    port.retry_chapter("work:1", request_id="req:2", expected=flagged["version"])
+    queued = port.chapter_metadata("work:1")
+    with pytest.raises(ValueError):
+        port.publish_chapter("work:1", reviewer="admin", expected=queued["version"])
+    with pytest.raises(ValueError):
+        port.review_chapter(
+            "work:1",
+            queued["current_revision"],
+            reviewer="admin",
+            decision="approved",
+            notes="n",
+            expected=queued["version"],
+            acknowledge_drift=True,
+        )
+    cancelled = port.cancel_chapter("work:1", expected=queued["version"])
+    assert cancelled["state"] == "cancelled" and cancelled["current_revision"] is not None
+    # The retry already re-pinned the canon, so nothing is outstanding; the older approval
+    # however no longer covers those pins, so it cannot authorise a release.
+    assert cancelled["review_required"] == []
+    assert cancelled["review"]["matches_basis"] is False
+    with pytest.raises(ValueError):
+        port.publish_chapter("work:1", reviewer="admin", expected=cancelled["version"])
+    assert port.publications("work:1") == []
+    review(port, "work:1", acknowledge_drift=True, notes="Re-checked against the current canon.")
+    rechecked = port.chapter_metadata("work:1")
+    assert rechecked["review"]["matches_basis"] is True
+    assert port.publish_chapter("work:1", reviewer="admin", expected=rechecked["version"])
 
 
 def test_generation_requires_independent_configuration_and_offline_review(env):
@@ -516,8 +827,9 @@ def test_review_and_publish_history_keep_published_content(tmp_path):
         )
         assert second != first
         revised = port.chapter_metadata("work:1")
-        assert revised["state"] == "needs_review"
-        assert revised["review_required"] == ["unpublished_revision"]
+        # A newer draft over a published revision is a pending publication, not drift.
+        assert revised["state"] == "draft"
+        assert revised["review_required"] == [] and revised["publication_pending"] is True
         assert port.admin_read_revision(first)["content"] == "First synthetic chapter."
         with pytest.raises(ValueError):
             port.publish_chapter("work:1", reviewer="admin", expected=revised["version"])

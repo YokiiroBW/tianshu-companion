@@ -75,26 +75,37 @@ services.gateway；未启用、无独立版本或无服务配置时 `unavailable
 `candidates_changed`、`recipe_changed`、`chapter_plan_changed`、
 `prior_chapter_changed`（前章修订或摘要版本变化）；无法归因到这些字段的素材变化（例如前章标题，
 或前章从未发布变为已发布而改变其 `standing`）记为 `material_changed`。
-另有 `unpublished_revision`（存在比已发布更新的草稿）。只要章节已有固定基准，原因就照实列出；
 状态则按内容区分：
 
 - 有草稿或已发布内容 → `needs_review`；**已发布正文、修订行与发布历史都不改**，
   读授权用户仍读到原正式文本。
 - 排队中/生成中的尝试被依赖变化作废 → `invalidated`，请求记录标记 `invalidated`，不再生成。
+  任何使章节离开 `queued`/`generating` 的漂移都会作废待办尝试，不会留下永远不会执行的请求。
 - 尚无内容的其他状态（`unavailable`/`failed`/`cancelled` 等）保留原状态，只列出漂移原因。
-- 清除标记只有两条显式路径：`retry_chapter` 重新生成（重钉当前正典），或 `revise_chapter`
-  人工改写（重钉当前正典）；随后审校并发布。**只记录审校意见不会清掉标记**。
+- `review_required` 只描述**依赖漂移**，不再混入“存在比已发布更新的草稿”；后者由元数据
+  `publication_pending` 表示。重新固定基准（`request_chapter`/`retry_chapter`/`revise_chapter`/
+  已确认的重审）后该字段按新基准实时重算，不会残留旧原因。
+- 清除标记的显式路径：`retry_chapter` 重新生成、`revise_chapter` 人工改写，或
+  `review_chapter(..., acknowledge_drift=True)` 针对当前依赖重审（见下节）。
 
 ## 修订、审校与发布
 
 - `revise_chapter(chapter_id, content, editor=, reason=, expected=, addresses_review=)`
   保存父链、编辑者、原因与来源，并重钉当前正典。模型离线、甚至完全没有写作配置时都可用；
   它也能创建章节的首个修订，因此人工可以完全脱离模型创作。排队/生成中先 `cancel_chapter`。
-- `review_chapter(chapter_id, revision_id, reviewer=, decision=, notes=, expected=)`
-  只接受当前修订，decision 为 `approved`/`changes_requested`/`rejected`，追加保存，不覆盖旧意见。
-- `publish_chapter(chapter_id, reviewer=, expected=)` 要求当前修订存在且该修订最近一次审校为
-  `approved`；同一修订重复发布幂等（不追加历史）；发布新修订会追加一条 `supersedes` 记录，
-  发布历史完整保留。过期的 `expected_version` 一律拒绝。
+- `review_chapter(chapter_id, revision_id, reviewer=, decision=, notes=, expected=,
+  acknowledge_drift=False)` 只接受当前修订，decision 为 `approved`/`changes_requested`/`rejected`，
+  追加保存，不覆盖旧意见。每条意见**同时绑定所审阅的修订与固定素材**
+  （`material_version`，元数据给出 `review.matches_basis`）。
+  `acknowledge_drift=True` 是显式“针对当前依赖重审”：只允许 `approved`，且章节不得有排队/生成中
+  的尝试；它把章节基准重钉到当前正典，并在意见里记录 `acknowledged_drift`（被确认的原因）与新的
+  `material_version`。它不改写正文、不追加发布记录。
+- `publish_chapter(chapter_id, reviewer=, expected=)` 的准入条件：
+  1) 有排队/生成中的尝试时先取消；2) 当前修订存在；3) 当前基准与正典无漂移
+  （`review_required` 为空）；4) 该修订最近一次审校为 `approved` **且其 `material_version` 等于
+  当前基准**——素材变更或重新固定后的旧批准不能用于新发布；5) 过期 `expected_version` 拒绝。
+  同一修订重复发布幂等（不追加历史）；发布新修订会追加一条 `supersedes` 记录，发布历史完整保留。
+  **待复核状态下不存在静默发布路径**：只能先修订、或针对当前依赖显式重审。
 
 ## 取消、未知与重启
 
@@ -108,6 +119,12 @@ services.gateway；未启用、无独立版本或无服务配置时 `unavailable
   因此正常路径只会得到 `unknown`）。
 - `request_id` 幂等重放：同章节同 `request_id` 返回已记录状态，不会第二次调用模型；
   同 `request_id` 用于其他章节为冲突。
+- 回包归属（返修）：生成调用返回后在同一事务内先校验**当前 attempt、章节状态与请求状态**。
+  只有仍持有该 attempt 的章节才会写入修订；正文的 `basis` 永远取自**该 attempt 自己的固定基准**
+  （`write_requests.basis`），而不是当时的章节基准。等待期间被作废或被新 `request_id` 取代的
+  旧尝试，其成功回包被丢弃并记 `state=superseded`、`stale=true`、`response_received=true`、
+  `superseded_by=<新请求>`、`revision=null`：既不写正文，也不改章节状态或新请求状态；
+  旧失败与旧取消同样只落在这条旧请求上。新尝试保持 `queued`/`reserved`，由下一次 pass 正常执行。
 
 ## 权限与读隔离
 
@@ -138,15 +155,22 @@ Platform→Core 提交 `request_id`/章节/`expected`；Core→Platform 返回�
 
 ## 实际验证
 
-- `python -m pytest tests/test_writing.py tests/test_writing_chain.py -q`：21 通过。
-- `python -m pytest -q`（设置 `TIANSHU_TLS_PYTHON`）：213 通过，1 跳过，95 子场景通过。
+- `python -m pytest tests/test_writing.py tests/test_writing_chain.py -q`：27 通过。
+- `python -m pytest -q`（设置 `TIANSHU_TLS_PYTHON`）：219 通过，1 跳过，95 子场景通过。
 - 显式设置 `TIANSHU_MEMORY_REPO` 后 `python -m pytest tests/test_profile_joint.py -q`：1 通过
   （只读固定 Memory 提交 `69b29f3`，本任务未修改 Memory）。
 - `python -m ruff check src integrations tests scripts`、`python -m ruff format --check ...`、
   `python -m compileall -q src integrations tests scripts`：通过。
+- 协调诊断脚本 `review-probes.py TS-073`：改前输出 `stale_approval_publish_result <rev>` 与
+  `chapter draft old_request draft new_request reserved`；改后输出
+  `denied ValueError('Dependencies changed; revise or re-review before publishing')` 与
+  `chapter queued old_request superseded new_request reserved`（该脚本最后一行按旧行为读取
+  `current_revision` 的 basis，修复后不存在该修订而报 `KeyError: None`，即未写入任何正文）。
 
 覆盖两章以上生成与前后依赖、修改前章后下章 `needs_review`、发布历史与 `supersedes`、
 取消/未知/重启不重发、幂等重放与冲突、过期 `expected_version`、跨 actor 与跨作品读隔离、
 无命名版本字段的素材变化（前章改标题、前章发布）与 `material_changed`、素材上限与
 `context_overflow`、v4→v5 迁移备份/回滚/水位不变。
+返修补验另覆盖：旧成功/旧失败/旧取消回包与新尝试交错（gate 用例）、旧批准在大纲/前章/素材变化后
+不能发布、显式重审（`acknowledge_drift`）与重新固定后旧批准失效。
 全部使用合成模型、合成素材与临时 SQLite，不代表真实模型质量或真实渠道发布。

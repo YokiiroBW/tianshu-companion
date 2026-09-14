@@ -153,10 +153,10 @@ def test_two_chapter_chain_review_publication_and_supervised_restart(tmp_path):
         ]
 
         # Regenerating the dependent chapter re-pins the refreshed canon; the published
-        # chapter two text is unchanged, so the newer draft is explicitly awaiting review.
+        # chapter two text is unchanged, so the newer draft is a pending publication.
         refreshed = await produce(writing, CHAPTERS[1], "req:3", retry=True)
-        assert refreshed["state"] == "needs_review"
-        assert refreshed["review_required"] == ["unpublished_revision"]
+        assert refreshed["state"] == "draft"
+        assert refreshed["review_required"] == [] and refreshed["publication_pending"] is True
         assert refreshed["basis"]["references"] == [[CHAPTERS[0], revised, 0]]
         assert refreshed["current_revision"] != published_second
         assert writing.read_chapter(CHAPTERS[1], reader="reader:story")["content"] == texts[1]
