@@ -508,6 +508,10 @@ class Life:
     def _available(self):
         return self.writing and self.config_version is not None and self.gateway.available
 
+    def writing_available(self):
+        """Independent writing switch shared by diary and long-form; never the chat fallback."""
+        return self._available()
+
     def recover(self):
         for item in self.store.list("life_diaries", states=["generating"]):
             item.update(state="interrupted")

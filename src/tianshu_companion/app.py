@@ -72,6 +72,7 @@ def build_runtime(config):
         life_writing=config.get("life_writing", False),
         life_config_version=config.get("life_config_version"),
         image_options=image_options,
+        writing_options=config.get("writing"),
         web_sender=Sender(contracts, client("platform_sender")),
     )
     return core, incoming, clients
@@ -122,6 +123,14 @@ def create_app(core=None, tokens=None):
                 LOG.error("Image worker failed: %s", type(exc).__name__)
             await asyncio.sleep(2)
 
+    async def writing_worker():
+        while True:
+            try:
+                await core.writing.work()
+            except Exception as exc:
+                LOG.error("Writing worker failed: %s", type(exc).__name__)
+            await asyncio.sleep(5)
+
     @asynccontextmanager
     async def lifespan(app):
         jobs = []
@@ -132,6 +141,7 @@ def create_app(core=None, tokens=None):
                 asyncio.create_task(publisher()),
                 asyncio.create_task(life_worker()),
                 asyncio.create_task(image_worker()),
+                asyncio.create_task(writing_worker()),
             ]
         yield
         for job in jobs:

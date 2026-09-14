@@ -23,9 +23,22 @@ LIFE_TABLES = {
 
 IMAGE_TABLES = {"image_outfits", "image_jobs"}
 
+WRITING_TABLES = {
+    "write_works",
+    "write_chapters",
+    "write_revisions",
+    "write_reviews",
+    "write_publications",
+    "write_materials",
+    "write_requests",
+    "write_recipes",
+    "write_access",
+}
+
 TABLES = (
     LIFE_TABLES
     | IMAGE_TABLES
+    | WRITING_TABLES
     | {
         "conversations",
         "collections",
@@ -74,12 +87,17 @@ class Store:
 
     def _initialize(self, path):
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4):
+        if version not in (0, 1, 2, 3, 4, 5):
             raise RuntimeError("Unsupported database schema version")
         # Backup the complete SQLite view (including WAL) before structural migration.
         # A unique file never overwrites earlier recovery evidence.
-        if version in (1, 2, 3) and str(path) != ":memory:":
-            label = {1: ".pre-source-v2-", 2: ".pre-life-v3-", 3: ".pre-images-v4-"}[version]
+        if version in (1, 2, 3, 4) and str(path) != ":memory:":
+            label = {
+                1: ".pre-source-v2-",
+                2: ".pre-life-v3-",
+                3: ".pre-images-v4-",
+                4: ".pre-writing-v5-",
+            }[version]
             backup = sqlite3.connect(str(path) + label + uuid.uuid4().hex + ".bak")
             try:
                 self.db.backup(backup)
@@ -88,7 +106,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
-        for table in sorted(TABLES - LIFE_TABLES - IMAGE_TABLES):
+        for table in sorted(TABLES - LIFE_TABLES - IMAGE_TABLES - WRITING_TABLES):
             self.db.execute(
                 f"CREATE TABLE IF NOT EXISTS {table} ("
                 "id TEXT PRIMARY KEY, conversation_id TEXT, position INTEGER, "
@@ -127,7 +145,7 @@ class Store:
                     "metadata",
                     dict(id="source_head", generation="generation:" + uuid.uuid4().hex, sequence=0),
                 )
-            for table in sorted(LIFE_TABLES | IMAGE_TABLES):
+            for table in sorted(LIFE_TABLES | IMAGE_TABLES | WRITING_TABLES):
                 self.db.execute(
                     f"CREATE TABLE IF NOT EXISTS {table} ("
                     "id TEXT PRIMARY KEY, conversation_id TEXT, position INTEGER, "
@@ -137,7 +155,7 @@ class Store:
                     f"CREATE INDEX IF NOT EXISTS {table}_queue ON "
                     f"{table}(conversation_id,status,position)"
                 )
-            self.db.execute("PRAGMA user_version=4")
+            self.db.execute("PRAGMA user_version=5")
 
     @contextmanager
     def transaction(self):

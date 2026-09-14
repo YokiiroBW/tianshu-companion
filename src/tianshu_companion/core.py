@@ -31,6 +31,7 @@ from .short_context import (
 from .source_sync import ingest as ingest_sources, migrate_legacy, read_facts
 from .source_sync import ensure_channel
 from .source_sync import invalidate_physical
+from .writing import Writing
 
 TERMINAL = {"sent", "failed", "cancelled", "observed", "closed_unknown"}
 ACTIVE = {
@@ -76,6 +77,7 @@ class Core:
         life_config_version=None,
         web_sender=None,
         image_options=None,
+        writing_options=None,
     ):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
@@ -91,6 +93,7 @@ class Core:
                 store, clock, gateway, life_config_version, self.models, writing=life_writing
             )
             self.images = Images(self.life, **(image_options or {}))
+            self.writing = Writing(self.life, **(writing_options or {}))
             migrate_legacy(store)
         except BaseException:
             store.close()
@@ -458,6 +461,7 @@ class Core:
         """Invoke once after acquiring the database owner lock, before accepting traffic."""
         self.life.recover()
         self.images.recover()
+        self.writing.recover()
         with self.store.transaction():
             for reply in self.store.list("replies", states=["sending"]):
                 reply.update(state="unknown", unknown_since=reply["attempted_at"])
