@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .clients import epoch
 from .contracts import canonical, digest
+from .source_sync import selector
 
 
 @dataclass(frozen=True)
@@ -26,15 +27,24 @@ def current_revision(store, turn):
 
 def sources_current(store, turn):
     for message in turn["bundle"]["messages"]:
-        base = digest({k: v for k, v in message["message_key"].items() if k != "revision"})
-        latest = store.latest_source(turn["conversation_id"], base)
-        if (
-            latest is None
-            or latest["revision"] != message["message_key"]["revision"]
-            or latest["request"]["kind"] == "retract"
-        ):
+        if not message_current(store, turn["scope"], message):
             return False
     return True
+
+
+def message_current(store, scope, message):
+    chosen = selector(message, scope["actor_id"])
+    latest = store.latest_source(scope["conversation_id"], digest(chosen["key"]))
+    row = store.get("admissions", digest(chosen))
+    return bool(
+        latest
+        and row
+        and latest["revision"] == message["message_key"]["revision"]
+        and latest["fact"]["state"] == "active"
+        and row["fact"]["physical_receipt_id"] == latest["fact"]["physical_receipt_id"]
+        and row["fact"]["source"] == message["source"]
+        and row["fact"]["scope"] == scope
+    )
 
 
 def select_recent(store, turn, policy, now):

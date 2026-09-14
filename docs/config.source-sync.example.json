@@ -1,0 +1,64 @@
+{
+  "contracts_path": "../../../contracts/text-dialogue/v1",
+  "database_path": ".runtime/source-sync-isolated.db",
+  "config_version": null,
+  "policy": {
+    "silence_ms": 5000,
+    "max_wait_ms": null,
+    "max_active_turns": 2,
+    "max_collectors_per_conversation": 32,
+    "max_queued_turns": 8,
+    "max_collection_messages": 256,
+    "max_collection_bytes": 262144,
+    "delivery_reconcile_timeout_ms": 30000
+  },
+  "short_context": {"max_turns": 4, "max_bytes": 8192, "max_age_seconds": 1800},
+  "roles": {
+    "actor:example-a": {"version": 1, "persona": "示例角色A；部署时使用平台发布的人格。"},
+    "actor:example-b": {"version": 1, "persona": "示例角色B；部署时使用平台发布的人格。"}
+  },
+  "bindings": {
+    "qq-example-group": {
+      "namespace": "qq",
+      "service": "nonebot",
+      "audience": "group",
+      "actor_ids": ["actor:example-a", "actor:example-b"],
+      "classification": {
+        "value": "unclassified",
+        "basis": "unclassified",
+        "policy_ref": null,
+        "policy_version": null
+      }
+    }
+  },
+  "callers": {
+    "nonebot": {
+      "token_env": "TIANSHU_NONEBOT_TO_CORE_TOKEN",
+      "issuer": "platform",
+      "origin_service": "platform"
+    },
+    "memory": {"token_env": "TIANSHU_MEMORY_TO_CORE_TOKEN"}
+  },
+  "services": {
+    "platform": {
+      "url": "https://platform.example.invalid",
+      "token_env": "TIANSHU_CORE_TO_PLATFORM_TOKEN",
+      "ca_file": null
+    },
+    "memory": {
+      "url": "https://memory.example.invalid",
+      "token_env": "TIANSHU_CORE_TO_MEMORY_TOKEN",
+      "ca_file": null
+    },
+    "gateway": {
+      "url": "https://gateway.example.invalid",
+      "token_env": "TIANSHU_CORE_TO_GATEWAY_TOKEN",
+      "ca_file": null
+    },
+    "nonebot": {
+      "url": "https://nonebot.example.invalid",
+      "token_env": "TIANSHU_CORE_TO_NONEBOT_TOKEN",
+      "ca_file": null
+    }
+  }
+}

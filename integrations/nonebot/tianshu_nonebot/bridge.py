@@ -31,7 +31,7 @@ def _request(
     )
     message_key = dict(channel=channel, message_id=str(message_id), revision=revision)
     return dict(
-        command=command(origin, "ingest:" + digest(message_key), time.time()),
+        command=command(origin, "ingest:" + digest([message_key, list(targets)]), time.time()),
         message_key=message_key,
         author=dict(namespace=namespace, immutable_account_id=str(account)),
         sent_at=utc(sent_at),
@@ -141,19 +141,25 @@ class Bridge:
         send_native=None,
         verify_send=None,
         refresh_origin=None,
+        confirm_admissions=None,
         clock=time.time,
     ):
         self.store, self.contracts, self.core_client = store, contracts, core_client
         self.destinations, self.send_native = destinations, send_native
         self.verify_send, self.refresh_origin, self.clock = verify_send, refresh_origin, clock
+        self.confirm_admissions = confirm_admissions
         self.locks = {}
 
     def capture(self, request, *, direct_commands=()):
         """Call once from a registered NoneBot matcher before handing off responsibility."""
-        self.contracts.check("conversation#ingest_request", request)
-        key = digest(request["message_key"])
+        fanout = "input" in request
+        self.contracts.check(
+            "sources#fanout_request" if fanout else "conversation#ingest_request", request
+        )
+        data = request["input"] if fanout else request
+        key = digest([data["message_key"], request["target_actor_ids"]])
         semantic = digest({k: v for k, v in request.items() if k != "command"})
-        text = "".join(p["text"] for p in request["parts"] if p["kind"] == "text").strip()
+        text = "".join(p["text"] for p in data["parts"] if p["kind"] == "text").strip()
         owner = (
             "direct"
             if any(text == cmd or text.startswith(cmd + " ") for cmd in direct_commands)
@@ -177,6 +183,7 @@ class Bridge:
                     attempts=0,
                     deadline=self.clock(),
                     receipt=None,
+                    fanout=fanout,
                 ),
             )
         return owner
@@ -195,15 +202,39 @@ class Bridge:
                     request["command"]["idempotency_key"],
                     self.clock(),
                 )
-                result = await self.core_client.call("/internal/v1/conversation/ingest", request)
-                self.contracts.check("conversation#ingest_response", result)
+                fanout = item.get("fanout", False)
+                data = request["input"] if fanout else request
+                if fanout and not self.confirm_admissions:
+                    raise Fault("dependency_unavailable")
+                result = await self.core_client.call(
+                    "/internal/v1/conversation/ingest-actors"
+                    if fanout
+                    else "/internal/v1/conversation/ingest",
+                    request,
+                )
+                self.contracts.check(
+                    "sources#fanout_response" if fanout else "conversation#ingest_response", result
+                )
                 if result["request_id"] != request["command"]["request_id"]:
                     raise Fault("invalid_input")
-                if result["collection_key"] != dict(
-                    channel=request["message_key"]["channel"], author=request["author"]
+                if fanout:
+                    self._check_admissions(request, result, item.get("routing_record"))
+                    # Persist the first route before confirmation or any further
+                    # remote call. A failed mapping retry cannot expand defaults.
+                    item["routing_record"] = dict(
+                        effective_actor_ids=result["effective_actor_ids"],
+                        routing_version=result["routing_version"],
+                    )
+                    self.store.put("inbox", item)
+                    # Trusted Platform prepare/confirm application callback uses
+                    # the inline facts, with no recursive Core/Memory source read.
+                    if await self.confirm_admissions(request, result) is not True:
+                        raise Fault("dependency_unavailable")
+                elif result["collection_key"] != dict(
+                    channel=data["message_key"]["channel"], author=data["author"]
                 ):
                     raise Fault("forbidden")
-                channel = request["message_key"]["channel"]
+                channel = data["message_key"]["channel"]
                 mapping = self.channel_mapping(channel)
                 if mapping is not None and mapping != result["conversation_id"]:
                     raise Fault("scope_changed")
@@ -214,7 +245,9 @@ class Bridge:
                             id=digest(channel),
                             channel=channel,
                             conversation_id=result["conversation_id"],
-                            core_receipt_id=result["receipt_id"],
+                            core_receipt_id=result["physical_receipt_id"]
+                            if fanout
+                            else result["receipt_id"],
                         ),
                     )
                 item.update(state="accepted", receipt=result)
@@ -226,6 +259,64 @@ class Bridge:
             item["attempts"] += 1
             with self.store.transaction():
                 self.store.put("inbox", item)
+
+    def _check_admissions(self, request, result, frozen):
+        data = request["input"]
+        expected = (
+            []
+            if data["kind"] == "retract"
+            else sorted(
+                frozen["effective_actor_ids"]
+                if frozen
+                else request["target_actor_ids"] or result["effective_actor_ids"]
+            )
+        )
+        if (
+            result["request_digest"] != digest(request)
+            or result["effective_actor_ids"] != expected
+            or result["routing_state"] != ("routed" if expected else "unrouted")
+            or (frozen and result["routing_version"] != frozen["routing_version"])
+            or sorted(o["actor_id"] for o in result["outcomes"]) != expected
+        ):
+            raise Fault("forbidden")
+        receipts = set()
+        for outcome in result["outcomes"]:
+            if outcome["state"] == "forbidden":
+                continue
+            actor, receipt, admission = (
+                outcome["actor_id"],
+                outcome["receipt"],
+                outcome["admission"],
+            )
+            scope = admission["scope"]
+            if (
+                receipt["receipt_id"] in receipts
+                or receipt["request_id"] != result["request_id"]
+                or receipt["deduplicated"] != (outcome["state"] == "duplicate")
+                or receipt["collection_key"]
+                != dict(channel=data["message_key"]["channel"], author=data["author"])
+                or receipt["conversation_id"] != result["conversation_id"]
+                or receipt["person_id"] != result["person_id"]
+                or admission["selector"]
+                != dict(
+                    actor_id=actor,
+                    key={k: v for k, v in data["message_key"].items() if k != "revision"},
+                )
+                or scope["actor_id"] != actor
+                or scope["person_id"] != result["person_id"]
+                or scope["conversation_id"] != result["conversation_id"]
+                or admission["physical_receipt_id"] != result["physical_receipt_id"]
+                or admission["source"]
+                != dict(
+                    message_key=data["message_key"],
+                    receipt_id=receipt["receipt_id"],
+                    archive_state="pending",
+                    locator=None,
+                )
+                or admission["accepted_at"] != receipt["accepted_at"]
+            ):
+                raise Fault("forbidden")
+            receipts.add(receipt["receipt_id"])
 
     def channel_mapping(self, channel):
         """Issuer reads only mappings learned from authenticated core ingest receipts."""

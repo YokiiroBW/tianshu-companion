@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
 
 from .clients import Gateway, JsonService, Memory, Origins, Sender, uid
-from .contracts import Contracts, Fault
+from .contracts import Contracts, Fault, strict_json
 from .core import Core, Policy
 from .store import Store
 from .short_context import ShortContextPolicy
@@ -27,7 +27,11 @@ def build_runtime(config):
 
     def client(name):
         entry = config.get("services", {}).get(name, {})
-        value = JsonService(entry.get("url"), os.environ.get(entry.get("token_env", "")))
+        value = JsonService(
+            entry.get("url"),
+            os.environ.get(entry.get("token_env", "")),
+            ca_file=entry.get("ca_file"),
+        )
         clients.append(value)
         return value
 
@@ -37,7 +41,8 @@ def build_runtime(config):
         token = os.environ.get(entry["token_env"])
         if token:
             incoming[service] = token
-            issuers[service] = (entry["issuer"], client(entry["origin_service"]))
+            if service in {"platform", "nonebot"}:
+                issuers[service] = (entry["issuer"], client(entry["origin_service"]))
     core = Core(
         Store(config["database_path"]),
         contracts,
@@ -127,11 +132,18 @@ def create_app(core=None, tokens=None):
                 if len(content) > 1_000_000:
                     raise Fault("invalid_input")
             try:
-                body = json.loads(content)
+                body = strict_json(content)
             except (ValueError, UnicodeError):
                 raise Fault("invalid_input") from None
             if isinstance(body, dict) and isinstance(body.get("command"), dict):
                 candidate = body["command"].get("request_id")
+                try:
+                    core.contracts.check("common#id", candidate)
+                    request_id = candidate
+                except Fault:
+                    pass
+            elif isinstance(body, dict):
+                candidate = body.get("request_id")
                 try:
                     core.contracts.check("common#id", candidate)
                     request_id = candidate
@@ -142,6 +154,17 @@ def create_app(core=None, tokens=None):
                 return JSONResponse(
                     result, background=BackgroundTask(core.acknowledge_ingest, result["receipt_id"])
                 )
+            if operation == "ingest-actors":
+                result = await core.ingest_actors(service, body, defer_processing=True)
+
+                async def release():
+                    for outcome in result["outcomes"]:
+                        if outcome["receipt"]:
+                            await core.acknowledge_ingest(outcome["receipt"]["receipt_id"])
+
+                return JSONResponse(result, background=BackgroundTask(release))
+            if operation == "facts":
+                return core.source_facts(service, body)
             return await core.cancel(service, body)
         except Fault as error:
             return JSONResponse(error.wire(request_id), status_code=error.status)
@@ -153,5 +176,13 @@ def create_app(core=None, tokens=None):
     @app.post("/internal/v1/conversation/cancel")
     async def cancel(request: Request):
         return await dispatch(request, "cancel")
+
+    @app.post("/internal/v1/conversation/ingest-actors")
+    async def ingest_actors(request: Request):
+        return await dispatch(request, "ingest-actors")
+
+    @app.post("/internal/v1/source-facts/read")
+    async def source_facts(request: Request):
+        return await dispatch(request, "facts")
 
     return app

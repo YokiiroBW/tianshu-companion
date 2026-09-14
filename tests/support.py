@@ -130,6 +130,11 @@ class FakeMemory:
             confirmed_memory_written=False,
         )
 
+    async def check_sources(self, turn, sources):
+        if self.unavailable:
+            raise Fault("dependency_unavailable")
+        return self.scope_version
+
 
 class FakeGateway:
     def __init__(self):
@@ -190,12 +195,24 @@ class Harness:
                     namespace="qq",
                     audience="self_private",
                     actor_ids=["actor:a", "actor:b"],
+                    classification=dict(
+                        value="real",
+                        basis="registered_input_mode",
+                        policy_ref="fixture:real",
+                        policy_version=1,
+                    ),
                 ),
                 "qq-group": dict(
                     service="nonebot",
                     namespace="qq",
                     audience="group",
                     actor_ids=["actor:a", "actor:b"],
+                    classification=dict(
+                        value="real",
+                        basis="registered_input_mode",
+                        policy_ref="fixture:real",
+                        policy_version=1,
+                    ),
                 ),
             },
             roles={

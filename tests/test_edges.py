@@ -13,7 +13,7 @@ class EdgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.h.core.close()
 
-    async def test_group_role_targets_preserved_without_replacing_primary_authorization(self):
+    async def test_group_role_targets_have_independent_collectors(self):
         h = self.h
         await h.ingest(text="A你好", group=True, channel="group:1", actor="actor:a")
         await h.ingest(text="B也听听", group=True, channel="group:1", actor="actor:b")
@@ -22,9 +22,11 @@ class EdgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("sent", h.turns()[0]["phase"])
         self.assertEqual(
             [["actor:a"], ["actor:b"]],
-            [m["target_actor_ids"] for m in h.turns()[0]["bundle"]["messages"]],
+            [t["bundle"]["messages"][0]["target_actor_ids"] for t in h.turns()],
         )
-        self.assertTrue(all(r["actor_id"] == "actor:a" for r in h.sender.calls))
+        self.assertEqual(
+            ["actor:a", "actor:a", "actor:b", "actor:b"], [r["actor_id"] for r in h.sender.calls]
+        )
 
     async def test_max_wait_marks_fragment_and_no_target_group_is_observed(self):
         h = self.h

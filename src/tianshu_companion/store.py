@@ -2,12 +2,25 @@
 
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 from .contracts import canonical
 
-TABLES = {"conversations", "collections", "inbox", "turns", "replies", "outbox", "commands"}
+TABLES = {
+    "conversations",
+    "collections",
+    "inbox",
+    "turns",
+    "replies",
+    "outbox",
+    "commands",
+    "physicals",
+    "admissions",
+    "metadata",
+}
+FACT_TABLES = {"physicals", "admissions", "turns", "replies", "outbox"}
 
 
 class Store:
@@ -34,9 +47,24 @@ class Store:
                 raise RuntimeError("Database already has a running owner") from None
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.row_factory = sqlite3.Row
-        if self.db.execute("PRAGMA user_version").fetchone()[0] not in (0, 1):
+        try:
+            self._initialize(path)
+        except BaseException:
             self.close()
+            raise
+
+    def _initialize(self, path):
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, 1, 2):
             raise RuntimeError("Unsupported database schema version")
+        # Backup the complete SQLite view (including WAL) before structural migration.
+        # A unique file never overwrites earlier recovery evidence.
+        if version == 1 and str(path) != ":memory:":
+            backup = sqlite3.connect(str(path) + ".pre-source-v2-" + uuid.uuid4().hex + ".bak")
+            try:
+                self.db.backup(backup)
+            finally:
+                backup.close()
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
@@ -61,20 +89,51 @@ class Store:
             "CREATE INDEX IF NOT EXISTS replies_turn ON replies("
             "json_extract(body,'$.turn_id'),status,position)"
         )
-        self.db.execute("PRAGMA user_version=1")
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS physicals_source ON physicals(conversation_id,"
+            "json_extract(body,'$.base'),json_extract(body,'$.revision') DESC)"
+        )
+        self._fact_dirty = False
+        with self.transaction():
+            if not self.get("metadata", "source_head"):
+                if version == 2:
+                    raise RuntimeError("Missing durable source head; trusted recovery required")
+                self.put(
+                    "metadata",
+                    dict(id="source_head", generation="generation:" + uuid.uuid4().hex, sequence=0),
+                )
+            self.db.execute("PRAGMA user_version=2")
 
     @contextmanager
     def transaction(self):
         self.db.execute("BEGIN IMMEDIATE")
+        self._fact_dirty = False
         try:
             yield
+            if self._fact_dirty:
+                head = self.get("metadata", "source_head")
+                head["sequence"] += 1
+                self.put("metadata", head)
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
+        finally:
+            self._fact_dirty = False
 
     def put(self, table, item):
         assert table in TABLES
+        if not self.db.in_transaction:
+            with self.transaction():
+                self.put(table, item)
+            return
+        previous = self.get(table, item["id"]) if table in FACT_TABLES else None
+        if (
+            table in FACT_TABLES
+            and previous != item
+            and (table != "outbox" or previous is None or previous["event"] != item["event"])
+        ):
+            self._fact_dirty = True
         self.db.execute(
             f"INSERT INTO {table} VALUES(?,?,?,?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, "
@@ -122,9 +181,20 @@ class Store:
 
     def latest_source(self, conversation_id, base):
         row = self.db.execute(
-            "SELECT body FROM inbox WHERE conversation_id=? AND json_extract(body,'$.base')=? "
+            "SELECT body FROM physicals WHERE conversation_id=? AND json_extract(body,'$.base')=? "
             "ORDER BY json_extract(body,'$.revision') DESC LIMIT 1",
             (conversation_id, base),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def source_head(self):
+        item = self.get("metadata", "source_head")
+        return {k: item[k] for k in ("generation", "sequence")}
+
+    def receipt_input(self, receipt_id):
+        row = self.db.execute(
+            "SELECT body FROM inbox WHERE json_extract(body,'$.receipt.receipt_id')=?",
+            (receipt_id,),
         ).fetchone()
         return json.loads(row[0]) if row else None
 

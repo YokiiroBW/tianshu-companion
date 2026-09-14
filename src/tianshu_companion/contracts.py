@@ -10,6 +10,7 @@ from referencing import Registry, Resource
 MANIFEST_HASH = "81e6cc4ddef7c6f82e055d4cb04b090db036dd5c52763473ce697aa02db478a1"
 PROFILE_MANIFEST_HASH = "488d05438dd5b5abaa43a66a7eab0eb5cf615d5af01a964a7286cd23e68f7eb7"
 PROFILE_DOMAIN = "profile-memory/v1"
+SOURCE_MANIFEST_HASH = "178d0ce66210bdfad4cfb85d8b5f0905b0b67f834e2a530efe5636ff0373633d"
 
 
 class Fault(Exception):
@@ -49,11 +50,28 @@ class Fault(Exception):
 
 
 def canonical(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
 
 
 def digest(value):
     return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def strict_json(data):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("Duplicate JSON key")
+            result[key] = value
+        return result
+
+    def constant(value):
+        raise ValueError("Non-finite JSON value")
+
+    return json.loads(data, object_pairs_hook=pairs, parse_constant=constant)
 
 
 class Contracts:
@@ -98,6 +116,28 @@ class Contracts:
         schema = json.loads(read(profile_root / "schemas/profiles.json"))
         self.schemas["profiles"] = schema
         self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
+        source_root = root.parent.parent / "source-sync/v1"
+        manifest = read(source_root / "manifest.json")
+        if hashlib.sha256(manifest).hexdigest() != SOURCE_MANIFEST_HASH:
+            raise ValueError("Unrecognized source contract release")
+        release = json.loads(manifest)
+        if release["version"] != "1.0.0" or {
+            d["package"]: d["manifest_sha256"] for d in release["dependencies"]
+        } != {"text-dialogue/v1": MANIFEST_HASH, PROFILE_DOMAIN: PROFILE_MANIFEST_HASH}:
+            raise ValueError("Unsupported source contract dependencies")
+        for name, expected in release["sha256"].items():
+            path = (source_root / name).resolve()
+            if (
+                not path.is_relative_to(source_root)
+                or hashlib.sha256(read(path)).hexdigest() != expected
+            ):
+                raise ValueError(f"Source contract content mismatch: {name}")
+        for path in (source_root / "schemas").glob("*.json"):
+            schema = json.loads(read(path))
+            self.schemas[path.stem] = schema
+            self.registry = self.registry.with_resource(
+                schema["$id"], Resource.from_contents(schema)
+            )
 
     def check(self, name, value):
         file, definition = name.split("#")

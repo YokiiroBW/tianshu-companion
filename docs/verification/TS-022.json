@@ -1,0 +1,65 @@
+{
+  "task": "TS-022",
+  "date": "2026-09-14",
+  "baseline_commit": "05c35db54df146bf2997eab6cd516c0948dfdc40",
+  "source_contract": {
+    "package": "source-sync/v1",
+    "version": "1.0.0",
+    "manifest_lf_sha256": "178d0ce66210bdfad4cfb85d8b5f0905b0b67f834e2a530efe5636ff0373633d",
+    "coordinator_release_commit": "154f068"
+  },
+  "verification": {
+    "format": "28 files already formatted",
+    "lint": "All checks passed",
+    "syntax": "compileall completed with exit code 0",
+    "full_suite": {
+      "command": "python -m pytest -q --tb=short",
+      "tls_fixture_enabled": true,
+      "passed": 93,
+      "skipped": 1,
+      "subtests_passed": 23,
+      "duration_seconds": 12.59,
+      "skip_reason": "TIANSHU_MEMORY_REPO not set; fixed legacy profile joint test skipped"
+    },
+    "https_fixture": {
+      "core": "actual uvicorn subprocess, Core product runtime, temporary SQLite",
+      "transport": "actual loopback TLS sockets; ephemeral CA and hostname verification enabled",
+      "remote_services": "synthetic Platform and Memory HTTP handlers in tests only",
+      "physical_inputs": 1,
+      "actor_admissions": 2,
+      "identity_registrations": 1,
+      "background_source_checks": 2,
+      "committed_events": 2,
+      "facts_acl_denied_status": 403,
+      "model_or_device_success_simulated": false
+    },
+    "legacy_profile_joint_supplement": {
+      "command": "TIANSHU_MEMORY_REPO=<coordinator-approved integrated Memory checkout> python -m pytest tests/test_profile_joint.py -q --tb=short",
+      "passed": 1,
+      "duration_seconds": 0.55,
+      "memory_commit": "69b29f3",
+      "isolation": "git archive of fixed commit into temporary directory; synthetic database and sources",
+      "transport": "actual Memory application through ASGITransport; not new source-sync integration"
+    },
+    "migration": [
+      "SQLite backup preserves v1 schema and original receipt",
+      "only original singleton actor evidence is migrated; B remains missing",
+      "ambiguous targets and mixed groups return 503 and do not schedule",
+      "physical retract does not become an actor source",
+      "fault-injected admission write rolls back and releases owner lock",
+      "ordinary restart preserves head; missing v2 head refuses startup"
+    ],
+    "updated_legacy_assertions": [
+      "old actor-mixing expectation now requires isolated collectors",
+      "blocked_scope now requires successful Memory check and repairs automatically"
+    ]
+  },
+  "unverified": [
+    "new source-sync Platform/Core/Memory product integration",
+    "complete L0/L1",
+    "real account, gateway model, QQ/TG channel or device operation",
+    "production TLS deployment and PostgreSQL/multiprocess operation",
+    "legacy admission_history proof migration on Platform",
+    "trusted coordinated recovery after watermark rollback/generation change"
+  ]
+}

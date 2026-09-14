@@ -18,7 +18,16 @@ from .context import (
     profile_check,
     profile_targets,
 )
-from .short_context import ShortContextPolicy, current_revision, select_recent, sources_current
+from .short_context import (
+    ShortContextPolicy,
+    current_revision,
+    select_recent,
+    sources_current,
+    message_current,
+)
+from .source_sync import ingest as ingest_sources, migrate_legacy, read_facts
+from .source_sync import ensure_channel
+from .source_sync import invalidate_physical
 
 TERMINAL = {"sent", "failed", "cancelled", "observed", "closed_unknown"}
 ACTIVE = {
@@ -69,6 +78,11 @@ class Core:
         self.models = asyncio.Semaphore(model_slots)
         self.jobs, self.send_jobs = {}, {}
         self.short_context_policy = short_context_policy or ShortContextPolicy()
+        try:
+            migrate_legacy(store)
+        except BaseException:
+            store.close()
+            raise
 
     def _save_turn(self, turn):
         turn["version"] += 1
@@ -90,6 +104,7 @@ class Core:
     async def _authorize(self, service, envelope, channel=None, author=None, scope=None):
         ctx = await self.origins.resolve(service, envelope, self.clock())
         channel = ctx["verified_channel"] if channel is None else channel
+        ensure_channel(self.store, channel)
         allowed = ctx["allowed_scope"]
         binding = self.bindings.get(channel["binding_id"])
         if (
@@ -139,224 +154,30 @@ class Core:
         return end
 
     async def ingest(self, service, request, *, defer_processing=False):
-        self.contracts.check("conversation#ingest_request", request)
-        channel, author = request["message_key"]["channel"], request["author"]
-        ctx, person, binding_version = await self._authorize(
-            service, request["command"], channel, author
-        )
-        if any(a != ctx["allowed_scope"]["actor_id"] for a in request["target_actor_ids"]):
-            raise Fault("forbidden")
-        now, deferred_fault = self.clock(), None
+        return await ingest_sources(self, service, request, defer_processing, legacy=True)
+
+    async def ingest_actors(self, service, request, *, defer_processing=False):
+        return await ingest_sources(self, service, request, defer_processing)
+
+    def source_facts(self, service, request):
+        return read_facts(self.store, self.contracts, service, request)
+
+    def reclassify_source(self, key, expected_revision, classification):
+        """Trusted owner application port, never an ingress/model-provided field."""
+        self.contracts.check("shared#key", key)
+        self.contracts.check("shared#classification", classification)
         with self.store.transaction():
-            cmd_key, signature, prior = self._command_key(service, "ingest", request)
-            if prior:
-                return {
-                    **prior["response"],
-                    "request_id": request["command"]["request_id"],
-                    "deduplicated": True,
-                }
-            key = digest(request["message_key"])
-            duplicate = self.store.get("inbox", key)
-            if duplicate:
-                if duplicate["signature"] != signature:
-                    raise Fault("idempotency_conflict")
-                result = {
-                    **duplicate["receipt"],
-                    "request_id": request["command"]["request_id"],
-                    "deduplicated": True,
-                }
-                self._remember_command(cmd_key, signature, result)
-                return result
-            if epoch(request["command"]["deadline_at"]) <= now:
-                raise Fault("timeout")
-            conv_key = digest(channel)
-            conv = self.store.get("conversations", conv_key)
-            if conv is None:
-                conv = dict(
-                    id=conv_key,
-                    conversation_id=uid("conv"),
-                    channel=channel,
-                    ingest_sequence=0,
-                    turn_sequence=0,
-                )
-            cid = conv["conversation_id"]
-            if ctx["allowed_scope"]["conversation_id"] not in (None, cid):
-                raise Fault("forbidden")
-            base = digest({k: v for k, v in request["message_key"].items() if k != "revision"})
-            latest = self.store.latest_source(cid, base)
-            if latest and latest["request"]["author"] != author:
-                raise Fault("forbidden")
-            if request["kind"] != "message" and latest is None:
-                raise Fault("invalid_input")
-            self._seal_due(now, cid)
-            collection_key = dict(channel=channel, author=author)
-            open_groups = self.store.list("collections", cid, ["collecting"])
-            collection = next(
-                (c for c in open_groups if c["collection_key"] == collection_key), None
-            )
-            stale = latest is not None and request["message_key"]["revision"] <= latest["revision"]
-            modified_group = (
-                self.store.get("collections", latest["collection_id"]) if latest else None
-            )
-            if latest and not stale and request["kind"] == "message":
-                raise Fault("invalid_input")
-            if stale or request["kind"] == "retract":
-                collection = modified_group
-            if latest and not stale and request["kind"] in {"edit", "retract"}:
-                if modified_group["state"] == "sealed":
-                    self._cancel_turn(
-                        self.store.get("turns", modified_group["turn_id"]), request["kind"]
-                    )
-                elif modified_group["state"] == "collecting":
-                    collection = modified_group
-            if collection is None or (
-                collection["state"] != "collecting" and not stale and request["kind"] != "retract"
-            ):
-                queued = self.store.list("turns", cid, ["queued"])
-                if (
-                    len(open_groups) >= self.policy.max_collectors_per_conversation
-                    or len(queued) + len(open_groups) >= self.policy.max_queued_turns
-                ):
-                    deferred_fault = Fault("queue_full")
-                else:
-                    continuations = [
-                        c
-                        for c in self.store.list("collections", cid)
-                        if c["collection_key"] == collection_key
-                        and c.get("possibly_incomplete")
-                        and c.get("source_context_revision") == conv.get("context_revision", 1)
-                        and not c.get("continued_by")
-                        and c["scope"]["actor_id"] == ctx["allowed_scope"]["actor_id"]
-                        and c["scope"]["person_id"] == person
-                    ]
-                    collection = dict(
-                        id=uid("col"),
-                        conversation_id=cid,
-                        collection_key=collection_key,
-                        state="collecting",
-                        # Immutable provenance of the first accepted input, including
-                        # fragments that close as observed without model generation.
-                        source_context_revision=conv.get("context_revision", 1),
-                        revision=0,
-                        started=now,
-                        deadline=now,
-                        sequence=conv["ingest_sequence"] + 1,
-                        messages=[],
-                        continuation_of=continuations[-1]["id"] if continuations else None,
-                        origin=request["command"]["origin"],
-                        service=service,
-                        scope={**ctx["allowed_scope"], "person_id": person, "conversation_id": cid},
-                        binding_version=binding_version,
-                        bootstrap_mapping=ctx["allowed_scope"]["conversation_id"] is None,
-                        source_deadline=epoch(request["command"]["deadline_at"]),
-                    )
-            if deferred_fault is None and not stale and request["kind"] != "retract":
-                if collection["scope"]["person_id"] != person:
-                    raise Fault("scope_changed")
-                members = [
-                    m
-                    for m in collection["messages"]
-                    if digest({k: v for k, v in m["message_key"].items() if k != "revision"})
-                    != base
-                ]
-                byte_count = sum(len(canonical(m["parts"]).encode()) for m in members) + len(
-                    canonical(request["parts"]).encode()
-                )
-                if (
-                    len(members) + 1 > self.policy.max_collection_messages
-                    or byte_count > self.policy.max_collection_bytes
-                ):
-                    if collection["messages"]:
-                        self._seal(collection, now, "resource_limit")
-                    deferred_fault = Fault("queue_full")
-            if deferred_fault is None:
-                conv["ingest_sequence"] += 1
-                seq, receipt_id = conv["ingest_sequence"], uid("receipt")
-                source = dict(
-                    message_key=request["message_key"],
-                    receipt_id=receipt_id,
-                    archive_state="pending",
-                    locator=None,
-                )
-                if not stale and collection["state"] == "collecting":
-                    collection["messages"] = [
-                        m
-                        for m in collection["messages"]
-                        if digest({k: v for k, v in m["message_key"].items() if k != "revision"})
-                        != base
-                    ]
-                    if request["kind"] != "retract":
-                        message = {
-                            k: copy.deepcopy(request[k])
-                            for k in [
-                                "message_key",
-                                "author",
-                                "sent_at",
-                                "parts",
-                                "reply_refs",
-                                "mentioned_accounts",
-                                "target_actor_ids",
-                            ]
-                        }
-                        message.update(
-                            person_id=person,
-                            accepted_at=utc(now),
-                            ingest_sequence=seq,
-                            source=source,
-                        )
-                        collection["messages"].append(message)
-                    collection["revision"] += 1
-                    collection["deadline"] = self._deadline(collection, now)
-                    if collection["scope"]["actor_id"] == ctx["allowed_scope"]["actor_id"]:
-                        collection["origin"] = request["command"]["origin"]
-                        collection["source_deadline"] = epoch(request["command"]["deadline_at"])
-                    if not collection["messages"]:
-                        collection["state"] = "cancelled"
-                    self.store.put("collections", collection)
-                result = dict(
-                    schema_version=1,
-                    request_id=request["command"]["request_id"],
-                    receipt_id=receipt_id,
-                    deduplicated=False,
-                    conversation_id=cid,
-                    person_id=person,
-                    collection_key=collection_key,
-                    collection_id=collection["id"],
-                    collection_revision=max(1, collection["revision"]),
-                    accepted_at=utc(now),
-                    ingest_sequence=seq,
-                    archive_state="pending",
-                )
-                self.store.put(
-                    "inbox",
-                    dict(
-                        id=key,
-                        conversation_id=cid,
-                        sequence=seq,
-                        base=base,
-                        revision=request["message_key"]["revision"],
-                        collection_id=collection["id"],
-                        signature=signature,
-                        request=request,
-                        receipt=result,
-                        source=source,
-                        stale=stale,
-                        response_released=not defer_processing,
-                    ),
-                )
-                # _seal_due may have advanced the persisted turn counter.
-                stored = self.store.get("conversations", conv_key)
-                if stored:
-                    conv["turn_sequence"] = stored["turn_sequence"]
-                    conv["context_revision"] = stored.get("context_revision", 1)
-                if not stale and request["kind"] in {"edit", "retract"}:
-                    conv["context_revision"] = conv.get("context_revision", 1) + 1
-                self.store.put("conversations", conv)
-                self._remember_command(cmd_key, signature, result)
-                self._seal_due(now, cid)
-        if deferred_fault:
-            raise deferred_fault
-        return result
+            conv = ensure_channel(self.store, key["channel"])
+            row = self.store.latest_source(conv["conversation_id"], digest(key)) if conv else None
+            if not row:
+                raise Fault("not_found")
+            if row["revision"] != expected_revision or row["fact"]["state"] != "active":
+                raise Fault("version_conflict")
+            if row["fact"]["classification"] == classification:
+                return
+            row["fact"]["classification"] = copy.deepcopy(classification)
+            self.store.put("physicals", row)
+            invalidate_physical(self, conv, row["base"], "classification_changed")
 
     async def acknowledge_ingest(self, receipt_id):
         """ASGI response-completed hook. A crash before response requires sender retry."""
@@ -369,13 +190,20 @@ class Core:
 
     def _responses_released(self, turn):
         return all(
-            self.store.get("inbox", digest(m["message_key"])).get("response_released", True)
+            (self.store.receipt_input(m["source"]["receipt_id"]) or {}).get(
+                "response_released", False
+            )
             for m in turn["bundle"]["messages"]
         )
 
     def _seal_due(self, now, cid=None):
         due = [
-            c for c in self.store.list("collections", cid, ["collecting"]) if c["deadline"] <= now
+            c
+            for c in self.store.list("collections", cid, ["collecting"])
+            if c["deadline"] <= now
+            and not self.store.get("conversations", digest(c["collection_key"]["channel"])).get(
+                "source_quarantined"
+            )
         ]
         for collection in sorted(due, key=lambda c: (c["deadline"], c["sequence"])):
             reason = "immediate_submit" if self.policy.silence_ms == 0 else "silence"
@@ -418,6 +246,7 @@ class Core:
             if i["sequence"] >= c["sequence"]
             and i["request"]["author"] != c["collection_key"]["author"]
             and not i["stale"]
+            and i.get("actor_id") == c["scope"]["actor_id"]
         ]
         bundle = dict(
             schema_version=1,
@@ -566,7 +395,7 @@ class Core:
             scope_version=turn["scope_version"],
             input_revision=turn["bundle"]["collection_revision"],
             sources=[m["source"] for m in turn["bundle"]["messages"]],
-            reality="real",
+            reality=self._event_reality(turn),
             confirmed_user_correction=False,
             delivery_state=delivery,
             reply_ids=[
@@ -579,7 +408,13 @@ class Core:
                 id=event["event_id"],
                 conversation_id=turn["conversation_id"],
                 sequence=turn["sequence"],
-                state="pending" if turn["scope_version"] else "blocked_scope",
+                state=(
+                    "discarded_source"
+                    if event["reality"] is None
+                    else "pending"
+                    if turn["scope_version"]
+                    else "blocked_scope"
+                ),
                 event=event,
                 attempts=0,
                 deadline=self.clock(),
@@ -594,6 +429,10 @@ class Core:
                 reply.update(state="unknown", unknown_since=reply["attempted_at"])
                 self.store.put("replies", reply)
             for turn in self.store.list("turns", states=ACTIVE):
+                if self.store.get(
+                    "conversations", digest(turn["bundle"]["collection_key"]["channel"])
+                ).get("source_quarantined"):
+                    continue
                 if any(r["state"] == "unknown" for r in self._replies(turn)):
                     turn.update(
                         phase="reconciling", delivery_state="unknown", unresolved_delivery=True
@@ -615,6 +454,8 @@ class Core:
         with self.store.transaction():
             self._seal_due(self.clock())
             for conv in self.store.list("conversations"):
+                if conv.get("source_quarantined"):
+                    continue
                 cid = conv["conversation_id"]
                 active = self.store.list("turns", cid, ACTIVE)
                 queued = self.store.list("turns", cid, ["queued"])
@@ -869,13 +710,7 @@ class Core:
             self._check_dependency(turn, dependency, self.store.get("turns", dependency["turn_id"]))
         inputs = turn["bundle"]["messages"] + self._continuation_messages(turn)
         for message in inputs:
-            base = digest({k: v for k, v in message["message_key"].items() if k != "revision"})
-            latest = self.store.latest_source(turn["conversation_id"], base)
-            if (
-                latest is None
-                or latest["revision"] != message["message_key"]["revision"]
-                or latest["request"]["kind"] == "retract"
-            ):
+            if not message_current(self.store, turn["scope"], message):
                 raise Fault("scope_changed")
         context = turn.get("short_context")
         if (
@@ -1202,10 +1037,33 @@ class Core:
                     self._finish(fresh, "closed_unknown", "unknown")
 
     async def flush_outbox(self):
+        for item in self.store.list("outbox", states=["blocked_scope"]):
+            if item["deadline"] > self.clock():
+                continue
+            try:
+                await self.repair_blocked_scope(
+                    item["event"]["aggregate_id"], self.memory.check_sources
+                )
+            except (Fault, OSError, TimeoutError) as error:
+                item["last_error"] = (
+                    error.code if isinstance(error, Fault) else "dependency_unavailable"
+                )
+                item["attempts"] += 1
+                item["deadline"] = self.clock() + min(60, 2 ** min(item["attempts"], 6))
+                self.store.put("outbox", item)
         for item in self.store.list("outbox", states=["pending"]):
             if item["deadline"] > self.clock():
                 continue
             try:
+                turn = self.store.get("turns", item["event"]["aggregate_id"])
+                ensure_channel(self.store, turn["bundle"]["collection_key"]["channel"])
+                if (
+                    not sources_current(self.store, turn)
+                    or self._event_reality(turn) != item["event"]["reality"]
+                ):
+                    item["state"] = "discarded_source"
+                    self.store.put("outbox", item)
+                    continue
                 self.contracts.check("conversation#committed_event", item["event"])
                 receipt = await self.memory.commit(item["event"])
                 item.update(state="delivered", receipt=receipt)
@@ -1224,9 +1082,11 @@ class Core:
         verify_current is a deployment-owned source/scope verifier. It must check
         current account binding, all input revisions, cancellation/forgetting and
         audience permissions, returning an authoritative version or None to discard.
-        No verifier is installed by default. The original event ID stays stable.
+        Runtime supplies the authenticated Memory source-sync/check client.
+        The original event ID stays stable.
         """
         turn = self.store.get("turns", turn_id)
+        ensure_channel(self.store, turn["bundle"]["collection_key"]["channel"])
         for item in self.store.list("outbox", states=["blocked_scope"]):
             if item["event"]["aggregate_id"] != turn_id:
                 continue
@@ -1237,7 +1097,7 @@ class Core:
                 fresh = self.store.get("turns", turn_id)
                 if fresh["version"] != turn["version"]:
                     raise Fault("version_conflict", current_version=fresh["version"])
-                if version is None:
+                if version is None or not sources_current(self.store, fresh):
                     item["state"] = "discarded_source"
                 elif isinstance(version, int) and not isinstance(version, bool) and version > 0:
                     item["event"]["scope_version"] = version
@@ -1246,6 +1106,19 @@ class Core:
                 else:
                     raise Fault("invalid_input")
                 self.store.put("outbox", item)
+
+    def _event_reality(self, turn):
+        values = set()
+        for message in turn["bundle"]["messages"]:
+            row = self.store.get("physicals", digest(message["message_key"]))
+            if row is None:
+                return None
+            values.add(row["fact"]["classification"]["value"])
+        return (
+            (next(iter(values)) if len(values) == 1 else "mixed")
+            if values and values <= {"real", "fictional"}
+            else None
+        )
 
     async def close(self):
         jobs = list(self.jobs.values()) + list(self.send_jobs.values())

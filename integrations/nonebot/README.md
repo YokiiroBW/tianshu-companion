@@ -6,6 +6,10 @@
 
 `Bridge.flush` 在 429/依赖故障时保留待重试记录、错误原因、下次时间；没有成功受理回执前不删除或宣称已交付。NoneBot 宿主应把 pending/last_error 显示为等待或背压。`refresh_origin` 只能由可信 issuer 从原已登记 SDK 事件续签，不能让用户 payload 自签。未安装续签器时过期来源持续拒绝。
 
+TS-022的capture同时接受source-sync/v1 fanout_request，按物理版本和原targets保留不同路由意图；SDK归一化默认幂等key也含targets。新接入由受信Platform应用先登记完整physical_input再签发source_input origin，将归一化的物理字段放入input，并保留独立command/target_actor_ids。新信封发往ingest-actors，不能把旧actor origin或raw SDK正文当成source_input授权。
+
+fanout模式必须注入真实 `confirm_admissions(request, result)` 应用回调。薄桥先核验完整effective集合、逐actor receipt/admission/physical/scope绑定及无receipt别名，持久冻结首个路由，再由Platform受信prepare/confirm用inline事实回填；返回True才标记accepted，503/失败持续pending。重试同key不重复创建Core受理，不循环查询Core或Memory来源，不新增映射RPC。只有旧单actor模式继续使用下述旧回执映射；旧路径不宣称建立source_input/admission_history，Platform无法核对的旧来源会503。
+
 成功受理后，薄桥从已认证核心响应验证 request_id 与 collection_key，再持久保存 conversation_id、原 channel_key 和核心 receipt_id。issuer 用 `channel_mapping(channel_key)` 取得该权威映射，后续 resolve 必须返回具体 conversation_id；首次 resolve/register 可为 null，不阻塞首次登记。既有非空映射冲突则拒绝更新。映射也可供下行目的地核验使用。W=0 的首次 select 可在映射保存前得到暂时 503，由核心有界等待处理；严禁把未知来源 scope 当任意会话授权。
 
 下行 `Bridge.send` 需要部署注入 `verify_send`（认证服务及实际来源/目标/角色权限核验）、当前 conversation→destination 映射和真实 SDK `send_native`；缺任意关键依赖就不可用。服务端在 TLS 认证入口接收已发布 `POST /internal/v1/conversation/send` 后调用此方法；此任务提供方法边界和测试，不随意增加来源签发/目标授权 HTTP 路由。`send_onebot_text`、`send_telegram_text` 是 SDK 回执映射 helper，只有真实 message_id 才能 sent；文本按纯文本发送，不启用模型返回的富文本指令。

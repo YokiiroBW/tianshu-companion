@@ -232,13 +232,14 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
             await memory.select(origin, scope, "coffee", dict(tokens=2048, bytes=8192))
         self.assertEqual("forbidden", error.exception.code)
 
-    async def test_blocked_scope_early_failure_releases_slot_and_requires_internal_verifier(self):
+    async def test_blocked_scope_early_failure_releases_slot_and_requires_memory_check(self):
         h = self.h
         await h.ingest()
         h.core.config_version = None
         await h.cycles()
         self.assertEqual("failed", h.turns()[0]["phase"])
         self.assertEqual("blocked_scope", h.core.store.list("outbox")[0]["state"])
+        h.memory.unavailable = True
         await h.core.flush_outbox()
         self.assertFalse(h.memory.commits)
 
@@ -246,7 +247,8 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, len(sources))
             return 7
 
-        await h.core.repair_blocked_scope(h.turns()[0]["id"], validated)
+        h.memory.check_sources = validated
+        h.clock.advance(2)
         await h.core.flush_outbox()
         self.assertEqual(7, h.memory.commits[0]["scope_version"])
 

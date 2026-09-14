@@ -1,4 +1,4 @@
-# 陪伴核心实现与边界（TS-020 / TS-021）
+# 陪伴核心实现与边界（TS-020 / TS-021 / TS-022）
 
 依据主仓库 `docs/development/workstreams/companion-memory.md` C1/C2、V2 第 3/5 节、消息防抖专题及 `contracts/text-dialogue/v1` 1.0.0。manifest 的 LF SHA256 固定为 `81e6cc4ddef7c6f82e055d4cb04b090db036dd5c52763473ce697aa02db478a1`；启动验证所有发布文件，未复制共享 schema。
 
@@ -22,7 +22,7 @@ Python 3.12 + FastAPI/httpx/jsonschema；标准库 SQLite/WAL、FULL 同步与�
 
 每个新 collector 在首条受理前检查 `queued + collectors < max_queued_turns`，因此满队列不会丢已受理输入。数量/字节超限的新增消息返回 429，已有组以 `resource_limit/possibly_incomplete` 封存；该片段只观察不调用生成/工具。下一完整静默组关联续接链并保留之前片段，已关联链不再挂到无关后续组；最大续接深度 32、总原生上下文 512 KiB，超限明确失败，原文仍在 inbox。W=0 立即封存，max_wait 默认关闭，配置上限触发的片段同样不执行。单轮最多 16 段，每段最多 32 KiB；一旦有 unknown，未发送的后段不继续提交。
 
-所有人物、角色共享 channel_key 对应的两个活跃槽。同组保留逐消息角色目标；首条已核验 scope 的角色承担本轮回复，其他目标保留在结构化消息中，不冒用另一个角色来源。这是首版确定性仲裁，尚无多角色分别生成。群内未明确面向该角色时只观察。引用和插话保留独立 source；不因为引用存在就读取私密原文。
+所有人物、角色共享 channel_key 对应的两个活跃槽。TS-022将物理P与角色受理A拆开，每个actor使用自己的receipt/scope/collector；同一物理输入可分别生成，不能再混入另一个角色的组。fanout按actor_id排序领取会话全局ingest_sequence，封存按deadline/首次受理序号领取turn_sequence，发送按全会话轮次/段号排序。旧单actor入口群内空targets继续只观察；新入口空targets采用服务器持久冻结的默认集合，默认空则不创建角色组。引用和插话保留独立source，不因为引用存在就读取私密原文。
 
 依赖识别目前覆盖“按你…方案/刚才…方案/照你…说/your plan/proposal”这类明确前轮方案短语，只等待该会话前一轮实际已发送结果与固定 result_version；没有通用语义规划器。其他输入保留原文一次主生成，不假装能可靠识别全部自然语言依赖。模型不接收工具执行权限。
 
@@ -56,12 +56,12 @@ Python 3.12 + FastAPI/httpx/jsonschema；标准库 SQLite/WAL、FULL 同步与�
 
 重启保留 collector UTC deadline；已准备待发内容继续核验后发送。中断的准备/模型调用关闭失败，不自动重跑可能已经计费的模型；中断 sending 变 unknown，先核对。已确认 sent 永不重发。
 
-有权威 scope_version 的终态在事务中生成合法 `conversation.turn_committed`；outbox 至少一次投递，消费回执保留 accepted/duplicate/stale_source/scope_changed 与 confirmed_memory_written=false。来源仍 pending，未接 Chat Audit 不虚报已永久归档。早期故障缺 scope_version 时保留本地 blocked_scope，turn 仍正常 failed/released；不投递伪造事件。`repair_blocked_scope` 是部署内部修复端口，需要当前输入修订/取消/遗忘/范围核验器，默认不安装；不依赖过期原用户引用，也不自创公开来源查询路由。
+有权威scope_version且来源classification可汇总的终态在事务中生成合法 `conversation.turn_committed`；outbox至少一次投递，消费回执保留accepted/duplicate/stale_source/scope_changed与confirmed_memory_written=false。来源仍pending，未接Chat Audit不虚报已永久归档。事件reality由每个实际P汇总：全real、全fictional或两类独立来源mixed；单P的mixed/unclassified不能提炼，保留本地discarded_source，来源RPC不输出伪造committed_event。早期故障缺scope_version时保留blocked_scope，turn仍failed/released。TS-022的publisher通过真实Memory服务客户端 `source-sync/check` 自动修复；相关范围/请求摘要/版本域均核验，回调期间本地输入已变化则丢弃，缺服务时持续保留可诊断失败。后台不携带过期用户origin，普通回复取消本身不撤回原始输入。
 
-默认 reconcile 不可查；真实来源签发、撤销传播、发送权限核验、回执查询与 blocked_scope 修复核验需要协调服务实现。网页 snapshot/SSE 尚未实现，本地 delivery_changed 投影不能当完整 I17 订阅服务。当前没有短期 inbox 清理或长期归档任务，数据库应位于隔离路径；在长期/高流量使用前必须补受控保留与索引策略。
+默认reconcile不可查；新来源签发、当前授权、发送权限核验和来源同步依赖协调服务的正式实现。Core已提供memory-only来源snapshot/head，详见 [来源接线说明](source-sync.md)，网页snapshot/SSE尚未实现，本地delivery_changed投影不能当完整I17订阅服务。当前没有短期inbox清理或长期归档任务，数据库应位于隔离路径；在长期/高流量使用前必须补受控保留与索引策略。
 
 ## 验收层级
 
-测试替身全部位于 tests；生产应用没有固定成功服务。测试覆盖真实本地数据库/事务/HTTP 路由/客户端序列化，不能证明真实外部授权和送达。`tests/trace_scenario.py` 记录实际模块重开后的两轮、unknown、outbox 状态到 JSON；各检查点注明合成依赖。真实 memory→gateway→QQ/TG、L0/L1、渠道 actual arrival、TLS 部署和生产 PostgreSQL 均未运行。
+测试替身全部位于tests；生产应用没有固定成功服务。测试覆盖真实本地数据库/事务/HTTP路由/客户端序列化，不能证明真实外部授权和送达。`tests/trace_scenario.py`记录实际模块重开后的两轮、unknown、outbox状态到JSON；各检查点注明合成依赖。TS-022另有真实Core进程、临时证书与TLS套接字回环，Platform/Memory仍为合成HTTP替身。真实memory→gateway→QQ/TG、完整L0/L1、渠道actual arrival、生产TLS部署与PostgreSQL未验收。
 
 TS-021 定向命令：`python -m pytest tests/test_profile_context.py tests/test_short_context.py tests/test_continuation_revision.py -q`。可选组件联合用例：显式设置 `TIANSHU_MEMORY_REPO` 为 Memory 仓库路径后运行 `python -m pytest tests/test_profile_joint.py -q`；只读 `git archive 69b29f3 src`，在临时目录加载固定版本实际生产者，消费者通过 httpx ASGITransport 调用真实 Memory HTTP 应用。Memory 数据库、发布批准、来源账本全部为临时合成夹具，Core issuer/model/sender 也是替身；未设置变量时明确跳过。该用例不是网络/TLS 验收，不连接真实来源、账号或现存数据库。Memory 真实 SourceAuthority 仍未接，缺失时继续 503，不能宣称完整 L0。启动、安装、静态和完整套件沿用根 AGENTS 的实际命令。

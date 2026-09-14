@@ -2,12 +2,14 @@
 
 import time
 import uuid
+import ssl
+from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 import httpx
 
-from .contracts import Fault, canonical, digest
+from .contracts import Fault, canonical, digest, strict_json
 
 
 def uid(prefix):
@@ -35,7 +37,7 @@ def command(origin, key, now, seconds=30):
 
 
 class JsonService:
-    def __init__(self, url=None, token=None, *, transport=None):
+    def __init__(self, url=None, token=None, *, transport=None, ca_file=None):
         if url and (
             urlsplit(url).scheme != "https"
             or urlsplit(url).username
@@ -45,8 +47,11 @@ class JsonService:
         ):
             raise ValueError("Internal service URL must be an explicitly configured HTTPS URL")
         self.url, self.token = url, token
+        if ca_file is not None and (not Path(ca_file).is_absolute() or not Path(ca_file).is_file()):
+            raise ValueError("CA file must be an existing absolute deployment path")
+        verify = ssl.create_default_context(cafile=ca_file) if ca_file else True
         self.client = httpx.AsyncClient(
-            timeout=15, follow_redirects=False, trust_env=False, transport=transport
+            timeout=15, follow_redirects=False, trust_env=False, transport=transport, verify=verify
         )
 
     async def call(self, path, body=None, headers=None):
@@ -61,7 +66,7 @@ class JsonService:
             )
             if len(response.content) > 2_000_000:
                 raise Fault("dependency_unavailable")
-            value = response.json()
+            value = strict_json(response.content)
             if response.status_code >= 300:
                 code = value.get("code") if isinstance(value, dict) else None
                 if code in {
@@ -87,6 +92,27 @@ class JsonService:
 class Origins:
     def __init__(self, contracts, issuers):
         self.contracts, self.issuers = contracts, issuers
+
+    async def input_access(self, service, ingest):
+        if service not in {"platform", "nonebot"} or service not in self.issuers:
+            raise Fault("unauthorized")
+        issuer, client = self.issuers[service]
+        if issuer != "platform":
+            raise Fault("forbidden")
+        request = dict(schema_version=1, request_id=uid("req"), operation="input", ingest=ingest)
+        value = await client.call("/internal/v1/source-access/read", request)
+        self.contracts.check("sources#input_authority", value)
+        if (
+            value["request_id"] != request["request_id"]
+            or value["request_digest"] != digest(request)
+            or value["ingest_digest"] != digest(ingest)
+            or value["input_digest"] != digest(ingest["input"])
+            or value["verified_account"] != ingest["input"]["author"]
+            or value["verified_channel"] != ingest["input"]["message_key"]["channel"]
+            or value["origin_ref"] != ingest["command"]["origin"]["assertion_ref"]
+        ):
+            raise Fault("forbidden")
+        return value
 
     async def resolve(self, service, envelope, now):
         if service not in self.issuers:
@@ -132,6 +158,27 @@ class Memory:
             if response["request_id"] != request["command"]["request_id"]:
                 raise Fault("dependency_unavailable")
         return response["person_id"], response["binding_version"]
+
+    async def check_sources(self, turn, sources):
+        request = dict(
+            schema_version=1,
+            request_id=uid("req"),
+            turn_id=turn["id"],
+            input_revision=turn["bundle"]["collection_revision"],
+            scope=turn["scope"],
+            sources=sources,
+        )
+        self.contracts.check("shared#check_request", request)
+        response = await self.client.call("/internal/v1/memory/source-sync/check", request)
+        self.contracts.check("shared#check_response", response)
+        if (
+            response["request_id"] != request["request_id"]
+            or response["request_digest"] != digest(request)
+            or response["scope"] != request["scope"]
+            or response["version_domain"] != "text-dialogue/v1"
+        ):
+            raise Fault("dependency_unavailable")
+        return response["scope_version"]
 
     async def select(self, origin, scope, text, budget, known_version=None):
         request = dict(
