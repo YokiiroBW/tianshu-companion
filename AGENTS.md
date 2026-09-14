@@ -16,6 +16,7 @@
 - 画像定向：`python -m pytest tests/test_profile_context.py tests/test_short_context.py tests/test_continuation_revision.py -q`。联合用例先显式设置 `TIANSHU_MEMORY_REPO` 为 Memory 仓库，再运行 `python -m pytest tests/test_profile_joint.py -q`；只读固定提交69b29f3，使用ASGI与合成来源，未设置时跳过，不能称完整联合验证通过。
 - 来源定向：`python -m pytest tests/test_source_sync.py tests/test_source_migration.py tests/test_source_bridge.py -q`。来源、身份、collector、watermark改动涉及共享状态，再跑完整组件套件；已有旧混actor断言和手动blocked_scope断言已按TS-022新行为更新。
 - 实际TLS回环：先设置 `TIANSHU_TLS_PYTHON` 为具有cryptography的解释器绝对路径，再运行 `python -m pytest tests/test_source_https.py -q -s`。该解释器仅生成临时单日回环证书，Core进程和测试仍用本项目虚拟环境；没有新增锁依赖或落库凭据。当前机器可用 `C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe`。未设置时明确跳过；远端Platform/Memory为合成HTTP替身，不是L0。
+- 查询传输定向：同样设置 `TIANSHU_TLS_PYTHON` 后运行 `python -m pytest tests/test_query_transport.py -q -s`；覆盖真实TLS空闲关闭恢复、并发隔离、预算/取消、写入无响应不重发及unknown封账。JsonService属共享调用链，变更后跑完整组件套件；查询白名单和限制见 `docs/query-transport.md`。
 - 合成持久轨迹：`python tests/trace_scenario.py --output .runtime/local-trace.json`。
 - 回环 HTTP 进程启动/关闭检查：`python tests/smoke_server.py`（不加载外部服务配置）。
 - 本地启动：`python -m uvicorn tianshu_companion.app:create_app --factory --host 127.0.0.1 --port 8765 --workers 1`；未配置业务请求返回 503。

@@ -1,5 +1,7 @@
 """Fixed service endpoints, bounded calls, and published wire documents."""
 
+import asyncio
+import re
 import time
 import uuid
 import ssl
@@ -37,6 +39,19 @@ def command(origin, key, now, seconds=30):
 
 
 class JsonService:
+    # Published text/profile/source-sync queries only. Source barriers may persist
+    # invalidations, but repeating these queries cannot issue a business command.
+    QUERY_PATHS = frozenset(
+        {
+            "/internal/v1/origins/resolve",
+            "/internal/v1/identity/resolve",
+            "/internal/v1/memory/select",
+            "/internal/v1/memory/profiles/select",
+            "/internal/v1/memory/source-sync/check",
+        }
+    )
+    QUERY_BUDGET_SECONDS = 15
+
     def __init__(self, url=None, token=None, *, transport=None, ca_file=None):
         if url and (
             urlsplit(url).scheme != "https"
@@ -57,13 +72,33 @@ class JsonService:
     async def call(self, path, body=None, headers=None):
         if not self.url or not self.token:
             raise Fault("dependency_unavailable")
+        retry_query = (body is not None and path in self.QUERY_PATHS) or (
+            body is None
+            and re.fullmatch(r"/internal/v1/model-requests/model:[0-9a-f]{32}", path) is not None
+        )
         try:
-            response = await self.client.request(
+            request = self.client.build_request(
                 "GET" if body is None else "POST",
                 self.url.rstrip("/") + path,
                 json=body,
                 headers={"Authorization": "Bearer " + self.token, **(headers or {})},
             )
+            # One wall-clock budget covers both attempts and the response body.
+            # Reuse serialized bytes/IDs/headers, never replace the shared client.
+            async with asyncio.timeout(self.QUERY_BUDGET_SECONDS if retry_query else None):
+                for attempt in range(2 if retry_query else 1):
+                    try:
+                        response = await self.client.send(request, stream=True)
+                        break
+                    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError):
+                        # HTTPX/httpcore releases the failed connection. Only retry
+                        # before response headers; this does NOT prove nonexecution.
+                        if not retry_query or attempt:
+                            raise
+                try:
+                    await response.aread()
+                finally:
+                    await response.aclose()
             if len(response.content) > 2_000_000:
                 raise Fault("dependency_unavailable")
             value = strict_json(response.content)
@@ -82,7 +117,7 @@ class JsonService:
                     raise Fault(code, unknown=value.get("execution_state") == "unknown")
                 raise Fault("dependency_unavailable")
             return value
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError, TimeoutError):
             raise Fault("dependency_unavailable") from None
 
     async def close(self):
