@@ -86,7 +86,11 @@ config_version 的聊天默认路由。不在源码填模型或供应商凭据�
 
 ## 读锁
 
-`diary_metadata` 不含正文或素材。`set_diary_access(actor_id, readers=..., expected=...)`
+`diary_metadata` 不含正文或素材。它另外给出捕获标记：`fictional`（生活日记始终是虚构条目）、
+`config_version`（创建时固定的写作配置版本）、`material_version`（素材哈希）以及
+`recipe_id`/`recipe_version`。`read_diary(..., reader=...)` 的正式内容同样带 `fictional` 和
+`material_version`，读者能判定这条内容对应哪次素材快照，不会把旧草稿当成当前状态。
+`set_diary_access(actor_id, readers=..., expected=...)`
 是 Core 管理的剧情读授权；readers 是宿主认证得到的身份，不接受用户自报身份作为权限。
 默认锁定。`read_diary(..., reader=...)` 在读取 revision 内容前检查授权和正式版本存在，
 有剧情授权也不能看草稿。`admin_read_revision` 是单独的系统管理员端口；宿主必须先验管理权限。
@@ -104,11 +108,26 @@ v1 仍沿用 pre-source-v2 备份前缀，包含升级前原始事实；保留�
 不入库。这里只用临时合成数据库验证，未操作生产数据。
 
 实际验证命令：
-- `.venv/Scripts/python.exe -m pytest tests/test_life.py -q`
+- `.venv/Scripts/python.exe -m pytest tests/test_life.py tests/test_life_chain.py -q`
 - `.venv/Scripts/python.exe -m ruff format --check src integrations tests scripts`
 - `.venv/Scripts/python.exe -m ruff check src integrations tests scripts`
 - `.venv/Scripts/python.exe -m compileall -q src integrations tests scripts`
 - 设置 TIANSHU_TLS_PYTHON 后 `.venv/Scripts/python.exe -m pytest -q`
+
+## 跨模块贯通（TS-070）
+
+`tests/test_life_chain.py` 用一个合成场景覆盖完整链：共享世界事件 → 各角色分别获知
+（participated/witnessed/told_by）→ 当日活动与手动保持 → 穿搭快照 → 日记素材和草稿 →
+图像任务快照，并包含重启后的证据。断言要点：
+
+- 只有参与者/可见者/被讲述者获知；未获知角色既不能转述，其素材与日记请求里也不出现该事件。
+- 状态版本一致：聊天上下文 `fictional_life` 摘要、房间控件与图像任务读数来自同一生活状态；
+  已捕获的图像任务保留创建时的 actor/room/world/outfit/工作流版本，之后的生活变化不改写它。
+- 手动保持只由显式 `resume_*`/到期解除，日程与另一角色的建议都不会覆盖它。
+- 重启后日程结算不重复写事件、已提交图像任务不重发、同素材日记任务不重复入队、正式版不重复发布。
+- 生活与图像数据都不进入真实 source-facts 流（source_head 不变），日记仍标记真实聊天来源 excluded。
+
+该场景只使用虚构标识、合成事件、本地 stub ComfyUI 与模型替身，不代表真实 GPU、真实渠道或现实对话总结。
 
 网页候选：snapshot actor/world/room 版本读取；expected_version 控件写入/恢复；日记metadata及判锁内容读取。
 另已审阅 TS014 网页会话快照候选并回报边界，尚未冻结，不在本模块私造网络 wire。

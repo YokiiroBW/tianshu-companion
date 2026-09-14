@@ -492,6 +492,7 @@ class Life:
                     id=key,
                     conversation_id=actor_id,
                     day=day,
+                    fictional=True,
                     recipe=recipe,
                     material_version=material_version,
                     state=state,
@@ -603,6 +604,7 @@ class Life:
                 source=source,
                 parent=item["current_revision"],
                 material_version=item["material_version"],
+                fictional=True,
                 created_at=self.clock(),
             ),
         )
@@ -649,7 +651,7 @@ class Life:
 
     def diary_metadata(self, diary_id):
         item = self._get("diaries", diary_id)
-        return {
+        metadata = {
             k: item[k]
             for k in (
                 "id",
@@ -659,9 +661,18 @@ class Life:
                 "version",
                 "current_revision",
                 "published_revision",
+                "config_version",
+                "material_version",
                 "real_chat_sources",
             )
         }
+        # Capture marks: a draft must stay readable against the recipe version and the
+        # material hash it was built from. Rows written before the mark existed are
+        # still fictional life rows, never real user facts.
+        metadata["fictional"] = item.get("fictional", True)
+        metadata["recipe_id"] = item["recipe"]["id"]
+        metadata["recipe_version"] = item["recipe"]["version"]
+        return metadata
 
     def read_diary(self, diary_id, *, reader):
         meta = self.diary_metadata(diary_id)
@@ -670,7 +681,15 @@ class Life:
         if not access or reader not in access["readers"] or meta["published_revision"] is None:
             raise PermissionError("Diary locked or unpublished")
         revision = self._get("revisions", meta["published_revision"])
-        return {k: revision[k] for k in ("id", "content", "created_at")}
+        # Published content keeps its capture marks, so a reader never mistakes it for
+        # the actor's live state and can align it with the material it was built from.
+        return {
+            "id": revision["id"],
+            "content": revision["content"],
+            "created_at": revision["created_at"],
+            "fictional": meta["fictional"],
+            "material_version": meta["material_version"],
+        }
 
     def admin_read_revision(self, revision_id):
         """Host-authorized administrator port; story affection never grants this capability."""
