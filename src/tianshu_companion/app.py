@@ -16,6 +16,7 @@ from .clients import Gateway, JsonService, Memory, Origins, Sender, uid
 from .contracts import Contracts, Fault, strict_json
 from .core import Core, Policy
 from .store import Store
+from .images import ComfyUI, Workflow
 from .short_context import ShortContextPolicy
 
 LOG = logging.getLogger(__name__)
@@ -43,6 +44,19 @@ def build_runtime(config):
             incoming[service] = token
             if service in {"platform", "nonebot"}:
                 issuers[service] = (entry["issuer"], client(entry["origin_service"]))
+    image_options = None
+    if config.get("images") is not None:
+        image_config = config["images"]
+        workflow = Workflow(
+            image_config["api_graph"], image_config["bindings"], image_config["outputs"]
+        )
+        transport = ComfyUI(image_config["base_url"], token_env=image_config.get("token_env"))
+        clients.append(transport)
+        image_options = dict(
+            transport=transport,
+            workflow=workflow,
+            staging=image_config["staging"],
+        )
     core = Core(
         Store(config["database_path"]),
         contracts,
@@ -57,6 +71,7 @@ def build_runtime(config):
         short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
         life_writing=config.get("life_writing", False),
         life_config_version=config.get("life_config_version"),
+        image_options=image_options,
         web_sender=Sender(contracts, client("platform_sender")),
     )
     return core, incoming, clients
@@ -99,6 +114,14 @@ def create_app(core=None, tokens=None):
                 LOG.error("Life worker failed: %s", type(exc).__name__)
             await asyncio.sleep(30)
 
+    async def image_worker():
+        while True:
+            try:
+                await core.images.work()
+            except Exception as exc:
+                LOG.error("Image worker failed: %s", type(exc).__name__)
+            await asyncio.sleep(2)
+
     @asynccontextmanager
     async def lifespan(app):
         jobs = []
@@ -108,6 +131,7 @@ def create_app(core=None, tokens=None):
                 asyncio.create_task(worker()),
                 asyncio.create_task(publisher()),
                 asyncio.create_task(life_worker()),
+                asyncio.create_task(image_worker()),
             ]
         yield
         for job in jobs:

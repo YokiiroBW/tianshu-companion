@@ -27,3 +27,5 @@ HTTP入口为 `POST /internal/v1/conversation/ingest-actors`、`/internal/v1/sou
 角色生活与日记内部端口、独立写作配置和SQLite v3恢复说明：[docs/life.md](docs/life.md)。
 
 网页会话快照与独立Platform发送端：[docs/web-conversation.md](docs/web-conversation.md)。
+
+Core 图像与衣橱内部端口、ComfyUI 工作流审阅、SQLite v4 恢复及尚未发布的图像候选：[docs/images.md](docs/images.md)。

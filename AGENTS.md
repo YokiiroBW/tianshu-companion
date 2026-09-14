@@ -33,3 +33,5 @@
 TS-071：数据库现为user_version=3；v2结构升级前SQLite backup至pre-life-v3随机备份，恢复须停机隔离DB/WAL/SHM。生活、日记及可信同产品端口见docs/life.md；定向命令：python -m pytest tests/test_life.py -q。日记必须显式life_writing及独立life_config_version，不回退聊天配置；当前只用虚构素材，不是现实对话总结日记。共享生命周期/迁移改动后跑完整组件套件。
 
 网页快照接线：另需正式web-conversation/v1 1.0.0（manifest LF SHA256 e493a1b5d0f4cec8d55995553faf84042f4c33a59365d15423e57f4dc70a6c09）。内部platform bearer读取，Core到Platform使用services.platform_sender独立companion凭据；web不回退NoneBot。定向python -m pytest tests/test_web_snapshot.py -q；配置/来源展示限制见docs/web-conversation.md。
+
+TS-072：数据库现为user_version=4，v3升级前pre-images-v4随机备份；图像/衣橱可信内部端口、原工作流只读审阅与候选见docs/images.md。定向：python -m pytest tests/test_images.py tests/test_life.py -q；迁移/生命周期改动后跑完整组件套件。禁止把合成HTTP测试称为真实GPU验证。

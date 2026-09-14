@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from .clients import command, epoch, uid, utc
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 from .life import Life
+from .images import Images
 from .web_snapshot import snapshot as read_web_snapshot
 from .context import (
     TEXT_DOMAIN,
@@ -74,6 +75,7 @@ class Core:
         life_writing=False,
         life_config_version=None,
         web_sender=None,
+        image_options=None,
     ):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
@@ -88,6 +90,7 @@ class Core:
             self.life = Life(
                 store, clock, gateway, life_config_version, self.models, writing=life_writing
             )
+            self.images = Images(self.life, **(image_options or {}))
             migrate_legacy(store)
         except BaseException:
             store.close()
@@ -454,6 +457,7 @@ class Core:
     def recover(self):
         """Invoke once after acquiring the database owner lock, before accepting traffic."""
         self.life.recover()
+        self.images.recover()
         with self.store.transaction():
             for reply in self.store.list("replies", states=["sending"]):
                 reply.update(state="unknown", unknown_since=reply["attempted_at"])
