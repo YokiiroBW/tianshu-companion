@@ -8,7 +8,20 @@ from pathlib import Path
 
 from .contracts import canonical
 
-TABLES = {
+LIFE_TABLES = {
+    "life_worlds",
+    "life_rooms",
+    "life_actors",
+    "life_events",
+    "life_known",
+    "life_recipes",
+    "life_materials",
+    "life_diaries",
+    "life_revisions",
+    "life_access",
+}
+
+TABLES = LIFE_TABLES | {
     "conversations",
     "collections",
     "inbox",
@@ -55,12 +68,13 @@ class Store:
 
     def _initialize(self, path):
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2):
+        if version not in (0, 1, 2, 3):
             raise RuntimeError("Unsupported database schema version")
         # Backup the complete SQLite view (including WAL) before structural migration.
         # A unique file never overwrites earlier recovery evidence.
-        if version == 1 and str(path) != ":memory:":
-            backup = sqlite3.connect(str(path) + ".pre-source-v2-" + uuid.uuid4().hex + ".bak")
+        if version in (1, 2) and str(path) != ":memory:":
+            label = ".pre-source-v2-" if version == 1 else ".pre-life-v3-"
+            backup = sqlite3.connect(str(path) + label + uuid.uuid4().hex + ".bak")
             try:
                 self.db.backup(backup)
             finally:
@@ -68,7 +82,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
-        for table in sorted(TABLES):
+        for table in sorted(TABLES - LIFE_TABLES):
             self.db.execute(
                 f"CREATE TABLE IF NOT EXISTS {table} ("
                 "id TEXT PRIMARY KEY, conversation_id TEXT, position INTEGER, "
@@ -101,13 +115,23 @@ class Store:
         self._fact_dirty = False
         with self.transaction():
             if not self.get("metadata", "source_head"):
-                if version == 2:
+                if version >= 2:
                     raise RuntimeError("Missing durable source head; trusted recovery required")
                 self.put(
                     "metadata",
                     dict(id="source_head", generation="generation:" + uuid.uuid4().hex, sequence=0),
                 )
-            self.db.execute("PRAGMA user_version=2")
+            for table in sorted(LIFE_TABLES):
+                self.db.execute(
+                    f"CREATE TABLE IF NOT EXISTS {table} ("
+                    "id TEXT PRIMARY KEY, conversation_id TEXT, position INTEGER, "
+                    "status TEXT, deadline REAL, body TEXT NOT NULL)"
+                )
+                self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS {table}_queue ON "
+                    f"{table}(conversation_id,status,position)"
+                )
+            self.db.execute("PRAGMA user_version=3")
 
     @contextmanager
     def transaction(self):

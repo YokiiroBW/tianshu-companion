@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, replace
 
 from .clients import command, epoch, uid, utc
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
+from .life import Life
 from .context import (
     TEXT_DOMAIN,
     TurnContext,
@@ -69,6 +70,8 @@ class Core:
         clock=time.time,
         model_slots=4,
         short_context_policy=None,
+        life_writing=False,
+        life_config_version=None,
     ):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
@@ -79,6 +82,9 @@ class Core:
         self.jobs, self.send_jobs = {}, {}
         self.short_context_policy = short_context_policy or ShortContextPolicy()
         try:
+            self.life = Life(
+                store, clock, gateway, life_config_version, self.models, writing=life_writing
+            )
             migrate_legacy(store)
         except BaseException:
             store.close()
@@ -424,6 +430,7 @@ class Core:
 
     def recover(self):
         """Invoke once after acquiring the database owner lock, before accepting traffic."""
+        self.life.recover()
         with self.store.transaction():
             for reply in self.store.list("replies", states=["sending"]):
                 reply.update(state="unknown", unknown_since=reply["attempted_at"])
@@ -444,6 +451,7 @@ class Core:
             self._seal_due(self.clock())
 
     async def tick(self):
+        self.life.tick()
         for job in [*self.jobs.values(), *self.send_jobs.values()]:
             if job.done() and not job.cancelled() and job.exception():
                 logging.getLogger(__name__).error(
@@ -820,6 +828,13 @@ class Core:
                 ),
             ):
                 profiles.append(profile_check(turn, target, text, selection, response))
+        summary = self.life.summary(turn["scope"]["actor_id"])
+        if summary is not None:
+            context.data["fictional_life"] = []
+            if context.remaining < 0:
+                del context.data["fictional_life"]
+            else:
+                context.append("fictional_life", summary)
         return context, metadata, checks, profiles
 
     async def _preflight(self, turn):

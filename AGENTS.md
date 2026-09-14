@@ -29,3 +29,5 @@
 数据库当前user_version=2。结构迁移前用SQLite backup保存 `数据库路径.pre-source-v2-随机值.bak`；随后Core在单事务中迁移可由原请求证明的actor，混组或缺原始归属的会话隔离503。迁移失败回滚事实并释放owner锁，修复故障后重试；恢复备份须停进程并隔离当前DB/WAL/SHM，不能在运行中覆盖或自行清除水位/隔离标记。完整步骤与边界见 `docs/source-sync.md`。
 
 本地隔离开发和提交用于审查；不自动推送、部署或操作真实设备。交付短记录 docs/handoffs/<任务编号>.md，含实际变更、验证、风险及下一步。
+
+TS-071：数据库现为user_version=3；v2结构升级前SQLite backup至pre-life-v3随机备份，恢复须停机隔离DB/WAL/SHM。生活、日记及可信同产品端口见docs/life.md；定向命令：python -m pytest tests/test_life.py -q。日记必须显式life_writing及独立life_config_version，不回退聊天配置；当前只用虚构素材，不是现实对话总结日记。共享生命周期/迁移改动后跑完整组件套件。

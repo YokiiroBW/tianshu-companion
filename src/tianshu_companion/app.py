@@ -55,6 +55,8 @@ def build_runtime(config):
         config_version=config.get("config_version"),
         policy=Policy(**config.get("policy", {})),
         short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
+        life_writing=config.get("life_writing", False),
+        life_config_version=config.get("life_config_version"),
     )
     return core, incoming, clients
 
@@ -88,12 +90,24 @@ def create_app(core=None, tokens=None):
                 LOG.error("Outbox worker failed: %s", type(exc).__name__)
             await asyncio.sleep(0.5)
 
+    async def life_worker():
+        while True:
+            try:
+                await core.life.work()
+            except Exception as exc:
+                LOG.error("Life worker failed: %s", type(exc).__name__)
+            await asyncio.sleep(30)
+
     @asynccontextmanager
     async def lifespan(app):
         jobs = []
         if core:
             core.recover()
-            jobs = [asyncio.create_task(worker()), asyncio.create_task(publisher())]
+            jobs = [
+                asyncio.create_task(worker()),
+                asyncio.create_task(publisher()),
+                asyncio.create_task(life_worker()),
+            ]
         yield
         for job in jobs:
             job.cancel()

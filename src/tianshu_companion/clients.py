@@ -348,6 +348,10 @@ class Gateway:
     def __init__(self, contracts, client):
         self.contracts, self.client = contracts, client
 
+    @property
+    def available(self):
+        return bool(self.client.url and self.client.token)
+
     async def generate(self, turn, messages):
         request_id = uid("model")
         headers = {

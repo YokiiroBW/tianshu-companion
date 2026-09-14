@@ -23,3 +23,5 @@ HTTP入口为 `POST /internal/v1/conversation/ingest-actors`、`/internal/v1/sou
 运行时已接Memory `/internal/v1/memory/source-sync/check` 修复blocked_scope；过期用户origin不会替代后台服务身份。三份发布合同、配置、迁移备份/恢复与覆盖区分见 [来源接线说明](docs/source-sync.md)。已通过真实Core进程TLS回环（远端为合成HTTP替身）；真实Platform/Memory/网关/渠道完整L0仍未验收。
 
 运行限制、状态表、来源边界与验收层级见 [实现说明](docs/implementation.md)，薄桥接入边界见 [NoneBot 说明](integrations/nonebot/README.md)。真实 QQ/TG、memory/gateway 联合链路和 PostgreSQL 仍未验收；生活、日记、工具执行与网页快照/SSE 留后续任务。
+
+角色生活与日记内部端口、独立写作配置和SQLite v3恢复说明：[docs/life.md](docs/life.md)。
