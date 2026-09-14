@@ -154,7 +154,11 @@ class ComfyUI:
                 raise ValueError("Unsafe artifact path")
         if not descriptor["filename"] or "/" in descriptor["filename"]:
             raise ValueError("Invalid filename")
-        async with self.client.stream("GET", "/view", params=descriptor) as response:
+        # ComfyUI resolves these suffixes before query type, even without a space.
+        if descriptor["filename"].endswith(("[input]", "[temp]", "[output]")):
+            raise ValueError("Artifact directory annotations are not allowed")
+        params = {key: descriptor[key] for key in ("filename", "subfolder", "type")}
+        async with self.client.stream("GET", "/view", params=params) as response:
             response.raise_for_status()
             data = bytearray()
             async for chunk in response.aiter_bytes():

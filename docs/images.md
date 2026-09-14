@@ -84,7 +84,10 @@ reference 不是 URL，也不自动上传素材。activities 是说明性元数�
 
 仅从本任务 history 中显式 outputs 白名单内 SaveImage 的 images 下载；只允许 output 类型。
 拒绝目录穿越、绝对路径、Windows 分隔符与盘符。返回 filename 只作为受约束 /view 查询参数，
-从不当作本地文件名。Core 专用目录内随机文件名排他创建，失败批次清理自身新文件，不覆盖现有文件。
+从不当作本地文件名。按本机 folder_paths.annotated_filepath 的大小写敏感 endswith 语义，
+拒绝末尾 `[input]`、`[temp]`、`[output]`，无论前面是否有空格；不剥后缀再读其他文件。
+`/view` 仅发送 filename/subfolder/type 三字段，history 扩展键（包括 preview/channel）不转发。
+Core 专用目录内随机文件名排他创建，失败批次清理自身新文件，不覆盖现有文件。
 PNG 首版校验签名/IHDR、尺寸上限、完整 chunk/CRC/IEND；不解码图像语义，也不支持 JPEG/WebP 输出。
 保存哈希、字节数、MIME、尺寸、staging_name、archived=false。未提供跨产品下载 URL。
 进程崩溃可能留下未登记暂存文件；其大小仍计入预算，停机后由管理员核对清理，不自动删除未知文件。

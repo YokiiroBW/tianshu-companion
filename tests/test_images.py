@@ -11,7 +11,7 @@ import time
 import zlib
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -288,6 +288,11 @@ def test_running_cancel_is_intent_only(tmp_path, server, race):
         dict(filename="../secret.png", subfolder="", type="output"),
         dict(filename="a.png", subfolder="../secret", type="output"),
         dict(filename="a.png", subfolder="", type="input"),
+        *[
+            dict(filename="secret.png" + prefix + suffix, subfolder="", type="output")
+            for prefix in (" ", "", "X")
+            for suffix in ("[input]", "[temp]", "[output]")
+        ],
         dict(filename="C:\\secret.png", subfolder="", type="output"),
     ],
 )
@@ -435,6 +440,49 @@ def test_changed_endpoint_does_not_query_old_prompt_or_starve_new_job(tmp_path, 
         assert len(state.posts) == 1 and state.posts[0]["prompt_id"] == new["prompt_id"]
         assert images.get("a-old")["submitted"] is False
         assert not any(job["prompt_id"] in path for _, path in state.calls)
+        await images.transport.close()
+        images.store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "synthetic.png",
+        "synthetic[output].png",
+        "synthetic.png [INPUT]",
+        "synthetic.png%20%5Binput%5D",
+    ],
+)
+def test_view_only_forwards_allowed_fields_and_preserves_literal_filename(
+    tmp_path, server, filename
+):
+    state, url = server
+
+    async def run():
+        images = port(tmp_path, url)
+        job = images.request("r", "a")
+        complete_descriptor = dict(
+            filename=filename,
+            subfolder="synthetic folder",
+            type="output",
+            preview="jpeg;1",
+            channel="a",
+            unknown="synthetic extension",
+        )
+        await images.work()
+        complete(state, job, complete_descriptor)
+        await images.work()
+        assert images.get("r")["state"] == "completed"
+        requests = [path for method, path in state.calls if path.startswith("/view")]
+        assert len(requests) == 1
+        assert parse_qs(urlsplit(requests[0]).query, keep_blank_values=True) == {
+            "filename": [filename],
+            "subfolder": ["synthetic folder"],
+            "type": ["output"],
+        }
+        assert images.get("r")["artifacts"][0]["sha256"] == hashlib.sha256(png()).hexdigest()
         await images.transport.close()
         images.store.close()
 
