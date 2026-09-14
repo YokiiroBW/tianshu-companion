@@ -522,14 +522,12 @@ class Core:
                 turn["bootstrap_mapping"] = False
                 turn["preparation"] = selection
                 turn["timings"]["memory_ms"] = (self.clock() - start) * 1000
-                older = self.store.recent_turns(turn["conversation_id"], turn["sequence"], 1)
-                if older and re.search(
-                    r"按你.*方案|刚才.*方案|照你.*说|your (?:plan|proposal)", text, re.I
-                ):
-                    dep = older[-1]
-                    turn["bundle"]["dependencies"] = [
-                        dict(turn_id=dep["id"], result_version=1, state="pending")
-                    ]
+                if re.search(r"按你.*方案|刚才.*方案|照你.*说|your (?:plan|proposal)", text, re.I):
+                    dep = self.store.previous_scope_turn(turn["scope"], turn["sequence"])
+                    if dep:
+                        turn["bundle"]["dependencies"] = [
+                            dict(turn_id=dep["id"], result_version=1, state="pending")
+                        ]
                 with self.store.transaction():
                     self._save_turn(turn)
             dependencies = []

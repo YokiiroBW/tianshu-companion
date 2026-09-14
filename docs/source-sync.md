@@ -26,6 +26,8 @@ classification由Core binding中显式 `classification` 配置保存，形状为
 
 普通回复cancel不撤回输入。发送前文字/画像两域探针、跨作者context_checks继承和TS-021不可上调的续接来源版本保留。输入编辑/撤回/分类改变使所有角色相关候选停止，已发送事实仍保留。终态缺scope_version由publisher调用Memory `/internal/v1/memory/source-sync/check`（只有服务身份，没有旧用户origin）；失败保留blocked_scope与last_error，权威返回后再次核对本地turn/input再发布原event_id。
 
+明确“按你刚才的方案”依赖按精确actor/person/audience/conversation取最近前序；共享会话中另一个actor/person插话不成为依赖。查询使用scope索引且只取一条，不跳过最近的失败、未送达或失效结果来回退旧方案。原 `_check_dependency` 精确scope、sent/result/source/版本校验与继承双域探针不放宽。此索引在现有SQLite表上幂等创建，不修改wire或数据schema版本。
+
 ## 部署配置
 
 `contracts_path`仍指向text-dialogue/v1；同时部署同根profile-memory/v1和source-sync/v1。`services`的url是固定HTTPS服务**基础地址**，客户端追加正式路径，不接受payload URL、重定向或关闭证书校验。每服务token由token_env指定的环境变量读取；可选ca_file须为现有绝对文件路径，缺省使用系统受信CA。

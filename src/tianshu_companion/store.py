@@ -82,6 +82,11 @@ class Store:
             "CREATE INDEX IF NOT EXISTS turns_recent ON turns(conversation_id,position)"
         )
         self.db.execute(
+            "CREATE INDEX IF NOT EXISTS turns_scope_recent ON turns(conversation_id,"
+            "json_extract(body,'$.scope.actor_id'),json_extract(body,'$.scope.person_id'),"
+            "json_extract(body,'$.scope.audience'),position)"
+        )
+        self.db.execute(
             "CREATE INDEX IF NOT EXISTS inbox_source ON inbox(conversation_id,"
             "json_extract(body,'$.base'),json_extract(body,'$.revision') DESC)"
         )
@@ -178,6 +183,30 @@ class Store:
             (conversation_id, before_sequence, limit),
         )
         return [json.loads(row[0]) for row in rows]
+
+    def previous_scope_turn(self, scope, before_sequence):
+        """One indexed predecessor; retain invalid/unsent candidates for strict checks.
+
+        Filtering on validity here would silently substitute an older plan when
+        the actual preceding result is revoked, failed or still being delivered.
+        """
+        row = self.db.execute(
+            "SELECT body FROM turns WHERE conversation_id=? "
+            "AND json_extract(body,'$.scope.actor_id')=? "
+            "AND json_extract(body,'$.scope.person_id')=? "
+            "AND json_extract(body,'$.scope.audience')=? "
+            "AND json_extract(body,'$.scope.conversation_id')=? "
+            "AND position<? ORDER BY position DESC LIMIT 1",
+            (
+                scope["conversation_id"],
+                scope["actor_id"],
+                scope["person_id"],
+                scope["audience"],
+                scope["conversation_id"],
+                before_sequence,
+            ),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
 
     def latest_source(self, conversation_id, base):
         row = self.db.execute(

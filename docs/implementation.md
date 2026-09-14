@@ -24,7 +24,7 @@ Python 3.12 + FastAPI/httpx/jsonschema；标准库 SQLite/WAL、FULL 同步与�
 
 所有人物、角色共享 channel_key 对应的两个活跃槽。TS-022将物理P与角色受理A拆开，每个actor使用自己的receipt/scope/collector；同一物理输入可分别生成，不能再混入另一个角色的组。fanout按actor_id排序领取会话全局ingest_sequence，封存按deadline/首次受理序号领取turn_sequence，发送按全会话轮次/段号排序。旧单actor入口群内空targets继续只观察；新入口空targets采用服务器持久冻结的默认集合，默认空则不创建角色组。引用和插话保留独立source，不因为引用存在就读取私密原文。
 
-依赖识别目前覆盖“按你…方案/刚才…方案/照你…说/your plan/proposal”这类明确前轮方案短语，只等待该会话前一轮实际已发送结果与固定 result_version；没有通用语义规划器。其他输入保留原文一次主生成，不假装能可靠识别全部自然语言依赖。模型不接收工具执行权限。
+依赖识别目前覆盖“按你…方案/刚才…方案/照你…说/your plan/proposal”这类明确前轮方案短语，按当前actor/person/audience/conversation精确scope索引取当前轮序号之前最近的一条候选（LIMIT 1）。其他actor或其他person插话不会替换该方案；查询不按状态、版本或来源有效性筛掉最近候选，因此最近候选失败/取消/失效时明确拒绝，不静默回退更旧方案。在途结果仍等待，已送达、固定result_version、来源/范围/双域版本及继承检查继续验证。没有匹配scope前序时不关联其他scope结果。没有通用语义规划器；其他输入保留原文一次主生成，不假装能可靠识别全部自然语言依赖。模型不接收工具执行权限。
 
 ## 身份、记忆和版本
 

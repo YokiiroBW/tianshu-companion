@@ -11,6 +11,7 @@
 - 初始化：`python -m venv .venv`；安装锁定开发依赖：`python -m pip install -r requirements-dev.txt`；登记两个包：`python -m pip install --no-deps -e .`（保留默认构建隔离）。
 - 格式检查：`python -m ruff format --check src integrations tests scripts`；静态检查：`python -m ruff check src integrations tests scripts`；语法：`python -m compileall -q src integrations tests scripts`。
 - 调度定向：`python -m pytest tests/test_core.py tests/test_edges.py -q`；边界定向：`python -m pytest tests/test_boundaries.py tests/test_gateway.py tests/test_bootstrap.py -q`；完整组件套件：`python -m pytest -q`。
+- 方案依赖定向：`python -m pytest tests/test_plan_dependencies.py -q`；依赖前序查询使用精确actor/person/audience/conversation索引和LIMIT 1，不筛掉未送达/失效的最近候选，不回退更旧方案；变更时同时验证调度、短期上下文与画像继承检查。
 - 短期上下文定向：`python -m pytest tests/test_short_context.py tests/test_continuation_revision.py -q`；改变共享状态/来源读取时同时验证调度套件。
 - 画像定向：`python -m pytest tests/test_profile_context.py tests/test_short_context.py tests/test_continuation_revision.py -q`。联合用例先显式设置 `TIANSHU_MEMORY_REPO` 为 Memory 仓库，再运行 `python -m pytest tests/test_profile_joint.py -q`；只读固定提交69b29f3，使用ASGI与合成来源，未设置时跳过，不能称完整联合验证通过。
 - 来源定向：`python -m pytest tests/test_source_sync.py tests/test_source_migration.py tests/test_source_bridge.py -q`。来源、身份、collector、watermark改动涉及共享状态，再跑完整组件套件；已有旧混actor断言和手动blocked_scope断言已按TS-022新行为更新。
