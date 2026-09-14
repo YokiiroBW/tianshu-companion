@@ -3,6 +3,7 @@
   "date": "2026-09-14",
   "baseline_commit": "05c35db54df146bf2997eab6cd516c0948dfdc40",
   "implementation_commit": "2229c9d494c9fee57b857ad8b704ff843d8f516b",
+  "review_fix_commit": "fbd79c01fcd8f5122089bcd7d8c7bfce0fac1d87",
   "source_contract": {
     "package": "source-sync/v1",
     "version": "1.0.0",
@@ -10,6 +11,24 @@
     "coordinator_release_commit": "154f068"
   },
   "verification": {
+    "review_followup": {
+      "reviewed_head": "1c4d20460a8d9e8377b431f04897303dc2298e9c",
+      "behavior": "Use the nearest exact actor/person/audience/conversation predecessor through an indexed LIMIT 1; retain strict validity/delivery checks and never skip to older plans",
+      "targeted": {"passed": 6, "subtests_passed": 24, "duration_seconds": 4.79},
+      "affected": {"passed": 53, "subtests_passed": 17, "duration_seconds": 4.37},
+      "format": "29 files already formatted",
+      "lint_syntax_diff": "passed",
+      "full_suite": {
+        "command": "python -m pytest -q --tb=short",
+        "tls_fixture_enabled": true,
+        "fixed_legacy_memory_joint_enabled": true,
+        "memory_commit": "69b29f3",
+        "passed": 100,
+        "skipped": 0,
+        "subtests_passed": 47,
+        "duration_seconds": 17.54
+      }
+    },
     "format": "28 files already formatted",
     "lint": "All checks passed",
     "syntax": "compileall completed with exit code 0",
