@@ -43,6 +43,8 @@ classification由Core binding中显式 `classification` 配置保存，形状为
 
 Memory→Core必须使用callers.memory对应凭据；Memory→Platform current使用其独立service=memory/source.current身份。在线viewer仍是独立companion→memory的完整scope origin，不能被传输服务身份覆盖。没有真实服务配置/账号/设备时，保留明确不可用，不填固定成功默认值。
 
+已只读核对集成Platform `a94d34534ba0b6002bdcdab9db1d5dd899a06a16` 和Memory `ba0e50d56d6a4e816267d710c41c6b0c49035431` 的运行文档：Memory的source_sync.core/platform.url使用完整正式端点，与Core自身基础地址配置不同；Memory后台consume/check还要求event_scopes登记实际映射后的精确actor/person/audience/conversation，空列表拒绝。这些配置必须由联合接线明确准备，Core不能用旧origin或宽泛默认scope越过；此处文档核对不是实际联合通过记录。
+
 ## 迁移、异常与恢复
 
 1. 只在隔离数据库验证并停止旧Core，确保单进程owner。首次打开user_version=1时，使用SQLite backup API（包含已提交WAL）生成唯一 `数据库路径.pre-source-v2-随机值.bak`，不覆盖旧备份；然后建立v2表与持久head。
