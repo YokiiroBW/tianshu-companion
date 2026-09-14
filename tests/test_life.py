@@ -445,3 +445,64 @@ def test_invalid_life_config_releases_database_owner(tmp_path):
     assert len(closed) == 1
     with closing(Store(tmp_path / "fixture.db")) as store:
         assert store.source_head()
+
+
+@pytest.mark.parametrize("hold_seconds", [None, 10])
+@pytest.mark.parametrize("move_room", [False, True])
+def test_actor_reconfiguration_preserves_manual_activity_until_release(
+    env, hold_seconds, move_room
+):
+    life, clock, _ = env
+    actor = life.snapshot("a")["actor"]
+    until = clock() + hold_seconds if hold_seconds is not None else None
+    held = life.set_activity("a", "painting", expected=actor["version"], hold_until=until)
+    clock.advance(2)
+    room = "room"
+    if move_room:
+        life.create_world("other-world", timezone_name="+08:00")
+        room = "other-room"
+        life.create_room(room, "other-world")
+    updated = life.configure_actor(
+        "a",
+        room,
+        personality_version=2,
+        mood="happy",
+        schedule=[dict(minute=0, activity="writing")],
+        expected=held["version"],
+    )
+    current = life.snapshot("a")["actor"]
+    assert current["personality_version"] == 2 and current["mood"] == "happy"
+    assert current["schedule"] == updated["schedule"] and current["room_id"] == room
+    assert current["manual"] == held["manual"]
+    assert current["activity"] == "painting" and current["changed_at"] == held["changed_at"]
+    if hold_seconds is None:
+        clock.advance(86400)
+        current = life.snapshot("a")["actor"]
+        assert current["activity"] == "painting"
+        life.resume_actor("a", expected=current["version"])
+    else:
+        clock.now = until
+    resumed = life.snapshot("a")["actor"]
+    assert resumed["activity"] == "writing" and resumed["manual"] is None
+
+
+def test_retry_diary_requires_positive_current_version_without_mutation(env):
+    life, _, _ = env
+    life.writing = False
+    meta = life.request_diary("a", "2026-09-14")
+    assert meta["state"] == "unavailable" and meta["version"] == 1
+    for invalid in (None, True, 0):
+        with pytest.raises(ValueError):
+            life.retry_diary(meta["id"], expected=invalid)
+        assert life.diary_metadata(meta["id"]) == meta
+    newer = life.retry_diary(meta["id"], expected=meta["version"])
+    assert newer["version"] == 2
+    with pytest.raises(ValueError):
+        life.retry_diary(meta["id"], expected=meta["version"])
+    assert life.diary_metadata(meta["id"]) == newer
+    life.writing = True
+    queued = life.retry_diary(meta["id"], expected=newer["version"])
+    assert queued["state"] == "queued"
+    with pytest.raises(ValueError):
+        life.retry_diary(meta["id"], expected=newer["version"])
+    assert life.diary_metadata(meta["id"]) == queued

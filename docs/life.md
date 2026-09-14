@@ -112,3 +112,7 @@ v1 仍沿用 pre-source-v2 备份前缀，包含升级前原始事实；保留�
 
 网页候选：snapshot actor/world/room 版本读取；expected_version 控件写入/恢复；日记metadata及判锁内容读取。
 另已审阅 TS014 网页会话快照候选并回报边界，尚未冻结，不在本模块私造网络 wire。
+
+角色配置更新（人格、心情、日程及迁移房间/世界）保留已有manual活动、到期时间及活动变化起点。
+只有显式resume_actor或保持到期才恢复新日程；配置更新不会暗中释放永久保持。
+retry_diary入口要求expected为正整数，None/bool/0及旧版本均拒绝且不修改任务。

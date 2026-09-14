@@ -184,9 +184,9 @@ class Life:
                 schedule=normalized,
                 schedule_version=(old or {}).get("schedule_version", 0) + 1,
                 activity=(old or {}).get("activity"),
-                changed_at=self.clock(),
+                changed_at=(old or {}).get("changed_at", self.clock()),
                 cursor=None,
-                manual=None,
+                manual=(old or {}).get("manual"),
                 recipe=recipe,
                 fictional=True,
             ),
@@ -514,6 +514,7 @@ class Life:
         self.tick(force=True)
 
     def retry_diary(self, diary_id, *, expected):
+        expected_version(expected)
         item = self._get("diaries", diary_id)
         if item["state"] not in {"unavailable", "interrupted", "failed"}:
             raise ValueError("Not retryable")
