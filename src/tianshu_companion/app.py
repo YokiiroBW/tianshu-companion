@@ -57,6 +57,7 @@ def build_runtime(config):
         short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
         life_writing=config.get("life_writing", False),
         life_config_version=config.get("life_config_version"),
+        web_sender=Sender(contracts, client("platform_sender")),
     )
     return core, incoming, clients
 
@@ -177,6 +178,8 @@ def create_app(core=None, tokens=None):
                             await core.acknowledge_ingest(outcome["receipt"]["receipt_id"])
 
                 return JSONResponse(result, background=BackgroundTask(release))
+            if operation == "web-snapshot":
+                return await core.web_snapshot(service, body)
             if operation == "facts":
                 return core.source_facts(service, body)
             return await core.cancel(service, body)
@@ -194,6 +197,10 @@ def create_app(core=None, tokens=None):
     @app.post("/internal/v1/conversation/ingest-actors")
     async def ingest_actors(request: Request):
         return await dispatch(request, "ingest-actors")
+
+    @app.post("/internal/v1/conversation/web-snapshot")
+    async def web_snapshot(request: Request):
+        return await dispatch(request, "web-snapshot")
 
     @app.post("/internal/v1/source-facts/read")
     async def source_facts(request: Request):

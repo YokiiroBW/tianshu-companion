@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from .clients import command, epoch, uid, utc
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 from .life import Life
+from .web_snapshot import snapshot as read_web_snapshot
 from .context import (
     TEXT_DOMAIN,
     TurnContext,
@@ -72,9 +73,11 @@ class Core:
         short_context_policy=None,
         life_writing=False,
         life_config_version=None,
+        web_sender=None,
     ):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
+        self.web_sender = web_sender
         self.bindings, self.roles, self.config_version = bindings, roles, config_version
         self.policy, self.clock = policy or Policy(), clock
         contracts.check("conversation#policy", asdict(self.policy))
@@ -164,6 +167,17 @@ class Core:
 
     async def ingest_actors(self, service, request, *, defer_processing=False):
         return await ingest_sources(self, service, request, defer_processing)
+
+    async def web_snapshot(self, service, request):
+        return await read_web_snapshot(self, service, request)
+
+    def _sender_for(self, turn):
+        namespace = turn["bundle"]["collection_key"]["channel"]["namespace"]
+        if namespace == "web":
+            if self.web_sender is None:
+                raise Fault("dependency_unavailable")
+            return self.web_sender
+        return self.sender  # Preserve the existing non-web channel path (qq/tg/etc.).
 
     def source_facts(self, service, request):
         return read_facts(self.store, self.contracts, service, request)
@@ -350,6 +364,15 @@ class Core:
             conversation = self.store.get("conversations", digest(channel))
             conversation["context_revision"] = conversation.get("context_revision", 1) + 1
             self.store.put("conversations", conversation)
+        if reason in {
+            "source_retracted",
+            "source_edited",
+            "permission_revoked",
+            "classification_changed",
+        }:
+            turn["display_invalidated"] = True
+            if turn["phase"] in TERMINAL:
+                self._save_turn(turn)
         if turn["phase"] in TERMINAL:
             return "too_late"
         turn.update(cancelled=True, failure=reason)
@@ -884,7 +907,8 @@ class Core:
             await self._reconcile(turn)
             return
         try:
-            if not getattr(self.sender, "available", True):
+            sender = self._sender_for(turn)
+            if not getattr(sender, "available", True):
                 raise Fault("dependency_unavailable")
             await self._preflight(turn)
         except Exception as error:
@@ -920,7 +944,7 @@ class Core:
             turn["phase"] = "sending"
             self._save_turn(turn)
         try:
-            receipt = await asyncio.wait_for(self.sender.send(request), timeout=20)
+            receipt = await asyncio.wait_for(sender.send(request), timeout=20)
             self._check_receipt(request, receipt)
         except Exception:
             receipt = dict(
@@ -1033,7 +1057,7 @@ class Core:
                 continue
             try:
                 receipt = await asyncio.wait_for(
-                    self.sender.reconcile(reply["request"]), timeout=10
+                    self._sender_for(turn).reconcile(reply["request"]), timeout=10
                 )
                 if receipt:
                     self.record_receipt(reply["id"], receipt)

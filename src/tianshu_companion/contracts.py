@@ -10,6 +10,7 @@ from referencing import Registry, Resource
 MANIFEST_HASH = "81e6cc4ddef7c6f82e055d4cb04b090db036dd5c52763473ce697aa02db478a1"
 PROFILE_MANIFEST_HASH = "488d05438dd5b5abaa43a66a7eab0eb5cf615d5af01a964a7286cd23e68f7eb7"
 PROFILE_DOMAIN = "profile-memory/v1"
+WEB_MANIFEST_HASH = "e493a1b5d0f4cec8d55995553faf84042f4c33a59365d15423e57f4dc70a6c09"
 SOURCE_MANIFEST_HASH = "178d0ce66210bdfad4cfb85d8b5f0905b0b67f834e2a530efe5636ff0373633d"
 
 
@@ -138,6 +139,28 @@ class Contracts:
             self.registry = self.registry.with_resource(
                 schema["$id"], Resource.from_contents(schema)
             )
+
+        web_root = root.parent.parent / "web-conversation/v1"
+        manifest = read(web_root / "manifest.json")
+        if hashlib.sha256(manifest).hexdigest() != WEB_MANIFEST_HASH:
+            raise ValueError("Unrecognized web conversation release")
+        release = json.loads(manifest)
+        if (
+            release["version"] != "1.0.0"
+            or release["package"] != "web-conversation/v1"
+            or release["dependency"]["manifest_sha256"] != MANIFEST_HASH
+        ):
+            raise ValueError("Unsupported web conversation dependencies")
+        for name, expected in release["sha256"].items():
+            path = (web_root / name).resolve()
+            if (
+                not path.is_relative_to(web_root)
+                or hashlib.sha256(read(path)).hexdigest() != expected
+            ):
+                raise ValueError(f"Web conversation content mismatch: {name}")
+        schema = json.loads(read(web_root / "schema.json"))
+        self.schemas["web-conversation"] = schema
+        self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
 
     def check(self, name, value):
         file, definition = name.split("#")
