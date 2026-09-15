@@ -12,6 +12,7 @@ from .clients import command, epoch, uid, utc
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 from .life import Life
 from .images import Images
+from .proactive import Proactive
 from .web_snapshot import snapshot as read_web_snapshot
 from .context import (
     TEXT_DOMAIN,
@@ -78,6 +79,8 @@ class Core:
         web_sender=None,
         image_options=None,
         writing_options=None,
+        proactive_options=None,
+        proactive_dispatcher=None,
     ):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
@@ -94,6 +97,13 @@ class Core:
             )
             self.images = Images(self.life, **(image_options or {}))
             self.writing = Writing(self.life, **(writing_options or {}))
+            self.proactive = Proactive(
+                store,
+                clock,
+                self._proactive_guard,
+                dispatcher=proactive_dispatcher,
+                **(proactive_options or {}),
+            )
             migrate_legacy(store)
         except BaseException:
             store.close()
@@ -184,6 +194,48 @@ class Core:
                 raise Fault("dependency_unavailable")
             return self.web_sender
         return self.sender  # Preserve the existing non-web channel path (qq/tg/etc.).
+
+    def _proactive_guard(self, subscription):
+        """Local authority re-check for one proactive destination.
+
+        Only Core's own durable facts are consulted: the registered channel binding, its
+        namespace, the audience, the actor's role set, the conversation identity and its
+        quarantine state. A remote Memory revocation that has not reached Core is not
+        covered here; that is a stated gap, not something this guard claims to verify.
+        """
+        channel = subscription["channel"]
+        binding = self.bindings.get(channel["binding_id"])
+        conversation = self.store.get("conversations", digest(channel))
+        reasons = []
+        if binding is None:
+            reasons.append("unknown_binding")
+        else:
+            if binding["namespace"] != channel["namespace"]:
+                reasons.append("namespace_mismatch")
+            if binding["audience"] != subscription["audience"]:
+                reasons.append("audience_mismatch")
+            if subscription["actor_id"] not in binding["actor_ids"]:
+                reasons.append("actor_not_bound")
+        if subscription["actor_id"] not in self.roles:
+            reasons.append("unknown_role")
+        if conversation is None:
+            reasons.append("unknown_conversation")
+        else:
+            if conversation["conversation_id"] != subscription["conversation_id"]:
+                reasons.append("conversation_mismatch")
+            if conversation.get("source_quarantined"):
+                reasons.append("source_quarantined")
+        return dict(
+            allowed=not reasons,
+            reason=reasons[0] if reasons else None,
+            reasons=reasons,
+            evidence=dict(
+                binding_id=channel["binding_id"],
+                namespace=channel["namespace"],
+                audience=subscription["audience"],
+                actor_id=subscription["actor_id"],
+            ),
+        )
 
     def source_facts(self, service, request):
         return read_facts(self.store, self.contracts, service, request)
@@ -462,6 +514,7 @@ class Core:
         self.life.recover()
         self.images.recover()
         self.writing.recover()
+        self.proactive.recover()
         with self.store.transaction():
             for reply in self.store.list("replies", states=["sending"]):
                 reply.update(state="unknown", unknown_since=reply["attempted_at"])
@@ -483,6 +536,7 @@ class Core:
 
     async def tick(self):
         self.life.tick()
+        self.proactive.tick()
         for job in [*self.jobs.values(), *self.send_jobs.values()]:
             if job.done() and not job.cancelled() and job.exception():
                 logging.getLogger(__name__).error(

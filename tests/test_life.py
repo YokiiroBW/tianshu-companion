@@ -304,7 +304,7 @@ def test_migration_backup_complete_and_life_ddl_rollback(tmp_path):
         db.commit()
     store = Store(path)  # owner lock released after migration failure
     try:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 6
         assert store.source_head() == head
         assert store.get("conversations", "synthetic")["private"] == "synthetic preserved"
         backups = list(tmp_path.glob("*.pre-life-v3-*.bak"))

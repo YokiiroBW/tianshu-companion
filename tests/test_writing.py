@@ -1025,7 +1025,7 @@ def test_v4_migration_backup_rollback_and_source_preservation(tmp_path):
         db.commit()
     with closing(Store(path)) as store:
         assert store.source_head() == head
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 6
         assert store.get("conversations", "synthetic")["private"] == "synthetic preserved"
     backups = sorted(tmp_path.glob("*.pre-writing-v5-*.bak"))
     assert len(backups) == 2

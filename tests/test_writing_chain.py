@@ -208,7 +208,7 @@ def test_two_chapter_chain_review_publication_and_supervised_restart(tmp_path):
 
     asyncio.run(scenario())
     with closing(Store(path)) as store:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 6
         assert len(store.list("write_publications")) == 4
         assert not list(tmp_path.glob("*.bak"))
 
@@ -276,4 +276,4 @@ def test_chain_human_only_authoring_review_and_publication_offline(tmp_path):
 
     asyncio.run(scenario())
     with closing(sqlite3.connect(path)) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 6

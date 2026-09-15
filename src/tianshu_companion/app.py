@@ -73,6 +73,7 @@ def build_runtime(config):
         life_config_version=config.get("life_config_version"),
         image_options=image_options,
         writing_options=config.get("writing"),
+        proactive_options=config.get("proactive"),
         web_sender=Sender(contracts, client("platform_sender")),
     )
     return core, incoming, clients
@@ -131,6 +132,14 @@ def create_app(core=None, tokens=None):
                 LOG.error("Writing worker failed: %s", type(exc).__name__)
             await asyncio.sleep(5)
 
+    async def proactive_worker():
+        while True:
+            try:
+                await core.proactive.work()
+            except Exception as exc:
+                LOG.error("Proactive worker failed: %s", type(exc).__name__)
+            await asyncio.sleep(2)
+
     @asynccontextmanager
     async def lifespan(app):
         jobs = []
@@ -142,6 +151,7 @@ def create_app(core=None, tokens=None):
                 asyncio.create_task(life_worker()),
                 asyncio.create_task(image_worker()),
                 asyncio.create_task(writing_worker()),
+                asyncio.create_task(proactive_worker()),
             ]
         yield
         for job in jobs:

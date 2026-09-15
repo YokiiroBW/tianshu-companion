@@ -35,10 +35,21 @@ WRITING_TABLES = {
     "write_access",
 }
 
+PROACTIVE_TABLES = {
+    "proactive_subscriptions",
+    "proactive_templates",
+    "proactive_goals",
+    "proactive_reminders",
+    "proactive_candidates",
+    "proactive_attempts",
+    "proactive_quota",
+}
+
 TABLES = (
     LIFE_TABLES
     | IMAGE_TABLES
     | WRITING_TABLES
+    | PROACTIVE_TABLES
     | {
         "conversations",
         "collections",
@@ -87,16 +98,17 @@ class Store:
 
     def _initialize(self, path):
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5):
+        if version not in (0, 1, 2, 3, 4, 5, 6):
             raise RuntimeError("Unsupported database schema version")
         # Backup the complete SQLite view (including WAL) before structural migration.
         # A unique file never overwrites earlier recovery evidence.
-        if version in (1, 2, 3, 4) and str(path) != ":memory:":
+        if version in (1, 2, 3, 4, 5) and str(path) != ":memory:":
             label = {
                 1: ".pre-source-v2-",
                 2: ".pre-life-v3-",
                 3: ".pre-images-v4-",
                 4: ".pre-writing-v5-",
+                5: ".pre-proactive-v6-",
             }[version]
             backup = sqlite3.connect(str(path) + label + uuid.uuid4().hex + ".bak")
             try:
@@ -106,7 +118,9 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
-        for table in sorted(TABLES - LIFE_TABLES - IMAGE_TABLES - WRITING_TABLES):
+        for table in sorted(
+            TABLES - LIFE_TABLES - IMAGE_TABLES - WRITING_TABLES - PROACTIVE_TABLES
+        ):
             self.db.execute(
                 f"CREATE TABLE IF NOT EXISTS {table} ("
                 "id TEXT PRIMARY KEY, conversation_id TEXT, position INTEGER, "
@@ -145,7 +159,7 @@ class Store:
                     "metadata",
                     dict(id="source_head", generation="generation:" + uuid.uuid4().hex, sequence=0),
                 )
-            for table in sorted(LIFE_TABLES | IMAGE_TABLES | WRITING_TABLES):
+            for table in sorted(LIFE_TABLES | IMAGE_TABLES | WRITING_TABLES | PROACTIVE_TABLES):
                 self.db.execute(
                     f"CREATE TABLE IF NOT EXISTS {table} ("
                     "id TEXT PRIMARY KEY, conversation_id TEXT, position INTEGER, "
@@ -155,7 +169,24 @@ class Store:
                     f"CREATE INDEX IF NOT EXISTS {table}_queue ON "
                     f"{table}(conversation_id,status,position)"
                 )
-            self.db.execute("PRAGMA user_version=5")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS proactive_candidates_subject ON "
+                "proactive_candidates(json_extract(body,'$.kind'),"
+                "json_extract(body,'$.subject_id'),position)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS proactive_candidates_due ON "
+                "proactive_candidates(status,deadline,position)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS proactive_subject_due ON "
+                "proactive_goals(status,deadline)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS proactive_reminder_due ON "
+                "proactive_reminders(status,deadline)"
+            )
+            self.db.execute("PRAGMA user_version=6")
 
     @contextmanager
     def transaction(self):
@@ -206,6 +237,11 @@ class Store:
         assert table in TABLES
         row = self.db.execute(f"SELECT body FROM {table} WHERE id=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def delete(self, table, key):
+        """Bounded housekeeping delete for derived rows; never used for fact tables."""
+        assert table in TABLES and table not in FACT_TABLES
+        self.db.execute(f"DELETE FROM {table} WHERE id=?", (key,))
 
     def list(self, table, conversation_id=None, states=None):
         assert table in TABLES
