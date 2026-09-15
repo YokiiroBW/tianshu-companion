@@ -160,6 +160,408 @@ def candidate(harness, kind="reminder", subject_id=None, state=None):
     return items[0]
 
 
+def states(harness, kind=None):
+    return {
+        c["subject_id"]: c["state"]
+        for c in harness.core.proactive.candidates(limit=512)
+        if kind is None or c["kind"] == kind
+    }
+
+
+def count_materializations(harness):
+    """Wrap the materialisation step so a tick's real scan work can be measured."""
+    proactive = harness.core.proactive
+    original = proactive._candidate
+    calls = []
+
+    def wrapper(kind, subject, occurrence, now):
+        calls.append((kind, subject["id"]))
+        return original(kind, subject, occurrence, now)
+
+    proactive._candidate = wrapper
+    return calls
+
+
+def register_due_batch(harness, target, prefix, count, *, kind, due):
+    """Register subjects that are not yet due, so registrations materialise nothing."""
+    return [
+        (reminder if kind == "reminder" else goal)(harness, target, f"{prefix}{index}", due + index)
+        for index in range(count)
+    ]
+
+
+def test_expired_head_subject_does_not_starve_the_due_queue():
+    """P1 regression: an expired one-shot kept the queue head and blocked every later
+    due subject, for both scheduled kinds."""
+
+    async def scenario():
+        harness = Fixture()
+        harness.clock.now = START
+        target = await member(
+            harness,
+            timezone_name="UTC",
+            quiet=("00:00", "00:00"),
+            cooldown_seconds=0,
+            expiry_seconds=3600,
+            daily_limit=8,
+            unanswered_limit=8,
+        )
+        proactive = harness.core.proactive
+        proactive.max_subjects = 1
+        templates = template(harness)
+
+        head = [
+            reminder(harness, target, "head:reminder", START, **templates),
+            goal(harness, target, "head:goal", START, summary="过期目标", **templates),
+        ]
+        harness.clock.now = START + 90000  # past both contact windows
+        proactive.tick(force=True)
+        assert set(states(harness).values()) == {"expired"}
+
+        # Both kinds are due now and must still reach a candidate with one scan slot.
+        late = [
+            reminder(harness, target, "due:reminder", harness.clock.now, **templates),
+            goal(harness, target, "due:goal", harness.clock.now, summary="新目标", **templates),
+        ]
+        for _ in range(3):
+            proactive.tick(force=True)
+        current = states(harness)
+        for item in late:
+            assert current[item["id"]] == "ready", current
+        for item in head:
+            assert current[item["id"]] == "expired", current
+        # The expired one-shots stay visible and are never silently re-armed.
+        assert proactive.reminder_metadata("head:reminder")["state"] == "active"
+        assert proactive.reminder_metadata("head:reminder")["due_at"] == START
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_ready_and_pending_heads_do_not_consume_scan_budget():
+    async def scenario():
+        harness = Fixture()
+        harness.clock.now = START
+        target = await member(
+            harness,
+            timezone_name="UTC",
+            quiet=("00:00", "00:00"),
+            cooldown_seconds=0,
+            daily_limit=8,
+            unanswered_limit=8,
+        )
+        proactive = harness.core.proactive
+        proactive.max_subjects = 1
+        templates = template(harness)
+
+        # Two subjects already holding an open candidate sit ahead of everything else.
+        held = register_due_batch(harness, target, "held", 2, kind="reminder", due=START + 1)
+        harness.clock.now = START + 10
+        proactive.tick(force=True)
+        assert set(states(harness).values()) == {"ready"}
+        later = reminder(harness, target, "later", harness.clock.now, **templates)
+        proactive.tick(force=True)
+        assert states(harness)[later["id"]] == "ready"
+        assert [item["id"] for item in held] == ["held0", "held1"]
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_backlog_beyond_the_batch_limit_drains_in_bounded_ticks():
+    async def scenario():
+        harness = Fixture()
+        harness.clock.now = START
+        target = await member(
+            harness,
+            timezone_name="UTC",
+            quiet=("00:00", "00:00"),
+            cooldown_seconds=0,
+            daily_limit=8,
+            unanswered_limit=8,
+            expiry_seconds=86400 * 7,
+        )
+        proactive = harness.core.proactive
+        template(harness)
+        for kind in ("reminder", "goal"):
+            register_due_batch(harness, target, kind + ":", 4, kind=kind, due=START + 3600)
+        proactive.max_subjects = 3
+        harness.clock.now = START + 7200  # every subject is due at once
+
+        calls = count_materializations(harness)
+        per_tick = []
+        for _ in range(3):
+            before = len(calls)
+            proactive.tick(force=True)
+            per_tick.append(len(calls) - before)
+        # Bounded by max_subjects per kind, and the whole backlog drains in two ticks:
+        # never an unbounded full scan and never an enlarged cap.
+        assert per_tick == [6, 2, 0], per_tick
+        assert len(states(harness, "reminder")) == 4
+        assert len(states(harness, "goal")) == 4
+        assert set(states(harness).values()) == {"ready"}
+        assert proactive.max_subjects == 3
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_scan_rotation_is_bounded_and_survives_a_restart(tmp_path):
+    path = str(tmp_path / "rotation.db")
+
+    async def scenario():
+        harness = Fixture(path)
+        harness.clock.now = START
+        ghost_target = await member(
+            harness,
+            channel="private:a",
+            actor="actor:a",
+            timezone_name="UTC",
+            quiet=("00:00", "00:00"),
+            cooldown_seconds=0,
+            daily_limit=8,
+            unanswered_limit=8,
+        )
+        real_target = await member(
+            harness,
+            channel="private:b",
+            account="b",
+            actor="actor:b",
+            timezone_name="UTC",
+            quiet=("00:00", "00:00"),
+            cooldown_seconds=0,
+            daily_limit=8,
+            unanswered_limit=8,
+        )
+        proactive = harness.core.proactive
+        proactive.max_subjects = 1
+        templates = template(harness)
+        ghost = reminder(harness, ghost_target, "ghost", START + 1, **templates)
+        real = reminder(harness, real_target, "real", START + 2, **templates)
+        harness.clock.now = START + 10
+
+        # A registration whose subscription row is gone can never produce a candidate and
+        # is not excluded by the occurrence filter, so only the rotating cursor can move
+        # the scan past it. Without a durable cursor the later subject starves forever.
+        harness.core.store.delete("proactive_subscriptions", ghost_target.subscription["id"])
+        proactive.tick(force=True)
+        assert states(harness) == {}
+        first = harness.core.store.get("metadata", "proactive_scan_reminder")
+        assert (first["subject_id"], first["deadline"]) == (ghost["id"], START + 1)
+        await harness.core.close()
+
+        restarted = Fixture(path)
+        restarted.clock.now = harness.clock.now
+        rotated = restarted.core.proactive
+        rotated.max_subjects = 1  # the same configured bound as before the restart
+        # The rotation state is durable: restarting does not send the scan back to the
+        # same unproductive head.
+        assert restarted.core.store.get("metadata", "proactive_scan_reminder") == first
+        # Recovery itself continues the rotation and reaches the later subject.
+        restarted.core.recover()
+        assert states(restarted)[real["id"]] == "ready"
+        assert (
+            restarted.core.store.get("metadata", "proactive_scan_reminder")["subject_id"]
+            == (real["id"])
+        )
+        await restarted.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_scan_cursor_advances_to_the_globally_last_scanned_row():
+    async def scenario():
+        harness = Fixture()
+        harness.clock.now = START
+        target = await member(
+            harness,
+            timezone_name="UTC",
+            quiet=("00:00", "00:00"),
+            cooldown_seconds=0,
+            daily_limit=8,
+            unanswered_limit=8,
+        )
+        proactive = harness.core.proactive
+        proactive.max_subjects = 4
+        templates = template(harness)
+        # Not due while registering, so the rotation state can be seeded by hand.
+        for index, name in enumerate(("early", "mid", "late")):
+            reminder(harness, target, name, START + 100 + index, **templates)
+        harness.core.store.put(
+            "metadata",
+            dict(
+                id="proactive_scan_reminder",
+                kind="reminder",
+                deadline=START + 101,
+                subject_id="mid",
+            ),
+        )
+        harness.clock.now = START + 200
+
+        # The window after the cursor yields 'late' and the wrap-around yields the head
+        # rows, so the cursor must end on the globally last row, not the last appended one.
+        proactive.tick(force=True)
+        assert harness.core.store.get("metadata", "proactive_scan_reminder")["subject_id"] == (
+            "late"
+        )
+        assert set(states(harness)) == {"early", "mid", "late"}
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_unusable_registration_is_isolated_and_leaves_the_scan():
+    async def scenario():
+        harness = Fixture()
+        harness.clock.now = START
+        target = await member(
+            harness,
+            timezone_name="UTC",
+            quiet=("00:00", "00:00"),
+            cooldown_seconds=0,
+            daily_limit=8,
+            unanswered_limit=8,
+        )
+        proactive = harness.core.proactive
+        proactive.max_subjects = 1
+        templates = template(harness)
+        proactive.put_template("doomed", 1, body="该{summary}了。")
+        broken = reminder(
+            harness, target, "broken", START + 1, template_id="doomed", template_version=1
+        )
+        healthy = reminder(harness, target, "healthy", START + 2, **templates)
+        # A template row that no longer exists must not fail the whole tick, and must not
+        # keep consuming the only scan slot on every rotation.
+        harness.core.store.delete("proactive_templates", digest(["doomed", 1]))
+        harness.clock.now = START + 10
+        proactive.tick(force=True)
+        assert proactive.reminder_metadata(broken["id"])["blocked_reason"] == "KeyError"
+        assert states(harness) == {}
+        proactive.tick(force=True)
+        assert states(harness)[healthy["id"]] == "ready"
+        # A blocked subject no longer consumes scan budget on later rotations.
+        calls = count_materializations(harness)
+        proactive.tick(force=True)
+        assert calls == []
+        # Re-registering with a working template clears the mark and the candidate is
+        # produced again on the next tick.
+        proactive.register_reminder(
+            "broken",
+            actor_id=target.subscription["actor_id"],
+            subscription_id=target.subscription["id"],
+            summary="修复后",
+            due_at=START + 1,
+            registered_by="admin:synthetic",
+            evidence_ref="synthetic:repair",
+            expected=proactive.reminder_metadata("broken")["version"],
+            **templates,
+        )
+        assert "blocked_reason" not in proactive.reminder_metadata("broken")
+        proactive.tick(force=True)
+        assert states(harness)["broken"] == "ready"
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_recurring_goal_keeps_progressing_under_scan_pressure():
+    async def scenario():
+        harness = Fixture()
+        harness.clock.now = START
+        target = await member(
+            harness,
+            timezone_name="UTC",
+            quiet=("00:00", "00:00"),
+            cooldown_seconds=0,
+            daily_limit=8,
+            unanswered_limit=8,
+            expiry_seconds=3600,
+        )
+        proactive = harness.core.proactive
+        proactive.max_subjects = 1
+        templates = template(harness)
+        stale = reminder(harness, target, "stale", START, **templates)
+        recurring = goal(
+            harness,
+            target,
+            "goal:recurring",
+            START,
+            summary="循环目标",
+            interval_seconds=6 * HOUR,
+            **templates,
+        )
+        harness.clock.now = START + 90000
+        proactive.tick(force=True)
+        assert states(harness)[stale["id"]] == "expired"
+        # The recurring goal's missed occurrences are skipped, not replayed, and the next
+        # future occurrence is reached with a single slot still held by the expired one.
+        assert proactive.goal_metadata(recurring["id"])["state"] == "active"
+        assert proactive.goal_metadata(recurring["id"])["next_due_at"] > harness.clock.now
+        for _ in range(2):
+            proactive.tick(force=True)
+        assert len(proactive.candidates()) == 2
+        due = proactive.goal_metadata(recurring["id"])["next_due_at"]
+        harness.clock.now = due
+        proactive.tick(force=True)
+        goal_candidates = [c for c in proactive.candidates() if c["subject_id"] == recurring["id"]]
+        assert [c["state"] for c in goal_candidates] == ["ready", "expired"]
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_open_candidate_queue_rotates_instead_of_starving_later_candidates():
+    async def scenario():
+        harness = Fixture()
+        harness.clock.now = START
+        # The earlier destination is inside a long quiet window, so its candidate stays
+        # open without progressing; the later one must still be decided.
+        quiet = await member(
+            harness,
+            channel="private:a",
+            actor="actor:a",
+            timezone_name="UTC",
+            quiet=("00:00", "23:59"),
+            cooldown_seconds=0,
+            daily_limit=8,
+            unanswered_limit=8,
+        )
+        active = await member(
+            harness,
+            channel="private:b",
+            account="b",
+            actor="actor:b",
+            timezone_name="UTC",
+            quiet=("00:00", "00:00"),
+            cooldown_seconds=0,
+            daily_limit=8,
+            unanswered_limit=8,
+        )
+        proactive = harness.core.proactive
+        proactive.max_candidates = 1
+        templates = template(harness)
+        held = reminder(harness, quiet, "held", START, **templates)
+        free = reminder(harness, active, "free", START + 1, **templates)
+        harness.clock.now = START + 10
+        # Evaluate from the head of the open queue, where the unproductive candidate sits.
+        harness.core.store.put(
+            "metadata",
+            dict(id="proactive_scan_candidate", kind="candidate", deadline=None, subject_id=None),
+        )
+        proactive.tick(force=True)
+        assert states(harness)[held["id"]] == "deferred"
+        assert states(harness)[free["id"]] == "pending"
+        # One evaluation slot per tick, so the second candidate is reached by rotation
+        # instead of waiting behind the deferred head forever.
+        proactive.tick(force=True)
+        assert states(harness)[free["id"]] == "ready"
+        await proactive.work()
+        assert states(harness)[free["id"]] == "sent"
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
 def test_default_off_and_only_explicit_registration():
     async def scenario():
         harness = Fixture()

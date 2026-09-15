@@ -607,6 +607,7 @@ class Proactive:
             "created_at",
             "completed_at",
             "cancelled_at",
+            "blocked_reason",
         )
         return {key: item[key] for key in keys if key in item}
 
@@ -741,20 +742,98 @@ class Proactive:
             self._advance(candidate, skipped=True)
         return state, reason
 
+    def _cursor(self, kind):
+        item = self.store.get("metadata", "proactive_scan_" + kind)
+        if not item or item.get("subject_id") is None:
+            return None  # An empty rotation restarts from the head of the due set.
+        return (item["deadline"], item["subject_id"])
+
+    def _set_cursor(self, kind, row):
+        key = "proactive_scan_" + kind
+        item = dict(
+            id=key,
+            kind=kind,
+            deadline=row[1] if row else None,
+            subject_id=row[0] if row else None,
+        )
+        if self.store.get("metadata", key) != item:
+            self.store.put("metadata", item)
+
+    def _rotating_scan(self, cursor_kind, base, args, limit):
+        """One bounded window of a (deadline, id) ordered set, with wrap-around.
+
+        A durable cursor walks the set and wraps, so every row is reached within
+        ``ceil(N / limit)`` ticks even when the head rows can never make progress. Work
+        per pass stays bounded by ``limit``: the window after the cursor and the
+        wrap-around share that budget, so this is never an unbounded full scan.
+        """
+        cursor = self._cursor(cursor_kind)
+        rows = []
+        if cursor is not None:
+            rows = self.store.db.execute(
+                f"SELECT id,deadline {base} AND (deadline>? OR (deadline=? AND id>?)) "
+                "ORDER BY deadline,id LIMIT ?",
+                [*args, cursor[0], cursor[0], cursor[1], limit],
+            ).fetchall()
+        if len(rows) < limit:
+            clause, extra = "", []
+            if cursor is not None:
+                clause = " AND (deadline<? OR (deadline=? AND id<=?))"
+                extra = [cursor[0], cursor[0], cursor[1]]
+            rows += self.store.db.execute(
+                f"SELECT id,deadline {base}{clause} ORDER BY deadline,id LIMIT ?",
+                [*args, *extra, limit - len(rows)],
+            ).fetchall()
+        # The window after the cursor and the wrap-around are two queries, so the last
+        # appended row is not necessarily the last row in (deadline, id) order.
+        scanned = max(rows, key=lambda row: (row[1], row[0])) if rows else None
+        self._set_cursor(cursor_kind, scanned)
+        return [row[0] for row in rows]
+
+    def _due_subjects(self, table, kind, now):
+        """Bounded, fair scan of the subjects that still need a candidate.
+
+        An occurrence that already has a candidate never consumes a scan slot, so a
+        handled, deferred, suppressed, failed or expired occurrence at the head of the
+        queue cannot starve the rest; the rotating cursor below covers everything else.
+        """
+        occurrence = "next_due_at" if kind == "goal" else "due_at"
+        base = (
+            f"FROM {table} WHERE status='active' AND deadline<=? "
+            "AND json_extract(body,'$.blocked_reason') IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM proactive_candidates c "
+            "WHERE json_extract(c.body,'$.kind')=? "
+            f"AND json_extract(c.body,'$.subject_id')={table}.id "
+            f"AND json_extract(c.body,'$.occurrence')=json_extract({table}.body,'$.{occurrence}'))"
+        )
+        return self._rotating_scan(kind, base, [now, kind], self.max_subjects)
+
+    def _open_candidates(self):
+        """Bounded, fair scan of the candidates that still need a decision.
+
+        Without the rotation the earliest ``max_candidates`` open candidates would be
+        re-evaluated forever and anything behind them would never leave ``pending``.
+        """
+        base = (
+            "FROM proactive_candidates WHERE status IN ('pending','deferred','suppressed','ready')"
+        )
+        return self._rotating_scan("candidate", base, [], self.max_candidates)
+
     def _materialize(self, now):
         """Create one durable candidate per due occurrence; never a duplicate one."""
         for table, kind in (("proactive_goals", "goal"), ("proactive_reminders", "reminder")):
-            rows = self.store.db.execute(
-                f"SELECT id FROM {table} WHERE status='active' AND deadline<=? "
-                "ORDER BY deadline,id LIMIT ?",
-                (now, self.max_subjects),
-            ).fetchall()
-            for row in rows:
-                subject = self._subject(kind, row[0])
+            for subject_id in self._due_subjects(table, kind, now):
+                subject = self._subject(kind, subject_id)
                 if subject is None:
                     continue
                 occurrence = subject["next_due_at"] if kind == "goal" else subject["due_at"]
-                self._candidate(kind, subject, occurrence, now)
+                try:
+                    self._candidate(kind, subject, occurrence, now)
+                except (KeyError, ValueError) as error:
+                    # One unusable registration must neither block the whole tick nor keep
+                    # consuming scan budget on every rotation; record it durably instead.
+                    subject["blocked_reason"] = type(error).__name__
+                    self._save_subject(kind, subject)
 
     def _candidate(self, kind, subject, occurrence, now):
         subscription = self.store.get("proactive_subscriptions", subject["subscription_id"])
@@ -825,13 +904,23 @@ class Proactive:
         return candidate_id
 
     def _prune(self, kind, subject_id):
+        """Bounded housekeeping that never drops the subject's current occurrence.
+
+        A pruned occurrence would be re-materialised as a fresh candidate, which could
+        resurrect a settled contact; the occurrence the subject is actually waiting on is
+        therefore always kept.
+        """
+        subject = self._subject(kind, subject_id)
+        current = None
+        if subject is not None:
+            current = subject["next_due_at"] if kind == "goal" else subject["due_at"]
         rows = self.store.db.execute(
-            "SELECT id,status FROM proactive_candidates WHERE "
-            "json_extract(body,'$.kind')=? AND json_extract(body,'$.subject_id')=? "
+            "SELECT id,status,json_extract(body,'$.occurrence') FROM proactive_candidates "
+            "WHERE json_extract(body,'$.kind')=? AND json_extract(body,'$.subject_id')=? "
             "ORDER BY json_extract(body,'$.version') DESC,id LIMIT ?",
             (kind, subject_id, self.max_history + self.max_pruned + 1),
         ).fetchall()
-        terminal = [row[0] for row in rows if row[1] in SETTLED_CANDIDATE]
+        terminal = [row[0] for row in rows if row[1] in SETTLED_CANDIDATE and row[2] != current]
         for key in terminal[self.max_history : self.max_history + self.max_pruned]:
             self.store.delete("proactive_candidates", key)
 
@@ -842,14 +931,8 @@ class Proactive:
             return
         with self.store.transaction():
             self._materialize(now)
-            rows = self.store.db.execute(
-                "SELECT id FROM proactive_candidates WHERE status IN "
-                "('pending','deferred','suppressed','ready') "
-                "ORDER BY deadline,position,id LIMIT ?",
-                (self.max_candidates,),
-            ).fetchall()
-            for row in rows:
-                candidate = self.store.get("proactive_candidates", row[0])
+            for candidate_id in self._open_candidates():
+                candidate = self.store.get("proactive_candidates", candidate_id)
                 if candidate is None or candidate["state"] not in OPEN_CANDIDATE:
                     continue
                 subscription = self.store.get(

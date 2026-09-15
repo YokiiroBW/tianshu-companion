@@ -69,6 +69,26 @@ proactive.register_reminder(
 未回复计数只依据 Core 自己已接受的 `collections`（真实 inbound）；
 主动联系只写 `proactive_*` 表，因此永远不会被当成用户输入。
 
+## 有界扫描与公平性
+
+每次 tick 的扫描是**有界且公平**的，既不无限全扫也不靠放大上限：
+
+- **事项扫描**（`goals`/`reminders` 各一次）：只取 `active` 且已到期的事项，
+  并且**当前 occurrence 已经有候选的事项完全不占扫描名额**——已处理、已延后、
+  已抑制、已失败或已过期的事项即使排在队头也不会挡住后面的到期事项。
+- **候选扫描**：只取仍待决策（`pending`/`deferred`/`suppressed`/`ready`）的候选，
+  同样按轮转窗口推进，否则最早的若干个候选会被反复评估而排在后面的候选永远停在 `pending`。
+- 两处都用 `metadata` 里的**持久轮转游标**按 `(deadline, id)` 前进并回绕：
+  每次至多扫描 `max_subjects`（每类）或 `max_candidates` 行，游标之后的一段与回绕段共享同一预算，
+  因此在 `ceil(N / limit)` 次 tick 内每个对象都会被访问到，进程重启后从原位置继续而不是回到队头。
+- 登记本身不可用（模板行缺失、渲染超出模板上限）的事项不会让整个 tick 失败，
+  只在该事项上记 `blocked_reason` 并退出扫描；用带 `expected` 的重新登记即可清除并恢复。
+- 候选清理只删该事项已终结且**不属于其当前 occurrence** 的历史候选，
+  避免把已结算的 occurrence 重新物化成新候选。
+
+一次性事项过期后保持 `active` 且保留原 `due_at`（可见、不静默重排），
+周期目标则跳到下一个未来 occurrence，不补播错过的时段。
+
 时间语义：所有到期时刻都是绝对 UTC epoch，静默窗口是配置时区的 civil minute。
 跨午夜窗口（start > end）与同一天窗口都支持；决策在每次 tick 从持久行重算，
 时钟前进/回退、进程重启都不会依赖已存的本地时间。
@@ -147,13 +167,19 @@ v1–v4 仍用既有备份前缀，旧对话事实、`source_head`、生活/图�
 
 ## 实际验证
 
-- `python -m pytest tests/test_proactive.py -q`：**15 passed**。
+- `python -m pytest tests/test_proactive.py -q`：**24 passed**。
   覆盖默认关闭与仅显式登记、模板缺失/未知占位符/不可变版本、静默/冷却/未回复/
   额度/到期五类决策与顺序、跨午夜窗口与时钟前后跳、TZif 真实夏令时缺口与回拨重复、
   并发争抢当日额度、撤权与本地授权复核、显式取消与取消目标、晚回包只落旧 attempt、
   unknown 不自动重发与重启恢复、无 dispatcher 时不声称送达且不耗额度、
   主动提交期间普通聊天照常完成、Core tick 与读端口按 actor 隔离、
-  失败不吃掉目标周期、v5→v6 迁移备份/回滚/水位不变。
+  失败不吃掉目标周期、v5→v6 迁移备份/回滚/水位不变；
+  返修另覆盖：过期/已处理/待处理队头不再挡住到期事项（goal 与 reminder 两类）、
+  超过批量的积压按 `max_subjects` 有界排空且每 tick 调用次数可测、
+  已有候选不占扫描名额、轮转游标在重启后继续（含回收流程本身推进）、
+  以及游标必须停在全局最后一行（回绕段与游标段是两次查询）、
+  候选队列同样轮转而不是让后面的候选永远停在 `pending`、
+  不可用登记只记 `blocked_reason` 并退出扫描、周期目标在扫描压力下仍推进。
 - `python -m pytest -q`（设置 `TIANSHU_TLS_PYTHON`）：见交接记录。
 - `python -m ruff format --check src integrations tests scripts`、
   `python -m ruff check src integrations tests scripts`、
