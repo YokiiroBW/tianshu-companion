@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from starlette.background import BackgroundTask
 from .clients import Gateway, JsonService, Memory, Origins, Sender, uid
 from .contracts import Contracts, Fault, strict_json
 from .core import Core, Policy
+from .direct import SyntheticPlugin
 from .store import Store
 from .images import ComfyUI, Workflow
 from .short_context import ShortContextPolicy
@@ -57,13 +59,29 @@ def build_runtime(config):
             workflow=workflow,
             staging=image_config["staging"],
         )
+    outbound = Sender(contracts, client("nonebot"))
+    # Explicit functional commands. With no `direct` section nothing is registered, so no
+    # text is ever claimed as a command and every message keeps following the chat chain.
+    # The delivery port is the existing outbound sender: no second message exit is created.
+    routing = config.get("direct")
+    direct_options = None
+    if routing:
+        adapter = None
+        if routing.get("adapter") == "synthetic":
+            adapter = SyntheticPlugin(time.time, slow=routing.get("synthetic_slow", False))
+        direct_options = dict(
+            adapter=adapter,
+            deliver=outbound,
+            timeout=routing.get("timeout", 20),
+            request_expiry=routing.get("request_expiry", 600),
+        )
     core = Core(
         Store(config["database_path"]),
         contracts,
         Origins(contracts, issuers),
         Memory(contracts, client("memory")),
         Gateway(contracts, client("gateway")),
-        Sender(contracts, client("nonebot")),
+        outbound,
         bindings=config.get("bindings", {}),
         roles=config.get("roles", {}),
         config_version=config.get("config_version"),
@@ -74,8 +92,11 @@ def build_runtime(config):
         image_options=image_options,
         writing_options=config.get("writing"),
         proactive_options=config.get("proactive"),
+        direct_options=direct_options,
         web_sender=Sender(contracts, client("platform_sender")),
     )
+    for spec in (routing or {}).get("commands", []):
+        core.direct.register_command(**spec)
     return core, incoming, clients
 
 
@@ -140,6 +161,16 @@ def create_app(core=None, tokens=None):
                 LOG.error("Proactive worker failed: %s", type(exc).__name__)
             await asyncio.sleep(2)
 
+    async def direct_worker():
+        # Commands execute here, off the chat path and off the ingest route, so a slow
+        # plugin cannot block message admission or the light conversation schedule.
+        while True:
+            try:
+                await core.direct.work()
+            except Exception as exc:
+                LOG.error("Direct command worker failed: %s", type(exc).__name__)
+            await asyncio.sleep(0.5)
+
     @asynccontextmanager
     async def lifespan(app):
         jobs = []
@@ -152,6 +183,7 @@ def create_app(core=None, tokens=None):
                 asyncio.create_task(image_worker()),
                 asyncio.create_task(writing_worker()),
                 asyncio.create_task(proactive_worker()),
+                asyncio.create_task(direct_worker()),
             ]
         yield
         for job in jobs:
@@ -226,6 +258,12 @@ def create_app(core=None, tokens=None):
                 return await core.web_snapshot(service, body)
             if operation == "facts":
                 return core.source_facts(service, body)
+            if operation == "direct-command":
+                return await core.direct_command(service, body)
+            if operation == "commands":
+                return core.commands(service)
+            if operation == "capability":
+                return await core.capability(service, body)
             return await core.cancel(service, body)
         except Fault as error:
             return JSONResponse(error.wire(request_id), status_code=error.status)
@@ -249,5 +287,17 @@ def create_app(core=None, tokens=None):
     @app.post("/internal/v1/source-facts/read")
     async def source_facts(request: Request):
         return await dispatch(request, "facts")
+
+    @app.post("/internal/v1/conversation/direct-command")
+    async def direct_command(request: Request):
+        return await dispatch(request, "direct-command")
+
+    @app.post("/internal/v1/direct/commands")
+    async def commands(request: Request):
+        return await dispatch(request, "commands")
+
+    @app.post("/internal/v1/capability/execute")
+    async def capability(request: Request):
+        return await dispatch(request, "capability")
 
     return app

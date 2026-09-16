@@ -4,6 +4,8 @@
 
 `Bridge.capture` 先持久化事件及唯一责任方。明确命令匹配由部署传入（完整命令或命令加空格参数）；direct 只交功能插件，companion 只进入核心，不双重回复。NoneBot matcher 应读取该结果并停止已交出的匹配传播；本任务不注册具体 GsCore 命令，也不启动真实 matcher/机器人。
 
+TS-024起明确命令分流有了独立模块 `tianshu_nonebot.routing`：`registry_matcher(command_table)` 由**核心的命令表**（`core.commands("nonebot")` / `POST /internal/v1/direct/commands`）构造平台/受众范围的匹配表，桥接不再自己维护一份命令名；`DirectRouter.capture/submit` 复用 `Bridge.capture` 判责与去重，`submit` 只把 `direct` 认领的消息交给 `POST /internal/v1/conversation/direct-command`（唯一执行仍在核心），核心判定不是命令时调 `Bridge.hand_back` 把该行退回陪伴队列。`BridgeDelivery` 让核心的桥接负责回复走既有 `Bridge.send`（目的地核验、reply_id 去重、unknown 纪律都在其中），没有第二条出站路径。只有 `reply_to="bridge"` 的登记可被认领；`reply_to="core"` 的裸命令文本继续走陪伴链。
+
 `Bridge.flush` 在 429/依赖故障时保留待重试记录、错误原因、下次时间；没有成功受理回执前不删除或宣称已交付。NoneBot 宿主应把 pending/last_error 显示为等待或背压。`refresh_origin` 只能由可信 issuer 从原已登记 SDK 事件续签，不能让用户 payload 自签。未安装续签器时过期来源持续拒绝。
 
 TS-022的capture同时接受source-sync/v1 fanout_request，按物理版本和原targets保留不同路由意图；SDK归一化默认幂等key也含targets。新接入由受信Platform应用先登记完整physical_input再签发source_input origin，将归一化的物理字段放入input，并保留独立command/target_actor_ids。新信封发往ingest-actors，不能把旧actor origin或raw SDK正文当成source_input授权。

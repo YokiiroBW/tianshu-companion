@@ -1341,7 +1341,7 @@ def test_v5_migration_backup_rollback_and_source_preservation(tmp_path):
         db.commit()
     with closing(Store(path)) as store:
         assert store.source_head() == head
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 7
         assert store.get("conversations", "synthetic")["private"] == "synthetic preserved"
         assert store.list("proactive_candidates") == []
     backups = sorted(tmp_path.glob("*.pre-proactive-v6-*.bak"))

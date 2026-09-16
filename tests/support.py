@@ -182,11 +182,126 @@ class FakeSender:
         return self.answers.get(request["reply_id"])
 
 
+class DirectPlugin:
+    """Synthetic plugin adapter for routing tests.
+
+    It never models a real GsCore or group-management API; it exists to drive the port.
+    `reply_for_core` deliberately violates the single-reply-owner rule so the engine's
+    refusal can be tested.
+    """
+
+    adapter = "synthetic"
+    available = True
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.calls = []
+        self.gate = None
+        self.slow = set()
+        self.states = []
+        self.reply_for_core = False
+        self.reply = None
+
+    async def execute(self, request):
+        self.calls.append(copy.deepcopy(request))
+        if self.gate:
+            await self.gate.wait()
+        state = self.states.pop(0) if self.states else "completed"
+        if state != "completed":
+            return dict(
+                adapter=self.adapter,
+                request_id=request["request_id"],
+                attempt_id=request["attempt_id"],
+                state=state,
+                task_ref=None,
+                result=None,
+                reply=None,
+                channel_message_ids=[],
+            )
+        if request["command_id"] in self.slow:
+            return dict(
+                adapter=self.adapter,
+                request_id=request["request_id"],
+                attempt_id=request["attempt_id"],
+                state="accepted",
+                task_ref="synthetic:" + request["attempt_id"],
+                result=None,
+                reply=None,
+                channel_message_ids=[],
+            )
+        reply = None
+        if request["reply_to"] == "bridge" or self.reply_for_core:
+            reply = dict(text=self.reply or ("[合成] " + request["command_id"]))
+        return dict(
+            adapter=self.adapter,
+            request_id=request["request_id"],
+            attempt_id=request["attempt_id"],
+            state="completed",
+            task_ref=None,
+            result=dict(kind="synthetic", parameters=request["parameters"]),
+            reply=reply,
+            channel_message_ids=[],
+        )
+
+    def complete(self, request_id, attempt_id, *, reply=None):
+        return dict(
+            adapter=self.adapter,
+            request_id=request_id,
+            attempt_id=attempt_id,
+            state="completed",
+            task_ref=None,
+            result=dict(kind="synthetic", late=True),
+            reply=dict(text=reply or "[合成] 完成"),
+            channel_message_ids=[],
+        )
+
+    async def reconcile(self, request):
+        return None
+
+
+class FakeDelivery:
+    """Synthetic outbound port; the production port is the existing bridge send path."""
+
+    available = True
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.calls = []
+        self.states = []
+        self.answers = {}
+        self.gate = None
+        self.retry_safe = False
+
+    def receipt(self, request, state="sent"):
+        return dict(
+            schema_version=1,
+            request_id=request["command"]["request_id"],
+            reply_id=request["reply_id"],
+            segment_sequence=request["segment_sequence"],
+            attempt_id="attempt:" + request["reply_id"],
+            state=state,
+            channel_message_ids=["synthetic:" + request["reply_id"]] if state == "sent" else [],
+            observed_at=utc(self.clock()),
+            retry_safe=state == "failed" and self.retry_safe,
+        )
+
+    async def send(self, request):
+        self.calls.append(copy.deepcopy(request))
+        if self.gate:
+            await self.gate.wait()
+        state = self.states.pop(0) if self.states else "sent"
+        return self.receipt(request, state)
+
+    async def reconcile(self, request):
+        return self.answers.get(request["reply_id"])
+
+
 class Harness:
-    def __init__(self, path=":memory:", **policy):
+    def __init__(self, path=":memory:", *, direct_options=None, **policy):
         self.clock, self.contracts = Clock(), contracts()
         self.origins, self.memory = FakeOrigins(self.clock), FakeMemory(self.clock)
         self.gateway, self.sender = FakeGateway(), FakeSender(self.clock)
+        self.direct_plugin, self.delivery = DirectPlugin(self.clock), FakeDelivery(self.clock)
         self.path = path
         self.options = dict(
             bindings={
@@ -222,10 +337,15 @@ class Harness:
             config_version=1,
             policy=Policy(**policy),
             clock=self.clock,
+            direct_options={
+                "adapter": self.direct_plugin,
+                "deliver": self.delivery,
+                **(direct_options or {}),
+            },
         )
         self.core = self.new_core()
 
-    def new_core(self):
+    def new_core(self, **overrides):
         return Core(
             Store(self.path),
             self.contracts,
@@ -233,7 +353,7 @@ class Harness:
             self.memory,
             self.gateway,
             self.sender,
-            **self.options,
+            **{**self.options, **overrides},
         )
 
     def request(

@@ -45,11 +45,17 @@ PROACTIVE_TABLES = {
     "proactive_quota",
 }
 
+# Explicit functional commands: the registry, the durable request bound to a message
+# version, and the per-attempt history. `direct_attempts` is derived history that may be
+# pruned; the registry row and the request row are the durable facts.
+DIRECT_TABLES = {"direct_commands", "direct_requests", "direct_attempts"}
+
 TABLES = (
     LIFE_TABLES
     | IMAGE_TABLES
     | WRITING_TABLES
     | PROACTIVE_TABLES
+    | DIRECT_TABLES
     | {
         "conversations",
         "collections",
@@ -98,17 +104,18 @@ class Store:
 
     def _initialize(self, path):
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7):
             raise RuntimeError("Unsupported database schema version")
         # Backup the complete SQLite view (including WAL) before structural migration.
         # A unique file never overwrites earlier recovery evidence.
-        if version in (1, 2, 3, 4, 5) and str(path) != ":memory:":
+        if version in (1, 2, 3, 4, 5, 6) and str(path) != ":memory:":
             label = {
                 1: ".pre-source-v2-",
                 2: ".pre-life-v3-",
                 3: ".pre-images-v4-",
                 4: ".pre-writing-v5-",
                 5: ".pre-proactive-v6-",
+                6: ".pre-routing-v7-",
             }[version]
             backup = sqlite3.connect(str(path) + label + uuid.uuid4().hex + ".bak")
             try:
@@ -119,7 +126,7 @@ class Store:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
         for table in sorted(
-            TABLES - LIFE_TABLES - IMAGE_TABLES - WRITING_TABLES - PROACTIVE_TABLES
+            TABLES - LIFE_TABLES - IMAGE_TABLES - WRITING_TABLES - PROACTIVE_TABLES - DIRECT_TABLES
         ):
             self.db.execute(
                 f"CREATE TABLE IF NOT EXISTS {table} ("
@@ -143,6 +150,11 @@ class Store:
             "json_extract(body,'$.base'),json_extract(body,'$.revision') DESC)"
         )
         self.db.execute(
+            "CREATE INDEX IF NOT EXISTS inbox_author ON inbox(conversation_id,"
+            "json_extract(body,'$.request.author.namespace'),"
+            "json_extract(body,'$.request.author.immutable_account_id'),position)"
+        )
+        self.db.execute(
             "CREATE INDEX IF NOT EXISTS replies_turn ON replies("
             "json_extract(body,'$.turn_id'),status,position)"
         )
@@ -159,7 +171,9 @@ class Store:
                     "metadata",
                     dict(id="source_head", generation="generation:" + uuid.uuid4().hex, sequence=0),
                 )
-            for table in sorted(LIFE_TABLES | IMAGE_TABLES | WRITING_TABLES | PROACTIVE_TABLES):
+            for table in sorted(
+                LIFE_TABLES | IMAGE_TABLES | WRITING_TABLES | PROACTIVE_TABLES | DIRECT_TABLES
+            ):
                 self.db.execute(
                     f"CREATE TABLE IF NOT EXISTS {table} ("
                     "id TEXT PRIMARY KEY, conversation_id TEXT, position INTEGER, "
@@ -186,7 +200,24 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS proactive_reminder_due ON "
                 "proactive_reminders(status,deadline)"
             )
-            self.db.execute("PRAGMA user_version=6")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS direct_commands_scope ON direct_commands("
+                "json_extract(body,'$.name'),json_extract(body,'$.command_id'),position)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS direct_requests_pending ON "
+                "direct_requests(status,position,id)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS direct_requests_version ON direct_requests("
+                "json_extract(body,'$.channel_key'),"
+                "json_extract(body,'$.message_id'),status,position)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS direct_attempts_request ON direct_attempts("
+                "json_extract(body,'$.request_id'),position,id)"
+            )
+            self.db.execute("PRAGMA user_version=7")
 
     @contextmanager
     def transaction(self):

@@ -150,8 +150,15 @@ class Bridge:
         self.confirm_admissions = confirm_admissions
         self.locks = {}
 
-    def capture(self, request, *, direct_commands=()):
-        """Call once from a registered NoneBot matcher before handing off responsibility."""
+    def capture(self, request, *, direct_commands=(), direct_match=None, audience=None):
+        """Call once from a registered NoneBot matcher before handing off responsibility.
+
+        `direct_commands` is the legacy deployment-supplied name list. `direct_match` is the
+        registry-backed decision: the deployment passes the matcher built from the registered
+        command snapshot, and the platform/audience scope must be supplied by the caller -
+        without a known scope the text is never claimed as a command. Either way the owner is
+        persisted once, so a duplicate SDK event cannot change who answers.
+        """
         fanout = "input" in request
         self.contracts.check(
             "sources#fanout_request" if fanout else "conversation#ingest_request", request
@@ -160,11 +167,19 @@ class Bridge:
         key = digest([data["message_key"], request["target_actor_ids"]])
         semantic = digest({k: v for k, v in request.items() if k != "command"})
         text = "".join(p["text"] for p in data["parts"] if p["kind"] == "text").strip()
-        owner = (
-            "direct"
-            if any(text == cmd or text.startswith(cmd + " ") for cmd in direct_commands)
-            else "companion"
-        )
+        if direct_match is not None and audience is not None:
+            verdict = direct_match(
+                text,
+                namespace=data["message_key"]["channel"]["namespace"],
+                audience=audience,
+            )
+            owner = "direct" if verdict.get("matched") else "companion"
+        else:
+            owner = (
+                "direct"
+                if any(text == cmd or text.startswith(cmd + " ") for cmd in direct_commands)
+                else "companion"
+            )
         with self.store.transaction():
             existing = self.store.get("inbox", key)
             if existing:
@@ -187,6 +202,24 @@ class Bridge:
                 ),
             )
         return owner
+
+    def hand_back(self, request):
+        """Return a direct-owned row to the companion queue after Core declined the command.
+
+        Core is authoritative about what is a registered complete command. When it answers
+        that a claimed text is not one, the durable ownership flips to the companion chain -
+        the ownership decision is recorded once, never held by two owners at the same time,
+        and the ordinary `flush` hand-off then persists the verified conversation mapping.
+        """
+        fanout = "input" in request
+        data = request["input"] if fanout else request
+        key = digest([data["message_key"], request["target_actor_ids"]])
+        with self.store.transaction():
+            item = self.store.get("inbox", key)
+            if item and item["owner"] == "direct":
+                item.update(owner="companion", state="pending", deadline=self.clock())
+                self.store.put("inbox", item)
+        return key
 
     async def flush(self):
         for item in self.store.list("inbox", states=["pending"]):

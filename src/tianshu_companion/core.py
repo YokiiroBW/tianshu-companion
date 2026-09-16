@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, replace
 
 from .clients import command, epoch, uid, utc
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
+from .direct import Direct
 from .life import Life
 from .images import Images
 from .proactive import Proactive
@@ -81,6 +82,7 @@ class Core:
         writing_options=None,
         proactive_options=None,
         proactive_dispatcher=None,
+        direct_options=None,
     ):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
@@ -103,6 +105,12 @@ class Core:
                 self._proactive_guard,
                 dispatcher=proactive_dispatcher,
                 **(proactive_options or {}),
+            )
+            self.direct = Direct(
+                store,
+                clock,
+                self._direct_guard,
+                **(direct_options or {}),
             )
             migrate_legacy(store)
         except BaseException:
@@ -239,6 +247,263 @@ class Core:
 
     def source_facts(self, service, request):
         return read_facts(self.store, self.contracts, service, request)
+
+    # ------------------------------------------------------------ functional commands
+
+    DIRECT_INPUT_FIELDS = frozenset(
+        {
+            "command",
+            "message_key",
+            "author",
+            "sent_at",
+            "kind",
+            "parts",
+            "reply_refs",
+            "mentioned_accounts",
+            "target_actor_ids",
+        }
+    )
+    CAPABILITY_REQUIRED = frozenset(
+        {
+            "command",
+            "capability_id",
+            "command_version",
+            "channel",
+            "parameters",
+            "reply_to",
+            "entry_ref",
+        }
+    )
+    CAPABILITY_OPTIONAL = frozenset({"message_key", "request_key", "wait_seconds"})
+
+    def _direct_guard(self, request):
+        """Local authority re-check for one functional request.
+
+        Only Core's own durable facts are consulted: the registered channel binding, its
+        namespace, the audience, the actor's role set, the conversation identity and its
+        quarantine state. No persona, affection score or model statement takes part. A
+        remote account-binding revocation that has not reached Core is not covered here -
+        the same stated gap the proactive guard carries, not something this guard claims.
+        """
+        channel = request["channel"]
+        binding = self.bindings.get(channel["binding_id"])
+        conversation = self.store.get("conversations", digest(channel))
+        reasons = []
+        if binding is None:
+            reasons.append("unknown_binding")
+        else:
+            if binding["namespace"] != channel["namespace"]:
+                reasons.append("namespace_mismatch")
+            if binding["audience"] != request["audience"]:
+                reasons.append("audience_mismatch")
+            if request["actor_id"] not in binding["actor_ids"]:
+                reasons.append("actor_not_bound")
+        if request["actor_id"] not in self.roles:
+            reasons.append("unknown_role")
+        if conversation is None:
+            reasons.append("unknown_conversation")
+        else:
+            if conversation["conversation_id"] != request["conversation_id"]:
+                reasons.append("conversation_mismatch")
+            if conversation.get("source_quarantined"):
+                reasons.append("source_quarantined")
+        return dict(
+            allowed=not reasons,
+            reason=reasons[0] if reasons else None,
+            reasons=reasons,
+            evidence=dict(
+                binding_id=channel["binding_id"],
+                namespace=channel["namespace"],
+                audience=request["audience"],
+                actor_id=request["actor_id"],
+            ),
+        )
+
+    def _bound_scope(self, channel, author):
+        """Account-to-actor binding learned from this conversation's accepted admissions.
+
+        The functional fast path resolves the requester locally, from Core's own durable
+        facts, so it does not add a live dependency on the origin or identity service. An
+        account that has never had an accepted message in this conversation therefore has
+        no actor binding yet, and its command is refused honestly instead of guessed.
+        """
+        conversation = self.store.get("conversations", digest(channel))
+        if conversation is None:
+            return None
+        row = self.store.db.execute(
+            "SELECT body FROM inbox WHERE conversation_id=? "
+            "AND json_extract(body,'$.request.author.namespace')=? "
+            "AND json_extract(body,'$.request.author.immutable_account_id')=? "
+            "AND json_extract(body,'$.actor_id') IS NOT NULL "
+            "ORDER BY position DESC,id DESC LIMIT 1",
+            (
+                conversation["conversation_id"],
+                author["namespace"],
+                author["immutable_account_id"],
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        item = json.loads(row[0])
+        return item["actor_id"], item["admission"]["scope"]
+
+    @staticmethod
+    def _direct_text(request):
+        return "".join(p["text"] for p in request["parts"] if p["kind"] == "text").strip()
+
+    async def direct_command(self, service, request):
+        """The NoneBot command fast path entry.
+
+        Ownership is decided by the bridge before Core sees the message, but Core stays
+        authoritative: it re-matches the whole registered command and its parameter shape.
+        A text the bridge claimed as direct that is not a registered complete command here
+        (a name registered only for another platform or audience, an ambiguous duplicate, or
+        a registration whose reply owner is Core) is handed to the existing companion chain
+        instead - so exactly one owner answers either way.
+        """
+        if service != "nonebot":
+            raise Fault("forbidden")
+        if not isinstance(request, dict) or set(request) != self.DIRECT_INPUT_FIELDS:
+            raise Fault("invalid_input")
+        self.contracts.check("conversation#ingest_request", request)
+        content = self._direct_text(request)
+        if not content:
+            raise Fault("invalid_input")
+        channel = request["message_key"]["channel"]
+        command_key, signature, prior = self._command_key(service, "direct-command", request)
+        if prior:
+            return {**prior["response"], "request_id": request["command"]["request_id"]}
+        if epoch(request["command"]["deadline_at"]) <= self.clock():
+            raise Fault("timeout")
+        conversation = ensure_channel(self.store, channel)
+        if conversation is None:
+            raise Fault("not_found")
+        bound = self._bound_scope(channel, request["author"])
+        if bound is None:
+            # No accepted inbound from this account in this conversation yet, so Core has no
+            # local actor binding for it. Never invent one from the payload.
+            raise Fault("forbidden")
+        actor_id, scope = bound
+        if actor_id not in request["target_actor_ids"]:
+            raise Fault("forbidden")
+        match = self.direct.match(
+            content, namespace=channel["namespace"], audience=scope["audience"]
+        )
+        if not match["matched"]:
+            # A Core-owned registration is answered by the companion turn that calls the
+            # capability, and an unknown/ambiguous text was never a command, so both reach
+            # the existing companion chain as ordinary input - exactly once.
+            result = await self.ingest(service, request, defer_processing=True)
+            response = dict(
+                schema_version=1,
+                request_id=request["command"]["request_id"],
+                owner="companion",
+                owner_reason=match["reason"],
+                request=None,
+                receipt=result,
+            )
+            self._remember_command(command_key, signature, response)
+            return response
+        view = self.direct.open_from_command(
+            content,
+            namespace=channel["namespace"],
+            audience=scope["audience"],
+            actor_id=actor_id,
+            person_id=scope["person_id"],
+            conversation_id=conversation["conversation_id"],
+            channel=channel,
+            message_key=request["message_key"],
+            origin_ref=request["command"]["origin"],
+            match=match,
+        )
+        response = dict(
+            schema_version=1,
+            request_id=request["command"]["request_id"],
+            owner="direct",
+            owner_reason=None,
+            request=view,
+            receipt=None,
+        )
+        self._remember_command(command_key, signature, response)
+        return response
+
+    def commands(self, service):
+        """The registered command table, for the bridge that has to route by its names.
+
+        The registry lives in Core, so a deployment derives its matcher table from here
+        instead of keeping a second copy of the names that could drift out of agreement.
+        """
+        if service != "nonebot":
+            raise Fault("forbidden")
+        return dict(
+            schema_version=1,
+            registry=self.direct.registry_version(),
+            commands=self.direct.commands(),
+        )
+
+    async def capability(self, service, request):
+        """Core's explicit capability entry; shares one execution with the command entry.
+
+        The caller states which capability, which parameters and which reply owner it wants,
+        and Core derives the requester from the authenticated origin context - never from the
+        payload. When the call answers a real user message it carries that message version,
+        so a command that already arrived through the fast path is not executed twice.
+        """
+        if not isinstance(request, dict):
+            raise Fault("invalid_input")
+        if set(request) - (self.CAPABILITY_REQUIRED | self.CAPABILITY_OPTIONAL) or not (
+            self.CAPABILITY_REQUIRED <= set(request)
+        ):
+            # An unknown field is refused, so no persona, score or permission claim can be
+            # smuggled in beside a real capability call.
+            raise Fault("invalid_input")
+        channel = request["channel"]
+        if request["reply_to"] not in {"core", "bridge"}:
+            raise Fault("invalid_input")
+        wait = request.get("wait_seconds", 0)
+        if type(wait) is not int or not 0 <= wait <= 30:
+            raise Fault("invalid_input")
+        ctx, person, _ = await self._authorize(service, request["command"], channel)
+        if epoch(request["command"]["deadline_at"]) <= self.clock():
+            raise Fault("timeout")
+        command_key, signature, prior = self._command_key(service, "capability", request)
+        if prior:
+            return {**prior["response"], "request_id": request["command"]["request_id"]}
+        conversation = ensure_channel(self.store, channel)
+        if conversation is None:
+            raise Fault("not_found")
+        scope = ctx["allowed_scope"]
+        view = self.direct.open_from_capability(
+            entry_ref=request["entry_ref"],
+            command_id=request["capability_id"],
+            command_version=request["command_version"],
+            actor_id=scope["actor_id"],
+            person_id=person,
+            audience=scope["audience"],
+            conversation_id=conversation["conversation_id"],
+            channel=channel,
+            origin_ref=request["command"]["origin"],
+            parameters=request["parameters"],
+            reply_to=request["reply_to"],
+            message_key=request.get("message_key"),
+            request_key=request.get("request_key"),
+        )
+        view = await self.direct.dispatch(view["id"], wait=wait)
+        bridge_owned = view["reply_owner"] == "bridge"
+        response = dict(
+            schema_version=1,
+            request_id=request["command"]["request_id"],
+            state=view["state"],
+            reply_state=view["reply_state"],
+            reply_owner=view["reply_owner"],
+            # One reply owner: a bridge-owned reply is delivered natively by the bridge, so
+            # Core is told the delivery state and is never handed a payload to announce.
+            result=None if bridge_owned else view["result"],
+            reply=None if bridge_owned else view["reply"],
+            request=view,
+        )
+        self._remember_command(command_key, signature, response)
+        return response
 
     def reclassify_source(self, key, expected_revision, classification):
         """Trusted owner application port, never an ingress/model-provided field."""
@@ -515,6 +780,7 @@ class Core:
         self.images.recover()
         self.writing.recover()
         self.proactive.recover()
+        self.direct.recover()
         with self.store.transaction():
             for reply in self.store.list("replies", states=["sending"]):
                 reply.update(state="unknown", unknown_since=reply["attempted_at"])
@@ -537,6 +803,7 @@ class Core:
     async def tick(self):
         self.life.tick()
         self.proactive.tick()
+        self.direct.tick()
         for job in [*self.jobs.values(), *self.send_jobs.values()]:
             if job.done() and not job.cancelled() and job.exception():
                 logging.getLogger(__name__).error(
@@ -989,11 +1256,30 @@ class Core:
             if reply is None:
                 self._finish(turn, "sent", "sent")
                 return
+            sequence = turn.get("send_sequence") or turn["sequence"]
+            conversation = self.store.get(
+                "conversations", digest(turn["bundle"]["collection_key"]["channel"])
+            )
+            if (
+                sequence == turn["sequence"]
+                and conversation is not None
+                and conversation.get("direct_sequence") is not None
+                and sequence <= conversation["direct_sequence"]
+            ):
+                # A functional command answered this conversation while the turn was still
+                # generating, and the shared outbound exit keeps one increasing position per
+                # conversation. The turn therefore moves into the next slot - once, so every
+                # segment of it stays in the same band - instead of being rejected as an
+                # older position. The user loses no reply and the order stays increasing.
+                sequence = conversation["turn_sequence"] + 1
+                conversation["turn_sequence"] = sequence
+                self.store.put("conversations", conversation)
+                turn["send_sequence"] = sequence
             request = dict(
                 command=command(turn["origin"], reply["id"], self.clock()),
                 conversation_id=cid,
                 turn_id=turn["id"],
-                turn_sequence=turn["sequence"],
+                turn_sequence=sequence,
                 reply_id=reply["id"],
                 actor_id=turn["scope"]["actor_id"],
                 destination=turn["bundle"]["collection_key"]["channel"],
