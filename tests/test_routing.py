@@ -2093,7 +2093,7 @@ def test_v6_migration_backup_rollback_and_source_preservation():
         db.commit()
     with closing(Store(path)) as store:
         assert store.source_head() == head
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
         assert store.get("conversations", "synthetic")["private"] == "synthetic preserved"
         assert store.list("direct_requests") == []
         assert store.list("direct_commands") == []
@@ -2103,7 +2103,7 @@ def test_v6_migration_backup_rollback_and_source_preservation():
     # Both attempts started below v7, so the persona step is crossed inside those same
     # migrations: a multi-version jump takes one recovery backup, at the highest structural
     # step, and never a second one for an earlier step in the same run.
-    assert not list(directory.glob("*.pre-persona-v8-*.bak"))
+    assert not list(directory.glob("*.pre-persona-ops-v9-*.bak"))
     for backup in backups:
         with closing(sqlite3.connect(backup)) as db:
             assert db.execute("PRAGMA user_version").fetchone()[0] == 6

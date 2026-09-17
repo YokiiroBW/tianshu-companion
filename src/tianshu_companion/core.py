@@ -987,11 +987,16 @@ class Core:
         dispatch) and hands the operation document to the one application entry point.
         No persona rule is implemented here, and the chat, ingest and bridge credentials
         never map to this service, so no unauthenticated remote write exists.
+
+        The authenticated service is recorded as the request's authorization scope, so one
+        credential's operation identities are never replayed or blocked by another's.
         """
         if self.personas is None:
             raise Fault("dependency_unavailable")
         if service != "persona_admin":
             raise Fault("forbidden")
+        if isinstance(request, dict) and "scope" not in request:
+            request = dict(request, scope=service)
         try:
             return self.personas.manage(request)
         except PersonaError as error:

@@ -27,12 +27,17 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 from .personas import PersonaError, Personas, deployment
 from .store import Store
 
 DEFAULT_TOKEN_ENV = "TIANSHU_PERSONA_ADMIN_TOKEN"
+# The maintenance surface is one authorization scope. Operation identities are partitioned
+# by it, so a request id minted here can never replay or block an operation issued through
+# the service's management port.
+CLI_SCOPE = "persona_cli"
 OPERATIONS = (
     "list",
     "get",
@@ -62,6 +67,15 @@ def build_parser():
     target.add_argument("--url", help="Base URL of a running Core management port.")
     parser.add_argument("--config", type=Path, help="Deployment configuration JSON for `import`.")
     parser.add_argument("--token-env", default=DEFAULT_TOKEN_ENV)
+    parser.add_argument(
+        "--request-id",
+        help=(
+            "Operation identity for a write. Re-sending the same request with the same "
+            "--request-id replays the recorded result instead of applying it twice; a "
+            "retry after a lost response must reuse it. Defaults to a fresh id, which "
+            "means no deduplication."
+        ),
+    )
     parser.add_argument("--subject", help="Character id, for example actor:companion.")
     parser.add_argument("--operator", help="Explicit operator identity; required for every write.")
     parser.add_argument("--reason", help="Bounded reason recorded with the change.")
@@ -81,7 +95,9 @@ def operation_document(args):
     """Arguments -> the application operation document, without applying persona rules.
 
     Only naming happens here: an argument that was not supplied stays absent, so the persona
-    module remains the single place that decides whether it was required and why.
+    module remains the single place that decides whether it was required and why. A write
+    always leaves with an operation identity - the supplied one, so a retry can replay it,
+    or a fresh one when the caller did not ask for deduplication.
     """
     document = {"operation": args.command}
     if args.command in SUBJECT_OPERATIONS:
@@ -89,6 +105,8 @@ def operation_document(args):
     if args.command in MUTATIONS:
         document["operator"] = args.operator
         document["reason"] = args.reason
+        document["request_id"] = args.request_id or uuid.uuid4().hex
+        document["scope"] = CLI_SCOPE
     if args.command in VERSIONED:
         document["expected"] = args.expected
     if args.command in ("approve", "reject", "publish", "rollback"):
@@ -144,7 +162,8 @@ def run(args, *, store=None):
     """One command. `store` is injectable for tests; production opens the file itself."""
     document = operation_document(args)
     if args.command == "import":
-        # One shared shape rule for the service startup import and this command.
+        # One shared shape rule for the service startup import and this command. The import
+        # is already keyed by the deployment document, so it carries no request identity.
         source_ref, roles = deployment(document["config"])
         document = dict(
             operation="import",

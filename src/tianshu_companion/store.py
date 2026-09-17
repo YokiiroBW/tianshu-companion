@@ -51,8 +51,10 @@ PROACTIVE_TABLES = {
 DIRECT_TABLES = {"direct_commands", "direct_requests", "direct_attempts"}
 
 # Registered character personas. `personas` is the live pointer row, `revisions` and
-# `publications` are append-only history, and `imports` keys the idempotent deployment
-# import. No row here can confer a permission: persona content is character text only.
+# `publications` are append-only history, `imports` keys the idempotent deployment import,
+# and `operations` is the request ledger: the identity one write was executed under and the
+# result it committed. No row here can confer a permission: persona content is character
+# text only.
 PERSONA_TABLES = {
     "persona_personas",
     "persona_revisions",
@@ -61,6 +63,7 @@ PERSONA_TABLES = {
     "persona_rollbacks",
     "persona_imports",
     "persona_access",
+    "persona_operations",
 }
 
 TABLES = (
@@ -118,11 +121,19 @@ class Store:
 
     def _initialize(self, path):
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
             raise RuntimeError("Unsupported database schema version")
         # Backup the complete SQLite view (including WAL) before structural migration.
         # A unique file never overwrites earlier recovery evidence.
-        if version in (1, 2, 3, 4, 5, 6, 7) and str(path) != ":memory:":
+        #
+        # One recovery backup per open, labelled with the *highest* structural step this
+        # process will apply, so the file always has a name a restore can be reasoned about:
+        # every version below the current one needs the current step, and an older file needs
+        # all the steps above it too. A v5 file opened by a v9 process therefore takes one
+        # `.pre-persona-ops-v9-` backup covering the whole chain; it is taken before any DDL,
+        # so no intermediate step can start without a restore point. An intermediate restore
+        # point requires upgrading one step at a time.
+        if 1 <= version <= 8 and str(path) != ":memory:":
             label = {
                 1: ".pre-source-v2-",
                 2: ".pre-life-v3-",
@@ -131,6 +142,7 @@ class Store:
                 5: ".pre-proactive-v6-",
                 6: ".pre-routing-v7-",
                 7: ".pre-persona-v8-",
+                8: ".pre-persona-ops-v9-",
             }[version]
             backup = sqlite3.connect(str(path) + label + uuid.uuid4().hex + ".bak")
             try:
@@ -184,6 +196,7 @@ class Store:
             "json_extract(body,'$.base'),json_extract(body,'$.revision') DESC)"
         )
         self._fact_dirty = False
+        self._in_transaction = False
         with self.transaction():
             if not self.get("metadata", "source_head"):
                 if version >= 2:
@@ -255,11 +268,27 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS persona_publications_subject ON persona_publications("
                 "json_extract(body,'$.subject'),position,id)"
             )
-            self.db.execute("PRAGMA user_version=8")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS persona_operations_request ON persona_operations("
+                "json_extract(body,'$.request_id'),json_extract(body,'$.operation'),position,id)"
+            )
+            self.db.execute("PRAGMA user_version=9")
 
     @contextmanager
     def transaction(self):
+        """One transaction per outermost `with`, so composed writes commit atomically.
+
+        SQLite has no nested transactions and `BEGIN` inside one is an error, so an inner
+        `with store.transaction():` joins the transaction already open: only the outermost
+        block commits (and only it advances the fact-stream head), and an exception anywhere
+        inside still rolls the whole thing back. That is what lets a composed operation - a
+        business write plus the ledger row that records its result - be one atomic step.
+        """
+        if self._in_transaction:
+            yield
+            return
         self.db.execute("BEGIN IMMEDIATE")
+        self._in_transaction = True
         self._fact_dirty = False
         try:
             yield
@@ -272,6 +301,7 @@ class Store:
             self.db.execute("ROLLBACK")
             raise
         finally:
+            self._in_transaction = False
             self._fact_dirty = False
 
     def put(self, table, item):

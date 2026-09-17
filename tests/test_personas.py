@@ -12,6 +12,7 @@ from contextlib import closing
 import pytest
 
 from support import Harness, persona_config
+from tianshu_companion.contracts import Fault
 from tianshu_companion.personas import (
     REVISION_SUFFIX,
     PersonaError,
@@ -286,6 +287,275 @@ def test_identical_content_from_the_same_parent_is_one_revision_and_replay_is_re
                 reason="replay",
             )
         assert immutable.value.code == "invalid_input"
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------- operation identity
+
+
+def with_request(operation, subject=A, **fields):
+    """One application operation document, as an adapter would submit it."""
+    document = {"operation": operation, "subject": subject, "request_id": "ops:1"}
+    document.update(fields)
+    return document
+
+
+def test_a_replayed_request_returns_its_recorded_result_and_writes_nothing_again():
+    async def scenario():
+        harness = Harness(personas=persona_config())
+        core = harness.core
+        personas = personas_of(harness)
+        document = {
+            "operation": "draft",
+            "subject": A,
+            "operator": "admin",
+            "reason": "editorial change",
+            "expected": personas.get(A)["version"],
+            "content": {"persona": "Requested text"},
+            "request_id": "ops:draft-1",
+        }
+        first = core.manage_persona("persona_admin", document)
+        revisions = len(personas.revisions(A))
+
+        # The response was lost; the caller retries the very same request.
+        replay = core.manage_persona("persona_admin", dict(document))
+        assert replay == first  # the recorded result, not a re-run
+        assert len(personas.revisions(A)) == revisions
+        assert len(core.store.list("persona_operations")) == 1
+        assert personas.get(A)["version"] == first["persona"]["version"]
+
+        # A different operation under its own identity is a separate request.
+        other = core.manage_persona(
+            "persona_admin",
+            dict(
+                document,
+                request_id="ops:draft-2",
+                expected=personas.get(A)["version"],
+                content={"persona": "Second text"},
+            ),
+        )
+        assert other["revision"]["content"] == {"persona": "Second text"}
+        assert len(core.store.list("persona_operations")) == 2
+        await core.close()
+
+    asyncio.run(scenario())
+
+
+def test_one_request_id_cannot_carry_two_different_requests():
+    async def scenario():
+        harness = Harness(personas=persona_config())
+        personas = personas_of(harness)
+        first = harness.core.manage_persona(
+            "persona_admin",
+            with_request(
+                "draft",
+                operator="admin",
+                reason="one",
+                expected=personas.get(A)["version"],
+                content={"persona": "First"},
+            ),
+        )
+        assert first["revision"]["content"] == {"persona": "First"}
+        version = personas.get(A)["version"]
+        with pytest.raises(Fault) as reused:
+            harness.core.manage_persona(
+                "persona_admin",
+                with_request(
+                    "draft",
+                    operator="admin",
+                    reason="one",
+                    expected=version,
+                    content={"persona": "Different content"},
+                ),
+            )
+        assert reused.value.code == "invalid_input"
+        # Nothing was applied and the identity still belongs to the first request.
+        assert personas.get(A)["draft"]["content"] == {"persona": "First"}
+        assert len(personas.revisions(A)) == 2  # the seed and the first draft
+        assert len(harness.core.store.list("persona_operations")) == 1
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_write_without_an_operation_identity_is_refused():
+    """Reads need none; every write operation refuses to run without one."""
+
+    async def scenario():
+        harness = Harness(personas=persona_config())
+        personas = personas_of(harness)
+        assert harness.core.manage_persona("persona_admin", {"operation": "list"})["subjects"]
+        draft = dict(with_request("draft", operator="admin", reason="r"))
+        draft.pop("request_id")
+        draft.update(expected=personas.get(A)["version"], content={"persona": "Unidentified"})
+        with pytest.raises(Fault) as missing:
+            harness.core.manage_persona("persona_admin", draft)
+        assert missing.value.code == "invalid_input"
+
+        revision = drafts(harness, A, {"persona": "Pending text"})["revision"]["revision_id"]
+        bare = {"subject": A, "operator": "admin", "reason": "no identity"}
+        for operation in ("approve", "reject", "publish", "rollback"):
+            with pytest.raises(PersonaError) as missing:
+                personas.manage(
+                    dict(
+                        bare,
+                        operation=operation,
+                        revision_id=revision,
+                        expected=personas.get(A)["version"],
+                    )
+                )
+            assert missing.value.code == "invalid_input"
+        for operation in ("retire", "restore"):
+            with pytest.raises(PersonaError) as missing:
+                personas.manage(
+                    dict(bare, operation=operation, expected=personas.get(A)["version"])
+                )
+            assert missing.value.code == "invalid_input"
+        # Not one of those attempts changed anything.
+        assert personas.get(A)["retired"] is False
+        assert personas.approvals(A) == []
+        assert personas.publications(A) == [] or all(
+            row["kind"] == "seed" for row in personas.publications(A)
+        )
+        assert personas.get(A)["draft"]["content"] == {"persona": "Pending text"}
+        assert harness.core.store.list("persona_operations") == []
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_identical_approval_retries_never_add_a_second_decision():
+    """The reviewer's finding: approval is a visible fact, and a retry must not repeat it."""
+
+    async def scenario():
+        harness = Harness(personas=persona_config())
+        core = harness.core
+        personas = personas_of(harness)
+        revision = drafts(harness, A, {"persona": "Reviewed text"})["revision"]["revision_id"]
+        document = with_request(
+            "approve",
+            revision_id=revision,
+            operator="reviewer",
+            reason="reviewed",
+            expected=personas.get(A)["version"],
+            request_id="ops:approve-1",
+        )
+        first = core.manage_persona("persona_admin", document)
+        assert personas.get(A)["state"] == "approved"
+        assert len(personas.approvals(A)) == 1
+        approved_version = first["persona"]["version"]
+
+        harness.clock.advance(3600)
+        replay = core.manage_persona("persona_admin", dict(document))
+        assert replay == first
+        assert len(personas.approvals(A)) == 1
+        assert personas.get(A)["version"] == approved_version
+        assert len(personas.publications(A)) == 1  # only the deployment seed
+        await core.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_expected_version_covers_the_approval_state():
+    """Two operators cannot both approve the same pending draft from one stale read."""
+
+    async def scenario():
+        harness = Harness(personas=persona_config())
+        personas = personas_of(harness)
+        revision = drafts(harness, A, {"persona": "Reviewed text"})["revision"]["revision_id"]
+        seen = personas.get(A)["version"]
+        personas.approve(A, revision, operator="reviewer-1", expected=seen, reason="reviewed")
+        # A second approval of the same draft from the same read is refused: the state the
+        # caller approved was already superseded, so this is a stale edit rather than a
+        # second signature.
+        with pytest.raises(PersonaError) as stale:
+            personas.approve(A, revision, operator="reviewer-2", expected=seen, reason="reviewed")
+        assert stale.value.code == "version_conflict"
+        assert len(personas.approvals(A)) == 1
+        # The operator who re-reads succeeds under a new request.
+        personas.approve(
+            A,
+            revision,
+            operator="reviewer-2",
+            expected=personas.get(A)["version"],
+            reason="reviewed",
+        )
+        assert len(personas.approvals(A)) == 2
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_operation_identities_are_durable_across_a_restart(tmp_path):
+    path = tmp_path / "requests.db"
+    document = {
+        "operation": "draft",
+        "subject": A,
+        "operator": "admin",
+        "reason": "before the restart",
+        "expected": 2,
+        "content": {"persona": "Durable text"},
+        "request_id": "ops:durable",
+    }
+    recorded = []
+
+    async def scenario():
+        harness = Harness(path, personas=persona_config())
+        first = harness.core.manage_persona("persona_admin", document)
+        assert first["persona"]["draft"]["content"] == {"persona": "Durable text"}
+        recorded.append(first)
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+    async def restarted():
+        harness = Harness(path, personas=persona_config())
+        personas = personas_of(harness)
+        revisions = len(personas.revisions(A))
+        replay = harness.core.manage_persona("persona_admin", dict(document))
+        assert replay == recorded[0]  # the result the first process committed
+        assert len(personas.revisions(A)) == revisions
+        assert len(harness.core.store.list("persona_operations")) == 1
+        # The identity is still bound to its request after the restart, not merely the row.
+        with pytest.raises(Fault) as reused:
+            harness.core.manage_persona(
+                "persona_admin",
+                dict(document, content={"persona": "Changed after restart"}, expected=3),
+            )
+        assert reused.value.code == "invalid_input"
+        assert personas.get(A)["draft"]["content"] == {"persona": "Durable text"}
+        await harness.core.close()
+
+    asyncio.run(restarted())
+
+
+def test_an_operation_identity_is_scoped_to_the_authorization_surface():
+    """Two credentials are two surfaces: one cannot block or replay the other's request."""
+
+    async def scenario():
+        harness = Harness(personas=persona_config())
+        personas = personas_of(harness)
+        document = with_request(
+            "draft",
+            operator="admin",
+            reason="editorial change",
+            expected=personas.get(A)["version"],
+            content={"persona": "Surface one"},
+        )
+        first = harness.core.manage_persona("persona_admin", dict(document))
+        assert first["revision"]["content"] == {"persona": "Surface one"}
+        # The same request id on another surface is a different operation, and the version
+        # check still applies to it.
+        with pytest.raises(PersonaError) as stale:
+            personas.manage(dict(document, scope="persona_console"))
+        assert stale.value.code == "version_conflict"
+        second = personas.manage(
+            dict(document, scope="persona_console", expected=personas.get(A)["version"])
+        )
+        assert second["revision"] is not None
+        assert len(harness.core.store.list("persona_operations")) == 2
         await harness.core.close()
 
     asyncio.run(scenario())
@@ -642,6 +912,7 @@ def test_management_port_is_gated_on_its_own_service_credential():
                     "reason": "x",
                     "expected": 99,
                     "content": {"persona": "y"},
+                    "request_id": "port:conflict",
                 },
             )
         assert conflict.value.code == "version_conflict"
@@ -693,6 +964,7 @@ def test_management_can_import_and_draft_from_the_deployment_document():
                 "reason": "config moved",
                 "expected": personas.get(A)["version"],
                 "from_config": dict(persona="Deployed A"),
+                "request_id": "port:draft-from-config",
             },
         )
         assert drafted["revision"]["content"] == {"persona": "Deployed A"}
@@ -705,7 +977,7 @@ def test_management_can_import_and_draft_from_the_deployment_document():
 # ------------------------------------------------------------------------ migration
 
 
-def test_v7_database_migrates_to_v8_with_backup_and_failed_migration_recovery(tmp_path):
+def test_v7_database_migrates_to_v9_with_backup_and_failed_migration_recovery(tmp_path):
     path = tmp_path / "legacy.db"
     with closing(Store(path)) as store:
         head = store.source_head()
@@ -727,9 +999,12 @@ def test_v7_database_migrates_to_v8_with_backup_and_failed_migration_recovery(tm
         db.commit()
     with closing(Store(path)) as store:
         assert store.source_head() == head
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
         assert store.get("conversations", "synthetic")["private"] == "synthetic preserved"
         assert store.list("persona_personas") == []
+        assert store.list("persona_operations") == []
+    # One backup per open, labelled with the version the process started from: this file was
+    # at v7, so the persona step is the label even though the open also applies the v9 step.
     backups = sorted(tmp_path.glob("*.pre-persona-v8-*.bak"))
     assert len(backups) == 2
     for backup in backups:
@@ -765,7 +1040,7 @@ def test_import_on_a_migrated_legacy_database_registers_the_deployed_roles(tmp_p
 
     asyncio.run(scenario())
     with closing(Store(path)) as store:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
         assert len(store.list("persona_personas")) == 2
 
 
@@ -812,6 +1087,7 @@ def test_direct_persona_object_shares_the_single_application_entry_point(tmp_pat
                 "reason": "from cli",
                 "expected": personas.get(A)["version"],
                 "content": {"persona": "CLI text"},
+                "request_id": "cli:1",
             }
         )
         assert drafted["operation"] == "draft"

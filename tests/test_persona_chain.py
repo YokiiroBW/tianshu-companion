@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -62,6 +63,26 @@ def free_port():
 def write_json(path, document):
     path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def draft_command(target, *, request_id, expected, content):
+    """One `draft` command line, so a retry reuses the very same arguments."""
+    return [
+        *target,
+        "--subject",
+        A,
+        "--operator",
+        "operator:cli",
+        "--reason",
+        "authoring with a retry",
+        "--request-id",
+        request_id,
+        "--expected",
+        str(expected),
+        "--content",
+        str(content),
+        "draft",
+    ]
 
 
 def test_offline_cli_runs_the_whole_lifecycle_as_a_real_process(tmp_path):
@@ -163,6 +184,149 @@ def test_offline_cli_runs_the_whole_lifecycle_as_a_real_process(tmp_path):
     store = Store(path)
     try:
         assert Personas(store, time.time).get(A)["published_revision"] == revision
+    finally:
+        store.close()
+
+
+def test_offline_cli_replays_a_repeated_request_after_the_response_is_lost(tmp_path):
+    """A real process, a real file: a resent command must not execute the write twice."""
+    path = tmp_path / "retry.db"
+    import_config(tmp_path, path)
+    document = write_json(tmp_path / "retry.json", {"persona": "Retried persona"})
+    target = ["--database", str(path)]
+    request = draft_command(target, request_id="cli-retry:1", expected=2, content=document)
+    code, first = cli(*request)
+    assert code == 0, first
+    revision = first["result"]["revision"]["revision_id"]
+
+    # The caller never saw the answer and sends exactly the same command again.
+    code, replay = cli(*request)
+    assert code == 0, replay
+    assert replay == first
+    assert replay["result"]["revision"]["revision_id"] == revision
+
+    store = Store(path)
+    try:
+        personas = Personas(store, time.time)
+        assert len(personas.revisions(A)) == 2  # the seed and one draft, not two
+        assert len(personas.approvals(A)) == 0
+        assert len(store.list("persona_operations")) == 1
+        assert personas.get(A)["version"] == first["result"]["persona"]["version"]
+    finally:
+        store.close()
+
+    # The same identity carrying a different request is refused, in a second process.
+    other = write_json(tmp_path / "other.json", {"persona": "Other persona"})
+    code, reused = cli(*draft_command(target, request_id="cli-retry:1", expected=3, content=other))
+    assert code == 1 and reused["code"] == "invalid_input"
+    store = Store(path)
+    try:
+        assert len(Personas(store, time.time).revisions(A)) == 2
+    finally:
+        store.close()
+
+
+def test_online_management_port_replays_and_refuses_reused_identities(tmp_path):
+    """The same operation identity rules hold on the authenticated port, over real HTTP."""
+    path = tmp_path / "served-retry.db"
+    config = write_json(
+        tmp_path / "retry-config.json",
+        {
+            "contracts_path": str(workspace() / "contracts/text-dialogue/v1"),
+            "database_path": str(path),
+            "config_version": None,
+            "policy": {"silence_ms": 5000},
+            "roles": {A: {"version": 1, "persona": "Served persona"}},
+            "bindings": {},
+            "callers": {},
+            "services": {},
+            "personas": {"admin_token_env": ADMIN_TOKEN_ENV},
+        },
+    )
+    port = free_port()
+    url = f"http://127.0.0.1:{port}"
+    environment = dict(os.environ)
+    environment["TIANSHU_COMPANION_CONFIG"] = str(config)
+    environment[ADMIN_TOKEN_ENV] = ADMIN_TOKEN
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "tianshu_companion.app:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--workers",
+            "1",
+        ],
+        cwd=str(ROOT),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=NO_WINDOW,
+    )
+    try:
+        wait_for_health(port, server)
+        first = write_json(tmp_path / "port-one.json", {"persona": "Port persona"})
+        second = write_json(tmp_path / "port-two.json", {"persona": "Other persona"})
+        target = ["--url", url, "--token-env", ADMIN_TOKEN_ENV]
+        request = draft_command(target, request_id="http-retry:1", expected=2, content=first)
+        code, drafted = cli(*request)
+        assert code == 0, drafted
+        revision = drafted["result"]["revision"]["revision_id"]
+
+        code, replay = cli(*request)
+        assert code == 0, replay
+        assert replay == drafted
+
+        code, reused = cli(
+            *draft_command(
+                target,
+                request_id="http-retry:1",
+                expected=drafted["result"]["persona"]["version"],
+                content=second,
+            )
+        )
+        assert code == 1 and reused["code"] == "invalid_input"
+
+        # The approval carries its own identity, and resending it adds no second decision.
+        approved = [
+            "--url",
+            url,
+            "--token-env",
+            ADMIN_TOKEN_ENV,
+            "--subject",
+            A,
+            "--operator",
+            "reviewer:online",
+            "--reason",
+            "reviewed",
+            "--request-id",
+            "http-retry:approve",
+            "--expected",
+            str(drafted["result"]["persona"]["version"]),
+            "--revision",
+            revision,
+            "approve",
+        ]
+        code, approval = cli(*approved)
+        assert code == 0, approval
+        code, again = cli(*approved)
+        assert code == 0, again
+        assert again == approval
+    finally:
+        stop(server)
+
+    # A third interpreter owns the file and sees one draft, one approval and two identities.
+    store = open_owned(path)
+    try:
+        personas = Personas(store, time.time)
+        assert len(personas.revisions(A)) == 2
+        assert len(personas.approvals(A)) == 1
+        assert len(store.list("persona_operations")) == 2
     finally:
         store.close()
 
@@ -340,6 +504,22 @@ def stop(process):
         process.kill()
         process.communicate(timeout=10)
     assert process.poll() is not None
+
+
+def open_owned(path):
+    """Take the owner lock after another process released it.
+
+    The released database keeps its WAL and shared-memory files, and on Windows the OS can
+    still hold a handle on them for a moment after the process is gone, so the first open
+    may fail with a transient I/O error. Nothing about the database is wrong in that case;
+    the retry is bounded and the failure is re-raised if it persists.
+    """
+    for _ in range(100):
+        try:
+            return Store(path)
+        except sqlite3.OperationalError:
+            time.sleep(0.05)
+    return Store(path)
 
 
 def workspace():

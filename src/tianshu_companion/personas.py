@@ -18,6 +18,11 @@ Rules that hold everywhere in here:
   and it is read by `Core` only as the system prompt of a conversation turn.
 - Rolling back publishes a *new* revision carrying an earlier revision's content, so the
   history stays append-only and an old approval can never be revived as current.
+- **A write is identified by its operation, not only by its bytes.** Every write carries a
+  request id, and the whole execution - the business writes and the result - is committed
+  in one transaction under that identity. Replaying the same request returns the recorded
+  result without touching anything; reusing the same request id for a different request is
+  refused. Content addressing deduplicates revisions; it does not deduplicate operations.
 """
 
 import json
@@ -26,12 +31,31 @@ import re
 from .contracts import canonical, digest
 
 REVISION_SUFFIX = "persona-revision/v1"
+OPERATION_SUFFIX = "persona-operation/v1"
 REVISION_SCALARS = (str, int, float, bool, type(None))
 REVISION_TEXT_FIELDS = {"persona": 20000, "tone": 20000, "style": 20000, "address": 4000}
 REVISION_MAX_FIELDS = 16
 IDENTITY_MAX = 128
 MAX_REVISIONS_PER_ACTOR = 512
 MAX_PERSONAS = 256
+# The result document a replayed write returns. Bounded like every other stored field.
+MAX_RESULT_BYTES = 65536
+REQUEST_MAX = 128
+
+# The fields that identify a request. Anything a caller could change and still expect the
+# same operation - content, revision, expected version, operator, reason, note, the
+# deployment entry being drafted from - belongs here; nothing volatile does.
+REQUEST_FIELDS = (
+    "operation",
+    "subject",
+    "content",
+    "from_config",
+    "revision_id",
+    "operator",
+    "expected",
+    "reason",
+    "note",
+)
 
 # Explicit operator identities only. A persona field, a chat message, a recalled memory or a
 # model answer is never an operator identity, and only these two entry points may call
@@ -95,6 +119,36 @@ def _required(request, key):
     if key not in request:
         _invalid("Missing " + key)
     return request[key]
+
+
+def request_identity(value):
+    """A bounded request id. It names one operation, and it is not a privilege."""
+    if not isinstance(value, str) or not value.strip() or len(value) > REQUEST_MAX:
+        _invalid("A bounded request_id is required for every write")
+    return value
+
+
+def operation_key(scope, request_id, operation):
+    """Identity of one write: authorization scope + request id + operation.
+
+    The scope keeps two differently authenticated callers apart, so a request id minted on
+    one surface can never replay or block an operation on another.
+    """
+    return digest(
+        dict(suffix=OPERATION_SUFFIX, scope=scope, request=request_id, operation=operation)
+    )
+
+
+def operation_digest(operation, document):
+    """The normalized request this identity is bound to.
+
+    Same key with a different digest is a different request reusing one identity, and that
+    is refused rather than silently applied. `canonical` makes the comparison independent of
+    key order, so an identical request always digests identically.
+    """
+    payload = {key: document[key] for key in REQUEST_FIELDS if key in document}
+    payload["operation"] = operation
+    return digest(dict(suffix=OPERATION_SUFFIX, request=payload))
 
 
 def normalize(content):
@@ -220,6 +274,60 @@ class Personas:
         item["version"] = (old or {}).get("version", 0) + 1
         self.store.put("persona_" + table, item)
         return item
+
+    # ------------------------------------------------------- operation identities
+
+    def _stored_operation(self, key):
+        return self.store.get("persona_operations", key)
+
+    def _record_operation(self, key, scope, request_id, operation, request_digest, result):
+        """Append one operation outcome. Called inside the write's own transaction."""
+        document = canonical(result)
+        if len(document.encode("utf-8")) > MAX_RESULT_BYTES:
+            _invalid("Operation result is too large to record")
+        return self._save(
+            "operations",
+            dict(
+                id=key,
+                conversation_id=None,
+                sequence=1,
+                state="applied",
+                scope=scope,
+                request_id=request_id,
+                operation=operation,
+                request_digest=request_digest,
+                result=json.loads(document),
+                applied_at=self.clock(),
+            ),
+        )
+
+    def _perform(self, operation, document, execute):
+        """Run one write under its operation identity, atomically with its result.
+
+        The ledger row and the business writes share one transaction, so a response that is
+        lost in transit can be retried: the retry finds the recorded outcome and returns it
+        instead of running the write a second time. A different request reusing the same
+        identity is refused; a *different* request with a stale `expected` version still
+        fails with `version_conflict`, because that check is not replaced by this one.
+        """
+        request_id = request_identity(_required(document, "request_id"))
+        scope = document.get("scope") or "local"
+        if not isinstance(scope, str) or not scope.strip() or len(scope) > IDENTITY_MAX:
+            _invalid("Invalid operation scope")
+        key = operation_key(scope, request_id, operation)
+        request_digest = operation_digest(operation, document)
+        with self.store.transaction():
+            stored = self._stored_operation(key)
+            if stored is not None:
+                if stored["request_digest"] != request_digest:
+                    _invalid(
+                        "This request_id is already bound to a different request; "
+                        "use a new request_id"
+                    )
+                return json.loads(canonical(stored["result"]))
+            result = execute()
+            self._record_operation(key, scope, request_id, operation, request_digest, result)
+        return result
 
     def _write_revision(self, subject, content, source, operator, parent, created_at, note=None):
         """Write-once. An existing row with the same id is verified, never overwritten."""
@@ -624,6 +732,10 @@ class Personas:
         same operation document here, so no rule is implemented twice and no entry point
         touches the persona tables directly. The host authenticates the caller before this
         runs; this method only sees an already-authorised operator identity.
+
+        A write must carry `request_id`. `scope` optionally names the authorization surface
+        that issued it and defaults to the local one; it partitions operation identities and
+        is never read as a permission.
         """
         if not isinstance(request, dict):
             _invalid("Invalid persona operation")
@@ -639,6 +751,9 @@ class Personas:
                 personas=[self.get(actor) for actor in subjects],
             )
         if operation == "import":
+            # The deployment import keeps its own idempotence: the document digest is the
+            # key, so replaying one deployment is already a no-op that reports itself as
+            # skipped, and a changed document is a new import rather than a reuse.
             if "config" in request:
                 result = self.import_config(request["config"])
             else:
@@ -656,46 +771,64 @@ class Personas:
         if operation == "capabilities":
             return dict(schema_version=1, operation=operation, **self.capabilities(subject))
         if operation == "draft":
-            result = self.draft(
+            result = self._submit(
+                operation,
+                request,
                 subject,
-                request.get("content"),
-                operator=_required(request, "operator"),
-                expected=_required(request, "expected"),
-                reason=_required(request, "reason"),
-                note=request.get("note"),
-                from_config=request.get("from_config"),
+                dict(
+                    content=request.get("content"),
+                    operator=_required(request, "operator"),
+                    expected=_required(request, "expected"),
+                    reason=_required(request, "reason"),
+                    note=request.get("note"),
+                    from_config=request.get("from_config"),
+                ),
             )
             return dict(schema_version=1, operation=operation, **result)
         if operation in {"approve", "reject"}:
-            method = self.approve if operation == "approve" else self.reject
-            persona = method(
+            persona = self._submit(
+                operation,
+                request,
                 subject,
-                _required(request, "revision_id"),
-                operator=_required(request, "operator"),
-                expected=_required(request, "expected"),
-                reason=_required(request, "reason"),
+                dict(
+                    revision_id=_required(request, "revision_id"),
+                    operator=_required(request, "operator"),
+                    expected=_required(request, "expected"),
+                    reason=_required(request, "reason"),
+                ),
             )
             return dict(schema_version=1, operation=operation, persona=persona)
         if operation in {"publish", "rollback"}:
-            method = self.publish if operation == "publish" else self.rollback
-            result = method(
+            result = self._submit(
+                operation,
+                request,
                 subject,
-                _required(request, "revision_id"),
-                operator=_required(request, "operator"),
-                expected=_required(request, "expected"),
-                reason=_required(request, "reason"),
+                dict(
+                    revision_id=_required(request, "revision_id"),
+                    operator=_required(request, "operator"),
+                    expected=_required(request, "expected"),
+                    reason=_required(request, "reason"),
+                ),
             )
             return dict(schema_version=1, operation=operation, **result)
         if operation in {"retire", "restore"}:
-            method = self.retire if operation == "retire" else self.restore
-            persona = method(
+            persona = self._submit(
+                operation,
+                request,
                 subject,
-                operator=_required(request, "operator"),
-                expected=_required(request, "expected"),
-                reason=_required(request, "reason"),
+                dict(
+                    operator=_required(request, "operator"),
+                    expected=_required(request, "expected"),
+                    reason=_required(request, "reason"),
+                ),
             )
             return dict(schema_version=1, operation=operation, persona=persona)
         _invalid("Unknown persona operation")
+
+    def _submit(self, operation, request, subject, options):
+        """One write, wrapped in its operation identity before any rule runs."""
+        method = getattr(self, operation)
+        return self._perform(operation, request, lambda: method(subject, **options))
 
     # ------------------------------------------------------------------- writing
 
@@ -741,7 +874,13 @@ class Personas:
         return dict(persona=self.get(subject), revision=self._view(revision["id"]))
 
     def approve(self, subject, revision_id, *, operator, expected, reason):
-        """Explicit approval of exactly one revision. Model and chat text never call this."""
+        """Explicit approval of exactly one revision. Model and chat text never call this.
+
+        Approval is a visible state change, so it advances the persona version like every
+        other write: `expected` covers the approval state too, and two operators cannot both
+        approve the same pending draft without one of them seeing a stale version. The
+        decision row is still append-only, so nothing here rewrites history.
+        """
         actor_id(subject)
         operator = identity(operator)
         _expected(expected)
@@ -756,6 +895,8 @@ class Personas:
                 or persona["published_revision"] == revision["id"]
             ):
                 _invalid("Only the pending draft of this character can be approved")
+            if persona["retired"]:
+                _invalid("A retired character cannot be approved; restore it first")
             self._save(
                 "approvals",
                 dict(
@@ -781,6 +922,17 @@ class Personas:
                     reason=reason,
                     created_at=self.clock(),
                 ),
+            )
+            self._save(
+                "personas",
+                dict(
+                    persona,
+                    state="approved",
+                    approved_at=self.clock(),
+                    approved_by=operator,
+                    updated_at=self.clock(),
+                ),
+                expected=persona["version"],
             )
         return self.get(subject)
 

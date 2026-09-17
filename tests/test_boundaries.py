@@ -306,6 +306,7 @@ class PersonaBoundaryTests(unittest.TestCase):
             "persona_rollbacks",
             "persona_imports",
             "persona_access",
+            "persona_operations",
         )
         owners = {"personas.py": None, "store.py": None}
         for path in sorted(
@@ -343,6 +344,31 @@ class PersonaBoundaryTests(unittest.TestCase):
         self.assertNotIn("store.list", source)
         self.assertEqual(1, source.count(".manage("))
         self.assertIn("from .store import Store", source)
+
+    def test_only_the_persona_domain_owns_operation_idempotence(self):
+        """One module decides what "the same request" means; the adapters only carry it."""
+        domain = self.source("personas.py")
+        self.assertIn("persona_operations", domain)
+        self.assertIn("operation_key", domain)
+        # The digest is what binds an identity to a request, and the ledger row is written
+        # in the same transaction as the business write rather than beside it.
+        self.assertIn("operation_digest", domain)
+        self.assertEqual(1, domain.count("self._record_operation("))
+        for name in ("core.py", "app.py", "persona_cli.py"):
+            source = self.source(name)
+            for word in ("request_digest", "operation_key", "persona_operations"):
+                self.assertNotIn(word, source, f"{name} re-implements operation identity")
+        # The HTTP adapter records which authorization surface authenticated the caller;
+        # the CLI carries an identity through and never inspects it.
+        self.assertIn("dict(request, scope=service)", self.source("core.py"))
+        self.assertIn("request_id", self.source("persona_cli.py"))
+        self.assertNotIn("request_digest", self.source("persona_cli.py"))
+
+    def test_store_transactions_are_reentrant_and_commit_once(self):
+        """A composed write - business rows plus its ledger row - is one atomic step."""
+        source = self.source("store.py")
+        self.assertIn("if self._in_transaction:", source)
+        self.assertEqual(1, source.count('"BEGIN IMMEDIATE"'))
 
     def test_direct_send_path_has_no_persona_dependency(self):
         source = self.source("direct.py")

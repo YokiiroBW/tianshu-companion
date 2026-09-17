@@ -12,11 +12,11 @@
 
 | 单元 | 拥有的职责 | 只允许依赖 | 明确不拥有 |
 | --- | --- | --- | --- |
-| `personas.Personas`（领域+用例） | 草稿/修订不可变、批准、发布指针、回退为**新修订**、撤权、导入游标、快照钉取与校验、`manage(request)` 唯一应用入口 | `Store` 的通用连接/事务/读写、`digest`/`canonical` | 角色权限与登记、来源登记、模型绑定、发送资格、Memory 关系数据、HTTP、CLI 参数、Direct 发送顺序 |
+| `personas.Personas`（领域+用例） | 草稿/修订不可变、批准、发布指针、回退为**新修订**、撤权、导入游标、快照钉取与校验、**操作幂等账本**、`manage(request)` 唯一应用入口 | `Store` 的通用连接/事务/读写、`digest`/`canonical` | 角色权限与登记、来源登记、模型绑定、发送资格、Memory 关系数据、HTTP、CLI 参数、Direct 发送顺序 |
 | `core.Core` | 在**既有准备边界**调用 `personas.pin(actor)` 取快照并把 `config_version` 写进 turn；每次模型调用前 `personas.verify(role)`；把 `PersonaError` 映射为本模块既有 `Fault` | `personas` 的四个公开方法：`pin`/`verify`/`recover`/`manage`/`import_config` | 草稿、批准、发布、回退、历史等业务规则；persona 表名（`test_boundaries.py` 结构断言禁止） |
-| `persona_cli`（适配器） | 参数解析 → 一个操作文档 → `Personas.manage`；离线用 `--database` 自持 owner 锁，在线用 `--url` 走管理端口 | `personas.manage`、`personas.deployment`（部署形状唯一规则）、`Store` | 任何人格规则、任何表名、任何直接写入、绕过单所有者 |
-| `app.create_app`（HTTP 适配器） | 只做鉴权 + 分发：`POST /internal/v1/persona/manage` → `core.manage_persona(service, body)` | `core.manage_persona` | 业务规则（`manage_persona` 本身只是"人设是否启用/是否 `persona_admin`"两件事的适配器） |
-| `store.Store` | 连接、事务、owner 锁、结构迁移与恢复备份 | `sqlite3` | 人格语义；`PERSONA_TABLES` 只出现在 `store.py` 的表清单里 |
+| `persona_cli`（适配器） | 参数解析 → 一个操作文档 → `Personas.manage`；离线用 `--database` 自持 owner 锁，在线用 `--url` 走管理端口；`--request-id` 只做透传，缺失时生成一次性 id | `personas.manage`、`personas.deployment`（部署形状唯一规则）、`Store` | 任何人格规则、任何表名、任何直接写入、绕过单所有者、自行判断"是否重复请求" |
+| `app.create_app`（HTTP 适配器） | 只做鉴权 + 分发：`POST /internal/v1/persona/manage` → `core.manage_persona(service, body)` | `core.manage_persona` | 业务规则（`manage_persona` 本身只是"人设是否启用/是否 `persona_admin`"、把已鉴权服务记为授权域三件事的适配器） |
+| `store.Store` | 连接、事务、owner 锁、结构迁移与恢复备份、**可重入事务**（内层 `with transaction()` 加入外层，只有最外层提交/回滚） | `sqlite3` | 人格语义；`PERSONA_TABLES` 只出现在 `store.py` 的表清单里 |
 | 角色/来源/绑定/发送（既有模块） | 权限、来源登记、模型绑定、发送资格 | 不变 | 人格文本永远改不动它们 |
 | Memory / Direct | 关系数据、功能指令与出站排序 | 不变 | 人格管理不写 Memory 关系数据、不碰 TS-024 顺序 |
 
@@ -38,6 +38,8 @@ personas.manage({
     "reason": "语气过于生硬",         # 有界理由，随事实一起留存
     "expected": 7,                   # 乐观并发：写入者看到的 persona 版本
     "revision_id": "<sha256>",
+    "request_id": "release-2026-09-17-1",  # 写入必填：这次操作的唯一身份
+    "scope": "persona_cli",          # 可选：签发该请求的授权域，默认 "local"
 })
 ```
 
@@ -47,7 +49,7 @@ personas.manage({
 python -m tianshu_companion.persona_cli --database .runtime/companion.db list
 python -m tianshu_companion.persona_cli --database .runtime/companion.db \
     --subject actor:companion --operator admin:1 --reason "语气调整" --expected 3 \
-    --content persona.json draft
+    --request-id release-2026-09-17-1 --content persona.json draft
 ```
 
 在线维护（自带独立管理凭据，与聊天/入站/桥接凭据分离）：
@@ -61,6 +63,36 @@ python -m tianshu_companion.persona_cli --url http://127.0.0.1:8765 list
   补救办法是停服，或改用 `--url` 走已鉴权的管理端口。
 - 没有任何 `callers` 凭据能到达人格写入：管理端口只认 `personas.admin_token_env`
   指定的那一个凭据（服务 `persona_admin`）；未配置时该端口不是"开放"，而是不可用（503）。
+
+## 操作幂等（请求身份与结果账本）
+
+**内容寻址只去重"修订正文"，不能替代"操作去重"。** 同一份文本再次提交是重放一条修订；
+但"这次请求是否已经执行过"必须由操作身份回答，否则重发会变成第二次事实、丢失的响应永远
+无法安全重试。规则：
+
+- **身份**：`request_id`（有界、必填）与签发它的授权域 `scope`（默认 `local`，管理端口记
+  已鉴权的服务名，CLI 记 `persona_cli`）共同构成一次写入的身份
+  `operation_key = digest({scope, request, operation})`。**每个写操作都要身份**（`draft`/
+  `approve`/`reject`/`publish`/`rollback`/`retire`/`restore`）；读操作（`list`/`get`/
+  `history`/`capabilities`）不需要。缺少身份时写入被拒（`invalid_input`），不会退化成
+  "执行但不记账"。
+- **绑定**：身份绑定一个**规范化请求摘要**（`canonical` 序列化的
+  `{operation, subject, content, from_config, revision_id, operator, expected, reason, note}`）。
+  键相同而摘要不同 = 另一个请求冒用同一身份 → 拒绝（`invalid_input`），并且**不产生任何写入**。
+  键相同且摘要相同 = 重放：返回**首次执行时记录的结果**，不再执行业务规则，也不再写任何事实。
+- **原子**：业务写入与账本行在**同一个 SQLite 事务**里提交（`Store.transaction()` 可重入，
+  内层加入外层，只有最外层提交/回滚），因此不存在"写了事实但没记结果"或反之的窗口。
+- **持久**：账本在 `persona_operations` 表里，重启后同一请求仍然重放同一结果；两把凭据
+  的两个授权域互不干扰（一个域不能重放或阻塞另一个域的请求）。
+- **不替代 CAS**：重放命中账本才跳过 `expected` 检查；**不同**请求带着过期 `expected`
+  依然返回 `version_conflict`，不会被"见过这个身份"变成成功。
+- **导入例外（既有语义，明确界定）**：`import` 的幂等键是**部署文档指纹**
+  （`persona_imports` 游标），同一文档重放返回 `skipped`，文档变化则是新导入；它不参与
+  `request_id` 账本，也不被账本覆盖。
+- **批准推进版本**：`approve` 改变可见状态（`state` 由 `draft` 变 `approved`、写入
+  `approved_at`/`approved_by`），因此**和其他写入一样推进 persona 版本**：`expected`
+  覆盖审批状态，两个操作者不能凭同一次旧读取各自批准同一份待决草稿（后者得
+  `version_conflict`）。决定行仍然只追加，不回写历史。
 
 ## 不变量
 
@@ -82,6 +114,11 @@ python -m tianshu_companion.persona_cli --url http://127.0.0.1:8765 list
    角色权限、来源、绑定、发送资格、Memory 关系数据。
 8. **撤权不复活**：`retire` 让该角色不再参与新的准备；已准备的轮次不受影响；
    `restore` 是唯一恢复方式。
+9. **写入按操作去重**：一次写入 = 一个 `request_id` + 一个规范化请求摘要 + 一条原子记录的
+   结果。重放返回原结果、不重复落事实；同键异请求被拒；过期 `expected` 仍是
+   `version_conflict`（见上一节）。
+10. **审批状态也在乐观并发内**：任何改变可见状态的写入（含 `approve`）都推进 persona
+    版本号，因此"我看到的那一版"同时覆盖指针与审批状态。
 
 ## 数据模型
 
@@ -94,6 +131,7 @@ python -m tianshu_companion.persona_cli --url http://127.0.0.1:8765 list
 | `persona_rollbacks` | 回退溯源：`target_revision`（被回退到的旧修订）与 `restored_revision`（新修订） |
 | `persona_imports` | 按部署文档指纹的导入游标（同一部署重放为 `skipped`） |
 | `persona_access` | 读取授权登记（谁可以读某个角色的历史） |
+| `persona_operations` | **操作账本**：一次写入的身份（`scope` + `request_id` + `operation` 的摘要、主键）它绑定的规范化请求摘要，以及首次执行时提交的结果文档；与业务写入同事务，重启后仍可重放 |
 
 ## 部署配置
 
@@ -116,14 +154,16 @@ python -m tianshu_companion.persona_cli --url http://127.0.0.1:8765 list
 
 ## 数据库与迁移
 
-数据库 `user_version=8`。打开低于 v8 的库且文件不是 `:memory:` 时，先做一次完整视图
-（含 WAL）的 SQLite backup 到 `<database>.pre-persona-v8-<random>.bak`，再在同一事务内
-创建 7 张 `persona_*` 表与索引并提升版本号；失败时回滚 DDL 与版本、释放 owner 锁。
+数据库 `user_version=9`。打开低于 v9 的库且文件不是 `:memory:` 时，先做一次完整视图
+（含 WAL）的 SQLite backup，再在同一事务内创建缺失的 `persona_*` 表（含操作账本）与索引
+并提升版本号；失败时回滚 DDL 与版本、释放 owner 锁。备份标签取**本次打开所跨越的最高结构
+步骤**：从 v8 打开得到 `<database>.pre-persona-ops-v9-<random>.bak`，从 v7 打开得到
+`<database>.pre-persona-v8-<random>.bak`（v8 是它跨越的最高人格步骤）。
 既有 `pre-source-v2`/`pre-life-v3`/`pre-images-v4`/`pre-writing-v5`/`pre-proactive-v6`/
 `pre-routing-v7` 流程不变，旧对话事实与 `source_head` 不变。
 
 **跨多个版本的一次升级只取一份恢复备份**（落在最高的那个结构步骤上，例如
-v5→v8 得到 `pre-persona-v8`，不会额外为 v6/v7 再各写一份）。这是本产品既有备份流程的
+v5→v9 得到 `pre-persona-ops-v9`，不会额外为 v6/v7/v8 再各写一份）。这是本产品既有备份流程的
 既有语义（每次打开最多一份、标签取本次跳升的最高步骤），本轮复用而未改动；
 需要某一中间版本的可恢复点时应从对应版本分步升级。
 
@@ -141,10 +181,13 @@ v5→v8 得到 `pre-persona-v8`，不会额外为 v6/v7 再各写一份）。这
 ## 实际验证
 
 - `python -m pytest tests/test_personas.py -q`：领域与用例、快照时序、损坏快照、
-  跨角色隔离、回退、撤权、恢复报告、边界形态、迁移与失败恢复。
+  跨角色隔离、回退、撤权、恢复报告、边界形态、迁移与失败恢复，以及**操作身份**：
+  重放返回记录结果且不重复落事实、同键异内容被拒、缺身份被拒、批准重试不追加决定、
+  过期版本不能靠身份变成成功、身份跨重启与跨授权域。
 - `python -m pytest tests/test_persona_chain.py -q`：**真实 CLI 子进程**（独立解释器 +
   隔离数据库）走完 draft→approve→publish→history，服务持锁时拒绝写入，
-  以及**真实回环服务**上的管理端口 + 独立凭据 + 离线复读同一状态。
+  重发同一 `--request-id` 命中账本、换内容复用同一 id 被拒，
+  以及**真实回环服务**上的管理端口 + 独立凭据 + 草案/批准两次重放 + 离线复读同一状态。
 - `python -m pytest tests/test_boundaries.py -q -k PersonaBoundary`：职责与依赖结构断言。
 - `python -m pytest -q`：完整组件套件见交接记录。
 - `python -m ruff format --check src integrations tests scripts`、
