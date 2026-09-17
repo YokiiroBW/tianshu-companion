@@ -160,9 +160,17 @@ core.direct.revoke_command("companion.synthetic.query", reason="operator_revoked
 所以由 Core 统一发放会话出站序号（`conversations.send_band` / `send_band_owner`，单元是轮次或
 直接请求），投递时**每个单元按自己的当前号重新判定**：
 
-- 单元自己的号 `>= send_band`（号唯一，相等只可能是自己）→ **沿用自己的号**，同一轮的所有
-  分段共用一个号，回执、重试与整轮身份都不变；
-- 否则 → **取 `max(turn_sequence, send_band) + 1` 的新号**（只在被别人超越后发生一次）。
+- 单元自己的号 `> send_band` → **沿用**（水位以上的号按构造从未发出去过）；
+- 号 `== send_band` 且 `send_band_owner` **就是本单元** → **沿用**：同一轮的所有分段共用一个号，
+  回执、重试与整轮身份都不变；
+- 否则（号更低，或号相等但归属别人）→ **取 `max(turn_sequence, send_band) + 1` 的新号**。
+
+**为什么相等也必须核对归属**：封盘号（`turn_sequence`）与出站号（`send_band`）是两套计数器。
+功能回复取号**不会**封盘，所以之后新入站聊天封盘时可能拿到一个**已经被功能回复用掉**的号
+（实测：功能回复用掉 band 2 → 新聊天封盘 `sequence=2`）。若只按数字判"是自己的"，该轮就会复用
+别人的 band，`Bridge.send` 视 `201` 为旧位置拒绝，**整轮聊天一条都发不出去**。
+归属只由持久记录决定（`send_band_owner` = 轮次 id 或直接请求 id，两者前缀不同、不可能相同），
+不靠数字巧合。
 
 功能回复投递前还要过一道**合法消息边界**：若该会话当前的号仍被一个**已经开始发送**的陪伴轮次
 持有（`turns.send_sequence` 已分配，或该轮已有分段离开 `pending`），功能回复不抢号、不改号，而是
@@ -179,6 +187,8 @@ core.direct.revoke_command("companion.synthetic.query", reason="operator_revoked
   （回执、投递超时或对账窗口封顶），届时功能回复照发；
 - 重启后不靠内存推断：号与会话记录都在库里；已被对账成 `sent` 的旧轮次若号已被超越，它的下一个
   分段取新号，不会重发已发过的分段（老位置的去重仍由 `reply_id` 负责）。
+- 功能回复**先发完**、之后才入站的新聊天同样安全：新轮次的封盘号若正好等于别人用过的号，
+  归属核对会判它不属于本轮，本轮改取水位之上的新号（单条与连续功能都有回归）。
 
 定向回归（真实 `Bridge`，同一出口）：
 `tests/test_routing.py::test_a_functional_reply_between_chat_segments_does_not_lose_the_next_segment`
@@ -188,7 +198,10 @@ core.direct.revoke_command("companion.synthetic.query", reason="operator_revoked
 `test_concurrent_functional_and_chat_sends_never_duplicate_a_segment`、
 `test_a_cancelled_turn_releases_the_boundary_for_a_waiting_functional_reply`、
 `test_a_restart_between_chat_segments_still_delivers_each_segment_once`、
-`test_a_functional_reply_never_costs_a_pending_chat_turn_its_reply`。
+`test_a_functional_reply_never_costs_a_pending_chat_turn_its_reply`、
+`test_a_chat_turn_after_a_functional_reply_never_reuses_its_band`（功能发完才入站的新聊天）、
+`test_consecutive_functional_replies_then_a_new_chat_turn_keep_every_segment`（连续功能同理）、
+`test_a_band_is_only_ever_reused_by_the_unit_that_owns_it`（归属规则本身）。
 
 ### 投递意图与重启恢复（`completed + submitting`）
 
@@ -300,6 +313,8 @@ v6→v7 迁移备份/回滚/水位不变，以及本轮的共享出口顺序与�
   不重复，一个轮次的分段始终在同一个号里；
 - 多次功能抢占、慢 IO、并发 worker、轮次被取消、发送中途重启：每种几何下应发的每条
   都恰好发出一次；
+- 功能回复发完**之后**才入站的新聊天（单条与连续功能）：封盘号即使等于别人用过的号，
+  本轮也取新号，两个分段恰好送达且位置严格递增；
 - 已提交投递意图（`completed + submitting`）跨真实重开连接：恢复成 `unknown` 且
   `unresolved`，不重跑功能、不伪造未送达、不自动重发，只用同一份投递证据
   把 sent / failed / 仍未知三种结论分别落地，晚到旧 attempt 回包不改写结论。

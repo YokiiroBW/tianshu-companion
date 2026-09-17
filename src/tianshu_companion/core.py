@@ -208,7 +208,7 @@ class Core:
         """Place one reply unit in the conversation's single increasing outbound order.
 
         The shared exit accepts one strictly increasing position per conversation
-        (`turn_sequence * 100 + segment_sequence`), so a unit may only reuse its own band
+        (`turn_sequence * 100 + segment_sequence`), so a unit may only reuse **its own** band
         while nothing else has taken a later one - otherwise the exit rejects the reply as an
         older position and that segment is lost. Every unit therefore takes its band here:
 
@@ -221,6 +221,13 @@ class Core:
           split. If a turn was already parked (unknown/cancelled) when another unit overtook
           it, its next segment simply takes a fresh band instead of being rejected.
 
+        Reuse is never inferred from the number alone. Seal order (`turn_sequence`) and outbound
+        order (`send_band`) are two counters: a functional reply takes a band without sealing a
+        turn, so a later seal can carry a number that is already another unit's band. A band is
+        therefore reusable only when it is above every band handed out so far, or when the
+        recorded owner is this very unit - `current == high` with a different owner is a
+        collision and must allocate instead of reusing.
+
         Returns `(band, waiting_on)`. `waiting_on` names the turn that must finish first, and
         `band` is None only when the conversation row is gone (caller keeps its own value).
         """
@@ -232,12 +239,14 @@ class Core:
             if owner is not None:
                 return None, owner
         high = conversation.get("send_band") or 0
-        if current is not None and current >= high:
-            # This unit still owns the last band (bands are unique, so `current == high` can
-            # only be this unit's own): reuse it, so all of its segments stay one ordered
-            # unit instead of being renumbered on every segment. The high-water mark moves up
-            # with it, otherwise a later unit could be given a band below this one and this
-            # unit's remaining segments would be rejected as older positions.
+        owner = conversation.get("send_band_owner")
+        if current is not None and (current > high or (current == high and owner == unit_id)):
+            # `current > high` is unused by construction (the mark only ever rises), and
+            # `current == high` is this unit's own band only when the owner says so. Reusing it
+            # keeps all of the unit's segments in one ordered band, so its identity survives
+            # for receipts, retries and restarts. The high-water mark moves up with it,
+            # otherwise a later unit could be given a band below this one and this unit's
+            # remaining segments would be rejected as older positions.
             conversation["send_band"] = current
             conversation["send_band_owner"] = unit_id
             self.store.put("conversations", conversation)

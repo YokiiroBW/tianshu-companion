@@ -1473,11 +1473,20 @@ class Direct:
             conversation = self.store.get("conversations", conversation_key)
             if conversation is None:
                 return None, None
-            conversation["turn_sequence"] += 1
-            conversation["send_band"] = conversation["turn_sequence"]
+            # No host coordinator: still never step below a band already handed out, so the
+            # conversation's outbound mark stays monotone on this path too.
+            band = (
+                max(
+                    conversation.get("turn_sequence", 0),
+                    conversation.get("send_band") or 0,
+                )
+                + 1
+            )
+            conversation["turn_sequence"] = band
+            conversation["send_band"] = band
             conversation["send_band_owner"] = request["id"]
             self.store.put("conversations", conversation)
-            return conversation["turn_sequence"], None
+            return band, None
         band, waiting = self.bands(
             conversation_key, unit_id=request["id"], current=None, wait_for_turn=True
         )

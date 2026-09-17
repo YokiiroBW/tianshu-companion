@@ -1448,6 +1448,121 @@ def test_repeated_functional_replies_cannot_overtake_a_turn_between_segments():
     asyncio.run(scenario())
 
 
+def test_a_chat_turn_after_a_functional_reply_never_reuses_its_band():
+    """A seal number can equal a band a functional reply already used; ownership decides."""
+
+    async def scenario():
+        h = Harness()
+        register(h, query_spec())
+        await establish(h)
+        exit_ = SharedExit(h)
+        try:
+            # Turn 1 completes first, at band 1.
+            assert [t["phase"] for t in h.turns()] == ["sent"]
+            entry = await h.core.direct_command("nonebot", h.request(text="/查询 first"))
+            await h.core.direct.work()
+            assert h.core.direct.request_view(entry["request"]["id"])["delivery_verified"]
+            assert exit_.positions == [201]
+            conversation = h.core.store.get("conversations", digest(exit_.channel))
+            # The functional reply took the outbound mark without sealing a turn.
+            assert (conversation["send_band"], conversation["send_band_owner"]) == (
+                2,
+                entry["request"]["id"],
+            )
+            # Only now does a new chat message arrive: it seals as turn 2, whose number equals
+            # the band the functional reply already used. That number is not this turn's band.
+            await h.ingest(text="direct 完成后的新聊天")
+            h.clock.advance(6)
+            await h.cycles(60)
+            turn = [t for t in h.turns() if t["sequence"] == 2][0]
+            assert turn["phase"] == "sent"
+            # Every segment went out exactly once, above the functional reply, in one band.
+            assert exit_.positions == [201, 301, 302]
+            assert exit_.chat_segments() == ["合成回复一", "合成回复二"]
+            assert len(exit_.native) == 3
+            assert turn["send_sequence"] == 3
+            conversation = h.core.store.get("conversations", digest(exit_.channel))
+            assert conversation["send_band"] == 3
+        finally:
+            exit_.close()
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_consecutive_functional_replies_then_a_new_chat_turn_keep_every_segment():
+    async def scenario():
+        h = Harness()
+        register(h, query_spec())
+        await establish(h)
+        exit_ = SharedExit(h)
+        try:
+            entries = [
+                await h.core.direct_command("nonebot", h.request(text="/查询 %d" % index))
+                for index in range(3)
+            ]
+            # Three functional replies in flight at once; the worker takes them in bounded
+            # position order, so drive it until every one of them is verified.
+            for _ in range(12):
+                await h.core.direct.work()
+                if all(
+                    h.core.direct.request_view(entry["request"]["id"])["delivery_verified"]
+                    for entry in entries
+                ):
+                    break
+            # Each functional reply took its own band while no turn was sending.
+            assert exit_.positions == [201, 301, 401]
+            assert len(exit_.functional()) == 3
+            await h.ingest(text="连续功能后的新聊天")
+            h.clock.advance(6)
+            await h.cycles(60)
+            turn = [t for t in h.turns() if t["sequence"] == 2][0]
+            assert turn["phase"] == "sent"
+            # The turn's seal number (2) is below every used band, so it takes a fresh one and
+            # its segments stay together above the functional replies.
+            assert exit_.positions == [201, 301, 401, 501, 502]
+            assert exit_.chat_segments() == ["合成回复一", "合成回复二"]
+            assert len(exit_.native) == 5
+            assert turn["send_sequence"] == 5
+            positions = exit_.positions
+            assert positions == sorted(positions) and len(set(positions)) == 5
+        finally:
+            exit_.close()
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_band_is_only_ever_reused_by_the_unit_that_owns_it():
+    """Direct unit check of the ownership rule behind the shared outbound mark."""
+
+    async def scenario():
+        h = Harness()
+        register(h, query_spec())
+        await establish(h)
+        key = digest(h.request()["message_key"]["channel"])
+        # Turn 1 already used band 1, so a functional reply takes the next band.
+        first, waiting = h.core.open_send_band(key, unit_id="direct:one", current=None)
+        assert (first, waiting) == (2, None)
+        # A different unit whose number equals the mark must not take it: equal is not "mine".
+        second, _ = h.core.open_send_band(key, unit_id="turn:two", current=2)
+        assert second == 3
+        # A unit whose old band is below the mark always moves on, even its previous owner.
+        again, _ = h.core.open_send_band(key, unit_id="direct:one", current=2)
+        assert again == 4
+        # Equal to the mark and owned by another unit: a fresh band, never a reuse.
+        third, _ = h.core.open_send_band(key, unit_id="turn:four", current=4)
+        assert third == 5
+        # Equal to the mark and owned by this unit: reuse keeps it one ordered band.
+        owned, _ = h.core.open_send_band(key, unit_id="turn:four", current=5)
+        assert owned == 5
+        conversation = h.core.store.get("conversations", key)
+        assert (conversation["send_band"], conversation["send_band_owner"]) == (5, "turn:four")
+        await h.core.close()
+
+    asyncio.run(scenario())
+
+
 def test_functional_replies_before_a_turn_keep_the_turn_in_one_band():
     async def scenario():
         h = Harness()
