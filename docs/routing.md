@@ -131,7 +131,9 @@ core.direct.revoke_command("companion.synthetic.query", reason="operator_revoked
   `redeliver=True` 只在最近一次投递 `failed` 且回执 `retry_safe is True`（桥接已证实
   未执行）时允许，`reply_id` 不变，桥接仍会去重。`unknown` 只能靠 `reconcile()` 只读核对。
 - `recover()`：`dispatching` → `unknown("interrupted_dependency_call")`，
-  `awaiting_result` → `unknown("interrupted_task")`；已完成的执行不会被重跑。
+  `awaiting_result` → `unknown("interrupted_task")`；已完成的执行不会被重跑；
+  已提交投递意图（`submitting`）的行同样收口成 `unknown` + `unresolved`，
+  见下文「投递意图与重启恢复」。
 
 ## 回复投递复用既有出口
 
@@ -145,22 +147,70 @@ core.direct.revoke_command("companion.synthetic.query", reason="operator_revoked
 目的地核验、`reply_id` 去重、`unknown` 纪律都已经在里面）；Core 与桥接分进程时注入既有
 `Sender` 客户端即可，两者落到同一个 `Bridge.send`。
 
-### 共用一个出口时的顺序（`direct_sequence` / `send_sequence`）
+### 共用一个出口时的顺序（会话出站序号 `send_band`）
 
 `Bridge.send` 对同一会话只接受**严格递增**的位置（`turn_sequence * 100 + segment_sequence`），
 拒绝更小的位置为 `version_conflict`。陪伴链在**封盘时**分配 `turn_sequence`，而功能回复在
-**投递时**从同一个会话计数器取号——因此可能出现「先封盘、后投递」的陪伴轮次位置低于已经
-发出的功能回执。若不处理，`Bridge.send` 会拒绝该轮次，**用户就丢了一条聊天回复**（实测：该轮
-落到 `reconciling` / `delivery_unknown`）。
+**投递时**取号——因此一个「先封盘、后投递」的陪伴轮次位置可能低于已经发出的功能回执，
+`Bridge.send` 会拒绝它，**用户就丢了一条聊天回复**。
 
-所以两条规则：
+号只能发一次，且一个轮次的所有分段必须落在同一个号里（否则同一条回复会横跨两个位置）。
+网关已限制一轮至多 16 个分段（`len(segments) > 16` 即 `invalid_input`），所以
+`号 * 100 + 分段号` 的编码在号递增时不会与别的号段相撞。
+所以由 Core 统一发放会话出站序号（`conversations.send_band` / `send_band_owner`，单元是轮次或
+直接请求），投递时**每个单元按自己的当前号重新判定**：
 
-- 功能回复投递时把用掉的号记在会话上（`conversations.direct_sequence`）；
-- 陪伴轮次在投递时若发现自己的号 `<= direct_sequence`，就**整体挪到下一个空位**
-  （记在轮次上 `send_sequence`，同一轮的所有分段共用这个号），而不是被拒绝。
+- 单元自己的号 `>= send_band`（号唯一，相等只可能是自己）→ **沿用自己的号**，同一轮的所有
+  分段共用一个号，回执、重试与整轮身份都不变；
+- 否则 → **取 `max(turn_sequence, send_band) + 1` 的新号**（只在被别人超越后发生一次）。
 
-结果是：功能回执不必等聊天模型完成（不排队），聊天回复也一条不丢，共享出口仍然只看到
-一个递增顺序。定向回归：`tests/test_routing.py::test_a_functional_reply_never_costs_a_pending_chat_turn_its_reply`。
+功能回复投递前还要过一道**合法消息边界**：若该会话当前的号仍被一个**已经开始发送**的陪伴轮次
+持有（`turns.send_sequence` 已分配，或该轮已有分段离开 `pending`），功能回复不抢号、不改号，而是
+把请求留在 `completed + ready_to_deliver`，记 `deferred_reason="outbound_band_busy"` 与
+`deferred_on=<轮次id>`。轮次到达终态后 `Core.tick` 立即唤起一次 direct worker，把等待的功能回复
+按**下一个号**发出。
+
+- **不等于排队等聊天模型**：还没开始发送的轮次（仍在生成/准备）不持有边界，功能回复照常立刻取号，
+  该轮稍后发自己的分段时自然拿到**更高**的号。等待只发生在「该轮的分段已经在出口排队」这个
+  消息边界上，模型早已产出文本；
+- 无序抢占会真的丢分段：若功能回复先取到 `501`，该轮在途的第二段 `402` 会被 `Bridge.send`
+  判为旧位置而失败——所以这里宁可等边界，也不让功能回执夺走在途聊天轮次的分段；
+- 边界等待有界：持有边界的轮次最终一定进入 `sent`/`failed`/`cancelled`/`closed_unknown`
+  （回执、投递超时或对账窗口封顶），届时功能回复照发；
+- 重启后不靠内存推断：号与会话记录都在库里；已被对账成 `sent` 的旧轮次若号已被超越，它的下一个
+  分段取新号，不会重发已发过的分段（老位置的去重仍由 `reply_id` 负责）。
+
+定向回归（真实 `Bridge`，同一出口）：
+`tests/test_routing.py::test_a_functional_reply_between_chat_segments_does_not_lose_the_next_segment`
+（301 → 401 → 501 → 402 的验收场景）、`test_repeated_functional_replies_cannot_overtake_a_turn_between_segments`、
+`test_functional_replies_before_a_turn_keep_the_turn_in_one_band`、
+`test_slow_outbound_io_defers_a_functional_reply_instead_of_interleaving`、
+`test_concurrent_functional_and_chat_sends_never_duplicate_a_segment`、
+`test_a_cancelled_turn_releases_the_boundary_for_a_waiting_functional_reply`、
+`test_a_restart_between_chat_segments_still_delivers_each_segment_once`、
+`test_a_functional_reply_never_costs_a_pending_chat_turn_its_reply`。
+
+### 投递意图与重启恢复（`completed + submitting`）
+
+投递前先在同一个事务里落一条 `reply_state="submitting"` 与**冻结的投递文档**（`delivery`：
+`reply_id`、`segment_sequence`、`command.request_id` 都在里面），然后才做 IO。进程在 IO 中途
+异常退出时，库里留下的就是这一行：意图已提交、结果未知。
+
+`recover()` 除了把在途执行记成 `unknown` 之外，还会专门认领这些 `submitting` 行，把它们标成
+`reply_state="unknown"`、`unresolved=true`、`blocked_reason="interrupted_delivery"`：
+
+- **不重跑功能**（适配器不会被再次调用，请求仍停在 `completed`）；
+- **不伪造没发**（不写 `failed`，也不假装 `sent`）；
+- **不盲目重发**（`work()` 不会再向渠道发一次）；
+- 只允许用**同一份投递证据**（同一 `reply_id`/`request_id`/`segment_sequence`）走只读
+  `reconcile()`：渠道说已送达才 `sent`，说没送达才 `failed`，仍无回音就保持 `unknown`。
+  晚到的旧 attempt 回包只落旧 attempt，不会改写已恢复的回复结论。
+
+定向回归：`test_a_committed_delivery_intent_survives_a_restart_and_reconciles_to_sent`、
+`test_a_committed_delivery_intent_that_never_arrived_is_never_resent`、
+`test_a_committed_delivery_intent_stays_unknown_and_ignores_a_late_callback`
+（都用真实文件库、真实重开连接；崩溃点用端口在意图提交后抛 `KeyboardInterrupt` 复现，是"IO 中途
+异常退出的那条记录"，不是真实进程 kill）。
 
 ## 诚实标注（未配置/未核实即失败）
 
@@ -176,6 +226,7 @@ core.direct.revoke_command("companion.synthetic.query", reason="operator_revoked
 | `adapter_available` / `delivery_port_available` | 依赖是否就位 |
 | `contract_gap` | 桥接负责回复但没有交付端口时的精确说明 |
 | `plugin_gap` | 适配器不是 `contract` 时的精确说明 |
+| `deferred_reason` / `deferred_on` | 等待合法消息边界时的原因与所等轮次（`outbound_band_busy`），发出后清空 |
 
 - 没有交付端口：请求 `completed` 但 `reply_state="not_started"`、
   `blocked_reason="delivery_port_unavailable"`，**不声称已回复**；
@@ -184,6 +235,10 @@ core.direct.revoke_command("companion.synthetic.query", reason="operator_revoked
 - 会话被重新映射（身份不一致）：`blocked_reason="conversation_mismatch"`，
   与「不存在」区分开，不把回复发到别处；
 - 投递 `unknown`：`reply_state="unknown"`、`unresolved=true`，只能靠 `reconcile()` 改变；
+- 重启时停在已提交投递意图：`reply_state="unknown"`、`unresolved=true`、
+  `blocked_reason="interrupted_delivery"`，同样只靠 `reconcile()` 改变；
+- 等合法消息边界：仍是 `reply_state="ready_to_deliver"` 且 `deferred_reason` 非空，
+  **不是**已送达也**不是**失败，轮次终态后自动发出；
 - 显式重投（`retry(redeliver=True)`）除要求最近回执 `failed` 且 `retry_safe=true` 外，
   还要求该回执的 `reply_id`/`segment_sequence` **确属本次投递文档**——别人的回执不能当作
   本次未执行的证明。
@@ -239,4 +294,12 @@ redeliver 需 `retry_safe` 证明、`reconcile` 是 unknown 的唯一出口、
 插件超时、取消（派发前与在途）、重启中断记 unknown 且不重发、
 晚回包只落旧 attempt、两个聊天轮次忙碌时命令仍执行、桥接复用 `capture`/`send` 而不建第二条出口、
 未配置扫描上限的有界轮转（含"所有请求同一毫秒位置、游标停在最后一行"的几何）、
-功能回执不夺走在途聊天轮次的回复、v6→v7 迁移备份/回滚/水位不变。
+v6→v7 迁移备份/回滚/水位不变，以及本轮的共享出口顺序与投递意图恢复：
+
+- 真实 `Bridge` 下功能回执与聊天分段交织（301→401→501→402 场景）：分段一条不丢、
+  不重复，一个轮次的分段始终在同一个号里；
+- 多次功能抢占、慢 IO、并发 worker、轮次被取消、发送中途重启：每种几何下应发的每条
+  都恰好发出一次；
+- 已提交投递意图（`completed + submitting`）跨真实重开连接：恢复成 `unknown` 且
+  `unresolved`，不重跑功能、不伪造未送达、不自动重发，只用同一份投递证据
+  把 sent / failed / 仍未知三种结论分别落地，晚到旧 attempt 回包不改写结论。

@@ -110,6 +110,7 @@ class Core:
                 store,
                 clock,
                 self._direct_guard,
+                bands=self.open_send_band,
                 **(direct_options or {}),
             )
             migrate_legacy(store)
@@ -202,6 +203,72 @@ class Core:
                 raise Fault("dependency_unavailable")
             return self.web_sender
         return self.sender  # Preserve the existing non-web channel path (qq/tg/etc.).
+
+    def open_send_band(self, conversation_key, *, unit_id, current=None, wait_for_turn=False):
+        """Place one reply unit in the conversation's single increasing outbound order.
+
+        The shared exit accepts one strictly increasing position per conversation
+        (`turn_sequence * 100 + segment_sequence`), so a unit may only reuse its own band
+        while nothing else has taken a later one - otherwise the exit rejects the reply as an
+        older position and that segment is lost. Every unit therefore takes its band here:
+
+        - a companion turn keeps one band for all of its segments, so the turn stays a single
+          ordered unit and its unknown receipts and retries keep pointing at one position;
+        - a functional reply must wait while a companion turn still has segments to hand to
+          the exit (`wait_for_turn`), which is a legal message boundary, not a wait for the
+          chat model: that turn's text already exists. When the boundary is reached the
+          functional reply takes the next band and the turn is finished, so no identity is
+          split. If a turn was already parked (unknown/cancelled) when another unit overtook
+          it, its next segment simply takes a fresh band instead of being rejected.
+
+        Returns `(band, waiting_on)`. `waiting_on` names the turn that must finish first, and
+        `band` is None only when the conversation row is gone (caller keeps its own value).
+        """
+        conversation = self.store.get("conversations", conversation_key)
+        if conversation is None:
+            return None, None
+        if wait_for_turn:
+            owner = self._outbound_band_owner(conversation)
+            if owner is not None:
+                return None, owner
+        high = conversation.get("send_band") or 0
+        if current is not None and current >= high:
+            # This unit still owns the last band (bands are unique, so `current == high` can
+            # only be this unit's own): reuse it, so all of its segments stay one ordered
+            # unit instead of being renumbered on every segment. The high-water mark moves up
+            # with it, otherwise a later unit could be given a band below this one and this
+            # unit's remaining segments would be rejected as older positions.
+            conversation["send_band"] = current
+            conversation["send_band_owner"] = unit_id
+            self.store.put("conversations", conversation)
+            return current, None
+        band = max(conversation.get("turn_sequence", 0), high) + 1
+        conversation["send_band"] = band
+        conversation["send_band_owner"] = unit_id
+        self.store.put("conversations", conversation)
+        return band, None
+
+    def _outbound_band_owner(self, conversation):
+        """The companion turn that holds the current band and still owes the exit segments.
+
+        A turn only holds it once it has actually started handing segments over (`send_sequence`
+        set or a segment no longer pending). A turn that is still generating has not taken a
+        band yet, so it must never make a functional reply wait for the chat model - it takes a
+        fresh band above the functional reply when its own first segment is ready instead.
+        Once a turn has started, it holds the boundary to its terminal phase, because its
+        remaining segments belong to the same band and would be rejected if another unit took a
+        later position in between.
+        """
+        owner = conversation.get("send_band_owner")
+        if owner is None:
+            return None
+        turn = self.store.get("turns", owner)
+        if turn is None or turn["phase"] in TERMINAL:
+            return None
+        started = turn.get("send_sequence") is not None or any(
+            reply["state"] != "pending" for reply in self._replies(turn)
+        )
+        return owner if started else None
 
     def _proactive_guard(self, subscription):
         """Local authority re-check for one proactive destination.
@@ -835,6 +902,19 @@ class Core:
                         self.jobs[turn["id"]] = asyncio.create_task(self._process(turn["id"]))
                 if cid not in self.send_jobs:
                     self.send_jobs[cid] = asyncio.create_task(self._deliver(cid))
+                waiting = ("direct", cid)
+                if (
+                    waiting not in self.jobs
+                    # Only a conversation that has handed a reply to the exit can have a
+                    # functional reply parked on its band, so most ticks stop here.
+                    and conv.get("send_band")
+                    and self._outbound_band_owner(conv) is None
+                    and self.direct.waiting_for_band(cid)
+                ):
+                    # The turn that held this conversation's outbound order has finished, so a
+                    # functional reply that waited for that legal message boundary goes out now
+                    # instead of waiting for the direct worker's next pass.
+                    self.jobs[waiting] = asyncio.create_task(self.direct.work())
         await asyncio.sleep(0)
 
     def _input_text(self, turn):
@@ -1257,23 +1337,16 @@ class Core:
                 self._finish(turn, "sent", "sent")
                 return
             sequence = turn.get("send_sequence") or turn["sequence"]
-            conversation = self.store.get(
-                "conversations", digest(turn["bundle"]["collection_key"]["channel"])
+            band, _ = self.open_send_band(
+                digest(turn["bundle"]["collection_key"]["channel"]),
+                unit_id=turn["id"],
+                current=sequence,
             )
-            if (
-                sequence == turn["sequence"]
-                and conversation is not None
-                and conversation.get("direct_sequence") is not None
-                and sequence <= conversation["direct_sequence"]
-            ):
-                # A functional command answered this conversation while the turn was still
-                # generating, and the shared outbound exit keeps one increasing position per
-                # conversation. The turn therefore moves into the next slot - once, so every
-                # segment of it stays in the same band - instead of being rejected as an
-                # older position. The user loses no reply and the order stays increasing.
-                sequence = conversation["turn_sequence"] + 1
-                conversation["turn_sequence"] = sequence
-                self.store.put("conversations", conversation)
+            if band is not None:
+                # One band for the whole turn (every segment stays in it, so the turn keeps
+                # a single identity for receipts, retries and the platform's ordering), with
+                # a fresh band only when another unit has already overtaken this turn.
+                sequence = band
                 turn["send_sequence"] = sequence
             request = dict(
                 command=command(turn["origin"], reply["id"], self.clock()),

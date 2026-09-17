@@ -15,7 +15,7 @@ from uuid import uuid4
 import pytest
 
 from support import Harness
-from tianshu_companion.clients import command, digest, uid
+from tianshu_companion.clients import command, digest, uid, utc
 from tianshu_companion.contracts import Fault
 from tianshu_companion.direct import (
     CONTRACT_GAP,
@@ -1271,6 +1271,556 @@ def test_bridge_router_never_claims_without_a_known_scope():
         finally:
             bridge_store.close()
             await h.core.close()
+
+    asyncio.run(scenario())
+
+
+class SharedExit:
+    """The real published path: Core's own sender and the functional port are one Bridge."""
+
+    def __init__(self, h, *, slow=None):
+        self.h = h
+        self.channel = h.request()["message_key"]["channel"]
+        self.conversation_id = h.core.store.get("conversations", digest(self.channel))[
+            "conversation_id"
+        ]
+        self.native = []
+        self.slow = slow
+        self.bridge_store = Store(":memory:")
+
+        async def send_native(destination, text):
+            if self.slow is not None:
+                await self.slow.wait()
+            self.native.append(text)
+            return ["native:" + str(len(self.native))]
+
+        async def verify(service, request):
+            if service != "companion":
+                raise Fault("forbidden")
+
+        self.bridge = Bridge(
+            self.bridge_store,
+            h.contracts,
+            None,
+            destinations={self.conversation_id: self.channel},
+            send_native=send_native,
+            verify_send=verify,
+            clock=h.clock,
+        )
+        h.core.sender = BridgeSender(self.bridge)
+        h.core.direct.delivery_port = BridgeDelivery(self.bridge)
+
+    @property
+    def positions(self):
+        return [reply["sequence"] for reply in self.bridge_store.list("replies")]
+
+    def chat_segments(self):
+        return [text for text in self.native if text.startswith("合成回复")]
+
+    def functional(self):
+        return [text for text in self.native if text.startswith("[合成]")]
+
+    async def deliver_until(self, request_id, *, passes=40):
+        """Run the direct worker the way the application's 0.5s worker does."""
+        for _ in range(passes):
+            await self.h.core.direct.work()
+            await self.h.cycles(4)
+            if self.h.core.direct.request_view(request_id)["reply_state"] == "sent":
+                return
+        raise AssertionError(
+            "request never delivered: " + repr(self.h.core.direct.request_view(request_id))
+        )
+
+    async def settle_chat(self, *, cycles=120):
+        await self.h.cycles(cycles)
+
+    def close(self):
+        self.bridge_store.close()
+
+
+def test_a_functional_reply_between_chat_segments_does_not_lose_the_next_segment():
+    """The exact acceptance case: 301 -> 401 -> 501 -> 402 must not drop the last segment."""
+
+    async def scenario():
+        h = Harness()
+        register(h, query_spec())
+        await establish(h)
+        exit_ = SharedExit(h)
+        try:
+            gate = asyncio.Event()
+            h.gateway.gates[2] = gate
+            await h.ingest(text="chat")
+            h.clock.advance(6)
+            await h.cycles(8)
+            first = await h.core.direct_command("nonebot", h.request(text="/查询 first"))
+            await h.core.direct.work()
+            # The model finishes; the turn now sends its segments one at a time.
+            gate.set()
+            for _ in range(200):
+                await h.cycles(1)
+                if len(exit_.chat_segments()) == 1:
+                    break
+            assert len(exit_.chat_segments()) == 1
+            assert [t["phase"] for t in h.turns()][-1] == "sending"
+            # A second functional reply arrives between the turn's two segments.
+            second = await h.core.direct_command("nonebot", h.request(text="/查询 second"))
+            await h.core.direct.work()
+            waiting = h.core.direct.request_view(second["request"]["id"])
+            # It waits for the legal message boundary instead of overtaking the turn's band.
+            assert waiting["reply_state"] == "ready_to_deliver"
+            assert waiting["deferred_reason"] == "outbound_band_busy"
+            assert len(exit_.native) == 2
+            await exit_.settle_chat()
+            await exit_.deliver_until(second["request"]["id"])
+            # Every reply that was owed went out, exactly once.
+            assert [t["phase"] for t in h.turns()] == ["sent", "sent"]
+            assert sorted(exit_.native) == sorted(
+                [
+                    "[合成] " + QUERY,
+                    "[合成] " + QUERY,
+                    "合成回复一",
+                    "合成回复二",
+                ]
+            )
+            assert h.core.direct.request_view(first["request"]["id"])["delivery_verified"]
+            assert h.core.direct.request_view(second["request"]["id"])["delivery_verified"]
+            positions = exit_.positions
+            assert positions == sorted(positions) and len(set(positions)) == 4
+            # The turn stayed one ordered unit: both of its segments in a single band.
+            chat = [
+                reply
+                for reply in exit_.bridge_store.list("replies")
+                if reply["sequence"] // 100 == 4
+            ]
+            assert [reply["sequence"] for reply in chat] == [401, 402]
+            assert exit_.positions[-1] == 501
+        finally:
+            exit_.close()
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_repeated_functional_replies_cannot_overtake_a_turn_between_segments():
+    async def scenario():
+        h = Harness()
+        register(h, query_spec())
+        await establish(h)
+        exit_ = SharedExit(h)
+        try:
+            gate = asyncio.Event()
+            h.gateway.gates[2] = gate
+            await h.ingest(text="chat")
+            h.clock.advance(6)
+            await h.cycles(8)
+            gate.set()
+            # Three functional replies while the turn still has segments to hand over.
+            entries = [
+                await h.core.direct_command("nonebot", h.request(text="/查询 %d" % index))
+                for index in range(3)
+            ]
+            for _ in range(60):
+                for entry in entries:
+                    await h.core.direct.work()
+                await h.cycles(4)
+                if all(
+                    h.core.direct.request_view(entry["request"]["id"])["reply_state"] == "sent"
+                    for entry in entries
+                ) and [t["phase"] for t in h.turns()] == ["sent", "sent"]:
+                    break
+            assert [t["phase"] for t in h.turns()] == ["sent", "sent"]
+            for entry in entries:
+                view = h.core.direct.request_view(entry["request"]["id"])
+                assert view["reply_state"] == "sent" and view["delivery_verified"]
+            assert len(exit_.functional()) == 3
+            assert exit_.chat_segments() == ["合成回复一", "合成回复二"]
+            positions = exit_.positions
+            assert positions == sorted(positions) and len(set(positions)) == 5
+            bands = {}
+            for reply in exit_.bridge_store.list("replies"):
+                bands.setdefault(reply["sequence"] // 100, []).append(reply["sequence"] % 100)
+            # Every functional reply has its own single-segment band and the turn has one band.
+            assert sorted(bands.values()) == [[1], [1], [1], [1, 2]]
+        finally:
+            exit_.close()
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_functional_replies_before_a_turn_keep_the_turn_in_one_band():
+    async def scenario():
+        h = Harness()
+        register(h, query_spec())
+        await establish(h)
+        exit_ = SharedExit(h)
+        try:
+            gate = asyncio.Event()
+            h.gateway.gates[2] = gate
+            await h.ingest(text="chat")
+            h.clock.advance(6)
+            await h.cycles(8)
+            # Two functional replies answer while the turn is still generating, so neither
+            # waits for the chat model and the turn takes a band above both of them.
+            for text in ("/查询 first", "/查询 second"):
+                entry = await h.core.direct_command("nonebot", h.request(text=text))
+                await h.core.direct.work()
+                assert h.core.direct.request_view(entry["request"]["id"])["reply_state"] == "sent"
+            gate.set()
+            await h.cycles(80)
+            assert [t["phase"] for t in h.turns()] == ["sent", "sent"]
+            assert len(exit_.chat_segments()) == 2
+            assert len(exit_.functional()) == 2
+            positions = exit_.positions
+            assert positions == sorted(positions) and len(set(positions)) == 4
+            assert positions[:2] == [301, 401]
+            assert positions[2:] == [501, 502]
+        finally:
+            exit_.close()
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_slow_outbound_io_defers_a_functional_reply_instead_of_interleaving():
+    async def scenario():
+        h = Harness()
+        register(h, query_spec())
+        await establish(h)
+        hold = asyncio.Event()
+        exit_ = SharedExit(h, slow=hold)
+        try:
+            gate = asyncio.Event()
+            h.gateway.gates[2] = gate
+            await h.ingest(text="chat")
+            h.clock.advance(6)
+            await h.cycles(8)
+            gate.set()
+            # Kick the chat delivery, then let its first segment sit inside a slow channel.
+            for _ in range(6):
+                await h.cycles(1)
+            entry = await h.core.direct_command("nonebot", h.request(text="/查询 slow"))
+            await h.core.direct.work()
+            view = h.core.direct.request_view(entry["request"]["id"])
+            assert view["reply_state"] in {"ready_to_deliver", "sent"}
+            assert view["reply_state"] != "unknown"
+            hold.set()
+            await exit_.deliver_until(entry["request"]["id"])
+            await h.cycles(120)
+            assert [t["phase"] for t in h.turns()] == ["sent", "sent"]
+            assert len(exit_.chat_segments()) == 2
+            assert exit_.functional() == ["[合成] " + QUERY]
+            positions = exit_.positions
+            assert positions == sorted(positions) and len(set(positions)) == 3
+        finally:
+            exit_.close()
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_functional_and_chat_sends_never_duplicate_a_segment():
+    async def scenario():
+        h = Harness()
+        register(h, query_spec())
+        await establish(h)
+        exit_ = SharedExit(h)
+        try:
+            h.gateway.gates[2] = asyncio.Event()
+            await h.ingest(text="chat")
+            h.clock.advance(6)
+            await h.cycles(8)
+            entries = [
+                await h.core.direct_command("nonebot", h.request(text="/查询 %d" % index))
+                for index in range(2)
+            ]
+            h.gateway.gates[2].set()
+            # Both workers run at once: the direct worker and the chat scheduler.
+            for _ in range(60):
+                await asyncio.gather(
+                    *(h.core.direct.work() for _ in entries),
+                    h.cycles(3),
+                )
+                if all(
+                    h.core.direct.request_view(entry["request"]["id"])["reply_state"] == "sent"
+                    for entry in entries
+                ) and [t["phase"] for t in h.turns()] == ["sent", "sent"]:
+                    break
+            assert [t["phase"] for t in h.turns()] == ["sent", "sent"]
+            assert len(exit_.chat_segments()) == 2
+            assert len(exit_.functional()) == 2
+            # Nothing was sent twice: the exit holds exactly one reply per reply id.
+            replies = exit_.bridge_store.list("replies")
+            assert len(replies) == len({reply["id"] for reply in replies}) == 4
+            assert len(exit_.native) == 4
+            assert exit_.positions == sorted(exit_.positions)
+        finally:
+            exit_.close()
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_cancelled_turn_releases_the_boundary_for_a_waiting_functional_reply():
+    async def scenario():
+        h = Harness()
+        register(h, query_spec())
+        await establish(h)
+        exit_ = SharedExit(h)
+        try:
+            gate = asyncio.Event()
+            h.gateway.gates[2] = gate
+            await h.ingest(text="chat")
+            h.clock.advance(6)
+            await h.cycles(8)
+            gate.set()
+            for _ in range(200):
+                await h.cycles(1)
+                if len(exit_.chat_segments()) == 1:
+                    break
+            turn = [t for t in h.turns() if t["phase"] == "sending"][0]
+            entry = await h.core.direct_command("nonebot", h.request(text="/查询 cancel"))
+            await h.core.direct.work()
+            assert (
+                h.core.direct.request_view(entry["request"]["id"])["deferred_reason"]
+                == "outbound_band_busy"
+            )
+            await h.cancel(turn)
+            await exit_.deliver_until(entry["request"]["id"])
+            view = h.core.direct.request_view(entry["request"]["id"])
+            assert view["reply_state"] == "sent" and view["deferred_reason"] is None
+            assert exit_.functional() == ["[合成] " + QUERY]
+            # The cancelled turn released the boundary without sending its remaining segment.
+            assert len(exit_.chat_segments()) == 1
+            assert [t["phase"] for t in h.turns()][-1] in {"cancelled", "failed"}
+        finally:
+            exit_.close()
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_restart_between_chat_segments_still_delivers_each_segment_once():
+    async def scenario():
+        directory = scratch("routing-restart")
+        path = str(directory / "companion.db")
+        h = Harness(path=path)
+        register(h, query_spec())
+        await establish(h)
+        exit_ = SharedExit(h)
+        try:
+            gate = asyncio.Event()
+            h.gateway.gates[2] = gate
+            await h.ingest(text="chat")
+            h.clock.advance(6)
+            await h.cycles(8)
+            gate.set()
+            for _ in range(200):
+                await h.cycles(1)
+                if len(exit_.chat_segments()) == 1:
+                    break
+            entry = await h.core.direct_command("nonebot", h.request(text="/查询 restart"))
+            await h.core.direct.work()
+            deferred = h.core.direct.request_view(entry["request"]["id"])
+            assert deferred["deferred_reason"] == "outbound_band_busy"
+            # Restart on the same database while the turn still owes a segment.
+            origins = dict(h.origins.values)
+            accounts = dict(h.memory.accounts)
+            h.core.store.close()
+            reopened = Harness(path=path)
+            # The source assertions and identity mapping are in-memory doubles; the durable
+            # facts being recovered - requests, replies, bands - are the database's.
+            reopened.origins.values.update(origins)
+            reopened.memory.accounts.update(accounts)
+            reopened.core.recover()
+            reopened.core.sender = BridgeSender(exit_.bridge)
+            reopened.core.direct.delivery_port = BridgeDelivery(exit_.bridge)
+            h = reopened
+            for _ in range(80):
+                await h.core.direct.work()
+                await h.cycles(4)
+                if h.core.direct.request_view(entry["request"]["id"])["reply_state"] == "sent":
+                    break
+            view = h.core.direct.request_view(entry["request"]["id"])
+            assert view["reply_state"] == "sent" and view["delivery_verified"]
+            assert [t["phase"] for t in h.turns()] == ["sent", "sent"]
+            assert len(exit_.chat_segments()) == 2
+            assert exit_.functional() == ["[合成] " + QUERY]
+            assert exit_.positions == sorted(exit_.positions)
+            assert len(exit_.native) == len(set(exit_.native)) == 3
+        finally:
+            exit_.close()
+            await h.core.close()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    asyncio.run(scenario())
+
+
+class InterruptedDelivery:
+    """A port that dies at the IO point after the delivery intent was already durable.
+
+    Raising a BaseException (not an Exception) propagates out of `Direct.deliver` before it
+    can settle, which is exactly the durable state an ungraceful exit leaves behind: the row
+    is `completed + submitting` with the frozen delivery document and no receipt.
+
+    This reproduces that state through the real production path - `dispatch` executes the
+    plugin, `_record_delivery_intent` commits, then the process "dies" - but it is an
+    interrupted coroutine at the exact crash point, not a real process kill.
+    """
+
+    available = True
+
+    def __init__(self):
+        self.attempts = 0
+        self.answers = {}
+
+    async def send(self, request):
+        self.attempts += 1
+        raise KeyboardInterrupt
+
+    async def reconcile(self, request):
+        return self.answers.get(request["reply_id"])
+
+
+def delivery_receipt(clock, delivery, state, *, native=None):
+    return dict(
+        schema_version=1,
+        request_id=delivery["command"]["request_id"],
+        reply_id=delivery["reply_id"],
+        segment_sequence=delivery["segment_sequence"],
+        attempt_id="attempt:reconcile",
+        state=state,
+        channel_message_ids=list(native or []),
+        observed_at=utc(clock()),
+        retry_safe=state == "failed",
+    )
+
+
+async def crash_after_intent(name):
+    """Drive the real path to the crash point and leave the durable row behind."""
+    directory = scratch(name)
+    path = str(directory / "companion.db")
+    crasher = InterruptedDelivery()
+    h = Harness(path=path, direct_options={"deliver": crasher})
+    register(h, query_spec())
+    await establish(h)
+    entry = await h.core.direct_command("nonebot", h.request(text="/查询 天气"))
+    request_id = entry["request"]["id"]
+    with pytest.raises(KeyboardInterrupt):
+        await h.core.direct.work()
+    row = h.core.store.get("direct_requests", request_id)
+    return directory, path, h, request_id, row
+
+
+def test_a_committed_delivery_intent_survives_a_restart_and_reconciles_to_sent():
+    async def scenario():
+        directory, path, h, request_id, row = await crash_after_intent("routing-intent-sent")
+        try:
+            # The crash point really is a committed intent: completed, submitting, no receipt.
+            assert row["state"] == "completed"
+            assert row["reply_state"] == "submitting"
+            assert row["delivery_receipt"] is None
+            assert row["unresolved"] in (False, None)
+            assert row["delivery"]["reply_id"] == digest([request_id, "reply"])
+            h.core.store.close()
+
+            reader = InterruptedDelivery()
+            r = Harness(path=path, direct_options={"deliver": reader})
+            r.core.recover()
+            recovered = r.core.direct.request_view(request_id)
+            # Recovered as unknown and unresolved, never as "probably sent".
+            assert recovered["reply_state"] == "unknown"
+            assert recovered["unresolved"] is True
+            assert recovered["blocked_reason"] == "interrupted_delivery"
+            # Nothing was re-executed and nothing was resent.
+            assert r.direct_plugin.calls == []
+            assert reader.attempts == 0
+            for _ in range(3):
+                await r.core.direct.work()
+            assert r.direct_plugin.calls == []
+            assert reader.attempts == 0
+
+            # The same delivery evidence answers: same reply id, same request id.
+            delivery = r.core.store.get("direct_requests", request_id)["delivery"]
+            reader.answers[delivery["reply_id"]] = delivery_receipt(
+                r.clock, delivery, "sent", native=["native:reconciled"]
+            )
+            await r.core.direct.reconcile(request_id)
+            settled = r.core.direct.request_view(request_id)
+            assert settled["reply_state"] == "sent"
+            assert settled["delivery_verified"] is True
+            assert settled["delivery_evidence"] == "published_contract_receipt"
+            assert settled["unresolved"] is False
+            assert settled["blocked_reason"] is None
+            assert settled["delivery_receipt"]["request_id"] == delivery["command"]["request_id"]
+            assert reader.attempts == 0
+            await r.core.close()
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    asyncio.run(scenario())
+
+
+def test_a_committed_delivery_intent_that_never_arrived_is_never_resent():
+    async def scenario():
+        directory, path, h, request_id, _ = await crash_after_intent("routing-intent-failed")
+        try:
+            h.core.store.close()
+            reader = InterruptedDelivery()
+            r = Harness(path=path, direct_options={"deliver": reader})
+            r.core.recover()
+            delivery = r.core.store.get("direct_requests", request_id)["delivery"]
+            reader.answers[delivery["reply_id"]] = delivery_receipt(r.clock, delivery, "failed")
+            await r.core.direct.reconcile(request_id)
+            settled = r.core.direct.request_view(request_id)
+            # The channel never took it: recorded honestly, and still not sent a second time.
+            assert settled["reply_state"] == "failed"
+            assert settled["delivery_verified"] is False
+            assert settled["unresolved"] is False
+            for _ in range(3):
+                await r.core.direct.work()
+            assert reader.attempts == 0
+            assert r.direct_plugin.calls == []
+            await r.core.close()
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    asyncio.run(scenario())
+
+
+def test_a_committed_delivery_intent_stays_unknown_and_ignores_a_late_callback():
+    async def scenario():
+        directory, path, h, request_id, row = await crash_after_intent("routing-intent-unknown")
+        try:
+            attempt_id = row["attempt_id"]
+            h.core.store.close()
+            reader = InterruptedDelivery()
+            r = Harness(path=path, direct_options={"deliver": reader})
+            r.core.recover()
+            # No answer available: it stays unknown and unresolved, and is never resent.
+            await r.core.direct.reconcile(request_id)
+            waiting = r.core.direct.request_view(request_id)
+            assert waiting["reply_state"] == "unknown"
+            assert waiting["unresolved"] is True
+            for _ in range(3):
+                await r.core.direct.work()
+            assert reader.attempts == 0
+
+            # A late plugin callback for the old attempt cannot rewrite the recovered reply:
+            # the attempt already has a receipt, so a differing late result is refused and
+            # the request keeps its unknown outcome.
+            late = r.direct_plugin.complete(request_id, attempt_id, reply="晚回包")
+            with pytest.raises(Fault) as error:
+                r.core.direct.settle(attempt_id, late)
+            assert error.value.code == "idempotency_conflict"
+            after = r.core.direct.request_view(request_id)
+            assert after["reply_state"] == "unknown"
+            assert after["unresolved"] is True
+            assert (after["reply"] or {}).get("text") != "晚回包"
+            assert r.direct_plugin.calls == []
+            await r.core.close()
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
     asyncio.run(scenario())
 

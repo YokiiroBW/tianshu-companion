@@ -272,6 +272,7 @@ class Direct:
         *,
         adapter=None,
         deliver=None,
+        bands=None,
         timeout=20,
         request_expiry=600,
         max_commands=256,
@@ -284,6 +285,10 @@ class Direct:
             raise ValueError("A host authority guard is required")
         self.store, self.clock, self.guard = store, clock, guard
         self.adapter, self.delivery_port = adapter, deliver
+        # The host's shared outbound coordinator. Without it this engine can only take the
+        # conversation's next position for itself, which is honest but cannot wait for a
+        # companion turn that is still sending its own segments.
+        self.bands = bands
         for name, value, ceiling in (
             ("timeout", timeout, 600),
             ("request_expiry", request_expiry, 86400),
@@ -881,6 +886,8 @@ class Direct:
                 "reply",
                 "delivery_receipt",
                 "blocked_reason",
+                "deferred_reason",
+                "deferred_on",
                 "cancel_requested",
                 "cancel_reason",
                 "superseded_by",
@@ -1428,27 +1435,18 @@ class Direct:
                 )
                 self.store.put("direct_requests", request)
                 return self.request_view(request_id)
-            conversation = self.store.get("conversations", digest(request["channel"]))
-            conversation["turn_sequence"] += 1
-            # Recorded so a chat turn that was already sealed but had not sent yet can take
-            # the next slot instead of being rejected by the shared outbound ordering.
-            conversation["direct_sequence"] = conversation["turn_sequence"]
-            self.store.put("conversations", conversation)
+            band, waiting = self._open_band(request_id, request)
+            if waiting is not None:
+                return self.request_view(request_id)
             delivery.update(
-                turn_sequence=conversation["turn_sequence"],
+                turn_sequence=band,
                 # The envelope is minted at delivery time from the request's own stored
                 # origin reference, so a long task does not inherit an expired deadline.
                 command=command(
                     request["origin_ref"], digest([request_id, "delivery"]), self.clock()
                 ),
             )
-            request.update(
-                reply_state="submitting",
-                delivery=delivery,
-                updated_at=self.clock(),
-                version=request["version"] + 1,
-            )
-            self.store.put("direct_requests", request)
+            self._record_delivery_intent(request, delivery)
         try:
             receipt = await asyncio.wait_for(
                 self.delivery_port.send(delivery), timeout=self.timeout
@@ -1461,6 +1459,72 @@ class Direct:
             receipt = None
         self._settle_delivery(request_id, receipt)
         return self.request_view(request_id)
+
+    def _open_band(self, request_id, request):
+        """Take this request's place in the conversation's shared outbound order.
+
+        Waiting is only ever for a companion turn that still has segments to hand to the
+        exit. That is a legal message boundary and the wait is bounded by that turn's
+        remaining segments - never by the chat model, which has already finished generating.
+        While waiting the request stays deliverable, so the worker simply tries again.
+        """
+        conversation_key = digest(request["channel"])
+        if self.bands is None:
+            conversation = self.store.get("conversations", conversation_key)
+            if conversation is None:
+                return None, None
+            conversation["turn_sequence"] += 1
+            conversation["send_band"] = conversation["turn_sequence"]
+            conversation["send_band_owner"] = request["id"]
+            self.store.put("conversations", conversation)
+            return conversation["turn_sequence"], None
+        band, waiting = self.bands(
+            conversation_key, unit_id=request["id"], current=None, wait_for_turn=True
+        )
+        if waiting is not None:
+            conversation = self.store.get("conversations", conversation_key)
+            if (
+                request.get("deferred_reason") != "outbound_band_busy"
+                or request.get("deferred_on") != waiting
+            ):
+                request.update(
+                    deferred_reason="outbound_band_busy",
+                    deferred_on=waiting,
+                    conversation_id=conversation and conversation["conversation_id"],
+                    updated_at=self.clock(),
+                    version=request["version"] + 1,
+                )
+                self.store.put("direct_requests", request)
+            return None, waiting
+        return band, None
+
+    def waiting_for_band(self, conversation_id):
+        """Is a functional reply parked on a companion turn's outbound band for this channel?"""
+        row = self.store.db.execute(
+            "SELECT 1 FROM direct_requests WHERE status IN ('completed','failed') "
+            "AND json_extract(body,'$.reply_state')='ready_to_deliver' "
+            "AND json_extract(body,'$.deferred_reason')='outbound_band_busy' "
+            "AND json_extract(body,'$.conversation_id')=? LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        return row is not None
+
+    def _record_delivery_intent(self, request, delivery):
+        """Persist `completed + submitting` before any IO.
+
+        This durable row is what an ungraceful exit leaves behind, and it is the evidence
+        `recover` and `reconcile` use afterwards: the same frozen document, the same reply id,
+        the same request id. Nothing about the reply is ever re-derived from a new decision.
+        """
+        request.update(
+            reply_state="submitting",
+            delivery=delivery,
+            deferred_reason=None,
+            deferred_on=None,
+            updated_at=self.clock(),
+            version=request["version"] + 1,
+        )
+        self.store.put("direct_requests", request)
 
     def _check_delivery(self, delivery, receipt):
         if (
@@ -1493,6 +1557,13 @@ class Direct:
                 reply_state=receipt["state"],
                 delivery_receipt=receipt,
                 unresolved=receipt["state"] == "unknown",
+                # A reason recorded for the interrupted state must not outlive it, otherwise a
+                # settled reply would still read as "blocked".
+                blocked_reason=(
+                    None
+                    if request.get("blocked_reason") == "interrupted_delivery"
+                    else request.get("blocked_reason")
+                ),
                 updated_at=self.clock(),
                 version=request["version"] + 1,
             )
@@ -1615,11 +1686,36 @@ class Direct:
                         else "interrupted_task"
                     ),
                 )
+            for request in self._interrupted_deliveries():
+                # The delivery intent was durable but no definite receipt was ever recorded,
+                # so the reply may or may not have reached the channel. It becomes `unknown`
+                # and unresolved: the only way forward is a read-only reconcile against the
+                # very same delivery document, never a plugin re-run and never a resend.
+                request.update(
+                    reply_state="unknown",
+                    unresolved=True,
+                    blocked_reason="interrupted_delivery",
+                    deferred_reason=None,
+                    deferred_on=None,
+                    updated_at=self.clock(),
+                    version=request["version"] + 1,
+                )
+                self.store.put("direct_requests", request)
             for request in self.store.list("direct_requests", states=["pending"]):
                 if request.get("blocked_reason") == "plugin_unavailable":
                     request["blocked_reason"] = None
                     self.store.put("direct_requests", request)
         self._prune()
+
+    def _interrupted_deliveries(self):
+        """Requests parked in `submitting`: a committed intent that never got a receipt."""
+        rows = self.store.db.execute(
+            "SELECT body FROM direct_requests "
+            "WHERE json_extract(body,'$.reply_state')='submitting' "
+            "ORDER BY position,id LIMIT ?",
+            (self.max_read,),
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def _prune(self):
         for request in self.store.list("direct_requests", states=sorted(SETTLED)):
