@@ -14,6 +14,7 @@
   "roles": {
     "actor:companion": {"version": 1, "persona": "温和、简洁。没有来源时坦诚说明无法核对往事。"}
   },
+  "personas": {"admin_token_env": "TIANSHU_PERSONA_ADMIN_TOKEN"},
   "bindings": {},
   "callers": {},
   "services": {}

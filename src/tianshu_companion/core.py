@@ -13,6 +13,7 @@ from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 from .direct import Direct
 from .life import Life
 from .images import Images
+from .personas import PersonaError, Personas
 from .proactive import Proactive
 from .web_snapshot import snapshot as read_web_snapshot
 from .context import (
@@ -83,11 +84,24 @@ class Core:
         proactive_options=None,
         proactive_dispatcher=None,
         direct_options=None,
+        personas=False,
+        persona_import=None,
     ):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
         self.web_sender = web_sender
         self.bindings, self.roles, self.config_version = bindings, roles, config_version
+        # Registered persona versions. Left off, `roles` is used as the mutable persona
+        # mapping exactly as before; turned on, the deployment mapping becomes the
+        # idempotent initial import and every later version is an explicit operator act.
+        if type(personas) is not bool:
+            raise ValueError("personas must be boolean")
+        if personas and not isinstance(persona_import, dict):
+            raise ValueError("Registered personas require one deployment configuration")
+        self.personas = Personas(store, clock) if personas else None
+        self.persona_import = persona_import if personas else None
+        # Filled by `recover`; empty means every persona pointer resolved at startup.
+        self.persona_problems = []
         self.policy, self.clock = policy or Policy(), clock
         contracts.check("conversation#policy", asdict(self.policy))
         self.models = asyncio.Semaphore(model_slots)
@@ -114,6 +128,10 @@ class Core:
                 **(direct_options or {}),
             )
             migrate_legacy(store)
+            if self.personas is not None:
+                # One idempotent initial import of the deployment document. It runs before
+                # the process accepts any traffic and is skipped once this source is known.
+                self.personas.import_config(self.persona_import)
         except BaseException:
             store.close()
             raise
@@ -857,6 +875,11 @@ class Core:
         self.writing.recover()
         self.proactive.recover()
         self.direct.recover()
+        if self.personas is not None:
+            # Unresolved persona pointers are reported, not invented. Turns already
+            # prepared keep the revision they recorded, so a missing live pointer cannot
+            # silently rewrite an in-flight turn's persona.
+            self.persona_problems = self.personas.recover()
         with self.store.transaction():
             for reply in self.store.list("replies", states=["sending"]):
                 reply.update(state="unknown", unknown_since=reply["attempted_at"])
@@ -898,10 +921,26 @@ class Core:
                 for turn in queued[: 2 - len(active)]:
                     if not self._responses_released(turn):
                         break
+                    try:
+                        role = self._pin_role(turn["scope"]["actor_id"])
+                    except PersonaError as error:
+                        # The preparation boundary is where a character's persona becomes
+                        # real: a character with no published, non-retired revision has no
+                        # persona to pin, so this turn fails here with the reason named
+                        # instead of calling a model with an unapproved character.
+                        turn.update(
+                            phase="failed",
+                            delivery_state="failed",
+                            result_version=1,
+                            failure=error.message,
+                            config_version=self.config_version,
+                        )
+                        self._save_turn(turn)
+                        continue
                     turn.update(
                         phase="preparing",
                         config_version=self.config_version,
-                        role=copy.deepcopy(self.roles[turn["scope"]["actor_id"]]),
+                        role=role,
                         bootstrap_until=min(turn["source_deadline"], self.clock() + 5),
                     )
                     turn["timings"]["started_at"] = utc(self.clock())
@@ -926,10 +965,59 @@ class Core:
                     self.jobs[waiting] = asyncio.create_task(self.direct.work())
         await asyncio.sleep(0)
 
+    def _pin_role(self, actor):
+        """Snapshot the persona at the turn preparation boundary.
+
+        Two calls at different times are allowed to return different revisions; that is
+        exactly the boundary a publication takes effect at. The turn keeps the returned
+        copy for its whole life (generation, retries and delivery), so a publication that
+        lands afterwards cannot rewrite a turn that was already prepared, is waiting on a
+        dependency, is generating, or is mid-send. Draft, approval and publication rules
+        stay in the persona module; this reads the live revision only.
+        """
+        if self.personas is None:
+            return copy.deepcopy(self.roles[actor])
+        return self.personas.pin(actor)
+
+    def manage_persona(self, service, request):
+        """Trusted same-product management port for registered character personas.
+
+        This is an adapter boundary and nothing else: it checks that the caller is the
+        dedicated persona-management service (the host authenticated the credential before
+        dispatch) and hands the operation document to the one application entry point.
+        No persona rule is implemented here, and the chat, ingest and bridge credentials
+        never map to this service, so no unauthenticated remote write exists.
+        """
+        if self.personas is None:
+            raise Fault("dependency_unavailable")
+        if service != "persona_admin":
+            raise Fault("forbidden")
+        try:
+            return self.personas.manage(request)
+        except PersonaError as error:
+            raise Fault(error.code) from None
+
     def _input_text(self, turn):
         return "\n".join(
             p["text"] for m in turn["bundle"]["messages"] for p in m["parts"] if p["kind"] == "text"
         )
+
+    def _check_role(self, turn):
+        """The pinned persona is the bytes the model sees; verify before every call.
+
+        A stored snapshot whose content no longer matches its revision is a corrupt or
+        tampered persona, so the turn fails instead of generating from it. The check
+        itself belongs to the persona module.
+        """
+        role = turn["role"]
+        if role is None:
+            raise Fault("dependency_unavailable")
+        if self.personas is None:
+            return
+        try:
+            self.personas.verify(role)
+        except PersonaError:
+            raise Fault("dependency_unavailable") from None
 
     async def _process(self, turn_id):
         try:
@@ -938,6 +1026,7 @@ class Core:
                 return
             if not turn["config_version"]:
                 raise Fault("dependency_unavailable")
+            self._check_role(turn)
             if turn["preparation"] is None:
                 if turn["bootstrap_mapping"] and self.clock() >= turn["bootstrap_until"]:
                     raise Fault("timeout")

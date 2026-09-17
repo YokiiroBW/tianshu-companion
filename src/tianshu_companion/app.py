@@ -46,6 +46,16 @@ def build_runtime(config):
             incoming[service] = token
             if service in {"platform", "nonebot"}:
                 issuers[service] = (entry["issuer"], client(entry["origin_service"]))
+    # Registered character personas: the deployment mapping seeds one absolute initial
+    # version, and every later version is an explicit operator act. The management
+    # credential is separate from the chat/ingest credentials so no channel or bridge
+    # credential can ever reach a persona write.
+    persona_config = config.get("personas")
+    persona_token = None
+    if persona_config:
+        persona_token = os.environ.get(persona_config["admin_token_env"])
+        if persona_token:
+            incoming["persona_admin"] = persona_token
     image_options = None
     if config.get("images") is not None:
         image_config = config["images"]
@@ -94,6 +104,10 @@ def build_runtime(config):
         proactive_options=config.get("proactive"),
         direct_options=direct_options,
         web_sender=Sender(contracts, client("platform_sender")),
+        personas=bool(persona_config),
+        # The whole deployment document: the persona module owns the rule for where a
+        # character is declared, so startup and the maintenance CLI read it identically.
+        persona_import=config if persona_config else None,
     )
     for spec in (routing or {}).get("commands", []):
         core.direct.register_command(**spec)
@@ -262,6 +276,8 @@ def create_app(core=None, tokens=None):
                 return await core.direct_command(service, body)
             if operation == "commands":
                 return core.commands(service)
+            if operation == "persona":
+                return core.manage_persona(service, body)
             if operation == "capability":
                 return await core.capability(service, body)
             return await core.cancel(service, body)
@@ -299,5 +315,12 @@ def create_app(core=None, tokens=None):
     @app.post("/internal/v1/capability/execute")
     async def capability(request: Request):
         return await dispatch(request, "capability")
+
+    @app.post("/internal/v1/persona/manage")
+    async def persona_manage(request: Request):
+        # Writer endpoint. It exists only when the dedicated management credential is
+        # configured; with no credential `persona_admin` is not a known caller, so this
+        # answers 401 and no unauthenticated remote write is possible.
+        return await dispatch(request, "persona")
 
     return app

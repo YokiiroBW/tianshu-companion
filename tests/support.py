@@ -296,8 +296,20 @@ class FakeDelivery:
         return self.answers.get(request["reply_id"])
 
 
+def persona_config(version=1, **entries):
+    """A deployment document shape, exactly as the service and the CLI both read it."""
+    return dict(
+        config_version=version,
+        roles=entries
+        or {
+            "actor:a": dict(version=1, persona="Role A"),
+            "actor:b": dict(version=1, persona="Role B"),
+        },
+    )
+
+
 class Harness:
-    def __init__(self, path=":memory:", *, direct_options=None, **policy):
+    def __init__(self, path=":memory:", *, direct_options=None, personas=None, **policy):
         self.clock, self.contracts = Clock(), contracts()
         self.origins, self.memory = FakeOrigins(self.clock), FakeMemory(self.clock)
         self.gateway, self.sender = FakeGateway(), FakeSender(self.clock)
@@ -342,6 +354,7 @@ class Harness:
                 "deliver": self.delivery,
                 **(direct_options or {}),
             },
+            **(dict(personas=True, persona_import=personas) if personas is not None else {}),
         )
         self.core = self.new_core()
 

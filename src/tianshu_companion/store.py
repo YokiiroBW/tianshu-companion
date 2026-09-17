@@ -50,12 +50,26 @@ PROACTIVE_TABLES = {
 # pruned; the registry row and the request row are the durable facts.
 DIRECT_TABLES = {"direct_commands", "direct_requests", "direct_attempts"}
 
+# Registered character personas. `personas` is the live pointer row, `revisions` and
+# `publications` are append-only history, and `imports` keys the idempotent deployment
+# import. No row here can confer a permission: persona content is character text only.
+PERSONA_TABLES = {
+    "persona_personas",
+    "persona_revisions",
+    "persona_publications",
+    "persona_approvals",
+    "persona_rollbacks",
+    "persona_imports",
+    "persona_access",
+}
+
 TABLES = (
     LIFE_TABLES
     | IMAGE_TABLES
     | WRITING_TABLES
     | PROACTIVE_TABLES
     | DIRECT_TABLES
+    | PERSONA_TABLES
     | {
         "conversations",
         "collections",
@@ -104,11 +118,11 @@ class Store:
 
     def _initialize(self, path):
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8):
             raise RuntimeError("Unsupported database schema version")
         # Backup the complete SQLite view (including WAL) before structural migration.
         # A unique file never overwrites earlier recovery evidence.
-        if version in (1, 2, 3, 4, 5, 6) and str(path) != ":memory:":
+        if version in (1, 2, 3, 4, 5, 6, 7) and str(path) != ":memory:":
             label = {
                 1: ".pre-source-v2-",
                 2: ".pre-life-v3-",
@@ -116,6 +130,7 @@ class Store:
                 4: ".pre-writing-v5-",
                 5: ".pre-proactive-v6-",
                 6: ".pre-routing-v7-",
+                7: ".pre-persona-v8-",
             }[version]
             backup = sqlite3.connect(str(path) + label + uuid.uuid4().hex + ".bak")
             try:
@@ -126,7 +141,13 @@ class Store:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
         for table in sorted(
-            TABLES - LIFE_TABLES - IMAGE_TABLES - WRITING_TABLES - PROACTIVE_TABLES - DIRECT_TABLES
+            TABLES
+            - LIFE_TABLES
+            - IMAGE_TABLES
+            - WRITING_TABLES
+            - PROACTIVE_TABLES
+            - DIRECT_TABLES
+            - PERSONA_TABLES
         ):
             self.db.execute(
                 f"CREATE TABLE IF NOT EXISTS {table} ("
@@ -172,7 +193,12 @@ class Store:
                     dict(id="source_head", generation="generation:" + uuid.uuid4().hex, sequence=0),
                 )
             for table in sorted(
-                LIFE_TABLES | IMAGE_TABLES | WRITING_TABLES | PROACTIVE_TABLES | DIRECT_TABLES
+                LIFE_TABLES
+                | IMAGE_TABLES
+                | WRITING_TABLES
+                | PROACTIVE_TABLES
+                | DIRECT_TABLES
+                | PERSONA_TABLES
             ):
                 self.db.execute(
                     f"CREATE TABLE IF NOT EXISTS {table} ("
@@ -217,7 +243,19 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS direct_attempts_request ON direct_attempts("
                 "json_extract(body,'$.request_id'),position,id)"
             )
-            self.db.execute("PRAGMA user_version=7")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS persona_revisions_subject ON persona_revisions("
+                "json_extract(body,'$.subject'),position,id)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS persona_approvals_revision ON persona_approvals("
+                "json_extract(body,'$.revision_id'),position,id)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS persona_publications_subject ON persona_publications("
+                "json_extract(body,'$.subject'),position,id)"
+            )
+            self.db.execute("PRAGMA user_version=8")
 
     @contextmanager
     def transaction(self):

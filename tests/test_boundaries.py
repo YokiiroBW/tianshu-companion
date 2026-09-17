@@ -1,3 +1,4 @@
+import ast
 import copy
 import json
 import tempfile
@@ -261,6 +262,95 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
                     Store(path)
             finally:
                 store.close()
+
+
+class PersonaBoundaryTests(unittest.TestCase):
+    """Module boundaries for persona management, checked against the source itself.
+
+    These are structural assertions, not behaviour: a wrong import direction or a table name
+    spelled out in the wrong module is the kind of change that silently re-creates a second
+    owner of one rule. The behaviour of each rule is covered in `test_personas.py`.
+    """
+
+    def source(self, name):
+        return (Path(__file__).parents[1] / "src/tianshu_companion" / name).read_text(
+            encoding="utf-8"
+        )
+
+    def imports(self, name):
+        tree = ast.parse(self.source(name))
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                found.add(node.module)
+            elif isinstance(node, ast.Import):
+                found.update(alias.name for alias in node.names)
+        return found
+
+    def test_persona_domain_owns_its_tables_and_knows_no_adapter(self):
+        source = self.source("personas.py")
+        # The domain never reaches back up into the orchestrator or the HTTP layer.
+        self.assertFalse(
+            {module for module in self.imports("personas.py") if module.endswith(("core", "app"))}
+        )
+        self.assertIn("persona_personas", source)
+        # The only place that builds a persona table name from a caller's word.
+        self.assertIn('"persona_" + table', source)
+
+    def test_no_other_module_names_a_persona_table(self):
+        tables = (
+            "persona_personas",
+            "persona_revisions",
+            "persona_publications",
+            "persona_approvals",
+            "persona_rollbacks",
+            "persona_imports",
+            "persona_access",
+        )
+        owners = {"personas.py": None, "store.py": None}
+        for path in sorted(
+            Path(__file__).parents[1].joinpath("src/tianshu_companion").glob("*.py")
+        ):
+            if path.name in owners:
+                continue
+            source = path.read_text(encoding="utf-8")
+            for table in tables:
+                self.assertNotIn(
+                    f'"{table}"',
+                    source,
+                    f"{path.name} reaches into {table}; persona tables have one owner",
+                )
+
+    def test_core_only_takes_and_verifies_the_pinned_snapshot(self):
+        source = self.source("core.py")
+        # Exactly one module-level import of the persona module, and no operator vocabulary.
+        self.assertIn("from .personas import PersonaError, Personas", source)
+        self.assertEqual(1, source.count("from .personas import"))
+        for word in (
+            "published_revision",
+            "draft_revision",
+            "expected",
+            "operator",
+            "approve",
+            "publish",
+        ):
+            self.assertNotIn(f'"{word}"', source, f"core.py re-states the persona rule {word}")
+
+    def test_persona_cli_never_touches_a_table_and_shares_the_use_case(self):
+        source = self.source("persona_cli.py")
+        self.assertNotIn("store.get", source)
+        self.assertNotIn("store.put", source)
+        self.assertNotIn("store.list", source)
+        self.assertEqual(1, source.count(".manage("))
+        self.assertIn("from .store import Store", source)
+
+    def test_direct_send_path_has_no_persona_dependency(self):
+        source = self.source("direct.py")
+        # Functional commands keep their ordering and their own authorization facts; the
+        # persona module is not part of that path at all.
+        self.assertNotIn("personas", self.imports("direct.py"))
+        self.assertNotIn("role =", source)
+        self.assertNotIn("persona =", source)
 
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):

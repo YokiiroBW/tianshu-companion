@@ -7,7 +7,7 @@ from contextlib import closing
 import pytest
 
 from support import Harness
-from tianshu_companion.store import Store
+from tianshu_companion.store import PERSONA_TABLES, Store
 
 WORK = "work:chain"
 CHAPTERS = ["work:chain:1", "work:chain:2", "work:chain:3"]
@@ -84,9 +84,31 @@ def publish(writing, chapter, *, reviewer="admin"):
     return writing.publish_chapter(chapter, reviewer=reviewer, expected=meta["version"])
 
 
+def rewind_to_v7(path):
+    """Leave a real database at user_version=7 so the run crosses the persona step.
+
+    A brand new file is created straight at the current version, so it has no migration to
+    take a recovery backup at all. Rewinding a real file to the pre-persona shape keeps the
+    restart in this test an actual v7 -> v8 migration.
+    """
+    with closing(Store(path)) as store:
+        for table in sorted(PERSONA_TABLES):
+            store.db.execute(f"DROP TABLE IF EXISTS {table}")
+        for index in (
+            "persona_revisions_subject",
+            "persona_approvals_revision",
+            "persona_publications_subject",
+        ):
+            store.db.execute(f"DROP INDEX IF EXISTS {index}")
+        store.db.execute("PRAGMA user_version=7")
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+
+
 def test_two_chapter_chain_review_publication_and_supervised_restart(tmp_path):
     path = tmp_path / "chain.db"
     calls, texts = [], ["Chapter one synthetic prose.", "Chapter two synthetic prose."]
+    rewind_to_v7(path)
 
     async def scenario():
         harness = open_writing(path, calls, texts, first=True)
@@ -208,9 +230,11 @@ def test_two_chapter_chain_review_publication_and_supervised_restart(tmp_path):
 
     asyncio.run(scenario())
     with closing(Store(path)) as store:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 8
         assert len(store.list("write_publications")) == 4
-        assert not list(tmp_path.glob("*.bak"))
+        # The v7 -> v8 persona migration is the only structural step here, and it took its
+        # recovery backup before changing anything.
+        assert len(list(tmp_path.glob("*.pre-persona-v8-*.bak"))) == 1
 
 
 def test_chain_human_only_authoring_review_and_publication_offline(tmp_path):
@@ -276,4 +300,4 @@ def test_chain_human_only_authoring_review_and_publication_offline(tmp_path):
 
     asyncio.run(scenario())
     with closing(sqlite3.connect(path)) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
