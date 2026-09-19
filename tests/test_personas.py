@@ -899,8 +899,20 @@ def test_management_port_is_gated_on_its_own_service_credential():
             with pytest.raises(Fault) as forbidden:
                 core.manage_persona(service, {"operation": "list"})
             assert forbidden.value.code == "forbidden"
+            # Browsing is the same one credential: a chat, ingest or bridge service reaches
+            # neither a write nor a read of the registered personas.
+            with pytest.raises(Fault) as browse:
+                core.manage_persona(service, {"operation": "catalog"})
+            assert browse.value.code == "forbidden"
         listed = core.manage_persona("persona_admin", {"operation": "list"})
         assert listed["subjects"] == [A, B]
+        catalog = core.manage_persona("persona_admin", {"operation": "catalog"})
+        assert [entry["subject"] for entry in catalog["entries"]] == [A, B]
+        assert catalog["consistency"] == "live_keyset"
+        directory = core.manage_persona(
+            "persona_admin", {"operation": "history_page", "subject": A, "kind": "revisions"}
+        )
+        assert directory["count"] == 1 and directory["has_more"] is False
 
         with pytest.raises(Fault) as conflict:
             core.manage_persona(
@@ -919,6 +931,11 @@ def test_management_port_is_gated_on_its_own_service_credential():
         with pytest.raises(Fault) as unknown:
             core.manage_persona("persona_admin", {"operation": "get", "subject": "actor:ghost"})
         assert unknown.value.code == "not_found"
+        with pytest.raises(Fault) as missing:
+            core.manage_persona(
+                "persona_admin", {"operation": "revision", "subject": A, "revision_id": "0" * 64}
+            )
+        assert missing.value.code == "not_found"
         with pytest.raises(Fault) as bad:
             core.manage_persona("persona_admin", {"operation": "explode"})
         assert bad.value.code == "invalid_input"
@@ -932,9 +949,10 @@ def test_management_port_refuses_without_registered_personas():
 
     async def scenario():
         harness = Harness()  # personas not enabled: the port is absent, not open
-        with pytest.raises(Fault) as error:
-            harness.core.manage_persona("persona_admin", {"operation": "list"})
-        assert error.value.code == "dependency_unavailable"
+        for document in ({"operation": "list"}, {"operation": "catalog"}):
+            with pytest.raises(Fault) as error:
+                harness.core.manage_persona("persona_admin", document)
+            assert error.value.code == "dependency_unavailable"
         await harness.core.close()
 
     asyncio.run(scenario())

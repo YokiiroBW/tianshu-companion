@@ -342,8 +342,31 @@ class PersonaBoundaryTests(unittest.TestCase):
         self.assertNotIn("store.get", source)
         self.assertNotIn("store.put", source)
         self.assertNotIn("store.list", source)
+        # The read commands are the same one use case: naming only, no SQL of their own.
+        self.assertNotIn("SELECT", source.upper())
         self.assertEqual(1, source.count(".manage("))
         self.assertIn("from .store import Store", source)
+
+    def test_the_query_rules_module_owns_no_table_and_no_adapter(self):
+        """Bounded reading is split by rule, not by convenience.
+
+        `persona_queries` holds the arithmetic - page limits, cursor binding, the four-field
+        comparison - and is pure: it imports no store, no domain and no adapter, and it can
+        never name a persona table. `personas` keeps the table names and the SQL, so exactly
+        one module still answers "where does a persona live".
+        """
+        imports = self.imports("persona_queries.py")
+        self.assertFalse(
+            {name for name in imports if name.endswith(("store", "personas", "core", "app"))}
+        )
+        source = self.source("persona_queries.py")
+        self.assertNotIn("persona_", source)
+        self.assertNotIn("SELECT", source.upper())
+        # The one direction that is allowed, and it is a single import.
+        self.assertIn("from .persona_queries import", self.source("personas.py"))
+        self.assertEqual(1, self.source("personas.py").count("from .persona_queries import"))
+        # The bounded page read lives in the domain that owns the tables, next to them.
+        self.assertIn("ORDER BY position,id LIMIT", self.source("personas.py"))
 
     def test_only_the_persona_domain_owns_operation_idempotence(self):
         """One module decides what "the same request" means; the adapters only carry it."""

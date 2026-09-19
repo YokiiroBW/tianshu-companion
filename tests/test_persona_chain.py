@@ -33,11 +33,18 @@ NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 def cli(*arguments, env=None):
-    """Run the installed command surface in its own interpreter."""
+    """Run the installed command surface in its own interpreter.
+
+    The command prints its answer as UTF-8 JSON, so the child is told to encode its standard
+    output as UTF-8 too. A captured pipe has no console, and the platform locale would
+    otherwise encode an answer that contains Chinese text in the local codepage - the answer
+    would then be unreadable to any consumer that expects the JSON it documented.
+    """
     environment = dict(os.environ)
     environment["PYTHONPATH"] = os.pathsep.join(
         [str(ROOT / "src"), environment.get("PYTHONPATH", "")]
     ).strip(os.pathsep)
+    environment["PYTHONIOENCODING"] = "utf-8"
     environment.update(env or {})
     process = subprocess.run(
         [sys.executable, "-m", "tianshu_companion.persona_cli", *arguments],
@@ -372,6 +379,388 @@ def test_offline_cli_reports_a_missing_character_without_touching_the_file(tmp_p
     code, unknown = cli("--database", str(path), "--subject", A, "get")
     assert code == 1
     assert unknown["code"] == "not_found"
+
+
+def test_the_real_management_port_serves_the_whole_browse_and_compare_chain(tmp_path):
+    """One real loopback server, one synthetic management credential, the whole read chain.
+
+    Nothing here is a mocked function boundary: every step is a separate interpreter speaking
+    HTTP to a live Core built from a deployment document, and the same state is read back
+    afterwards by a third interpreter that owns the file. This is the chain a future web
+    surface would use, and it is also the proof that browsing writes nothing: the ledger and
+    the revision count are checked at the end against the writes alone.
+    """
+    path = tmp_path / "browse.db"
+    other = "actor:b"
+    third = "actor:c"
+    config = write_json(
+        tmp_path / "browse-config.json",
+        {
+            "contracts_path": str(workspace() / "contracts/text-dialogue/v1"),
+            "database_path": str(path),
+            "config_version": None,
+            "policy": {"silence_ms": 5000},
+            "roles": {
+                A: {"version": 1, "persona": "Served persona"},
+                other: {"version": 1, "persona": "Second persona"},
+                third: {"version": 1, "persona": "Third persona"},
+            },
+            "bindings": {},
+            "callers": {
+                "platform": {
+                    "token_env": "TIANSHU_SYNTHETIC_PLATFORM_TOKEN",
+                    "issuer": "synthetic-issuer",
+                    "origin_service": "platform_origin",
+                }
+            },
+            "services": {},
+            "personas": {"admin_token_env": ADMIN_TOKEN_ENV},
+        },
+    )
+    port = free_port()
+    url = f"http://127.0.0.1:{port}"
+    environment = dict(os.environ)
+    environment["TIANSHU_COMPANION_CONFIG"] = str(config)
+    environment[ADMIN_TOKEN_ENV] = ADMIN_TOKEN
+    environment["TIANSHU_SYNTHETIC_PLATFORM_TOKEN"] = "synthetic-platform-credential"
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "tianshu_companion.app:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--workers",
+            "1",
+        ],
+        cwd=str(ROOT),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=NO_WINDOW,
+    )
+    try:
+        wait_for_health(port, server)
+        target = ["--url", url, "--token-env", ADMIN_TOKEN_ENV]
+
+        # 1. The live keyset directory, one record at a time, following its own cursor.
+        seen, cursor = [], None
+        while True:
+            arguments = [*target, "--limit", "1", "catalog"]
+            if cursor is not None:
+                arguments += ["--cursor", cursor]
+            code, page = cli(*arguments)
+            assert code == 0, page
+            assert page["result"]["consistency"] == "live_keyset"
+            seen.extend(entry["subject"] for entry in page["result"]["entries"])
+            cursor = page["result"]["next_cursor"]
+            assert len(seen) < 10, "catalog paging did not terminate"
+            if not cursor:
+                break
+        assert seen == [A, other, third]
+
+        # 2. One history kind of one character, and the seed revision it names.
+        code, history = cli(*target, "--subject", A, "--kind", "revisions", "history_page")
+        assert code == 0, history
+        assert history["result"]["count"] == 1 and history["result"]["has_more"] is False
+        seed = history["result"]["entries"][0]["revision_id"]
+        assert "content" not in history["result"]["entries"][0]
+
+        # 3. The existing write chain, unchanged, over the same port.
+        code, current = cli(*target, "--subject", A, "get")
+        assert code == 0, current
+        authored = write_json(tmp_path / "authored.json", {"persona": "温和\n简洁", "tone": "温和"})
+        code, drafted = cli(
+            *target,
+            "--subject",
+            A,
+            "--operator",
+            "operator:chain",
+            "--reason",
+            "authored over the port",
+            "--request-id",
+            "chain:draft",
+            "--expected",
+            str(current["result"]["persona"]["version"]),
+            "--content",
+            str(authored),
+            "draft",
+        )
+        assert code == 0, drafted
+        revision = drafted["result"]["revision"]["revision_id"]
+        code, approved = cli(
+            *target,
+            "--subject",
+            A,
+            "--operator",
+            "reviewer:chain",
+            "--reason",
+            "reviewed over the port",
+            "--request-id",
+            "chain:approve",
+            "--expected",
+            str(drafted["result"]["persona"]["version"]),
+            "--revision",
+            revision,
+            "approve",
+        )
+        assert code == 0, approved
+        code, published = cli(
+            *target,
+            "--subject",
+            A,
+            "--operator",
+            "operator:chain",
+            "--reason",
+            "released over the port",
+            "--request-id",
+            "chain:publish",
+            "--expected",
+            str(approved["result"]["persona"]["version"]),
+            "--revision",
+            revision,
+            "publish",
+        )
+        assert code == 0, published
+
+        # 4. The newly published version, read on its own, and compared with the seed.
+        code, one = cli(*target, "--subject", A, "--revision", revision, "revision")
+        assert code == 0, one
+        assert one["result"]["revision"]["content"] == {"persona": "温和\n简洁", "tone": "温和"}
+        assert one["result"]["is_published"] is True and one["result"]["is_draft"] is False
+        assert one["result"]["published_revision"] == revision
+        code, diff = cli(*target, "--subject", A, "--left", seed, "--right", revision, "compare")
+        assert code == 0, diff
+        assert diff["result"]["comparison_scope"] == ["persona", "tone", "style", "address"]
+        assert diff["result"]["fields"]["persona"]["change"] == "modified"
+        assert diff["result"]["fields"]["persona"]["left"] == "Served persona"
+        assert diff["result"]["fields"]["persona"]["right"] == "温和\n简洁"
+        assert diff["result"]["fields"]["tone"]["change"] == "added"
+        assert diff["result"]["content_identical"] is False
+        assert diff["result"]["identical_revision"] is False
+
+        # 5. A page cursor taken here, then a rollback: the cursor is refused, not spliced.
+        code, opened = cli(
+            *target, "--subject", A, "--kind", "revisions", "--limit", "1", "history_page"
+        )
+        assert code == 0, opened
+        stale = opened["result"]["next_cursor"]
+        assert stale
+        code, latest = cli(*target, "--subject", A, "get")
+        assert code == 0, latest
+        code, rolled = cli(
+            *target,
+            "--subject",
+            A,
+            "--operator",
+            "operator:chain",
+            "--reason",
+            "rolled back over the port",
+            "--request-id",
+            "chain:rollback",
+            "--expected",
+            str(latest["result"]["persona"]["version"]),
+            "--revision",
+            seed,
+            "rollback",
+        )
+        assert code == 0, rolled
+        restored = rolled["result"]["restored_revision"]
+        code, refused = cli(
+            *target,
+            "--subject",
+            A,
+            "--kind",
+            "revisions",
+            "--limit",
+            "1",
+            "--cursor",
+            stale,
+            "history_page",
+        )
+        assert code == 1 and refused["code"] == "version_conflict"
+        # Reopening the first page is the documented way forward, and it now shows the
+        # rollback as a new revision that replays the older text.
+        code, reopened = cli(
+            *target, "--subject", A, "--kind", "revisions", "--limit", "1", "history_page"
+        )
+        assert code == 0, reopened
+        code, back = cli(
+            *target, "--subject", A, "--left", revision, "--right", restored, "compare"
+        )
+        assert code == 0, back
+        assert back["result"]["fields"]["persona"]["left"] == "温和\n简洁"
+        assert back["result"]["fields"]["persona"]["right"] == "Served persona"
+        assert back["result"]["fields"]["persona"]["change"] == "modified"
+        code, replayed = cli(
+            *target, "--subject", A, "--left", seed, "--right", restored, "compare"
+        )
+        assert code == 0, replayed
+        assert replayed["result"]["content_identical"] is True
+        assert replayed["result"]["identical_revision"] is False
+        assert all(
+            field["change"] == "unchanged" for field in replayed["result"]["fields"].values()
+        )
+
+        # 6. Another character's revision and another character's cursor stay unreachable.
+        code, foreign = cli(*target, "--subject", other, "get")
+        assert code == 0, foreign
+        other_seed = foreign["result"]["persona"]["published_revision"]
+        code, crossed = cli(*target, "--subject", A, "--revision", other_seed, "revision")
+        assert code == 1 and crossed["code"] == "invalid_input"
+        code, wrong = cli(
+            *target,
+            "--subject",
+            A,
+            "--kind",
+            "revisions",
+            "--limit",
+            "1",
+            "--cursor",
+            stale,
+            "catalog",
+        )
+        assert code == 1 and wrong["code"] == "invalid_input"
+    finally:
+        stop(server)
+
+    # A third interpreter owns the file and sees exactly the four writes: browsing left no
+    # trace at all, and every revision the chain read is durable.
+    store = open_owned(path)
+    try:
+        personas = Personas(store, time.time)
+        assert len(personas.revisions(A)) == 3  # the seed, the release, the rollback
+        assert len(personas.publications(A)) == 3
+        assert len(personas.approvals(A)) == 2
+        assert len(personas.rollbacks(A)) == 1
+        assert len(store.list("persona_operations")) == 4  # draft, approve, publish, rollback
+    finally:
+        store.close()
+
+
+def test_the_management_port_serves_no_browse_without_its_own_credential(tmp_path):
+    """One credential opens the browse surface, and nothing else does. Real HTTP, real 401."""
+    path = tmp_path / "credentials.db"
+    config = write_json(
+        tmp_path / "credentials-config.json",
+        {
+            "contracts_path": str(workspace() / "contracts/text-dialogue/v1"),
+            "database_path": str(path),
+            "config_version": None,
+            "policy": {"silence_ms": 5000},
+            "roles": {A: {"version": 1, "persona": "Served persona"}},
+            "bindings": {},
+            "callers": {
+                "platform": {
+                    "token_env": "TIANSHU_SYNTHETIC_PLATFORM_TOKEN",
+                    "issuer": "synthetic-issuer",
+                    "origin_service": "platform_origin",
+                },
+                "nonebot": {
+                    "token_env": "TIANSHU_SYNTHETIC_BRIDGE_TOKEN",
+                    "issuer": "synthetic-issuer",
+                    "origin_service": "bridge_origin",
+                },
+            },
+            "services": {},
+            "personas": {"admin_token_env": ADMIN_TOKEN_ENV},
+        },
+    )
+    port = free_port()
+    url = f"http://127.0.0.1:{port}"
+    environment = dict(os.environ)
+    environment["TIANSHU_COMPANION_CONFIG"] = str(config)
+    environment[ADMIN_TOKEN_ENV] = ADMIN_TOKEN
+    environment["TIANSHU_SYNTHETIC_PLATFORM_TOKEN"] = "synthetic-platform-credential"
+    environment["TIANSHU_SYNTHETIC_BRIDGE_TOKEN"] = "synthetic-bridge-credential"
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "tianshu_companion.app:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--workers",
+            "1",
+        ],
+        cwd=str(ROOT),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=NO_WINDOW,
+    )
+    try:
+        wait_for_health(port, server)
+        # The host authenticates the platform and bridge credentials - they are real callers -
+        # but neither is the persona-management service, so a browse is forbidden, not served.
+        foreign = {
+            "TIANSHU_SYNTHETIC_PLATFORM_TOKEN": "synthetic-platform-credential",
+            "TIANSHU_SYNTHETIC_BRIDGE_TOKEN": "synthetic-bridge-credential",
+        }
+        for token_env, credential in foreign.items():
+            environment_of_cli = {token_env: credential}
+            code, refused = cli(
+                "--url", url, "--token-env", token_env, "catalog", env=environment_of_cli
+            )
+            assert code == 1, refused
+            assert refused["code"] == "forbidden" and refused["status"] == 403
+            code, refused_write = cli(
+                "--url",
+                url,
+                "--token-env",
+                token_env,
+                "--subject",
+                A,
+                "--operator",
+                "operator:foreign",
+                "--reason",
+                "not my surface",
+                "--expected",
+                "99",
+                "--content",
+                str(write_json(tmp_path / "foreign.json", {"persona": "foreign"})),
+                "draft",
+                env=environment_of_cli,
+            )
+            assert code == 1 and refused_write["code"] == "forbidden"
+        # No credential at all, and one that is simply wrong: unauthenticated, nothing served.
+        for authorization in (None, "Bearer not-a-credential"):
+            headers = {"Content-Type": "application/json"}
+            if authorization:
+                headers["Authorization"] = authorization
+            request = urllib.request.Request(
+                url + "/internal/v1/persona/manage",
+                data=json.dumps({"operation": "catalog"}).encode("utf-8"),
+                headers=headers,
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=10)
+            assert error.value.code == 401
+            assert json.load(error.value)["code"] == "unauthorized"
+        # The management credential itself still browses.
+        code, served = cli("--url", url, "--token-env", ADMIN_TOKEN_ENV, "catalog")
+        assert code == 0, served
+        assert [entry["subject"] for entry in served["result"]["entries"]] == [A]
+    finally:
+        stop(server)
+
+    # Nothing above wrote a fact: only the seed import exists, and no operation was recorded.
+    store = open_owned(path)
+    try:
+        personas = Personas(store, time.time)
+        assert len(personas.revisions(A)) == 1
+        assert len(personas.approvals(A)) == 0 and len(personas.publications(A)) == 1
+        assert store.list("persona_operations") == []
+    finally:
+        store.close()
 
 
 def test_online_cli_uses_the_management_port_and_its_own_credential(tmp_path):

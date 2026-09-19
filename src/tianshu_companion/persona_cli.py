@@ -18,6 +18,10 @@ Two deployment shapes, one command surface:
 
 Either way the command names an operator and every mutation is explicit. Nothing here can
 be triggered by a chat message, a model answer, a source document or a persona field.
+
+The read commands (`list`/`catalog`/`history_page`/`revision`/`compare`/`get`/`history`/
+`capabilities`) are the same on both shapes and carry no operator and no request id: they
+browse one bounded page or one comparison and write nothing.
 """
 
 import argparse
@@ -40,6 +44,10 @@ DEFAULT_TOKEN_ENV = "TIANSHU_PERSONA_ADMIN_TOKEN"
 CLI_SCOPE = "persona_cli"
 OPERATIONS = (
     "list",
+    "catalog",
+    "history_page",
+    "revision",
+    "compare",
     "get",
     "history",
     "capabilities",
@@ -54,7 +62,10 @@ OPERATIONS = (
 )
 MUTATIONS = ("draft", "approve", "reject", "publish", "rollback", "retire", "restore", "import")
 VERSIONED = ("draft", "approve", "reject", "publish", "rollback", "retire", "restore")
-SUBJECT_OPERATIONS = tuple(op for op in OPERATIONS if op not in ("list", "import"))
+# Operations that name one character. `catalog` browses the whole directory instead.
+SUBJECT_OPERATIONS = tuple(op for op in OPERATIONS if op not in ("list", "import", "catalog"))
+# Read operations: one bounded page or one comparison, no operation identity at all.
+PAGED = ("catalog", "history_page")
 
 
 def build_parser():
@@ -86,6 +97,22 @@ def build_parser():
         "--from-config", action="store_true", help="Draft this character's config entry."
     )
     parser.add_argument("--note", help="Optional editor note stored with the revision.")
+    parser.add_argument(
+        "--limit", type=int, help="Page size for `catalog`/`history_page`; default 20, maximum 100."
+    )
+    parser.add_argument(
+        "--cursor",
+        help=(
+            "Opaque continuation cursor returned as `next_cursor` by the previous page. It "
+            "belongs to one request: another character, kind or page size is refused."
+        ),
+    )
+    parser.add_argument(
+        "--kind",
+        help="History kind for `history_page`: revisions, publications, approvals or rollbacks.",
+    )
+    parser.add_argument("--left", help="Left revision id for `compare`.")
+    parser.add_argument("--right", help="Right revision id for `compare`.")
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("command", choices=OPERATIONS)
     return parser
@@ -107,10 +134,18 @@ def operation_document(args):
         document["reason"] = args.reason
         document["request_id"] = args.request_id or uuid.uuid4().hex
         document["scope"] = CLI_SCOPE
+    if args.command in PAGED:
+        document["limit"] = args.limit
+        document["cursor"] = args.cursor
+    if args.command == "history_page":
+        document["kind"] = args.kind
     if args.command in VERSIONED:
         document["expected"] = args.expected
-    if args.command in ("approve", "reject", "publish", "rollback"):
+    if args.command in ("approve", "reject", "publish", "rollback", "revision"):
         document["revision_id"] = args.revision
+    if args.command == "compare":
+        document["left"] = args.left
+        document["right"] = args.right
     if args.command == "draft":
         document["note"] = args.note
         if args.content is not None:

@@ -23,12 +23,31 @@ Rules that hold everywhere in here:
   in one transaction under that identity. Replaying the same request returns the recorded
   result without touching anything; reusing the same request id for a different request is
   refused. Content addressing deduplicates revisions; it does not deduplicate operations.
+- **Reading a character is bounded and separate from writing it.** Browsing (catalog and one
+  history kind at a time), reading one immutable revision and comparing two of them are read
+  operations: they carry no request id, write no fact and no ledger row, and move no pointer.
+  They page with SQL `LIMIT` instead of holding a whole history in memory, and their cursors,
+  byte budgets and comparison rules live in `persona_queries`, which knows no table.
 """
 
 import json
 import re
 
 from .contracts import canonical, digest
+from .persona_queries import (
+    CURSOR_RESERVE,
+    DOCUMENT_MAX_BYTES,
+    HISTORY_KINDS,
+    PAGE_MAX_BYTES,
+    QueryError,
+    comparison,
+    fit,
+    issue_cursor,
+    new_secret,
+    page_limit,
+    read_cursor,
+    within_budget,
+)
 
 REVISION_SUFFIX = "persona-revision/v1"
 OPERATION_SUFFIX = "persona-operation/v1"
@@ -56,6 +75,15 @@ REQUEST_FIELDS = (
     "reason",
     "note",
 )
+
+# One history, one table. The kind vocabulary is `persona_queries`'; the table names are the
+# domain's, so no adapter can name a table and no pure rule has to know one.
+HISTORY_TABLES = {
+    "revisions": "persona_revisions",
+    "publications": "persona_publications",
+    "approvals": "persona_approvals",
+    "rollbacks": "persona_rollbacks",
+}
 
 # Explicit operator identities only. A persona field, a chat message, a recalled memory or a
 # model answer is never an operator identity, and only these two entry points may call
@@ -119,6 +147,20 @@ def _required(request, key):
     if key not in request:
         _invalid("Missing " + key)
     return request[key]
+
+
+def _record_key(value):
+    """One `(position, id)` continuation key, exactly the shape a page cursor hands back."""
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or isinstance(value[0], bool)
+        or not isinstance(value[0], int)
+        or not isinstance(value[1], str)
+        or not value[1]
+    ):
+        _invalid("Malformed cursor")
+    return value
 
 
 def request_identity(value):
@@ -235,6 +277,9 @@ class Personas:
 
     def __init__(self, store, clock):
         self.store, self.clock = store, clock
+        # One process-local cursor signing key. It is never persisted, so cursors handed out
+        # by an earlier process are refused rather than silently reinterpreted.
+        self.cursor_secret = new_secret()
 
     # ------------------------------------------------------------------ internals
 
@@ -605,10 +650,22 @@ class Personas:
         # Approval rows are owned by the character (`conversation_id`), so the revision is
         # matched on its own field. A later rejection withdraws an earlier approval: the
         # last decision on this revision is the one that stands.
-        rows = [
-            row for row in self.store.list("persona_approvals") if row["revision_id"] == revision_id
-        ]
-        return rows[-1] if rows and rows[-1]["decision"] == "approved" else None
+        row = self._last_decision(revision_id)
+        return row if row is not None and row["decision"] == "approved" else None
+
+    def _last_decision(self, revision_id):
+        """The last decision on one revision, read through its own index and one row.
+
+        The answer is the same one `_approval` has always given - the last decision in
+        `(position, id)` order wins - but it no longer requires the whole decision table to
+        be loaded first, so a read stays bounded by the page rather than by the history.
+        """
+        row = self.store.db.execute(
+            "SELECT body FROM persona_approvals WHERE json_extract(body,'$.revision_id')=? "
+            "ORDER BY position DESC,id DESC LIMIT 1",
+            (revision_id,),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
 
     def revisions(self, subject):
         actor_id(subject)
@@ -664,6 +721,321 @@ class Personas:
             "changes_send_eligibility": False,
             "changes_memory_relations": False,
         }
+
+    # ------------------------------------------------------------- bounded reading
+
+    def _bounded(self, call, *arguments):
+        """Run one bounded read, mapping a pure rule's refusal into the persona vocabulary."""
+        try:
+            return call(*arguments)
+        except QueryError as error:
+            raise PersonaError(error.code, error.message) from None
+
+    def _revision_row(self, revision_id):
+        return None if revision_id is None else self.store.get("persona_revisions", revision_id)
+
+    def _location(self, persona):
+        """Where a character's pointers stand, as one small document every read shares.
+
+        Full persona text is deliberately absent: a list or a page says which revision is
+        live, and the caller reads the text through the single-revision read.
+        """
+        return dict(
+            persona_version=persona["version"],
+            state=self._state(
+                persona,
+                self._revision_row(persona["published_revision"]),
+                self._revision_row(persona["draft_revision"]),
+            ),
+            published_revision=persona["published_revision"],
+            draft_revision=persona["draft_revision"],
+        )
+
+    def _page_rows(self, table, subject, after, limit):
+        """One keyset page straight from SQL: `LIMIT` bounds the read, nothing is sliced.
+
+        The read is a range scan on the character's own index, not the whole history held in
+        memory and cut afterwards. `after` is the `(position, id)` the previous cursor ended
+        on, which is the same order `Store.list` uses, so a page can neither repeat nor skip
+        a record.
+        """
+        sql = "SELECT position,id,body FROM " + table + " WHERE conversation_id=?"
+        arguments = [subject]
+        if after is not None:
+            sql += " AND (position>? OR (position=? AND id>?))"
+            arguments += [after[0], after[0], after[1]]
+        sql += " ORDER BY position,id LIMIT ?"
+        arguments.append(limit)
+        return [
+            (row[0], row[1], json.loads(row[2])) for row in self.store.db.execute(sql, arguments)
+        ]
+
+    def _page(
+        self,
+        operation,
+        entries,
+        keys,
+        limit,
+        *,
+        more_probe=False,
+        subject=None,
+        kind=None,
+        version=None,
+        consistency=None,
+    ):
+        """Assemble one bounded page: whole records, an exact continuation cursor.
+
+        The budget covers the finished response, cursor included, so a caller can always
+        parse what it received and can always continue at the record the page ended on. A
+        page that is short because of the budget still says `has_more`, so nothing is lost
+        silently and nothing incomplete is sent.
+        """
+        kept, kept_keys = fit(entries, keys, PAGE_MAX_BYTES - CURSOR_RESERVE)
+        more = more_probe or len(kept) < len(entries)
+        document = dict(
+            schema_version=1,
+            operation=operation,
+            limit=limit,
+            count=len(kept),
+            entries=kept,
+            has_more=more,
+            next_cursor=(
+                issue_cursor(
+                    self.cursor_secret,
+                    dict(
+                        operation=operation,
+                        subject=subject,
+                        kind=kind,
+                        limit=limit,
+                        version=version,
+                        last_key=kept_keys[-1],
+                    ),
+                )
+                if more
+                else None
+            ),
+        )
+        if consistency is not None:
+            document["consistency"] = consistency
+        return within_budget(document, PAGE_MAX_BYTES)
+
+    def _catalog_entry(self, persona):
+        published = self._revision_row(persona["published_revision"])
+        draft = self._revision_row(persona["draft_revision"])
+        return dict(
+            subject=persona["subject"],
+            state=self._state(persona, published, draft),
+            version=persona["version"],
+            published_revision=persona["published_revision"],
+            draft_revision=persona["draft_revision"],
+            retired=persona["retired"],
+            updated_at=persona["updated_at"],
+        )
+
+    def _read_catalog(self, request):
+        """A live keyset directory: characters in ascending id, one bounded page at a time.
+
+        No snapshot is promised across pages - the pointer each entry reports is the one it
+        had when that page was read - so a character registered behind the cursor is simply
+        not repeated, and one registered ahead of it appears on the next page. Nothing here
+        loads the directory into memory: the page is `LIMIT`ed in SQL and the cursor is the
+        last subject that was returned.
+        """
+        limit = page_limit(request.get("limit"))
+        cursor = request.get("cursor")
+        after = None
+        if cursor is not None:
+            binding = read_cursor(self.cursor_secret, cursor, operation="catalog", limit=limit)
+            last_key = binding["last_key"]
+            if len(last_key) != 1 or not isinstance(last_key[0], str):
+                _invalid("Malformed cursor")
+            after = last_key[0]
+        sql = "SELECT body FROM persona_personas"
+        arguments = []
+        if after is not None:
+            sql += " WHERE id>?"
+            arguments.append(after)
+        sql += " ORDER BY id LIMIT ?"
+        arguments.append(limit + 1)
+        rows = [json.loads(row[0]) for row in self.store.db.execute(sql, arguments)]
+        return self._page(
+            "catalog",
+            [self._catalog_entry(row) for row in rows[:limit]],
+            [[row["subject"]] for row in rows[:limit]],
+            limit,
+            more_probe=len(rows) > limit,
+            consistency="live_keyset",
+        )
+
+    def _history_entry(self, kind, row):
+        if kind == "revisions":
+            decision = self._last_decision(row["id"])
+            return dict(
+                revision_id=row["id"],
+                fingerprint=row["fingerprint"],
+                parent=row["parent"],
+                source=row["source"],
+                operator=row["operator"],
+                note=row["note"],
+                created_at=row["created_at"],
+                decision=decision["decision"] if decision else None,
+                decided_by=decision["operator"] if decision else None,
+                decided_at=decision["created_at"] if decision else None,
+            )
+        if kind == "publications":
+            return dict(
+                publication_id=row["id"],
+                revision_id=row["revision_id"],
+                supersedes=row["supersedes"],
+                generation=row["sequence"],
+                kind=row["kind"],
+                state=row["state"],
+                operator=row["operator"],
+                reason=row["reason"],
+                created_at=row["created_at"],
+            )
+        if kind == "approvals":
+            return dict(
+                approval_id=row["id"],
+                revision_id=row["revision_id"],
+                fingerprint=row["fingerprint"],
+                decision=row["decision"],
+                state=row["state"],
+                operator=row["operator"],
+                reason=row["reason"],
+                created_at=row["created_at"],
+            )
+        return dict(
+            rollback_id=row["id"],
+            restored_revision=row["restored_revision"],
+            target_revision=row["target_revision"],
+            superseded_revision=row["superseded_revision"],
+            state=row["state"],
+            operator=row["operator"],
+            reason=row["reason"],
+            created_at=row["created_at"],
+        )
+
+    def _read_history_page(self, subject, request):
+        """One history kind of one character, page by page, bound to the version it read.
+
+        The pointer and the page come from the same short transaction, and the cursor carries
+        the version they were taken at. Any later draft, approval, rejection, publication,
+        rollback, retirement or restore advances that version, so an old cursor is refused
+        with `version_conflict` instead of quietly stitching a newer page onto an older
+        pointer. The only way forward is to reopen the first page.
+        """
+        kind = request.get("kind")
+        if kind not in HISTORY_KINDS:
+            _invalid("kind must be one of " + ", ".join(HISTORY_KINDS))
+        limit = page_limit(request.get("limit"))
+        cursor = request.get("cursor")
+        with self.store.transaction():
+            persona = self._persona(subject)
+            version = persona["version"]
+            after = None
+            if cursor is not None:
+                binding = read_cursor(
+                    self.cursor_secret,
+                    cursor,
+                    operation="history_page",
+                    subject=subject,
+                    kind=kind,
+                    limit=limit,
+                )
+                if binding["version"] != version:
+                    _conflict("This history moved since the page was read; reopen the first page")
+                after = _record_key(binding["last_key"])
+            rows = self._page_rows(HISTORY_TABLES[kind], subject, after, limit + 1)
+        return self._page(
+            "history_page",
+            [self._history_entry(kind, row) for _, _, row in rows[:limit]],
+            [[position, record_id] for position, record_id, _ in rows[:limit]],
+            limit,
+            more_probe=len(rows) > limit,
+            subject=subject,
+            kind=kind,
+            version=version,
+        )
+
+    def _read_revision(self, subject, request):
+        """One immutable revision of one character, with where it stands right now.
+
+        Membership is checked before any content is returned, so another character's history
+        is not readable through this subject. The pointers and the text come from the same
+        read transaction, so the answer never pairs today's pointer with yesterday's bytes.
+        """
+        revision_id = _required(request, "revision_id")
+        if not isinstance(revision_id, str) or not revision_id:
+            _invalid("A revision id is required")
+        with self.store.transaction():
+            row = self._revision_for(subject, revision_id)
+            if row["fingerprint"] != fingerprint(row["content"]):
+                _invalid("Revision content does not match its fingerprint")
+            persona = self._persona(subject)
+            document = dict(
+                schema_version=1,
+                operation="revision",
+                subject=subject,
+                revision=self._view(row["id"]),
+                is_published=persona["published_revision"] == row["id"],
+                is_draft=persona["draft_revision"] == row["id"],
+                **self._location(persona),
+            )
+        return within_budget(document, DOCUMENT_MAX_BYTES)
+
+    def _read_compare(self, subject, request):
+        """Two immutable revisions of one character, compared field by field.
+
+        The answer is only about the four persona text fields plus a digest-level statement
+        about any extension field, so it can never dress an extension change up as persona
+        text - nor report four unchanged fields as "the persona is identical". No model is
+        called, no quality is scored and nothing is approved: the reviewers' own operations
+        stay the only way a revision reaches a model. Both revisions must belong to the
+        request's character.
+        """
+        left_id = _required(request, "left")
+        right_id = _required(request, "right")
+        for name, value in (("left", left_id), ("right", right_id)):
+            if not isinstance(value, str) or not value:
+                _invalid("A revision id is required for " + name)
+        with self.store.transaction():
+            left = self._revision_for(subject, left_id)
+            right = self._revision_for(subject, right_id)
+            left_fingerprint, right_fingerprint = (
+                fingerprint(left["content"]),
+                fingerprint(right["content"]),
+            )
+            if left["fingerprint"] != left_fingerprint or right["fingerprint"] != right_fingerprint:
+                _invalid("Revision content does not match its fingerprint")
+            persona = self._persona(subject)
+            document = dict(
+                schema_version=1,
+                operation="compare",
+                subject=subject,
+                left=self._revision_ref(left),
+                right=self._revision_ref(right),
+                **comparison(
+                    left["content"],
+                    right["content"],
+                    left_id=left["id"],
+                    right_id=right["id"],
+                    left_fingerprint=left_fingerprint,
+                    right_fingerprint=right_fingerprint,
+                ),
+                **self._location(persona),
+            )
+        # Over budget the comparison is refused, never shortened: a truncated diff would read
+        # as if the missing fields were equal, and both revisions stay readable on their own.
+        return within_budget(
+            document, DOCUMENT_MAX_BYTES, "Comparison exceeds the response byte budget"
+        )
+
+    def _revision_ref(self, row):
+        """One revision without its text; the values live in the comparison itself."""
+        reference = self._view(row["id"])
+        reference.pop("content")
+        return reference
 
     # ------------------------------------------------------------------ pinning
 
@@ -736,6 +1108,11 @@ class Personas:
         A write must carry `request_id`. `scope` optionally names the authorization surface
         that issued it and defaults to the local one; it partitions operation identities and
         is never read as a permission.
+
+        The reads that browse a character (`catalog`/`history_page`/`revision`/`compare`) are
+        dispatched here as well, so both adapters get them without a second entry point and
+        without either one owning a rule. They carry no `request_id`, because they are not
+        writes: they record nothing, move no pointer and are safe to repeat.
         """
         if not isinstance(request, dict):
             _invalid("Invalid persona operation")
@@ -750,6 +1127,8 @@ class Personas:
                 subjects=subjects,
                 personas=[self.get(actor) for actor in subjects],
             )
+        if operation == "catalog":
+            return self._bounded(self._read_catalog, request)
         if operation == "import":
             # The deployment import keeps its own idempotence: the document digest is the
             # key, so replaying one deployment is already a no-op that reports itself as
@@ -764,6 +1143,12 @@ class Personas:
                 )
             return dict(schema_version=1, operation=operation, **result)
         subject = actor_id(_required(request, "subject"))
+        if operation == "history_page":
+            return self._bounded(self._read_history_page, subject, request)
+        if operation == "revision":
+            return self._bounded(self._read_revision, subject, request)
+        if operation == "compare":
+            return self._bounded(self._read_compare, subject, request)
         if operation == "get":
             return dict(schema_version=1, operation=operation, persona=self.get(subject))
         if operation == "history":

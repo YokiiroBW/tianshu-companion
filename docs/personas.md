@@ -8,13 +8,20 @@
 `tianshu_companion.persona_cli`（本地/在线维护适配器）；`core.py` 只在既有"准备边界"
 取一次快照，`store.py` 只加表与迁移，`app.py` 只加一条受鉴权的管理路由。
 
+TS-076 在同一入口上补**只读浏览与版本比较**：新增
+`tianshu_companion.persona_queries`（纯规则：页大小、游标绑定、字节预算、四字段比较），
+`personas.py` 增加 `catalog`/`history_page`/`revision`/`compare` 四个只读操作与带 `LIMIT` 的
+页查询，`persona_cli.py` 增加同语义命令。`app.py`/`core.py`/`store.py` 未改：既有
+`POST /internal/v1/persona/manage` 已经做了鉴权与分发，不需要第二条端口。
+
 ## 职责与依赖表（高内聚低耦合符合性）
 
 | 单元 | 拥有的职责 | 只允许依赖 | 明确不拥有 |
 | --- | --- | --- | --- |
-| `personas.Personas`（领域+用例） | 草稿/修订不可变、批准、发布指针、回退为**新修订**、撤权、导入游标、快照钉取与校验、**操作幂等账本**、`manage(request)` 唯一应用入口 | `Store` 的通用连接/事务/读写、`digest`/`canonical` | 角色权限与登记、来源登记、模型绑定、发送资格、Memory 关系数据、HTTP、CLI 参数、Direct 发送顺序 |
-| `core.Core` | 在**既有准备边界**调用 `personas.pin(actor)` 取快照并把 `config_version` 写进 turn；每次模型调用前 `personas.verify(role)`；把 `PersonaError` 映射为本模块既有 `Fault` | `personas` 的四个公开方法：`pin`/`verify`/`recover`/`manage`/`import_config` | 草稿、批准、发布、回退、历史等业务规则；persona 表名（`test_boundaries.py` 结构断言禁止） |
-| `persona_cli`（适配器） | 参数解析 → 一个操作文档 → `Personas.manage`；离线用 `--database` 自持 owner 锁，在线用 `--url` 走管理端口；`--request-id` 只做透传，缺失时生成一次性 id | `personas.manage`、`personas.deployment`（部署形状唯一规则）、`Store` | 任何人格规则、任何表名、任何直接写入、绕过单所有者、自行判断"是否重复请求" |
+| `personas.Personas`（领域+用例） | 草稿/修订不可变、批准、发布指针、回退为**新修订**、撤权、导入游标、快照钉取与校验、**操作幂等账本**、**有界页查询（SQL `LIMIT`）**、`manage(request)` 唯一应用入口 | `Store` 的通用连接/事务/读写、`digest`/`canonical`、`persona_queries` 的纯规则 | 角色权限与登记、来源登记、模型绑定、发送资格、Memory 关系数据、HTTP、CLI 参数、Direct 发送顺序 |
+| `persona_queries`（纯规则，TS-076 新增） | 页大小校验、**游标编码/校验**、**页字节预算**、**四字段比较** | `contracts.canonical`、标准库 | 任何表名、任何 Store、任何 SQL、任何人格事实、HTTP/CLI/权限 |
+| `core.Core` | 在**既有准备边界**调用 `personas.pin(actor)` 取快照并把 `config_version` 写进 turn；每次模型调用前 `personas.verify(role)`；把 `PersonaError` 映射为本模块既有 `Fault` | `personas` 的四个公开方法：`pin`/`verify`/`recover`/`manage`/`import_config` | 草稿、批准、发布、回退、历史、浏览与比较等业务规则；persona 表名（`test_boundaries.py` 结构断言禁止） |
+| `persona_cli`（适配器） | 参数解析 → 一个操作文档 → `Personas.manage`；离线用 `--database` 自持 owner 锁，在线用 `--url` 走管理端口；`--request-id` 只做透传，缺失时生成一次性 id | `personas.manage`、`personas.deployment`（部署形状唯一规则）、`Store` | 任何人格规则、任何 SQL、任何表名、任何直接写入、绕过单所有者、自行判断"是否重复请求" |
 | `app.create_app`（HTTP 适配器） | 只做鉴权 + 分发：`POST /internal/v1/persona/manage` → `core.manage_persona(service, body)` | `core.manage_persona` | 业务规则（`manage_persona` 本身只是"人设是否启用/是否 `persona_admin`"、把已鉴权服务记为授权域三件事的适配器） |
 | `store.Store` | 连接、事务、owner 锁、结构迁移与恢复备份、**可重入事务**（内层 `with transaction()` 加入外层，只有最外层提交/回滚） | `sqlite3` | 人格语义；`PERSONA_TABLES` 只出现在 `store.py` 的表清单里 |
 | 角色/来源/绑定/发送（既有模块） | 权限、来源登记、模型绑定、发送资格 | 不变 | 人格文本永远改不动它们 |
@@ -119,6 +126,56 @@ python -m tianshu_companion.persona_cli --url http://127.0.0.1:8765 list
    `version_conflict`（见上一节）。
 10. **审批状态也在乐观并发内**：任何改变可见状态的写入（含 `approve`）都推进 persona
     版本号，因此"我看到的那一版"同时覆盖指针与审批状态。
+11. **浏览是读，而且必须是有界的**：`catalog`/`history_page`/`revision`/`compare` 不带
+    `request_id`，不写事实、不写账本、不推进版本、不动指针；每一页由 SQL `LIMIT` 限定，
+    禁止把整段历史读进内存再在 Python 里切片。
+
+## 有界浏览与版本比较（TS-076）
+
+同一管理端口新增四个**只读**操作，`app.py`/`core.py` 不需要改：凭据、请求上限与错误映射
+全部沿用既有那一套，未配置 `personas` 段时与写入一样不可用。
+
+```json
+{"operation": "catalog",      "limit": 20, "cursor": "<不透明游标>"}
+{"operation": "history_page", "subject": "actor:companion", "kind": "revisions", "limit": 20, "cursor": "..."}
+{"operation": "revision",     "subject": "actor:companion", "revision_id": "<sha256>"}
+{"operation": "compare",      "subject": "actor:companion", "left": "<sha256>", "right": "<sha256>"}
+```
+
+| 操作 | 回答的问题 | 关键规则 |
+| --- | --- | --- |
+| `catalog` | 有哪些角色、当前指针停在哪 | **实时 keyset 目录**：按 subject 升序，以最后已返回的 subject 为下一页界限，响应带 `consistency="live_keyset"`；**不承诺跨页快照**（每个条目的指针是"读这一页那一刻"的值），翻页期间注册在游标之前的角色只会出现在重新打开的目录里，已返回过的角色不会重复。无模糊搜索、无任意排序、无 offset |
+| `history_page` | 一个角色的某一类历史（`revisions`/`publications`/`approvals`/`rollbacks`） | 首请求在**同一个短读事务**里取 `persona.version` 与该页；后续请求先验证当前版本，不一致返回 `version_conflict` 并指示重开第一页。游标绑定 `subject`/`kind`/`version`/`limit`/`last_key`，跨角色、跨种类、跨操作、跨页大小一律 `invalid_input`；页内条目按 `(position, id)` 递增，无遗漏无重复 |
+| `revision` | 某一条**不可变**修订的正文与它此刻的定位 | 必填 `subject` + `revision_id`，先核对所属角色才返回正文；未知修订 `not_found`、异角色修订 `invalid_input`，都不泄露别的角色正文。响应含 `fingerprint`、当前 `persona_version`、`state`、`published_revision`/`draft_revision` 与 `is_published`/`is_draft`，指针与正文同一读事务 |
+| `compare` | 同一角色的两个不可变版本之间到底改了什么 | 比较域固定为 **`persona`/`tone`/`style`/`address`**（响应标 `comparison_scope`）；每字段给 `presence.left/right`、`change`（`added`/`removed`/`modified`/`unchanged`）与**完整左右值**；缺字段与 `null` 明确区分。正文允许的其他 scalar 字段只按**规范化摘要**比较（`additional_fields_present`/`additional_fields_changed` + 有界字段名列表），不出泛化 diff |
+
+- **身份不由四个字段推断**：`identical_revision` 只在两个 `revision_id` 相同时为真，
+  `content_identical` 只按全正文 `fingerprint` 相同为真。四个字段都没变但扩展字段变了时，
+  响应明确给出 `additional_fields_changed=true`，绝不报告"人格完全相同"。
+- **只陈述差异**：不调用任何模型、不做质量打分、不自动批准；审批与指针变化不改写不可变正文。
+  草稿/批准/发布/回退仍然只能由原来的写操作完成，客户端用读回的 `persona_version` 与
+  `revision_id` 走既有写链。
+- **字节预算**：页响应按**实际 UTF-8 JSON 字节**上限 256 KiB，单条修订与比较上限 1 MiB。
+  达预算只返回**已经完整编码**的条目并给准确 `next_cursor`（`has_more` 同时为真），
+  单条自身超预算明确 `invalid_input`，绝不发不完整 JSON、也不"截正文后当完整"；
+  `compare` 超限只拒绝不截断，两端修订可用 `revision` 分别读全。
+- **游标**：不透明、最多 2048 字符、用**进程随机密钥** HMAC 签名。篡改、跨 subject/kind/
+  operation/limit 复用、形状不对一律 `invalid_input`；密钥不落库、不新增存储表，因此
+  **进程重启后旧游标失效**，重开第一页即可。游标不携带任何正文或凭据。
+
+```bash
+python -m tianshu_companion.persona_cli --database .runtime/companion.db --limit 20 catalog
+python -m tianshu_companion.persona_cli --database .runtime/companion.db \
+    --subject actor:companion --kind revisions --limit 20 history_page
+python -m tianshu_companion.persona_cli --database .runtime/companion.db \
+    --subject actor:companion --revision <sha256> revision
+python -m tianshu_companion.persona_cli --url http://127.0.0.1:8765 \
+    --subject actor:companion --left <sha256> --right <sha256> compare
+```
+
+四个命令在离线与在线两种形状上完全一致，都是一次 `Personas.manage` 调用；`persona_cli`
+里没有任何 SQL 或表名。管理端口的凭据规则不变：只认 `personas.admin_token_env` 指定的
+那个凭据，普通 platform/bridge/聊天凭据读不到也写不了。
 
 ## 数据模型
 
@@ -177,18 +234,34 @@ v5→v9 得到 `pre-persona-ops-v9`，不会额外为 v6/v7/v8 再各写一份�
 - 跨进程并发不在范围内：`Store` 是单进程所有者（owner 锁），乐观并发在**进程内**
   由 `expected` CAS 保证；两个 OS 进程同时写同一库由 owner 锁整体拒绝。
 - 人格文本不保证文案质量、语气或人设一致性；本轮不做模型改写、不做人格评分。
+- TS-076 的浏览与比较是**同产品管理面**，不是面向浏览器的账户体系：没有普通网页账户、
+  没有 CORS 授权、没有伪造的平台登录，也不把请求里的 `scope` 当授权事实。未来平台页面
+  需要另行冻结同源连接器、身份映射与页面位置，本卡不设计。
+- TS-076 没有新增表、索引或迁移：页查询复用既有 `persona_*_queue` 与
+  `persona_approvals_revision` 索引；`store.py` 未改。
+- 读操作的拒绝只表达"这次读不成立"，不承诺重试语义：`version_conflict` 需重开第一页，
+  `invalid_input` 需修正游标或参数。
 
 ## 实际验证
 
-- `python -m pytest tests/test_personas.py -q`：领域与用例、快照时序、损坏快照、
-  跨角色隔离、回退、撤权、恢复报告、边界形态、迁移与失败恢复，以及**操作身份**：
-  重放返回记录结果且不重复落事实、同键异内容被拒、缺身份被拒、批准重试不追加决定、
-  过期版本不能靠身份变成成功、身份跨重启与跨授权域。
+- `python -m pytest tests/test_persona_queries.py tests/test_personas.py tests/test_persona_chain.py -q`：
+  领域与用例、快照时序、损坏快照、跨角色隔离、回退、撤权、恢复报告、边界形态、
+  迁移与失败恢复，**操作身份**（重放返回记录结果且不重复落事实、同键异内容被拒、
+  缺身份被拒、批准重试不追加决定、过期版本不能靠身份变成成功、身份跨重启与跨授权域），
+  以及 TS-076 的**有界浏览与比较**：纯规则（页大小、游标绑定/篡改、字节预算、四字段比较）、
+  目录逐页无遗漏无重复、游标跨 subject/kind/operation/limit 被拒、版本变化后旧页
+  `version_conflict`、单修订与跨角色隔离、中文/换行/相同版/多字段/缺字段/回退派生版/大正文比较、
+  读操作前后事实与账本计数不变、以及"页读的 SQL 语句数不随历史长度增长"的有界性证据。
 - `python -m pytest tests/test_persona_chain.py -q`：**真实 CLI 子进程**（独立解释器 +
   隔离数据库）走完 draft→approve→publish→history，服务持锁时拒绝写入，
-  重发同一 `--request-id` 命中账本、换内容复用同一 id 被拒，
-  以及**真实回环服务**上的管理端口 + 独立凭据 + 草案/批准两次重放 + 离线复读同一状态。
-- `python -m pytest tests/test_boundaries.py -q -k PersonaBoundary`：职责与依赖结构断言。
+  重发同一 `--request-id` 命中账本、换内容复用同一 id 被拒；
+  **真实回环服务**上的管理端口 + 独立凭据 + 草案/批准两次重放 + 离线复读同一状态；
+  以及 TS-076 的**全链**：真实 uvicorn 进程上 catalog→history_page→revision→compare→
+  draft/approve/publish→新版读取→rollback→再次比较→旧游标被拒，普通 platform/bridge
+  凭据与无凭据请求在同一真实服务上被拒（403/401），停机后第三个解释器核对库内只有四次写入。
+- `python -m pytest tests/test_boundaries.py -q -k PersonaBoundary`：职责与依赖结构断言
+  （含 `persona_queries.py` 不含表名/不含 SQL/不依赖 store·personas·core·app，
+  `personas.py` 只一处 `from .persona_queries import`，带 `LIMIT` 的页查询在 `personas.py`）。
 - `python -m pytest -q`：完整组件套件见交接记录。
 - `python -m ruff format --check src integrations tests scripts`、
   `python -m ruff check src integrations tests scripts`、
