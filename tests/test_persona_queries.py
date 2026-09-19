@@ -34,7 +34,7 @@ from tianshu_companion.persona_queries import (
     read_cursor,
     within_budget,
 )
-from tianshu_companion.personas import Personas
+from tianshu_companion.personas import HISTORY_TABLES, MAX_REVISIONS_PER_ACTOR, Personas
 from tianshu_companion.store import PERSONA_TABLES, Store
 
 A = "actor:a"
@@ -212,6 +212,77 @@ def test_a_cursor_is_opaque_bounded_and_bound_to_its_request():
             read_cursor(
                 secret, broken, operation="history_page", subject=A, kind="revisions", limit=20
             )
+
+
+def test_a_malformed_cursor_is_a_refusal_and_never_a_raised_exception():
+    """Every bad cursor shape is the same domain refusal, whatever the bytes are.
+
+    A token that is not ASCII used to reach `hmac` (`'中.x'` raised UnicodeEncodeError) or the
+    signature comparison (`'abc.中'` raised TypeError): neither is a `QueryError`, so neither
+    could be mapped by the domain and the port would have answered 500 instead of refusing.
+    The shape is now proved before anything decodes, signs or compares it.
+    """
+    secret = new_secret()
+    payload = issue_cursor(
+        secret,
+        dict(
+            operation="catalog",
+            subject=None,
+            kind=None,
+            limit=5,
+            version=None,
+            last_key=[A],
+        ),
+    ).split(".")[0]
+    malformed = (
+        "中.x",
+        "abc.中",
+        "中文.tag",
+        payload + ".中",
+        payload + ".tag中",
+        "中" * 8,
+        "\x00.\x01",
+        "a\tb.c",
+        "a\nb.c",
+        "a b.c",
+        "a.b c",
+        payload + "\u00a0.tag",
+        payload + ".tag.",
+        "." + payload,
+        payload + "..tag",
+        payload + ".ta=g",
+        payload + ".ta+g",
+        payload + ".ta/g",
+        payload + ".tag==",
+        b"bytes.tag",
+        ["list"],
+        {"payload": payload},
+        3.5,
+        0,
+        0.0,
+        False,
+        "",
+        ".",
+        ".x",
+        "x.",
+    )
+    for broken in malformed:
+        with pytest.raises(QueryError) as error:
+            read_cursor(secret, broken, operation="catalog", limit=5)
+        assert error.value.code == "invalid_input", broken
+    # A well-formed cursor still reads, so none of the refusals above came from the binding.
+    token = issue_cursor(
+        secret,
+        dict(
+            operation="catalog",
+            subject=None,
+            kind=None,
+            limit=5,
+            version=None,
+            last_key=[A],
+        ),
+    )
+    assert read_cursor(secret, token, operation="catalog", limit=5)["last_key"] == [A]
 
 
 def test_a_cursor_payload_has_exactly_one_shape():
@@ -392,6 +463,67 @@ def test_history_entries_carry_no_persona_text():
         encoded = json.dumps(page, ensure_ascii=False)
         assert "秘密人格正文" not in encoded and "秘密语气" not in encoded
         assert page["entries"][0]["fingerprint"]  # a fingerprint is not the text
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_every_history_page_states_the_version_it_was_read_at():
+    """The basis is in the response, on every page, not hidden inside the cursor.
+
+    A caller has to be able to consume a page without decoding the opaque cursor: the subject
+    it belongs to, the kind it walks, the `persona_version` the records were projected against
+    and an explicit statement that the page is bound to that version. The last page states it
+    with `next_cursor` absent just as the first one does, and so does an empty history.
+    """
+
+    async def scenario():
+        harness = Harness(personas=persona_config())
+        personas = harness.core.personas
+        empty = ask(harness, operation="history_page", subject=A, kind="rollbacks", limit=2)
+        assert empty["count"] == 0 and empty["entries"] == []
+        assert empty["next_cursor"] is None and empty["has_more"] is False
+        assert empty["subject"] == A and empty["kind"] == "rollbacks"
+        assert empty["consistency"] == "version_bound"
+        assert empty["persona_version"] == personas.get(A)["version"]
+
+        revisions = [draft(harness, A, {"persona": "版本 %d" % index}) for index in range(5)]
+        version = personas.get(A)["version"]
+        first = ask(harness, operation="history_page", subject=A, kind="revisions", limit=2)
+        assert first["subject"] == A and first["kind"] == "revisions"
+        assert first["persona_version"] == version
+        assert first["consistency"] == "version_bound"
+        middle = ask(
+            harness,
+            operation="history_page",
+            subject=A,
+            kind="revisions",
+            limit=2,
+            cursor=first["next_cursor"],
+        )
+        assert middle["persona_version"] == version and middle["next_cursor"]
+        last = ask(
+            harness,
+            operation="history_page",
+            subject=A,
+            kind="revisions",
+            limit=2,
+            cursor=middle["next_cursor"],
+        )
+        assert last["next_cursor"] is None and last["has_more"] is False
+        # The last page still names its basis: nothing has to be inferred from a cursor that
+        # is not there any more.
+        assert last["subject"] == A and last["kind"] == "revisions"
+        assert last["persona_version"] == version  # unchanged by reading
+        assert last["consistency"] == "version_bound"
+        assert [entry["revision_id"] for entry in last["entries"]] == revisions[-2:]
+        assert personas.get(A)["version"] == version  # reading moved nothing
+
+        # A page of another kind states its own kind and the same version.
+        publications = ask(harness, operation="history_page", subject=A, kind="publications")
+        assert publications["kind"] == "publications"
+        assert publications["persona_version"] == version
+        assert "subject" not in ask(harness, operation="catalog")
         await harness.core.close()
 
     asyncio.run(scenario())
@@ -710,48 +842,177 @@ def test_reading_writes_no_fact_no_pointer_and_no_ledger_row():
     asyncio.run(scenario())
 
 
-def test_a_page_read_does_not_grow_with_the_history_behind_it():
+# ------------------------------------------------- how much work a page read really does
+
+
+def page_sql(harness, table, subject, after, limit):
+    """The exact page statement the domain runs, captured from the connection itself.
+
+    The SQL is not retyped in this file: it is read back from the statement the domain
+    executed, so the plan and the step count below describe the query that ships rather than a
+    copy of it that could drift. `sqlite3`'s trace callback expands the bound values into the
+    text, which is exactly what `EXPLAIN QUERY PLAN` wants.
+    """
+    queries = []
+    store = harness.core.store
+    store.db.set_trace_callback(queries.append)
+    try:
+        harness.core.personas._page_rows(table, subject, after, limit)
+    finally:
+        store.db.set_trace_callback(None)
+    return [query for query in queries if query.startswith("SELECT position,id,body")][-1]
+
+
+def query_plan(harness, sql):
+    rows = harness.core.store.db.execute("EXPLAIN QUERY PLAN " + sql).fetchall()
+    return " | ".join(row[-1] for row in rows)
+
+
+def catalog_page_sql(harness, cursor, limit=3):
+    """One real catalog request, with the directory statement it ran captured on the way."""
+    document = {"operation": "catalog", "limit": limit}
+    if cursor is not None:
+        document["cursor"] = cursor
+    queries = []
+    store = harness.core.store
+    store.db.set_trace_callback(queries.append)
+    try:
+        page = ask(harness, **document)
+    finally:
+        store.db.set_trace_callback(None)
+    return page, [q for q in queries if q.startswith("SELECT body FROM persona_personas")][0]
+
+
+def vm_steps(harness, sql):
+    """How much work the statement really did, counted in SQLite VM instructions.
+
+    Not wall clock: the progress handler fires once per VM instruction, so the number is a
+    deterministic property of the database and the statement. A short page that still walked
+    the whole history cannot hide behind a constant statement count any more - the work itself
+    is what is measured.
+    """
+    counter = [0]
+
+    def progress():
+        counter[0] += 1
+        return False
+
+    store = harness.core.store
+    store.db.set_progress_handler(progress, 1)
+    try:
+        rows = list(store.db.execute(sql))
+    finally:
+        store.db.set_progress_handler(None, 0)
+    return counter[0], len(rows)
+
+
+def history_rows(harness, table, subject):
+    return harness.core.personas._page_rows(table, subject, None, 10**6)
+
+
+def test_every_history_kind_pages_through_its_own_index():
+    """Four kinds, first and last page each: a range seek, never a temporary sort.
+
+    `LIMIT` on its own does not bound the work. With a predicate the index cannot serve,
+    SQLite answers `ORDER BY position,id` with `USE TEMP B-TREE FOR ORDER BY` and must visit
+    every record of the character before it can return a short page. Each history therefore has
+    a derived `(conversation_id, position, id)` index and the page seeks into it with one row
+    value, which is what these plans have to show.
+    """
+
     async def scenario():
-        measurements = []
-        for extra in (0, 30):
+        harness = Harness(personas=persona_config())
+        personas = harness.core.personas
+        revision = draft(harness, A, {"persona": "作者版本"})
+        approve(harness, A, revision)
+        publish(harness, A, revision)
+        seed = personas.publications(A)[0]["revision_id"]
+        personas.rollback(
+            A,
+            seed,
+            operator="operator:test",
+            expected=personas.get(A)["version"],
+            reason="synthetic rollback",
+        )
+        for kind, table in sorted(HISTORY_TABLES.items()):
+            rows = history_rows(harness, table, A)
+            assert rows, kind
+            # A deep cursor: the page starts at the record before the last one, so the read
+            # has to seek past everything that precedes it.
+            after = [rows[max(len(rows) - 2, 0)][0], rows[max(len(rows) - 2, 0)][1]]
+            first = query_plan(harness, page_sql(harness, table, A, None, 2))
+            deep = query_plan(harness, page_sql(harness, table, A, after, 2))
+            assert "TEMP B-TREE" not in first and "TEMP B-TREE" not in deep, (kind, first, deep)
+            assert f"USING INDEX {table}_page" in first, (kind, first)
+            assert "(conversation_id=? AND (position,id)>(?,?))" in deep, (kind, deep)
+            # The character's own rows only: the constraint leads the index, so the page can
+            # never read another character's history.
+            assert "conversation_id=?" in first and "conversation_id=?" in deep, (kind, first, deep)
+        await harness.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_deep_page_costs_the_same_however_long_the_history_is():
+    """The work of one page does not grow with the records that precede it.
+
+    A synthetic history is built at the declared per-actor revision ceiling
+    (`MAX_REVISIONS_PER_ACTOR`, 512 revisions: the deployment seed plus 511 authored ones) and
+    compared with a short one. That ceiling is a declared constant rather than an enforced
+    write limit - only `MAX_PERSONAS` is enforced today - so this stays *at* the declared
+    ceiling: it is a read-path sample, not a scenario beyond the product's own bound, and
+    nothing here is claimed to be a user-writable history with more revisions than that.
+    """
+
+    async def scenario():
+        measured = {}
+        for count in (16, MAX_REVISIONS_PER_ACTOR - 1):
             harness = Harness(personas=persona_config())
-            for index in range(4 + extra):
-                draft(harness, A, {"persona": "版本 %d" % index})
-            queries = []
-            harness.core.store.db.set_trace_callback(queries.append)
-            page = ask(harness, operation="history_page", subject=A, kind="revisions", limit=3)
-            harness.core.store.db.set_trace_callback(None)
-            history = [query for query in queries if "persona_revisions" in query]
-            assert history and all("LIMIT" in query for query in history)
-            assert any("ORDER BY position,id LIMIT" in query for query in history)
-            measurements.append((page["count"], len(queries)))
+            for index in range(count):
+                draft(harness, A, {"persona": "版本 %04d" % index})
+            rows = history_rows(harness, "persona_revisions", A)
+            assert len(rows) == count + 1  # the deployment seed plus the authored revisions
+            # Three records follow the cursor and `count - 2` precede it, so a read that
+            # walked the preceding records would cost about `count` times as much.
+            after = [rows[-5][0], rows[-5][1]]
+            deep_steps, returned = vm_steps(
+                harness, page_sql(harness, "persona_revisions", A, after, 4)
+            )
+            assert returned == 4 and deep_steps > 0
+            measured[count] = deep_steps
             await harness.core.close()
-        # The same page size costs the same number of statements whatever the history holds:
-        # nothing is read into memory and sliced, and every read is bounded by its own LIMIT.
-        assert measurements[0] == measurements[1] == (3, measurements[0][1])
-        assert measurements[0][1] <= 12
+        long_history, short_history = measured[MAX_REVISIONS_PER_ACTOR - 1], measured[16]
+        # 32 times the preceding records, and the same page still costs about the same work.
+        # (The old predicate needed a temporary b-tree here: 3642 VM steps at 512 records
+        # against 186 at 16 - the count grew with the history, which is the defect this index
+        # and the row-value seek remove.)
+        assert long_history <= short_history * 2 + 64, (long_history, short_history)
 
     asyncio.run(scenario())
 
 
 def test_the_directory_read_is_bounded_the_same_way():
+    """The directory walks its primary key in order: `LIMIT` stops it, no sort, no offset."""
+
     async def scenario():
         measurements = []
         for count in (4, 40):
             harness = Harness(personas=directory(count))
-            queries = []
-            harness.core.store.db.set_trace_callback(queries.append)
-            page = ask(harness, operation="catalog", limit=3)
-            harness.core.store.db.set_trace_callback(None)
-            directory_query = [
-                query for query in queries if query.startswith("SELECT body FROM persona_personas")
-            ]
-            assert len(directory_query) == 1
-            assert "ORDER BY id LIMIT" in directory_query[0]
-            assert "OFFSET" not in directory_query[0].upper()
-            measurements.append((page["count"], len(queries)))
+            page, first = catalog_page_sql(harness, None)
+            assert page["next_cursor"]
+            assert "OFFSET" not in first.upper()
+            assert "TEMP B-TREE" not in query_plan(harness, first)
+            assert "ORDER BY id LIMIT" in first
+            steps, returned = vm_steps(harness, first)
+            assert returned == 4  # limit + 1: enough to know there is more
+            # A later page seeks to the last subject it was given instead of counting rows.
+            _, later = catalog_page_sql(harness, page["next_cursor"])
+            assert "TEMP B-TREE" not in query_plan(harness, later)
+            assert "(id>?" in query_plan(harness, later)
+            measurements.append(steps)
             await harness.core.close()
-        assert measurements[0] == measurements[1] == (3, measurements[0][1])
+        assert measurements[0] == measurements[1]
+        assert measurements[0] < 40  # a bounded first page, not a walk of the directory
 
     asyncio.run(scenario())
 
@@ -794,3 +1055,51 @@ def test_reads_are_served_by_the_single_application_entry_point_only():
         assert two["operation"] == "compare" and two["content_identical"] is True
     finally:
         store.close()
+
+
+def test_opening_a_v9_database_adds_the_paging_indexes_without_touching_its_facts(tmp_path):
+    """The derived indexes appear on an existing database, idempotently, and change no fact.
+
+    The four paging indexes are created in the same open path as the other persona indexes, so
+    a database written before them - a real v9 file - gains them the next time it is opened.
+    Nothing else may move: the facts, the fields, `user_version` and every pointer stay exactly
+    as they were, and reopening a second time is a no-op.
+    """
+
+    async def scenario():
+        path = tmp_path / "companion.db"
+        harness = Harness(str(path), personas=persona_config())
+        draft(harness, A, {"persona": "已存在的版本", "tone": "已存在的语气"})
+        approve(harness, A, draft(harness, A, {"persona": "待批准版本"}))
+        store = harness.core.store
+        indexes = (
+            "persona_revisions_page",
+            "persona_publications_page",
+            "persona_approvals_page",
+            "persona_rollbacks_page",
+        )
+        assert all(index in index_names(store) for index in indexes)
+        # Simulate a database written before the indexes existed.
+        for index in indexes:
+            store.db.execute("DROP INDEX " + index)
+        facts = {table: store.list(table) for table in PERSONA_TABLES}
+        version = store.db.execute("PRAGMA user_version").fetchone()[0]
+        await harness.core.close()
+
+        for _ in range(2):  # idempotent: the second open finds them and creates nothing twice
+            reopened = Store(str(path))
+            try:
+                assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == version
+                assert all(index in index_names(reopened) for index in indexes)
+                assert {table: reopened.list(table) for table in PERSONA_TABLES} == facts
+            finally:
+                reopened.close()
+
+    asyncio.run(scenario())
+
+
+def index_names(store):
+    return {
+        row[0]
+        for row in store.db.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+    }

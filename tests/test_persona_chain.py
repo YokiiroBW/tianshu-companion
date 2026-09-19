@@ -763,6 +763,182 @@ def test_the_management_port_serves_no_browse_without_its_own_credential(tmp_pat
         store.close()
 
 
+def test_the_real_management_port_refuses_every_malformed_cursor_without_failing(tmp_path):
+    """A malformed cursor is a refusal on the wire, never a server error.
+
+    A cursor that is not ASCII used to reach `hmac` (`'中.x'` raised `UnicodeEncodeError`) or
+    the signature comparison (`'abc.中'` raised `TypeError`). Neither is a refusal the domain
+    can map, so the port would have answered 500 for a cursor the caller simply got wrong.
+    Every shape now answers 400 with `invalid_input`, the same server keeps serving, and the
+    valid cursor still continues the page it was issued for.
+    """
+    path = tmp_path / "cursors.db"
+    config = write_json(
+        tmp_path / "cursors-config.json",
+        {
+            "contracts_path": str(workspace() / "contracts/text-dialogue/v1"),
+            "database_path": str(path),
+            "config_version": None,
+            "policy": {"silence_ms": 5000},
+            "roles": {A: {"version": 1, "persona": "Served persona"}},
+            "bindings": {},
+            "callers": {},
+            "services": {},
+            "personas": {"admin_token_env": ADMIN_TOKEN_ENV},
+        },
+    )
+    port = free_port()
+    url = f"http://127.0.0.1:{port}"
+    environment = dict(os.environ)
+    environment["TIANSHU_COMPANION_CONFIG"] = str(config)
+    environment[ADMIN_TOKEN_ENV] = ADMIN_TOKEN
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "tianshu_companion.app:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--workers",
+            "1",
+        ],
+        cwd=str(ROOT),
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=NO_WINDOW,
+    )
+    try:
+        wait_for_health(port, server)
+
+        def post(document):
+            request = urllib.request.Request(
+                url + "/internal/v1/persona/manage",
+                data=json.dumps(document, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer " + ADMIN_TOKEN,
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as error:
+                return error.code, json.load(error)
+
+        # Two authored revisions over the same port, so one history has three records.
+        target = ["--url", url, "--token-env", ADMIN_TOKEN_ENV]
+        for index in range(2):
+            code, current = cli(*target, "--subject", A, "get")
+            assert code == 0, current
+            code, drafted = cli(
+                *target,
+                "--subject",
+                A,
+                "--operator",
+                "operator:cursor",
+                "--reason",
+                "authoring before the cursor check",
+                "--request-id",
+                f"cursor:draft:{index}",
+                "--expected",
+                str(current["result"]["persona"]["version"]),
+                "--content",
+                str(
+                    write_json(
+                        tmp_path / f"cursor-{index}.json",
+                        {"persona": f"合成版本 {index}", "tone": "温和"},
+                    )
+                ),
+                "draft",
+            )
+            assert code == 0, drafted
+
+        status, first = post(
+            {"operation": "history_page", "subject": A, "kind": "revisions", "limit": 2}
+        )
+        assert status == 200, first
+        valid = first["next_cursor"]
+        assert valid and first["has_more"] is True
+        payload, _, tag = valid.partition(".")
+        assert payload and tag
+        malformed = (
+            "中.x",  # a non-ASCII payload used to raise inside the signer
+            "abc.中",  # a non-ASCII tag used to raise inside the comparison
+            payload + ".中",
+            "中" * 4,
+            "a\tb.c",
+            "\x00.x",
+            "abc",
+            ".x",
+            "x.",
+            payload + ".tag",  # the right shape with the wrong signature
+            payload + "..tag",
+            payload + ".tag==",
+            payload + ".ta+g",
+            "x" * 3000,  # over the bounded cursor length
+            12345,
+            True,
+            ["list"],
+            {"payload": payload},
+        )
+        for cursor in malformed:
+            status, body = post({"operation": "catalog", "limit": 5, "cursor": cursor})
+            assert status == 400, (cursor, status, body)
+            assert body["code"] == "invalid_input", (cursor, body)
+        # A valid cursor presented to another request is refused, not reinterpreted: another
+        # operation, another kind and another page size are all different requests.
+        for document in (
+            {"operation": "catalog", "limit": 2, "cursor": valid},
+            {
+                "operation": "history_page",
+                "subject": A,
+                "kind": "publications",
+                "limit": 2,
+                "cursor": valid,
+            },
+            {
+                "operation": "history_page",
+                "subject": A,
+                "kind": "revisions",
+                "limit": 3,
+                "cursor": valid,
+            },
+        ):
+            status, body = post(document)
+            assert status == 400 and body["code"] == "invalid_input", (document, status, body)
+        # Nothing above took the server down, and the cursor still continues its own page.
+        assert server.poll() is None
+        status, rest = post(
+            {
+                "operation": "history_page",
+                "subject": A,
+                "kind": "revisions",
+                "limit": 2,
+                "cursor": valid,
+            }
+        )
+        assert status == 200, rest
+        assert rest["count"] == 1 and rest["next_cursor"] is None
+        assert rest["subject"] == A and rest["kind"] == "revisions"
+        assert rest["consistency"] == "version_bound"
+        assert rest["persona_version"] == first["persona_version"]
+    finally:
+        stop(server)
+
+    store = open_owned(path)
+    try:
+        personas = Personas(store, time.time)
+        assert len(personas.revisions(A)) == 3  # the seed and the two authored revisions
+        assert len(store.list("persona_operations")) == 2  # the two drafts, and no read
+    finally:
+        store.close()
+
+
 def test_online_cli_uses_the_management_port_and_its_own_credential(tmp_path):
     path = tmp_path / "served.db"
     config = write_json(
@@ -899,14 +1075,15 @@ def open_owned(path):
     """Take the owner lock after another process released it.
 
     The released database keeps its WAL and shared-memory files, and on Windows the OS can
-    still hold a handle on them for a moment after the process is gone, so the first open
-    may fail with a transient I/O error. Nothing about the database is wrong in that case;
-    the retry is bounded and the failure is re-raised if it persists.
+    still hold a handle on them - and on the owner lock file - for a moment after the process
+    is gone, so the first open may fail with a transient I/O error or with the owner lock
+    still reported as taken. Nothing about the database is wrong in that case; the retry is
+    bounded (five seconds) and the failure is re-raised if it persists.
     """
     for _ in range(100):
         try:
             return Store(path)
-        except sqlite3.OperationalError:
+        except (RuntimeError, sqlite3.OperationalError):
             time.sleep(0.05)
     return Store(path)
 

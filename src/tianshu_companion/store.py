@@ -272,6 +272,23 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS persona_operations_request ON persona_operations("
                 "json_extract(body,'$.request_id'),json_extract(body,'$.operation'),position,id)"
             )
+            # One paging index per persona history: the page read walks a character's history
+            # in `(position, id)` order with a range seek, so it needs an index whose key is
+            # exactly `(conversation_id, position, id)`. The `_queue` index above leads with
+            # `status`, which a page read does not constrain, so without these SQLite would
+            # answer `ORDER BY position,id` with a temporary b-tree and visit every record of
+            # the character to return a short page. Derived indexes only: no fact, no field,
+            # no version and no lock changes, and `IF NOT EXISTS` keeps the open idempotent.
+            for table in (
+                "persona_revisions",
+                "persona_publications",
+                "persona_approvals",
+                "persona_rollbacks",
+            ):
+                self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS {table}_page ON "
+                    f"{table}(conversation_id,position,id)"
+                )
             self.db.execute("PRAGMA user_version=9")
 
     @contextmanager

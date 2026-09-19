@@ -752,18 +752,23 @@ class Personas:
         )
 
     def _page_rows(self, table, subject, after, limit):
-        """One keyset page straight from SQL: `LIMIT` bounds the read, nothing is sliced.
+        """One keyset page straight from SQL: a range seek, never a scan of the history.
 
-        The read is a range scan on the character's own index, not the whole history held in
-        memory and cut afterwards. `after` is the `(position, id)` the previous cursor ended
-        on, which is the same order `Store.list` uses, so a page can neither repeat nor skip
-        a record.
+        `LIMIT` alone does not make a read bounded: without a matching index `ORDER BY
+        position,id` needs a temporary b-tree, and SQLite then has to visit every record of
+        the character before it can answer - a short page would still walk the whole history.
+        The query therefore matches `persona_<kind>_page(conversation_id,position,id)` and
+        seeks with one row value, so the page starts at the record the cursor ended on:
+        `(position,id) > (?,?)` covers both the later-position case and the equal-position
+        case with a larger id in a single index range. The plan is
+        `SEARCH ... USING INDEX persona_<kind>_page (conversation_id=? AND (position,id)>(?,?))`
+        with no temporary b-tree, so a deep page costs the same as the first one.
         """
         sql = "SELECT position,id,body FROM " + table + " WHERE conversation_id=?"
         arguments = [subject]
         if after is not None:
-            sql += " AND (position>? OR (position=? AND id>?))"
-            arguments += [after[0], after[0], after[1]]
+            sql += " AND (position,id)>(?,?)"
+            arguments += [after[0], after[1]]
         sql += " ORDER BY position,id LIMIT ?"
         arguments.append(limit)
         return [
@@ -789,12 +794,25 @@ class Personas:
         parse what it received and can always continue at the record the page ended on. A
         page that is short because of the budget still says `has_more`, so nothing is lost
         silently and nothing incomplete is sent.
+
+        A page of one character's history always states the basis it was read at - the
+        subject, the kind and the persona version the records were projected against - so a
+        caller never has to decode the opaque cursor to learn which version it is looking at,
+        and the last page states it just as explicitly as the first one.
         """
         kept, kept_keys = fit(entries, keys, PAGE_MAX_BYTES - CURSOR_RESERVE)
         more = more_probe or len(kept) < len(entries)
-        document = dict(
-            schema_version=1,
-            operation=operation,
+        document = dict(schema_version=1, operation=operation)
+        if subject is not None:
+            document.update(
+                subject=subject,
+                kind=kind,
+                persona_version=version,
+                consistency="version_bound",
+            )
+        elif consistency is not None:
+            document["consistency"] = consistency
+        document.update(
             limit=limit,
             count=len(kept),
             entries=kept,
@@ -815,8 +833,6 @@ class Personas:
                 else None
             ),
         )
-        if consistency is not None:
-            document["consistency"] = consistency
         return within_budget(document, PAGE_MAX_BYTES)
 
     def _catalog_entry(self, persona):
@@ -838,8 +854,10 @@ class Personas:
         No snapshot is promised across pages - the pointer each entry reports is the one it
         had when that page was read - so a character registered behind the cursor is simply
         not repeated, and one registered ahead of it appears on the next page. Nothing here
-        loads the directory into memory: the page is `LIMIT`ed in SQL and the cursor is the
-        last subject that was returned.
+        loads the directory into memory: the page is `LIMIT`ed in SQL, ordered by the primary
+        key so it is an index seek rather than a sort, and the cursor is the last subject that
+        was returned. Inside one page the records and their pointers come from the same short
+        read transaction.
         """
         limit = page_limit(request.get("limit"))
         cursor = request.get("cursor")
@@ -857,10 +875,12 @@ class Personas:
             arguments.append(after)
         sql += " ORDER BY id LIMIT ?"
         arguments.append(limit + 1)
-        rows = [json.loads(row[0]) for row in self.store.db.execute(sql, arguments)]
+        with self.store.transaction():
+            rows = [json.loads(row[0]) for row in self.store.db.execute(sql, arguments)]
+            entries = [self._catalog_entry(row) for row in rows[:limit]]
         return self._page(
             "catalog",
-            [self._catalog_entry(row) for row in rows[:limit]],
+            entries,
             [[row["subject"]] for row in rows[:limit]],
             limit,
             more_probe=len(rows) > limit,
@@ -924,6 +944,13 @@ class Personas:
         rollback, retirement or restore advances that version, so an old cursor is refused
         with `version_conflict` instead of quietly stitching a newer page onto an older
         pointer. The only way forward is to reopen the first page.
+
+        The response metadata, the page records and the revision/approval projection are all
+        formed inside that one read transaction; only serialization, the byte budget and the
+        cursor encoding happen after it. The page therefore states its own basis - subject,
+        kind and `persona_version`, with `consistency="version_bound"` - on every page
+        including the last and the empty one, so a caller reads the version it is looking at
+        from the response instead of decoding the opaque cursor.
         """
         kind = request.get("kind")
         if kind not in HISTORY_KINDS:
@@ -947,10 +974,12 @@ class Personas:
                     _conflict("This history moved since the page was read; reopen the first page")
                 after = _record_key(binding["last_key"])
             rows = self._page_rows(HISTORY_TABLES[kind], subject, after, limit + 1)
+            entries = [self._history_entry(kind, row) for _, _, row in rows[:limit]]
+            keys = [[position, record_id] for position, record_id, _ in rows[:limit]]
         return self._page(
             "history_page",
-            [self._history_entry(kind, row) for _, _, row in rows[:limit]],
-            [[position, record_id] for position, record_id, _ in rows[:limit]],
+            entries,
+            keys,
             limit,
             more_probe=len(rows) > limit,
             subject=subject,

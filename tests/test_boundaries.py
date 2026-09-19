@@ -368,6 +368,29 @@ class PersonaBoundaryTests(unittest.TestCase):
         # The bounded page read lives in the domain that owns the tables, next to them.
         self.assertIn("ORDER BY position,id LIMIT", self.source("personas.py"))
 
+    def test_the_paging_indexes_and_the_seek_that_uses_them_stay_together(self):
+        """A matching index is a schema fact and the seek that needs it is a domain fact.
+
+        `LIMIT` alone does not bound a page: the read also has to be an index range seek, so
+        the derived `(conversation_id, position, id)` index is declared where schema lives and
+        the row-value predicate that uses it stays where SQL lives. Splitting them - an index
+        with no reader, or a predicate with no index - is how a bounded read silently becomes a
+        full scan again, so both halves are asserted here.
+        """
+        store = self.source("store.py")
+        for table in (
+            "persona_revisions",
+            "persona_publications",
+            "persona_approvals",
+            "persona_rollbacks",
+        ):
+            self.assertIn(f'"{table}"', store)
+        self.assertIn('{table}_page ON "', store)
+        self.assertIn("{table}(conversation_id,position,id)", store)
+        self.assertIn("(position,id)>(?,?)", self.source("personas.py"))
+        # The index declaration is derived-only: it may not touch a fact, a field or a version.
+        self.assertNotIn("ALTER TABLE", store)
+
     def test_only_the_persona_domain_owns_operation_idempotence(self):
         """One module decides what "the same request" means; the adapters only carry it."""
         domain = self.source("personas.py")

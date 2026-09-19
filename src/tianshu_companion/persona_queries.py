@@ -15,7 +15,9 @@ Three rules are load-bearing:
   is refused instead of trimmed: the client can read it through the single-revision read.
 - **A cursor is opaque, verified and bound.** It carries no text and no credential, it is
   signed with a process-local secret so a restart invalidates it, and it is accepted only by
-  the same operation, subject, kind and page size that issued it.
+  the same operation, subject, kind and page size that issued it. Its structure is proved
+  before anything decodes or compares it, so every malformed cursor - including one that is
+  not ASCII - is the same bounded refusal instead of a raised exception.
 - **A comparison states differences, never quality.** Only the four persona text fields are
   interpreted as persona semantics; any other field of the document is reported as present
   and changed, by digest only, so an extension field can never be dressed up as persona text
@@ -27,10 +29,17 @@ import hashlib
 import hmac
 import json
 import os
+import string
 
 from .contracts import canonical
 
 INVALID = "invalid_input"
+# A cursor is two unpadded base64url segments joined by one dot, so the whole token is ASCII
+# and every segment stays inside this alphabet. Anything else - another script, a control
+# character, padding, a second dot, a quote - is refused as a malformed cursor *before* it
+# reaches base64, `hmac` or a comparison, where it would otherwise raise something the domain
+# cannot map (a UnicodeEncodeError or a TypeError would surface as a 500, not a refusal).
+CURSOR_ALPHABET = frozenset(string.ascii_letters + string.digits + "-_")
 
 # Page size. `None` means "the caller did not ask", which is the documented default; a boolean
 # is not a number and is refused like any other out-of-range value.
@@ -124,6 +133,22 @@ def _unb64(text):
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
+def _segment(value, message):
+    """One unpadded base64url segment, or a refusal.
+
+    This is the gate every cursor passes before any decoding, signing or comparison: the
+    token's own structure is checked first, so a malformed cursor is always an
+    `invalid_input` from this module and never an exception raised inside a standard-library
+    call. No business exception is swallowed here - the shape is simply proved first.
+    """
+    if not value or not value.isascii():
+        invalid(message)
+    for character in value:
+        if character not in CURSOR_ALPHABET:
+            invalid(message)
+    return value
+
+
 def _tag(secret, payload):
     return _b64(hmac.new(secret, payload.encode("ascii"), hashlib.sha256).digest())
 
@@ -146,12 +171,20 @@ def read_cursor(secret, token, *, operation, limit, subject=None, kind=None):
     binding makes a cursor unusable on another character, another history kind, another
     operation or another page size. The caller compares the bound version itself, because a
     moved version is a conflict to report, not a malformed cursor.
+
+    Every rejection here is the same bounded refusal: a token that is not a string, that is
+    empty or oversized, that holds anything outside the ASCII base64url alphabet (another
+    script, a control character, padding, a second dot), whose payload does not decode to the
+    binding shape, or whose signature does not verify. Nothing raises out of this function, so
+    a malformed cursor can never become a server error on the wire.
     """
     if not isinstance(token, str) or not token or len(token) > CURSOR_MAX:
         invalid("A bounded cursor is required")
     payload, dot, tag = token.partition(".")
     if not dot or not payload or not tag:
         invalid("Malformed cursor")
+    _segment(payload, "Malformed cursor")
+    _segment(tag, "Malformed cursor")
     if not hmac.compare_digest(tag, _tag(secret, payload)):
         invalid("Cursor failed verification")
     try:
