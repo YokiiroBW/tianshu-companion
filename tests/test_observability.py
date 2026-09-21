@@ -13,6 +13,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -166,6 +167,10 @@ class RecordTests(unittest.TestCase):
             adapter.emit(event, "started")
         for outcome in obs.OUTCOMES:
             adapter.emit("runtime.background_work", outcome)
+        # The diagnostic stream is written by the adapter's own thread, exactly like a segment
+        # file, so reaching a quiet point is what makes the sink readable - and it also proves
+        # every one of these records was accepted.
+        self.assertTrue(adapter.flush())
         records = sink.lines
         self.assertEqual(len(obs.EVENTS) + len(obs.OUTCOMES), len(records))
         for record in records:
@@ -220,6 +225,10 @@ class RecordTests(unittest.TestCase):
         adapter = obs.LogAdapter(None, stderr=sink)
         with self.assertRaises(ValueError):
             adapter.emit("some.arbitrary.name", "started")
+        # The admission path refuses the same way: an event name is never invented for it
+        # either, and a refusal must not be mistaken for a dropped record.
+        with self.assertRaises(ValueError):
+            asyncio.run(adapter.admit("some.arbitrary.name", "started"))
         self.assertEqual([], sink.lines)
 
     def test_static_error_code_registry_replaces_unknown_codes(self):
@@ -491,6 +500,263 @@ class _Sink:
         return [json.loads(line) for line in bytes(self.buffer).splitlines() if line.strip()]
 
 
+def _close_quietly(descriptor):
+    """Release a descriptor that may already be closed, without turning cleanup into a failure."""
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _drain_pipe(descriptor):
+    """Everything readable from a non-blocking descriptor right now, never a wait."""
+    chunks = []
+    while True:
+        try:
+            chunk = os.read(descriptor, 1 << 16)
+        except (BlockingIOError, InterruptedError):
+            break
+        except OSError:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+class AdmissionTests(unittest.TestCase):
+    """Admission is durable, and a refusal happens before any side effect can be lost.
+
+    The three promises checked here are the ones a log failure could otherwise break: the
+    admission record reaches the disk *before* the work it accounts for, a destination that
+    cannot take the record refuses new business instead of letting it run unlogged, and a
+    refusal never becomes a retry of something already in flight.
+    """
+
+    def _adapter(self, **options):
+        """A real adapter in a real directory, closed by the case even when an assertion fails.
+
+        The directory is cleaned with `ignore_cleanup_errors` for the same reason: on Windows an
+        open handle would otherwise turn a test failure into a cleanup error and hide the cause.
+        """
+        holder = tempfile.TemporaryDirectory(prefix="tianshu-admit-", ignore_cleanup_errors=True)
+        self.addCleanup(holder.cleanup)
+        adapter = obs.LogAdapter(holder.name, stderr=_Sink(), **options)
+        self.addCleanup(adapter.close)
+        return adapter, holder.name
+
+    def test_admission_waits_for_a_real_write_and_the_record_is_on_disk_afterwards(self):
+        adapter, directory = self._adapter()
+        self.assertTrue(asyncio.run(adapter.admit("runtime.started", "succeeded")))
+        # No flush, no poll, no sleep: the record is already readable from the file.
+        records = [
+            json.loads(line)
+            for path in sorted(Path(directory).iterdir())
+            for line in path.read_bytes().splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(["runtime.started"], [record["event"] for record in records])
+
+    def test_admission_refuses_when_the_destination_cannot_take_the_record(self):
+        adapter, _ = self._adapter()
+        self.assertTrue(adapter.flush())
+        # A destination that fails its write must refuse admission, not accept the record and
+        # drop it later: the caller acts on this answer.
+        original_write = adapter._write
+
+        def failing(line, *, fsync):
+            original_write(line, fsync=False)
+            return False
+
+        adapter._write = failing
+        self.assertFalse(asyncio.run(adapter.admit("runtime.started", "succeeded")))
+        self.assertEqual(1, adapter.dropped)
+        adapter._write = original_write
+        # Recovery is explicit, and it is a real write: the adapter is usable again after it.
+        self.assertTrue(adapter.probe())
+        self.assertEqual("ok", adapter.health())
+        self.assertTrue(asyncio.run(adapter.admit("runtime.started", "succeeded")))
+
+    def test_a_full_queue_refuses_rather_than_dropping_silently(self):
+        adapter, _ = self._adapter(queue_records=1)
+        # Block the writer so the single queue slot stays occupied, then ask for a second
+        # record: it must be refused and counted, never accepted and forgotten.
+        gate = threading.Event()
+        original_write = adapter._write
+
+        def gated(line, *, fsync):
+            gate.wait(timeout=10)
+            return original_write(line, fsync=False)
+
+        adapter._write = gated
+        self.assertTrue(adapter.emit("runtime.started", "succeeded"))
+        self.assertFalse(adapter.emit("runtime.background_work", "succeeded"))
+        self.assertEqual("writer_saturated", adapter.health())
+        self.assertFalse(adapter.accepts_business())
+        self.assertGreaterEqual(adapter.dropped, 1)
+        gate.set()
+        adapter._write = original_write
+        self.assertTrue(adapter.flush())
+
+    def test_the_business_loop_keeps_running_while_the_writer_holds_a_slow_disk(self):
+        """A slow disk must not stop the event loop: only the writer waits for it."""
+
+        async def scenario():
+            adapter, _ = self._adapter()
+            gate = threading.Event()
+            original_write = adapter._write
+
+            def slow(line, *, fsync):
+                gate.wait(timeout=10)
+                return original_write(line, fsync=False)
+
+            adapter._write = slow
+            # The admission is started but not awaited: the loop must stay responsive while the
+            # writer is stuck inside the disk call.
+            pending = asyncio.create_task(adapter.admit("runtime.started", "succeeded"))
+            ticks = 0
+            for _ in range(20):
+                await asyncio.sleep(0.005)
+                ticks += 1
+            self.assertGreaterEqual(ticks, 20)
+            self.assertFalse(pending.done())
+            gate.set()
+            self.assertTrue(await pending)
+            adapter._write = original_write
+
+        asyncio.run(scenario())
+
+    def test_cancelling_an_admission_leaves_no_phantom_record(self):
+        """A cancelled admission is cancelled: the caller is never told `admitted` after it
+        stopped waiting, and the writer still finishes what it was already given."""
+
+        async def scenario():
+            adapter, _ = self._adapter()
+            gate = threading.Event()
+            original_write = adapter._write
+
+            def slow(line, *, fsync):
+                gate.wait(timeout=10)
+                return original_write(line, fsync=False)
+
+            adapter._write = slow
+            pending = asyncio.create_task(adapter.admit("runtime.started", "succeeded"))
+            await asyncio.sleep(0.02)
+            pending.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await pending
+            gate.set()
+            # The writer still finishes what it was given, and the adapter stays usable.
+            self.assertTrue(adapter.flush())
+            self.assertEqual("ok", adapter.health())
+            adapter._write = original_write
+
+        asyncio.run(scenario())
+
+    def test_closing_never_races_a_live_write_handle(self):
+        """`close` stops the writer and joins it before releasing the handle it owns."""
+        adapter, directory = self._adapter()
+        for _ in range(20):
+            adapter.emit("runtime.background_work", "succeeded")
+        adapter.close()
+        self.assertTrue(adapter.closed)
+        self.assertIsNone(adapter._stream)
+        self.assertIsNone(adapter._writer)
+        # A second close is a no-op, and no later emit reaches a released handle.
+        adapter.close()
+        self.assertFalse(adapter.emit("runtime.background_work", "succeeded"))
+        self.assertEqual(0, adapter.pending)
+        records = [
+            json.loads(line)
+            for path in sorted(Path(directory).iterdir())
+            for line in path.read_bytes().splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(20, len(records))
+
+
+class DomainOutcomeTests(unittest.TestCase):
+    """Every published domain state maps onto the frozen outcome enumeration."""
+
+    def test_every_published_domain_state_has_a_registered_outcome(self):
+        # The states the published contracts and this product's durable rows actually use.
+        published = (
+            # conversation#send_receipt#state
+            "sent",
+            "failed",
+            "unknown",
+            # conversation#turn#delivery_state and source-sync committed_event
+            "not_started",
+            "partial",
+            "not_required",
+            # conversation#cancel_response#state
+            "cancelled",
+            "partially_cancelled",
+            "too_late",
+            # routing: functional request and attempt states
+            "accepted",
+            "pending",
+            "dispatching",
+            "submitted",
+            "completed",
+            "registered",
+            "revoked",
+            "superseded",
+            "expired",
+            "deferred",
+        )
+        for state in published:
+            outcome = obs.runtime_outcome(state)
+            self.assertIn(outcome, obs.OUTCOMES, state)
+        # The mapping is what adapts, never the enumeration: the frozen set is unchanged.
+        self.assertEqual(
+            ("started", "succeeded", "failed", "cancelled", "unknown", "rejected", "degraded"),
+            obs.OUTCOMES,
+        )
+        # A successful send is a success, not a refusal: this is the defect the mapping fixes.
+        self.assertEqual("succeeded", obs.runtime_outcome("sent"))
+        self.assertEqual("succeeded", obs.runtime_outcome("completed"))
+        self.assertEqual("unknown", obs.runtime_outcome("unknown"))
+        self.assertEqual("failed", obs.runtime_outcome("failed"))
+        # A value that is not a state at all is refused rather than guessed.
+        self.assertIsNone(obs.runtime_outcome("something_else"))
+        self.assertIsNone(obs.runtime_outcome(None))
+
+    def test_a_delivered_turn_is_recorded_as_succeeded_and_not_dropped(self):
+        async def scenario():
+            h = Harness(silence_ms=0)
+            logs = _LogDirectory(self)
+            app = logs.attach(create_app(h.core, {"nonebot": "nonebot-token"}, None))
+            import httpx
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://core"
+            ) as client:
+                response = await client.post(
+                    "/internal/v1/conversation/ingest",
+                    json=h.request(text="hello"),
+                    headers={"Authorization": "Bearer nonebot-token"},
+                )
+                self.assertEqual(200, response.status_code)
+                for _ in range(200):
+                    await h.core.tick()
+                    await asyncio.sleep(0)
+            await h.core.close()
+            return logs
+
+        logs = asyncio.run(scenario())
+        records = logs.records()
+        # The success path really is reported: a delivered send is `succeeded`, and the
+        # adapter dropped nothing on the way.
+        delivered = [r for r in records if r["event"] == "turn.delivery.finished"]
+        self.assertTrue(delivered)
+        for record in delivered:
+            self.assertIn(record["outcome"], obs.OUTCOMES)
+        self.assertNotIn("sent", [r["outcome"] for r in records])
+        for record in records:
+            self.assertIn(record["outcome"], obs.OUTCOMES)
+
+
 class SequenceTests(unittest.TestCase):
     """Concurrency, uniqueness and full coverage."""
 
@@ -510,6 +776,7 @@ class SequenceTests(unittest.TestCase):
             worker.start()
         for worker in workers:
             worker.join()
+        self.assertTrue(adapter.flush())
         records = sink.lines
         self.assertEqual(total, len(records))
         sequences = sorted(record["sequence"] for record in records)
@@ -532,6 +799,7 @@ class SequenceTests(unittest.TestCase):
             for outcome in obs.OUTCOMES:
                 adapter.emit(event, outcome)
                 total += 1
+        self.assertTrue(adapter.flush())
         records = sink.lines
         self.assertEqual(total, len(records))
         self.assertEqual(total, len({(r["event"], r["outcome"]) for r in records}))
@@ -551,6 +819,7 @@ class SequenceTests(unittest.TestCase):
         # carries a contract-valid number instead of inheriting the refused one.
         adapter._sequence = 7
         self.assertTrue(adapter.emit("runtime.background_work", "succeeded"))
+        self.assertTrue(adapter.flush())
         self.assertEqual(8, sink.lines[-1]["sequence"])
 
 
@@ -587,11 +856,14 @@ class DurabilityTests(unittest.TestCase):
             # Shrink the budget after opening, so the refusal is reached with real content.
             adapter.max_directory_bytes = 4096
             written = 0
-            while adapter.emit("runtime.background_work", "succeeded"):
+            # Admission is what proves a record landed, so the loop uses it: with `emit` the
+            # writes would still be queued, and the count would measure nothing.
+            while asyncio.run(adapter.admit("runtime.background_work", "succeeded")):
                 written += 1
                 if written > 100000:
                     break
             self.assertLess(written, 100000)
+            self.assertGreater(written, 0)
             self.assertEqual("capacity_exhausted", adapter.health())
             self.assertFalse(adapter.accepts_business())
             # The records already written are still readable, and nothing was removed.
@@ -606,15 +878,21 @@ class DurabilityTests(unittest.TestCase):
             sink = _Sink()
             adapter = obs.LogAdapter(directory, stderr=sink)
             self.assertTrue(adapter.emit("runtime.started", "succeeded", fsync=True))
-            # A write that cannot succeed: the descriptor is closed under the adapter and
-            # every following write attempt fails on that same closed descriptor.
+            # Reach a quiet point first: the file handle belongs to the writer thread, so the
+            # failure has to be injected where the writer will meet it, not by reaching into a
+            # handle another thread is using.
+            self.assertTrue(adapter.flush())
+            # A write that cannot succeed: every following append raises on a closed handle.
             adapter._stream.close()
-            self.assertFalse(adapter.emit("runtime.background_failed", "failed"))
+            # The admission gate is where a destination failure must surface: a request that
+            # cannot have its record written is refused, not admitted and then quietly dropped.
+            self.assertFalse(asyncio.run(adapter.admit("runtime.background_failed", "failed")))
             self.assertEqual("log_unavailable", adapter.health())
             self.assertEqual(1, adapter.dropped)
             # The warning is fixed and safe, and it is written exactly once.
             self.assertEqual(1, bytes(sink.buffer).count(b"runtime log"))
             self.assertFalse(adapter.emit("runtime.background_failed", "failed"))
+            self.assertTrue(adapter.flush())
             self.assertEqual(1, bytes(sink.buffer).count(b"runtime log"))
             # Recovery needs a genuinely successful write, not a repeated failed attempt.
             self.assertFalse(adapter.probe())
@@ -623,6 +901,75 @@ class DurabilityTests(unittest.TestCase):
             self.assertTrue(adapter.probe())
             self.assertEqual("ok", adapter.health())
             self.assertTrue(adapter.emit("runtime.background_work", "succeeded"))
+            self.assertTrue(adapter.flush())
+            adapter.close()
+
+    def test_a_stream_nobody_reads_never_stops_the_caller(self):
+        """A captured standard error whose pipe has filled must cost records, not latency.
+
+        This is the defect that froze a whole runtime: the diagnostic channel was written
+        synchronously by whoever called `emit`, which is the event loop, so once the pipe's
+        buffer filled the process stopped answering - no request, no health probe, no background
+        pass - until someone drained that pipe. A real pipe is used here, filled on purpose, and
+        the writer must return promptly with the loss counted.
+        """
+        read_end, write_end = os.pipe()
+        for descriptor in (read_end, write_end):
+            self.addCleanup(_close_quietly, descriptor)
+        # Both ends are non-blocking: the reader below must never be the thing that waits, and
+        # an empty pipe is reported as empty rather than hung on.
+        os.set_blocking(read_end, False)
+        os.set_blocking(write_end, False)
+        # The raw descriptor is the stream: the adapter is given exactly the pipe a container
+        # runtime gives a captured standard error.
+        adapter = obs.LogAdapter(None, stderr=write_end)
+        # More records than the queue and the pipe can both hold, so the writer really meets a
+        # full pipe. `emit` must never wait for that: every call returns.
+        started = time.monotonic()
+        accepted = 0
+        for _ in range(20000):
+            if adapter.emit("runtime.background_work", "succeeded"):
+                accepted += 1
+            if time.monotonic() - started > 20:
+                self.fail("emit stopped returning while the diagnostic stream was blocked")
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 20.0)
+        self.assertGreater(accepted, 0)
+        # Reaching a quiet point is bounded too: whether the writer managed to place the rest of
+        # the backlog or met a full pipe, `flush` answers inside its bound instead of waiting for
+        # a reader that never comes.
+        flushed_at = time.monotonic()
+        adapter.flush(timeout=0.5)
+        self.assertLess(time.monotonic() - flushed_at, 5.0)
+        self.assertGreater(adapter.dropped, 0)
+        # The loss is bounded by the queue, not unbounded: at most one queue's worth of records
+        # can be waiting, and everything else was counted as dropped.
+        self.assertLessEqual(adapter.pending, adapter.queue_records)
+        # Closing is bounded as well, even with the writer parked on that pipe.
+        closed_at = time.monotonic()
+        adapter.close(drain=0.5)
+        self.assertLess(time.monotonic() - closed_at, 30.0)
+        # Draining the pipe proves the records that were written really were written, so the
+        # dropped count is a bound on loss and not an excuse for writing nothing.
+        drained = _drain_pipe(read_end)
+        self.assertTrue(drained.startswith(b'{"schema_version"'))
+        # The writer thread is a daemon that cannot outlive the interpreter, and it never held
+        # the state lock while waiting, so the adapter is still fully readable afterwards.
+        self.assertEqual("non_durable", adapter.health())
+
+    def test_a_quiet_point_is_never_reported_while_a_record_is_still_queued(self):
+        """`flush` may only answer True once the writer has really finished the record.
+
+        The pending count is published by the producer *before* the record is queued, because
+        the writer can consume it the instant it appears: with the count published afterwards,
+        `flush` and `admit` could observe zero and report a durable write that had not happened.
+        """
+        for _ in range(200):
+            sink = _Sink()
+            adapter = obs.LogAdapter(None, stderr=sink)
+            self.assertTrue(adapter.emit("runtime.started", "succeeded"))
+            self.assertTrue(adapter.flush())
+            self.assertEqual(1, len(sink.lines))
             adapter.close()
 
     def test_without_a_configured_directory_the_channel_is_non_durable(self):
@@ -631,7 +978,9 @@ class DurabilityTests(unittest.TestCase):
         self.assertFalse(adapter.durable)
         self.assertEqual("non_durable", adapter.health())
         self.assertTrue(adapter.emit("runtime.started", "succeeded"))
+        self.assertTrue(adapter.flush())
         self.assertEqual("runtime.started", sink.lines[0]["event"])
+        adapter.close()
 
     def test_configuration_is_explicit_and_an_unusable_value_fails_startup(self):
         adapter = log_adapter_from_environment({})

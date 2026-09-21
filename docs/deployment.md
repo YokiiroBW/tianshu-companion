@@ -10,7 +10,7 @@
 | 进程入口、绑定校验、TLS 规则、单 owner 锁 | 已在回环地址上真实跑过（见 `tests/test_runtime_cli.py`） |
 | 健康检查端点、专用凭据、封闭检查集 | 已用 ASGI 真实请求验证（见 `tests/test_health.py`） |
 | 运行事件日志：字段、轮转、预算、降级、关联号 | 已用真实文件系统验证（见 `tests/test_observability.py`） |
-| `Dockerfile` / `.dockerignore` / 容器健康检查脚本 | **未构建镜像**。本批没有执行 `docker build`，因此"镜像能构建""容器能启动"都**不成立** |
+| `Dockerfile` / `.dockerignore` / 容器健康检查脚本 | **未构建镜像**。本批没有执行 `docker build`，因此"镜像能构建""容器能启动"都**不成立**；健康检查脚本本身用真实回环 TLS 监听验证过（见 `tests/test_runtime_cli.py`） |
 | 真实 Memory / 网关 / 渠道 / PostgreSQL | **未验收**。`/health/ready` 的 `dependencies` 恒为 `not_verified` |
 | 部署到任何真实主机或 NAS | **未发生**。本批只用合成数据与隔离测试 |
 
@@ -78,6 +78,24 @@ python -m tianshu_companion.runtime_cli \
 本身健康的情况变成重启循环。`scripts/container_healthcheck.py` 只用标准库、不依赖本包、
 不写任何东西，因此应用导入失败时它仍然能给出答案。
 
+它探测的地址与 TLS 参数与部署一致，且全部可覆盖：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `TIANSHU_HEALTHCHECK_URL` | 无 | 完整地址，给出后覆盖下面四项 |
+| `TIANSHU_HEALTHCHECK_SCHEME` | `http` | 非回环或已启用 TLS 时设为 `https` |
+| `TIANSHU_HEALTHCHECK_HOST` | `127.0.0.1` | 探测主机 |
+| `TIANSHU_HEALTHCHECK_PORT` | `8765` | 探测端口，必须与 `--port` 一致 |
+| `TIANSHU_HEALTHCHECK_CA` | 无 | 私有 CA 的 PEM 路径，用于校验服务端证书 |
+| `TIANSHU_HEALTHCHECK_TIMEOUT` | `3.0` | 单次探测超时（秒） |
+
+- TLS 校验**始终开启**：`https` 下要求 `CERT_REQUIRED` 且 `check_hostname` 恒为真，没有
+  "跳过校验"的开关。自签或私有 CA 部署必须给出 `TIANSHU_HEALTHCHECK_CA`，否则探测失败——
+  这是对的：一个连证书都不校验的健康检查只会把错误配置报成健康。
+- 探测请求不带任何凭据，也**从不**读 `/health/ready`：它只回答"进程是否在回答"。
+- 探测地址与端口写错（例如容器里监听 8765 却探测 8080）时，健康检查会失败而不是碰巧通过，
+  所以 `TIANSHU_HEALTHCHECK_PORT` 必须与入口的 `--port` 保持一致。
+
 就绪回答封闭为 `{status, service, checks}`，检查键固定为
 `configuration` / `logs` / `runtime` / `dependencies`，取值限
 `ok` / `failed` / `not_configured` / `not_verified` / `non_durable`。探针不 tick 调度、
@@ -93,6 +111,10 @@ python -m tianshu_companion.runtime_cli \
   `logs=failed`。这是刻意的：宁可拒绝业务，也不让文件超过它自己声明的预算。
 - 写入失败 ⇒ 不向业务抛异常，内存中降级，标准错误一条固定告警；恢复只能靠一次真正成功
   的写入，或运维显式调用 `LogAdapter.probe()`。
+- **不要用 `subprocess.PIPE` 捕获运行进程的标准错误却不读取它。** 无人读取的管道写满后
+  会永久阻塞写入方，所以适配器把标准错误也交给自己的写线程、并把它设为非阻塞：写不进去
+  的记录计为 `dropped`，绝不阻塞事件循环。生产部署应让标准错误落到容器运行时可读的地方
+  （默认即如此），或用 `TIANSHU_LOG_DIR` 走文件通道。
 
 细节与完整事件表见 `docs/runtime-events.md`。
 

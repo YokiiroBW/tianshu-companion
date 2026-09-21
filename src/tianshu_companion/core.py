@@ -1603,12 +1603,15 @@ class Core:
                 retry_safe=False,
             )
         # One reply, one outcome. An `unknown` verdict is recorded as unknown and never
-        # becomes a retry: the log repeats the receipt, it never decides a new one.
+        # becomes a retry: the log repeats the receipt, it never decides a new one. The
+        # receipt's own state is a *domain* verdict (`sent`, `failed`, `unknown`); the adapter
+        # maps it onto the frozen runtime outcome, so a successful send is reported as
+        # `succeeded` instead of being refused for not being a runtime word.
         obs.emit(
             self.events,
             "turn.delivery.finished",
             receipt["state"],
-            level="INFO" if receipt["state"] == "sent" else "WARNING",
+            error_code=None if receipt["state"] == "sent" else "result_unknown",
         )
         self.record_receipt(reply["id"], receipt)
 

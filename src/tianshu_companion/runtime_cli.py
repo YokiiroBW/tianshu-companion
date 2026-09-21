@@ -173,7 +173,10 @@ def resolve(arguments, environ=None, platform=None):
         database=Path(database),
         log_dir=Path(log_dir) if log_dir else None,
         host=arguments.host or DEFAULT_HOST,
-        port=arguments.port or DEFAULT_PORT,
+        # `is None` rather than `or`: an explicit `--port 0` is a real value the operator typed,
+        # and it is out of range. Treating it as "unset" would silently bind the default port
+        # instead of refusing, which is how a deployment ends up listening where nobody expects.
+        port=DEFAULT_PORT if arguments.port is None else arguments.port,
         certificate=arguments.tls_cert,
         key=arguments.tls_key,
     )
@@ -184,6 +187,12 @@ def environment_for(paths, environ=None):
 
     `TIANSHU_COMPANION_CONFIG` stays the one entry point, so the original loopback
     development path and the published factory keep working unchanged.
+
+    `TIANSHU_CONTRACTS` and `TIANSHU_COMPANION_DATABASE` are the *deployment* paths, and the
+    application factory gives them precedence over the values written in the configuration
+    document (see `app.apply_deployment_overrides`). Writing them here is therefore not
+    decoration: it is what makes `--database /data/companion.db` actually open that database
+    instead of whichever path a stale document still names.
     """
     values = dict(os.environ if environ is None else environ)
     values[ENVIRONMENT["config"]] = str(paths.config)

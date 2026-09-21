@@ -85,7 +85,7 @@ class _Response:
         return f"<{self.status_code} {self.body[:120]!r}>"
 
 
-def call(app, path, *, token=None, method="GET"):
+def call(app, path, *, token=None, method="GET", json=None):
     """One request against the application's ASGI surface, without a network."""
 
     async def scenario():
@@ -93,7 +93,7 @@ def call(app, path, *, token=None, method="GET"):
             transport=httpx.ASGITransport(app=app), base_url="http://core"
         ) as client:
             headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
-            response = await client.request(method, path, headers=headers)
+            response = await client.request(method, path, headers=headers, json=json)
             return _Response(response.status_code, response.content, dict(response.headers))
 
     return asyncio.run(scenario())
@@ -237,15 +237,47 @@ class ReadinessTruthTests(unittest.TestCase):
         # never silently `ok` just because records happen to reach standard error.
         with mock.patch.dict(os.environ, {obs.ENVIRONMENT_LOG_DIR: ""}):
             app = self.logs.attach(create_app(self.h.core, {"nonebot": CHAT_TOKEN}, None))
-        body = call(app, "/health/ready", token=TOKEN).json()
+        response = call(app, "/health/ready", token=TOKEN)
+        body = response.json()
         self.assertEqual("non_durable", body["checks"]["logs"])
         self.assertEqual("not_ready", body["status"])
+        self.assertEqual(503, response.status_code)
 
     def test_a_capacity_exhausted_log_makes_the_process_not_ready(self):
         self.logs.adapter.capacity_exhausted = True
-        body = call(self.app, "/health/ready", token=TOKEN).json()
+        response = call(self.app, "/health/ready", token=TOKEN)
+        body = response.json()
         self.assertEqual("failed", body["checks"]["logs"])
         self.assertEqual("not_ready", body["status"])
+        # The status line is the verdict, not decoration: a load balancer reads 200/503, and a
+        # body that says `not_ready` under a 200 is a false readiness claim.
+        self.assertEqual(503, response.status_code)
+
+    def test_the_ready_status_code_is_the_verdict_and_the_probe_changes_nothing(self):
+        """`/health/ready` answers 200 only when ready, 503 when not, over the real surface."""
+        before_logs = self.logs.digest()
+        before_db, before_head = database_digest(self.h.core.store), head(self.h.core.store)
+        ready = call(self.app, "/health/ready", token=TOKEN)
+        self.assertEqual(200, ready.status_code)
+        self.assertEqual("ready", ready.json()["status"])
+        # The same credential, one local condition failing: the code follows the body.
+        self.logs.adapter.capacity_exhausted = True
+        blocked = call(self.app, "/health/ready", token=TOKEN)
+        self.assertEqual(503, blocked.status_code)
+        self.assertEqual("not_ready", blocked.json()["status"])
+        self.assertEqual(ready.json()["service"], blocked.json()["service"])
+        # Neither answer wrote anything, in the log or in the database.
+        self.assertEqual(before_logs, self.logs.digest())
+        self.assertEqual(before_db, database_digest(self.h.core.store))
+        self.assertEqual(before_head, head(self.h.core.store))
+
+    def test_an_unwritable_log_makes_the_process_not_ready_with_a_503(self):
+        """An IO failure is its own verdict: `log_unavailable`, and the code says so."""
+        self.logs.adapter.io_failed = True
+        response = call(self.app, "/health/ready", token=TOKEN)
+        self.assertEqual(503, response.status_code)
+        self.assertEqual("not_ready", response.json()["status"])
+        self.assertEqual("failed", response.json()["checks"]["logs"])
 
     def test_an_exhausted_log_also_refuses_new_business_without_resending_anything(self):
         self.logs.adapter.capacity_exhausted = True
@@ -257,6 +289,60 @@ class ReadinessTruthTests(unittest.TestCase):
         self.assertEqual("close", response.headers.get("connection"))
         # The refusal happened before admission: nothing was queued, so nothing can be retried.
         self.assertEqual([], self.h.turns())
+
+    def test_an_unwritable_log_refuses_new_business_with_a_body_and_runs_nothing(self):
+        """A destination that cannot take the record refuses the work, body or no body.
+
+        The refusal is decided at admission, before the request is read and before any business
+        code runs, which is exactly why it cannot lose an in-flight side effect.
+        """
+        adapter = self.logs.adapter
+        # One real request first, so the writer has a handle to fail on and the case proves the
+        # difference between a healthy destination and a broken one. The body is not a valid
+        # ingest request, so a healthy destination answers 400 - a business answer, not a
+        # dependency refusal - and no turn is ever created by it.
+        healthy = call(
+            self.app, "/internal/v1/conversation/ingest", token=CHAT_TOKEN, method="POST"
+        )
+        self.assertEqual(400, healthy.status_code)
+        before = len(self.h.turns())
+        self.assertTrue(adapter.flush())
+        adapter._stream.close()
+        payload = {
+            "command": {
+                "issuer": "nonebot",
+                "audience": "companion",
+                "assertion_ref": "origin:missing",
+            }
+        }
+        response = call(
+            self.app,
+            "/internal/v1/conversation/ingest",
+            token=CHAT_TOKEN,
+            method="POST",
+            json=payload,
+        )
+        self.assertEqual(503, response.status_code)
+        # The refusal names its own cause - the log destination, not "some dependency" - and it
+        # is a registered error code, so it cannot be a message from anywhere else.
+        self.assertEqual({"code": "log_unavailable"}, response.json())
+        self.assertIn("log_unavailable", obs.ERROR_CODES)
+        # The header names the real reason: a failed destination is not an exhausted budget, and
+        # an operator sent to look at the budget would be looking at the wrong thing.
+        self.assertEqual("unavailable", response.headers.get("x-tianshu-log-capacity"))
+        self.assertEqual(before, len(self.h.turns()))
+        # And the same answer for a request that carries no body at all.
+        self.assertEqual(
+            503,
+            call(
+                self.app, "/internal/v1/conversation/ingest", token=CHAT_TOKEN, method="POST"
+            ).status_code,
+        )
+        self.assertEqual(before, len(self.h.turns()))
+        # The refusal is honest about why, and readiness agrees.
+        self.assertEqual(
+            "failed", call(self.app, "/health/ready", token=TOKEN).json()["checks"]["logs"]
+        )
 
     def _file_harness(self):
         """A file-backed store, because an owner lock only exists for a real database file."""

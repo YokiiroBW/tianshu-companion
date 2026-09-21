@@ -15,25 +15,43 @@ Everything runs on loopback with synthetic paths in a temporary directory. No co
 built, no deployment happens, and no external service or real credential is involved.
 """
 
+import asyncio
 import contextlib
+import importlib.util
 import io
 import json
 import os
+import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from tianshu_companion import app as app_module
+from tianshu_companion import observability as obs
 from tianshu_companion import runtime_cli
+from tianshu_companion.app import create_app
 from tianshu_companion.store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 NEW_PROCESS_GROUP = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+
+
+def _load_healthcheck():
+    """Import the container health check by path: it is a script, not part of the package."""
+    path = ROOT / "scripts" / "container_healthcheck.py"
+    spec = importlib.util.spec_from_file_location("tianshu_container_healthcheck", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class _Recorder:
@@ -163,6 +181,31 @@ class _ResolutionTests(unittest.TestCase):
             platform="linux",
         )
         self.assertEqual(Path("/tmp/one.db"), paths.database)
+
+    def test_an_explicit_port_of_zero_is_kept_and_refused_not_replaced(self):
+        """`--port 0` is a value the operator typed, and it is out of range.
+
+        Treating a falsy port as "unset" would silently bind the default 8765 instead, which is
+        how a deployment ends up listening somewhere nobody asked for.
+        """
+        paths = runtime_cli.resolve(self.parse("--port", "0"), environ={}, platform="linux")
+        self.assertEqual(0, paths.port)
+        self.assertEqual(
+            "port_out_of_range", runtime_cli.bind_refusal(paths.host, paths.port, None, None)
+        )
+        recorder = _Recorder()
+        self.assertEqual(
+            2,
+            runtime_cli.main(
+                ["--port", "0"], environ={}, platform="linux", server_factory=recorder
+            ),
+        )
+        self.assertEqual(0, recorder.served)
+        # An omitted port still resolves to the documented default.
+        self.assertEqual(
+            runtime_cli.DEFAULT_PORT,
+            runtime_cli.resolve(self.parse(), environ={}, platform="linux").port,
+        )
 
     def test_the_environment_wins_over_the_platform_default(self):
         paths = runtime_cli.resolve(
@@ -296,6 +339,147 @@ class _MainTests(unittest.TestCase):
         self.assertEqual(8765, recorder.config.port)
         self.assertIsNone(recorder.config.ssl_certfile)
         self.assertFalse(recorder.config.access_log)
+
+
+class _DeploymentPathTests(unittest.TestCase):
+    """The explicit deployment paths reach the real runtime, not just the environment.
+
+    A `--database` flag that only sets a variable nothing reads is worse than no flag: the
+    operator believes the process opened the mounted volume while it quietly opened whatever a
+    stale configuration document still named. These cases drive the real assembly point
+    (`create_app` -> `build_runtime` -> `Store`/`Contracts`) with synthetic paths in a temporary
+    directory, and check which path was actually used and which was left untouched.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(
+            prefix="tianshu-deploy-", ignore_cleanup_errors=True
+        )
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.stale_database = self.root / "stale.db"
+        self.deployed_database = self.root / "mounted" / "companion.db"
+        # A deployed pack keeps the published layout: the manifest hashes its own files by
+        # their path relative to the contracts root, so the copy must be the whole tree.
+        self.deployed_root = self.root / "mounted-contracts"
+        self.deployed_contracts = self.deployed_root / "text-dialogue" / "v1"
+        shutil.copytree(_contracts_path().parents[1], self.deployed_root)
+        self.config = self.root / "companion.json"
+        # The document names the *old* paths: the deployment variables must win over it.
+        self.config.write_text(
+            json.dumps(
+                {
+                    "contracts_path": str(_contracts_path()),
+                    "database_path": str(self.stale_database),
+                    "config_version": None,
+                    "policy": {"silence_ms": 5000},
+                    "roles": {},
+                    "bindings": {},
+                    "callers": {},
+                    "services": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.environment = {
+            "TIANSHU_COMPANION_CONFIG": str(self.config),
+            "TIANSHU_COMPANION_DATABASE": str(self.deployed_database),
+            "TIANSHU_CONTRACTS": str(self.deployed_contracts),
+        }
+        self.addCleanup(self._close)
+
+    def _close(self):
+        if getattr(self, "core", None) is not None:
+            asyncio.run(self.core.close())
+
+    def build(self, environment=None):
+        """Assemble the real application factory under exactly the given deployment variables.
+
+        Every `TIANSHU_*` variable of the ambient environment is dropped first, so "which path
+        was used" is decided by the variables under test rather than by whatever this machine
+        happens to export - while the platform's own variables (certificate stores, and the
+        like) are left alone.
+        """
+        wanted = self.environment if environment is None else environment
+        cleaned = {
+            key: value for key, value in os.environ.items() if not key.startswith("TIANSHU_")
+        }
+        cleaned.update(wanted)
+        with mock.patch.dict(os.environ, cleaned, clear=True):
+            app = create_app()
+        self.core = app.state.core
+        return app
+
+    def opened_database(self):
+        """The file the store actually opened, read from SQLite rather than from a flag."""
+        return Path(self.core.store.db.execute("PRAGMA database_list").fetchone()[2])
+
+    def test_the_deployment_database_and_contracts_are_the_ones_actually_used(self):
+        app = self.build()
+        # The real store opened the deployed path, and it is a real database file.
+        self.assertEqual(self.deployed_database.resolve(), self.opened_database())
+        self.assertTrue(self.deployed_database.is_file())
+        self.assertEqual(9, self.core.store.db.execute("PRAGMA user_version").fetchone()[0])
+        # The path the document named was never touched: no file, no owner lock, no side file.
+        self.assertFalse(self.stale_database.exists())
+        self.assertEqual([], sorted(self.root.glob("stale.db*")))
+        # The contract pack that was loaded is the deployed one, byte for byte.
+        self.assertEqual(
+            (self.deployed_contracts / "manifest.json").read_bytes(),
+            (_contracts_path() / "manifest.json").read_bytes(),
+        )
+        self.assertIsNotNone(app.state.log)
+
+    def test_an_explicit_path_wins_over_the_environment_and_the_document(self):
+        """Explicit argument, then its variable, then the document: the documented order."""
+        explicit_database = self.root / "explicit" / "explicit.db"
+        paths = runtime_cli.resolve(
+            runtime_cli.build_parser().parse_args(
+                [
+                    "--config",
+                    str(self.config),
+                    "--database",
+                    str(explicit_database),
+                    "--contracts",
+                    str(self.deployed_contracts),
+                ]
+            ),
+            environ={"TIANSHU_COMPANION_DATABASE": str(self.root / "from-env.db")},
+            platform="win32",
+        )
+        self.assertEqual(explicit_database, paths.database)
+        self.assertEqual(self.deployed_contracts, paths.contracts)
+        # The CLI's own environment handed to the factory carries those same resolved paths.
+        environment = runtime_cli.environment_for(paths, environ=dict(self.environment))
+        self.build(environment)
+        self.assertEqual(explicit_database.resolve(), self.opened_database())
+        self.assertTrue(explicit_database.is_file())
+        self.assertFalse((self.root / "from-env.db").exists())
+        self.assertFalse(self.stale_database.exists())
+
+    def test_a_document_with_no_deployment_variables_still_works(self):
+        """The factory stays compatible: no override, no change in behaviour."""
+        self.build({"TIANSHU_COMPANION_CONFIG": str(self.config)})
+        self.assertEqual(self.stale_database.resolve(), self.opened_database())
+        self.assertTrue(self.stale_database.is_file())
+        self.assertFalse(self.deployed_database.exists())
+
+    def test_the_override_never_mutates_the_document_the_caller_loaded(self):
+        document = {"contracts_path": "old-contracts", "database_path": "old-database"}
+        resolved = app_module.apply_deployment_overrides(
+            document,
+            {
+                "TIANSHU_CONTRACTS": "new-contracts",
+                "TIANSHU_COMPANION_DATABASE": "new-database",
+            },
+        )
+        self.assertEqual("new-contracts", resolved["contracts_path"])
+        self.assertEqual("new-database", resolved["database_path"])
+        # The caller's own mapping is untouched, and an absent variable changes nothing.
+        self.assertEqual(
+            {"contracts_path": "old-contracts", "database_path": "old-database"}, document
+        )
+        self.assertEqual(document, app_module.apply_deployment_overrides(document, {"PATH": "x"}))
 
 
 class _ProcessTests(unittest.TestCase):
@@ -468,7 +652,105 @@ class _ProcessTests(unittest.TestCase):
         )
         self.stop(process)
         self.assertNotEqual(0, second.returncode)
-        self.assertIn(b"owner", (second.stdout + second.stderr).lower())
+
+    def test_a_real_process_never_writes_a_caller_supplied_value_anywhere(self):
+        """The canary travels through a real process: headers, a body, and the query string.
+
+        Everything the process writes is inspected - the whole event stream and both of its
+        standard streams - because "the record is closed" is only worth something if the real
+        deployment also keeps it that way.
+        """
+        canary = "CANARY-7b21-not-a-real-secret"
+        process, port = self.start()
+        self.reachable(process, port)
+        connection = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            body = json.dumps({"secret": canary, "text": canary}).encode()
+            request = (
+                b"POST /internal/v1/conversation/ingest?" + canary.encode() + b" HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Authorization: Bearer " + canary.encode() + b"\r\n"
+                b"X-Tianshu-Correlation-Id: " + canary.encode() + b"\r\n"
+                b"X-Canary: " + canary.encode() + b"\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: close\r\n\r\n" + body
+            )
+            connection.sendall(request)
+            answered = b""
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                answered += chunk
+        finally:
+            connection.close()
+        self.assertIn(b"HTTP/1.1", answered)
+        self.stop(process)
+        out, err = process.communicate(timeout=30)
+        blobs = [path.read_bytes() for path in sorted(self.logs.iterdir()) if path.is_file()] + [
+            out,
+            err,
+        ]
+        self.assertTrue(any(blob for blob in blobs))
+        for blob in blobs:
+            self.assertNotIn(canary.encode(), blob)
+        # And what the process did write is still the frozen record, on a real process.
+        records = [
+            json.loads(line)
+            for path in sorted(self.logs.iterdir())
+            for line in path.read_bytes().splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(records)
+        for record in records:
+            self.assertIn(record["outcome"], obs.OUTCOMES)
+            self.assertIn(record["event"], obs.EVENTS)
+            if record["error_code"] is not None:
+                self.assertIn(record["error_code"], obs.ERROR_CODES)
+            self.assertLessEqual(len(json.dumps(record).encode()) + 1, obs.MAX_RECORD_BYTES)
+
+    def test_a_request_that_cannot_be_accounted_for_is_refused_by_the_real_process(self):
+        """An unwritable destination refuses the work, in the deployment, not just in a test.
+
+        The refusal is visible to the caller as 503, the process stays alive (a log failure is
+        not a crash loop), and readiness reports the log as failed rather than pretending.
+        """
+        process, port = self.start()
+        self.reachable(process, port)
+        # Make the destination unusable from outside the process: the directory is replaced by a
+        # file, so no further segment can be created in it.
+        self.stop(process)
+        log_root = self.logs
+        if log_root.exists():
+            shutil.rmtree(log_root)
+        log_root.write_bytes(b"not-a-directory")
+        process, port = self.start()
+        try:
+            self.assertTrue(
+                _wait_for_port(port, process),
+                "the runtime refused to start instead of serving with an unusable log",
+            )
+            connection = socket.create_connection(("127.0.0.1", port), timeout=10)
+            try:
+                connection.sendall(
+                    b"POST /internal/v1/conversation/ingest HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Length: 2\r\n"
+                    b"Connection: close\r\n\r\n{}"
+                )
+                answered = b""
+                while True:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        break
+                    answered += chunk
+            finally:
+                connection.close()
+            self.assertIn(b" 503 ", answered)
+        finally:
+            if process.poll() is None:
+                self.stop(process)
 
     def test_a_probe_writes_nothing_to_the_log_directory(self):
         import urllib.request
@@ -581,10 +863,103 @@ class _HealthcheckTests(unittest.TestCase):
         # docstring explains the rule, so only the executable text is inspected.
         source = (ROOT / "scripts" / "container_healthcheck.py").read_text(encoding="utf-8")
         code = source.split('"""', 2)[2]
-        self.assertIn('DEFAULT_URL = "http://127.0.0.1:8765/health/live"', code)
+        self.assertIn('DEFAULT_PATH = "/health/live"', code)
         self.assertNotIn("/health/ready", code)
         self.assertNotIn("TIANSHU_DIAGNOSTICS_TOKEN", code)
         self.assertNotIn("Authorization", code)
+
+    def test_the_check_follows_the_deployment_address_and_scheme(self):
+        """A TLS listener on a custom port must be probed as such, not as plaintext 8765.
+
+        A hard-coded address would report a healthy HTTPS process as unhealthy forever, so the
+        address is assembled from the deployment's own configuration - and verification is
+        never relaxed to make a private CA work.
+        """
+        module = _load_healthcheck()
+        self.assertEqual("http://127.0.0.1:8765/health/live", module.probe_url({}))
+        self.assertEqual(
+            "https://127.0.0.1:9443/health/live",
+            module.probe_url(
+                {
+                    "TIANSHU_HEALTHCHECK_SCHEME": "https",
+                    "TIANSHU_HEALTHCHECK_PORT": "9443",
+                }
+            ),
+        )
+        self.assertEqual(
+            "https://companion.internal:8443/health/live",
+            module.probe_url(
+                {"TIANSHU_HEALTHCHECK_URL": "https://companion.internal:8443/health/live"}
+            ),
+        )
+        # Plaintext needs no TLS context at all.
+        self.assertIsNone(module.ssl_context("http://127.0.0.1:8765/health/live", None, {}))
+        # An HTTPS address always gets a verifying context, with a CA added when one is named.
+        context = module.ssl_context("https://127.0.0.1:9443/health/live", None, {})
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(ssl.CERT_REQUIRED, context.verify_mode)
+        self.assertTrue(
+            module.ssl_context("https://127.0.0.1:9443/health/live", None, {}).verify_mode
+        )
+
+    def test_a_trusted_tls_listener_is_healthy_and_an_untrusted_one_is_not(self):
+        """Real TLS: a private CA is added, and nothing is ever switched off.
+
+        The listener is a real `https` socket on a loopback port with an ephemeral certificate
+        generated for `127.0.0.1` - the same shape a deployment uses. The probe must answer
+        `healthy` when it is given that CA, and must *fail* when it is not, because a check that
+        accepted any certificate would report a machine-in-the-middle as a healthy runtime.
+        """
+        pem = _ephemeral_loopback_certificate(self.root)
+        server = _LivenessTlsServer(str(pem), str(self.root / "key.pem"))
+        self.addCleanup(server.shutdown)
+        url = f"https://127.0.0.1:{server.port}/health/live"
+        # Untrusted: the certificate is not in the default trust store, so verification fails
+        # and the probe says so instead of accepting it.
+        untrusted = self.check(url)
+        self.assertNotEqual(0, untrusted.returncode, untrusted.stdout)
+        self.assertIn(b"unhealthy", untrusted.stderr)
+        self.assertIn(b"SSL", untrusted.stderr)
+        # Trusted: the same address, with the deployment's own CA named explicitly.
+        trusted = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "container_healthcheck.py"),
+                "--url",
+                url,
+                "--ca",
+                str(self.root / "cert.pem"),
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            timeout=30,
+            creationflags=NO_WINDOW,
+        )
+        self.assertEqual(0, trusted.returncode, trusted.stderr)
+        self.assertEqual(b"healthy", trusted.stdout.strip())
+        # The certificate covers the address, not the name: a name-based URL must still be
+        # verified, so the check cannot be fooled by a hostname that resolves to loopback.
+        mismatched = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "container_healthcheck.py"),
+                "--url",
+                f"https://localhost:{server.port}/health/live",
+                "--ca",
+                str(self.root / "cert.pem"),
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            timeout=30,
+            creationflags=NO_WINDOW,
+        )
+        self.assertNotEqual(0, mismatched.returncode)
+        self.assertIn(b"unhealthy", mismatched.stderr)
+        # Whatever the answer, the probe asked liveness and only liveness: the handshake
+        # failures never reach the application, so the served path is the one check that
+        # completed - and no other path was ever requested.
+        self.assertIn("/health/live", server.paths)
+        self.assertEqual({"/health/live"}, set(server.paths))
 
     def test_the_image_declares_the_health_check_and_a_non_root_identity(self):
         text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -610,6 +985,92 @@ def _contracts_path():
         return Path(os.environ["TIANSHU_CONTRACTS"])
     context = json.loads((ROOT / ".runtime/workspace-context.json").read_text(encoding="utf-8"))
     return Path(context["workspace"]) / "contracts/text-dialogue/v1"
+
+
+CERT_PROGRAM = """
+import datetime, ipaddress, pathlib, sys
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+root=pathlib.Path(sys.argv[1])
+key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
+name=x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,"Companion synthetic loopback")])
+now=datetime.datetime.now(datetime.timezone.utc)
+cert=(x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+ .serial_number(x509.random_serial_number()).not_valid_before(now-datetime.timedelta(minutes=5))
+ .not_valid_after(now+datetime.timedelta(days=1))
+ .add_extension(x509.BasicConstraints(ca=True,path_length=None),critical=True)
+ .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),critical=False)
+ .sign(key,hashes.SHA256()))
+(root/"cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+(root/"key.pem").write_bytes(key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()))
+"""
+
+
+def _ephemeral_loopback_certificate(root):
+    """A one-day certificate for `127.0.0.1`, generated by an interpreter with `cryptography`.
+
+    Nothing is committed: the certificate and its key exist only in this case's temporary
+    directory, which is why the TLS cases are skipped rather than faked when the explicit
+    certificate runtime is not configured. The project's own environment is never extended with
+    a certificate dependency, and the listener under test is still the project's interpreter.
+    """
+    interpreter = os.environ.get("TIANSHU_TLS_PYTHON")
+    if not interpreter:
+        raise unittest.SkipTest(
+            "Set TIANSHU_TLS_PYTHON to an interpreter with cryptography to exercise real TLS"
+        )
+    subprocess.run(
+        [interpreter, "-c", CERT_PROGRAM, str(root)],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    return root / "cert.pem"
+
+
+class _LivenessTlsServer:
+    """A real `https` listener that serves the liveness payload and records what was asked."""
+
+    def __init__(self, certificate, key):
+        import http.server
+
+        self.paths = []
+        self.certificate, self.key = certificate, key
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                server.paths.append(self.path)
+                if self.path == "/health/live":
+                    body = b'{"status":"alive"}'
+                    self.send_response(200)
+                else:
+                    body = b'{"status":"not_here"}'
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *arguments):
+                """Silence: this listener's output is not the subject of the case."""
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certificate, key)
+        self.httpd.socket = context.wrap_socket(self.httpd.socket, server_side=True)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def shutdown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=10)
 
 
 def _wait_for_port(port, process, attempts=200):

@@ -1352,7 +1352,7 @@ class Direct:
             self.events,
             "direct.attempt.finished",
             outcome,
-            level="INFO" if outcome == "completed" else "WARNING",
+            error_code=None if outcome == "completed" else "result_unknown",
         )
         return self.request_view(request_id)
 
@@ -1625,12 +1625,14 @@ class Direct:
                 request.update(state="cancelled", blocked_reason=request["cancel_reason"])
             self.store.put("direct_requests", request)
             self._notify(request_id)
-        # One delivery intent, one reported outcome. An `unknown` receipt stays unknown.
+        # One delivery intent, one reported outcome. An `unknown` receipt stays unknown. The
+        # receipt's state is the domain's verdict (`sent`/`failed`/`unknown`); the adapter maps
+        # it onto the frozen runtime outcome.
         obs.emit(
             self.events,
             "direct.delivery.finished",
             receipt["state"],
-            level="INFO" if receipt["state"] == "sent" else "WARNING",
+            error_code=None if receipt["state"] == "sent" else "result_unknown",
         )
 
     async def reconcile(self, request_id):

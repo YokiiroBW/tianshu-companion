@@ -188,16 +188,21 @@ async def run_loop(
         await pause(delay, wait)
 
 
-class _LogBudgetExhausted(Exception):
-    """Internal signal: the log directory budget filled up before this request ran."""
-
-
 class RuntimeEvents:
-    """Application middleware: one correlation ID, three lifecycle events per request.
+    """Application middleware: one correlation ID, one admitted start, one truthful end.
 
     Everything that answers a probe rather than a caller is deliberately excluded. A probe must
     be purely read-only, which includes not writing a log record, so the middleware never sees
     it and the log directory is byte-for-byte identical before and after a probe.
+
+    Admission is the gate, and it is a *durable* one: the start record is written and fsynced
+    before the application is called, awaited outside any transaction, so a request that cannot
+    be accounted for in the log never runs. The alternative - checking a health flag and hoping
+    the later write succeeds - would let side effects happen with no record of them.
+
+    The end record reports what actually happened: the status the application sent, the
+    exception it raised, or the cancellation it received. A rejected or failed request is not
+    reported as a success.
     """
 
     def __init__(self, app, port, enabled=True):
@@ -210,7 +215,7 @@ class RuntimeEvents:
             return
         headers = {
             key.decode("latin-1").lower(): value.decode("latin-1")
-            for key, value in scope.get("headers") or []
+            for key, value in (scope.get("headers") or [])
         }
         offered = headers.get(obs.CORRELATION_HEADER.lower())
         # An invalid value - including one that looks like a secret - is replaced and never
@@ -218,13 +223,8 @@ class RuntimeEvents:
         correlation = offered if obs.valid_correlation_id(offered) else obs.new_correlation_id()
         started = time.perf_counter()
         announced = refusal = False
-
-        async def wrapped_receive():
-            if not refusal and self._refused():
-                # The budget filled up before this request read its body, so nothing in the
-                # application has run yet and no side effect can be lost by refusing now.
-                raise _LogBudgetExhausted
-            return await receive()
+        status = {"code": None}
+        outcome = {"value": "succeeded", "code": None, "level": None}
 
         async def wrapped_send(message):
             nonlocal announced
@@ -233,41 +233,73 @@ class RuntimeEvents:
                     # The 503 has already been sent; the application's own response is not
                     # written on top of it, so the caller sees exactly one answer.
                     return
+                status["code"] = message["status"]
                 announced = True
             elif message["type"] == "http.response.body" and not announced:
                 return
             await send(message)
 
         with obs.correlation_scope(correlation):
-            obs.emit(self.port, "service.request.started", "started", correlation_id=correlation)
             try:
-                if self._refused() and headers.get("content-length") not in (None, "0"):
-                    raise _LogBudgetExhausted
-                await self.app(scope, wrapped_receive, wrapped_send)
-            except _LogBudgetExhausted:
+                admitted = await obs.admit(
+                    self.port, "service.request.started", "started", correlation_id=correlation
+                )
+            except asyncio.CancelledError:
+                raise
+            if not admitted:
+                # No durable record, so no business. Nothing has run yet, which is exactly why
+                # refusing here cannot lose an in-flight side effect - and why no request body
+                # needs to be read first.
                 refusal = True
+                code = "log_capacity_exhausted" if self._full() else "log_unavailable"
                 obs.emit(
                     self.port,
                     "service.request.finished",
                     "rejected",
-                    level="ERROR",
                     correlation_id=correlation,
-                    error_code="log_capacity_exhausted",
+                    error_code=code,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
                 )
-                await self._refuse(send)
+                await self._refuse(send, code)
+                return
+            try:
+                await self.app(scope, receive, wrapped_send)
+            except asyncio.CancelledError:
+                outcome.update(value="cancelled", code="cancelled", level="WARNING")
+                raise
+            except Exception as error:
+                outcome.update(value="failed", code=obs.failure_class(error), level="ERROR")
+                raise
             finally:
-                if not refusal:
-                    obs.emit(
-                        self.port,
-                        "service.request.finished",
-                        "succeeded",
-                        correlation_id=correlation,
-                        duration_ms=round((time.perf_counter() - started) * 1000, 3),
-                        fsync=True,
-                    )
+                self._report_finished(status["code"], outcome, correlation, started)
 
-    async def _refuse(self, send):
-        body = json.dumps({"code": "dependency_unavailable"}).encode()
+    def _report_finished(self, status, outcome, correlation, started):
+        """Record the real terminal state of the request, never a blanket success."""
+        if outcome["value"] == "succeeded" and isinstance(status, int) and status >= 400:
+            outcome.update(
+                value="rejected" if status < 500 else "failed",
+                code="unauthorized" if status in (401, 403) else "invalid_input",
+                level="WARNING" if status < 500 else "ERROR",
+            )
+        obs.emit(
+            self.port,
+            "service.request.finished",
+            outcome["value"],
+            level=outcome["level"],
+            correlation_id=correlation,
+            error_code=outcome["code"],
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+
+    async def _refuse(self, send, code):
+        """Refuse a request that has no accounting record, naming the real reason.
+
+        The header says what actually happened: `exhausted` only when the directory budget really
+        ran out, `unavailable` when the destination could not take the record at all. Reporting
+        "exhausted" for a failed writer would send an operator to look at the wrong thing.
+        """
+        body = json.dumps({"code": code}).encode()
+        reason = b"exhausted" if code == "log_capacity_exhausted" else b"unavailable"
         await send(
             {
                 "type": "http.response.start",
@@ -275,12 +307,15 @@ class RuntimeEvents:
                 "headers": [
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(body)).encode()),
-                    (b"x-tianshu-log-capacity", b"exhausted"),
+                    (b"x-tianshu-log-capacity", reason),
                     (b"connection", b"close"),
                 ],
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+    def _full(self):
+        return bool(self.port is not None and getattr(self.port, "capacity_exhausted", False))
 
     def _refused(self):
         return self.port is not None and not self.port.accepts_business()
@@ -383,6 +418,32 @@ def build_runtime(config):
     return core, incoming, clients, life_readers
 
 
+def apply_deployment_overrides(config, environ=None):
+    """Let the explicitly deployed paths win over the ones written in the document.
+
+    The runtime entry point resolves `--database` / `--contracts` (then their environment
+    variables, then the platform default) and exports the result as `TIANSHU_COMPANION_DATABASE`
+    and `TIANSHU_CONTRACTS`. Those are *deployment* decisions: a mounted volume and a mounted
+    contract pack. The configuration document is a description of the deployment, and a stale
+    one must not silently send the process to a different database or a contract pack that is
+    not the one mounted.
+
+    Precedence, from strongest to weakest: explicit deployment variable, value in the document,
+    platform default. The document is copied, never mutated, so a caller that keeps its own
+    reference still sees what it loaded.
+    """
+    environ = os.environ if environ is None else environ
+    resolved = dict(config)
+    for key, variable in (
+        ("database_path", "TIANSHU_COMPANION_DATABASE"),
+        ("contracts_path", "TIANSHU_CONTRACTS"),
+    ):
+        deployed = environ.get(variable)
+        if deployed:
+            resolved[key] = deployed
+    return resolved
+
+
 def create_app(core=None, tokens=None, life_readers=None):
     clients = []
     configured = core is not None
@@ -390,7 +451,7 @@ def create_app(core=None, tokens=None, life_readers=None):
         config = json.loads(
             Path(os.environ["TIANSHU_COMPANION_CONFIG"]).read_text(encoding="utf-8")
         )
-        core, tokens, clients, life_readers = build_runtime(config)
+        core, tokens, clients, life_readers = build_runtime(apply_deployment_overrides(config))
         configured = True
     tokens = tokens or {}
     if len(set(tokens.values())) != len(tokens) or any(not token for token in tokens.values()):
@@ -442,7 +503,7 @@ def create_app(core=None, tokens=None, life_readers=None):
         jobs = []
         try:
             if core:
-                obs.emit(log_port, "runtime.started", "succeeded", fsync=True)
+                await obs.admit(log_port, "runtime.started", "succeeded")
                 core.recover()
                 jobs = [
                     loop("core.tick", core.tick, 0.05, _counter(core, "core.tick")),
@@ -463,7 +524,11 @@ def create_app(core=None, tokens=None, life_readers=None):
                 ]
             yield
         finally:
-            obs.emit(log_port, "runtime.stopping", "started", fsync=True)
+            # Shutdown is itself reported durably, and in the only order that makes the
+            # records trustworthy: `stopped` is confirmed on the disk *before* the writer is
+            # closed, so the last line of the stream is never a record that was still queued
+            # when the handle went away.
+            await obs.admit(log_port, "runtime.stopping", "started")
             stopping.set()
             for job in jobs:
                 job.cancel()
@@ -472,8 +537,12 @@ def create_app(core=None, tokens=None, life_readers=None):
                 await core.close()
             for client in clients:
                 await client.close()
-            log_port.close()
-            obs.emit(log_port, "runtime.stopped", "succeeded", fsync=True)
+            await obs.admit(log_port, "runtime.stopped", "succeeded")
+            close = getattr(log_port, "aclose", None)
+            if close is not None:
+                await close()
+            else:
+                log_port.close()
 
     health_view = health_module.Health(
         os.environ.get(health_module.TOKEN_ENV), core=core, log=log_port
@@ -504,7 +573,10 @@ def create_app(core=None, tokens=None, life_readers=None):
             )
         if not health_view.authorized(request.headers.get("Authorization")):
             return JSONResponse({"code": "unauthorized"}, status_code=401)
-        return JSONResponse(health_view.ready())
+        # The status code is the verdict, not decoration: a body that says `not_ready` while
+        # the response says 200 is exactly the kind of false readiness a load balancer trusts.
+        answer = health_view.ready()
+        return JSONResponse(answer, status_code=200 if answer["status"] == "ready" else 503)
 
     async def dispatch(request, operation):
         request_id = uid("req")
