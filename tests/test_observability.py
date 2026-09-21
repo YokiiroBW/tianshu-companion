@@ -287,6 +287,47 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(set(obs.EVENTS), emitted & set(obs.EVENTS))
         self.assertEqual(set(), emitted - set(obs.EVENTS))
 
+    def test_the_terminal_registry_matches_what_each_event_means(self):
+        """Which records must be persisted is decided by meaning, and checked in both directions.
+
+        A terminal record is one that *is* a result: something finished, failed, was cancelled,
+        was deferred, or the process stopped. A record that only announces work that has not
+        finished is not terminal, and forcing it to disk would be paying for a promise nobody
+        made. Both directions are asserted here because a registry that drifts - a new
+        `...finished` event that nobody classified, or an announcement quietly promoted - is how
+        "the completion is durable" turns into a claim about some completions.
+        """
+        terminal = set(obs.TERMINAL_EVENTS)
+        registered = set(obs.EVENTS)
+        self.assertEqual(set(), terminal - registered)
+        completions = {name for name in registered if name.endswith(".finished")}
+        self.assertEqual(set(), completions - terminal)
+        cancellations = {name for name in registered if name.endswith(".cancelled")}
+        self.assertEqual(set(), cancellations - terminal)
+        self.assertIn("runtime.background_failed", terminal)
+        self.assertIn("runtime.background_work", terminal)
+        self.assertIn("direct.delivery.deferred", terminal)
+        self.assertIn("outbox.flush", terminal)
+        # `direct.request.finished` is not a registered event at all: a direct request is closed
+        # out by its attempt and delivery events, so it must not be declared anywhere.
+        self.assertNotIn("direct.request.finished", registered | terminal)
+        announcements = {
+            "runtime.started",
+            "runtime.stopping",
+            "service.request.started",
+            "peer.call.started",
+            "turn.prepared",
+            "turn.queued",
+            "turn.generation.started",
+            "turn.delivery.started",
+            "direct.request.queued",
+            "direct.attempt.started",
+            "direct.delivery.started",
+        }
+        self.assertEqual(set(), announcements & terminal)
+        # Together the two sets are the whole registry, so neither list can silently lose a name.
+        self.assertEqual(announcements, registered - terminal - {"runtime.log_probe"})
+
 
 class SecretTests(unittest.TestCase):
     """No secret reaches the log by any of the four paths the card names."""
@@ -786,6 +827,126 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(adapter.close())
         self.assertEqual(10, len(_records_in(directory)))
 
+    def test_a_full_queue_never_swallows_the_stop_request(self):
+        """A shutdown against a full queue still ends the owner, with no sentinel hand-delivered.
+
+        The stop request used to be a single sentinel pushed into the same bounded queue the
+        records use. When that queue was full the push was simply dropped, and the owner - the only
+        thread allowed to release the handle - stayed parked in `get` for ever: the records it held
+        were written, the count reached zero, and the thread never left. The stop intent is now a
+        piece of state the owner observes on its own, so an IO that recovers really does end the
+        shutdown, and the repeated close reports the completion instead of replaying the timeout.
+        """
+        adapter, directory = self._adapter(queue_records=1, drain_seconds=0.03)
+        self.assertTrue(asyncio.run(adapter.admit("service.request.started", "started")))
+        owner = adapter._writer
+        entered, release = threading.Event(), threading.Event()
+        original = adapter._write
+
+        def held(line, *, fsync):
+            entered.set()
+            release.wait(timeout=30)
+            return original(line, fsync=fsync)
+
+        adapter._write = held
+        # One record is inside the writer, the other fills the only queue slot: the sentinel has
+        # nowhere to go, which is exactly the case that used to strand the owner.
+        self.assertTrue(adapter.emit("service.request.finished", "succeeded"))
+        self.assertTrue(entered.wait(timeout=10))
+        self.assertTrue(adapter.emit("service.request.finished", "succeeded"))
+
+        async def scenario():
+            confirmed = await adapter.aclose(timeout=0.03)
+            return confirmed
+
+        self.assertFalse(asyncio.run(scenario()))
+        release.set()
+        owner.join(timeout=30)
+        # Nobody pushed anything into the queue by hand: the owner left because it saw the stop.
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(0, adapter.pending)
+        self.assertEqual(0, adapter.dropped)
+        self.assertTrue(adapter.close())
+        self.assertEqual(
+            ["service.request.started", "service.request.finished", "service.request.finished"],
+            [record["event"] for record in _records_in(directory)],
+        )
+
+    def test_a_close_answers_inside_its_budget_even_when_the_owners_close_is_slow(self):
+        """The deadline must cover the owner's own handle release, not just the join.
+
+        Closing a file is IO, and a filesystem can park it. When that close ran while holding the
+        state lock, every thread that needed that lock - including the closer checking its own
+        deadline - waited for it: a 30 ms budget returned after 250 ms. The lock is now only ever
+        used to swap a reference, so the closer reports "unconfirmed" inside its budget while the
+        owner is still finishing, and the handle is still released by the owner alone.
+        """
+        adapter, directory = self._adapter(drain_seconds=0.03)
+        self.assertTrue(asyncio.run(adapter.admit("service.request.started", "started")))
+        owner = adapter._writer
+        stream = adapter._stream
+        calls = []
+        entered, release = threading.Event(), threading.Event()
+
+        class _Held:
+            def __getattr__(self, name):
+                return getattr(stream, name)
+
+            def close(self):
+                calls.append(threading.current_thread() is owner)
+                entered.set()
+                release.wait(timeout=30)
+                return stream.close()
+
+        adapter._stream = _Held()
+        timer = threading.Timer(0.25, release.set)
+        timer.start()
+
+        async def scenario():
+            started = time.monotonic()
+            confirmed = await adapter.aclose(timeout=0.03)
+            return confirmed, time.monotonic() - started
+
+        try:
+            confirmed, elapsed = asyncio.run(scenario())
+            self.assertFalse(confirmed)
+            # Well inside the window the release was held for: the budget is real.
+            self.assertLess(elapsed, 0.12)
+            self.assertTrue(entered.wait(timeout=10))
+            self.assertEqual([True], calls)
+        finally:
+            release.set()
+            timer.join()
+        owner.join(timeout=30)
+        self.assertFalse(owner.is_alive())
+        self.assertIsNone(adapter._stream)
+        self.assertEqual(1, len(_records_in(directory)))
+
+    def test_a_repeated_close_reports_the_shutdown_as_it_is_now(self):
+        """A close that timed out must not be replayed once the owner has finished."""
+        adapter, _ = self._adapter(drain_seconds=0.03)
+        self.assertTrue(asyncio.run(adapter.admit("service.request.started", "started")))
+        owner = adapter._writer
+        entered, release = threading.Event(), threading.Event()
+        original = adapter._write
+
+        def held(line, *, fsync):
+            entered.set()
+            release.wait(timeout=30)
+            return original(line, fsync=fsync)
+
+        adapter._write = held
+        self.assertTrue(adapter.emit("service.request.finished", "succeeded"))
+        self.assertTrue(entered.wait(timeout=10))
+        self.assertFalse(asyncio.run(adapter.aclose(timeout=0.03)))
+        release.set()
+        owner.join(timeout=30)
+        self.assertFalse(owner.is_alive())
+        # The log really is stopped now, so a later close says so instead of replaying the earlier
+        # timeout - and it does not start a second shutdown to get there.
+        self.assertTrue(adapter.close())
+        self.assertTrue(adapter.close())
+
     def test_a_terminal_event_is_persisted_not_merely_written(self):
         """The end of a request is fsynced by the writer; a plain record need not be.
 
@@ -798,8 +959,8 @@ class AdmissionTests(unittest.TestCase):
         adapter, directory = self._adapter()
         real = os.fsync
         with mock.patch.object(os, "fsync", wraps=real) as sync:
-            # A non-terminal record is written without forcing a disk sync of its own.
-            self.assertTrue(adapter.emit("runtime.background_work", "succeeded"))
+            # A record that only announces work is written without forcing a disk sync of its own.
+            self.assertTrue(adapter.emit("runtime.started", "succeeded"))
             self.assertTrue(adapter.flush())
             after_plain = sync.call_count
             # The terminal event of a request must be durable by the time the quiet point is
@@ -815,9 +976,46 @@ class AdmissionTests(unittest.TestCase):
         # already on disk, and the file holds every record in order.
         self.assertTrue(adapter.close())
         self.assertEqual(
-            ["runtime.background_work", "service.request.finished"],
+            ["runtime.started", "service.request.finished"],
             [record["event"] for record in _records_in(directory)],
         )
+
+    def test_the_real_background_seam_persists_both_of_its_outcomes(self):
+        """A pass that worked and a pass that failed are both persisted, through the real loop.
+
+        The background seam is a completion like any other: the contract asks for the end of
+        actual background work to be persisted, and `run_loop` reports exactly that - a real pass
+        that did work, or a real pass that failed. The *real* `run_loop` is exercised here rather
+        than a rehearsal of it, so a change to the seam cannot pass while the registry stays
+        wrong.
+        """
+        sink = _Sink()
+        adapter, _directory = self._adapter()
+        counts = []
+        real = os.fsync
+        with mock.patch.object(os, "fsync", wraps=real) as sync:
+            counts.append(sync.call_count)
+            for fail in (False, True):
+                stop = asyncio.Event()
+
+                async def work():
+                    if fail:
+                        raise OSError("synthetic background failure")
+
+                async def pause(seconds, wait):
+                    wait.set()
+
+                asyncio.run(run_loop("synthetic.work", work, port=adapter, wait=stop, sleep=pause))
+                self.assertTrue(adapter.flush())
+                counts.append(sync.call_count)
+        # Both outcomes are terminal records, so each one adds its own fsync: written is not the
+        # same as persisted, and the seam that reports real work is not an exception to that.
+        self.assertEqual([0, 1, 2], counts)
+        self.assertEqual(
+            ["runtime.background_work", "runtime.background_failed"],
+            [record["event"] for record in _records_in(_directory)],
+        )
+        self.assertEqual([], sink.lines)
 
     def test_a_terminal_event_still_cannot_become_a_business_retry(self):
         """A lost completion record is reported, never replayed as business work.

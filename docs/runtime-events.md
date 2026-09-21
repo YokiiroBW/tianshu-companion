@@ -48,49 +48,54 @@
 `EVENTS` 是完整的静态登记表（`observability.py`）。下表列出全部已登记事件、它们的发出点，
 以及它们记录的是"发生了什么"还是"开始/结束"。
 
-**终态列**标记的是 `TERMINAL_EVENTS`：这些事件结束一次请求、轮次、尝试、投递或进程本身，
-合同要求它们**持久**落盘（不只是写进内核），因此写者在写完这类记录后额外做一次
-`fsync`——在**写者自己的线程**上做，业务事件接缝（含持有权威事务的代码）永远不等待磁盘。
-其余事件只保证"已写入"，需要静默点时用 `flush()` / `await_flush()` 等一次真实排空。
+**终态列**标记的是 `TERMINAL_EVENTS`：这些事件**本身就是结果**（某件事已经结束、失败、被
+取消、被延后，或进程已停止），合同要求它们**持久**落盘（不只是写进内核），因此写者在写完
+这类记录后额外做一次 `fsync`——在**写者自己的线程**上做，业务事件接缝（含持有权威事务的
+代码）永远不等待磁盘。其余事件只保证"已写入"，需要静默点时用 `flush()` / `await_flush()`
+等一次真实排空。
+
+分类按**含义**决定，两个方向都被 `tests/test_observability.py` 锁住：任何 `…finished`、任何
+`…cancelled`，以及后台实际工作/失败、延后投递、出箱扫描、鉴权通过都必须在终态表里；只
+**宣告**工作尚未结束的事件（`…started`、`turn.prepared`、`turn.queued`）不得在表里。
+`runtime.log_probe` 不在表里，因为它已经自带 `fsync=True`，且不经过登记表发出。
 
 | 事件 | 发出点 | outcome | 终态 | 说明 |
 | --- | --- | --- | --- | --- |
 | `runtime.started` | `app.create_app` lifespan 启动 | `succeeded` | | 进程完成装配并开始服务 |
 | `runtime.stopping` | lifespan 关闭开始 | `started` | | 收到停止请求，开始收尾 |
 | `runtime.stopped` | lifespan 关闭结束 | `succeeded` | ✔ | 后台任务已取消、库已关闭、owner 锁已释放 |
-| `runtime.log_probe` | `LogAdapter.probe()` | `succeeded` / `failed` | | 运维显式发起的日志通道恢复探针（见第 5 节） |
-| `runtime.background_work` | `app.run_loop` 每一轮真实做功 | `succeeded` | | 本轮确实处理了工作 |
-| `runtime.background_failed` | `app.run_loop` 每一轮失败 | `failed` | | 每次失败都记，不采样、不去重，带失败标签 |
+| `runtime.log_probe` | `LogAdapter.probe()` | `succeeded` / `failed` | （自带 fsync） | 运维显式发起的日志通道恢复探针（见第 5 节） |
+| `runtime.background_work` | `app.run_loop` 每一轮真实做功 | `succeeded` | ✔ | 这一轮**确实做了工作**，是已完成的结果 |
+| `runtime.background_failed` | `app.run_loop` 每一轮失败 | `failed` | ✔ | 每次失败都记，不采样、不去重，带失败标签 |
 | `service.request.started` | `RuntimeEvents` 中间件 | `started` | | 入站请求开始，带关联号 |
-| `service.request.authenticated` | 入站鉴权通过处 | `succeeded` | | 凭据被接受（不写凭据本身） |
+| `service.request.authenticated` | 入站鉴权通过处 | `succeeded` | ✔ | 凭据被接受（不写凭据本身），是已发生的结果 |
 | `service.request.finished` | `RuntimeEvents` 中间件 | `succeeded` / `rejected` | ✔ | 请求结束，带 `duration_ms`；容量耗尽时为 `rejected` + `log_capacity_exhausted` |
 | `peer.call.started` | `clients.JsonService.call` | `started` | | 调用既有内部对端开始，带固定 `peer` 标签 |
-| `peer.call.finished` | `clients.JsonService.call` | `succeeded` / `failed` | | 调用结束，带 `duration_ms` 与失败标签 |
+| `peer.call.finished` | `clients.JsonService.call` | `succeeded` / `failed` | ✔ | 调用结束，带 `duration_ms` 与失败标签 |
 | `turn.prepared` | `core` 准备轮次 | `succeeded` | | 快照已固定 |
 | `turn.queued` | `core` 入队 | `succeeded` | | 轮次进入调度队列 |
 | `turn.generation.started` | `core` 调用模型前 | `started` | | 开始生成 |
-| `turn.generation.finished` | `core` 模型返回后 | `succeeded` / `failed` / `unknown` | | 失败带 `error.code`（Fault）或失败标签 |
-| `turn.cancelled` | `core` 取消 | `cancelled` | | 轮次被取消 |
+| `turn.generation.finished` | `core` 模型返回后 | `succeeded` / `failed` / `unknown` | ✔ | 失败带 `error.code`（Fault）或失败标签 |
+| `turn.cancelled` | `core` 取消 | `cancelled` | ✔ | 轮次被取消 |
 | `turn.delivery.started` | `core` 投递开始 | `started` | | 开始出站投递 |
 | `turn.delivery.finished` | `core` 投递结束 | `succeeded` / `failed` / `unknown` | ✔ | 投递结果 |
-| `outbox.flush` | `core` 出箱扫描 | `succeeded` | | 一次出箱处理 |
+| `outbox.flush` | `core` 出箱扫描 | `succeeded` | ✔ | 一次出箱处理已经发生 |
 | `direct.request.queued` | `direct` 功能指令入队 | `succeeded` | | 指令请求进入独立执行单元 |
-| `direct.request.cancelled` | `direct` 取消 | `cancelled` | | 指令请求被取消 |
+| `direct.request.cancelled` | `direct` 取消 | `cancelled` | ✔ | 指令请求被取消 |
 | `direct.attempt.started` | `direct` 执行开始 | `started` | | 一次执行尝试开始 |
 | `direct.attempt.finished` | `direct` 执行结束 | `succeeded` / `failed` / `unknown` | ✔ | 执行结果 |
 | `direct.delivery.started` | `direct` 投递开始 | `started` | | 指令回复开始投递 |
 | `direct.delivery.finished` | `direct` 投递结束 | `succeeded` / `failed` / `unknown` | ✔ | 指令回复投递结果 |
-| `direct.delivery.deferred` | `direct` 让号等待 | `degraded` | | 出站序号仍被在途轮次持有，按 `outbound_band_busy` 延后 |
-
-`direct.request.finished` 登记在 `EVENTS` 里，但**当前没有发出点**：功能指令请求的结束由
-`direct.attempt.finished` / `direct.delivery.finished` 记录，请求层没有单独的收口事件。它保留
-在登记表中是为了不改变已发布的封闭枚举；这是"登记了但未发出"，不是"已覆盖"。
+| `direct.delivery.deferred` | `direct` 让号等待 | `degraded` | ✔ | 出站序号仍被在途轮次持有，按 `outbound_band_busy` 延后 |
 
 `runtime.stopping` 是收尾的**开始**而不是终态，所以它不要求额外 `fsync`；进程真正的终态是
 `runtime.stopped`。
 
 **未覆盖项（明确写出，不假装覆盖）**
 
+- **`direct.request.finished` 不存在**：它既没有登记在 `EVENTS`，也没有发出点——功能指令请求
+  由 `direct.attempt.finished` / `direct.delivery.finished` 收口。第二次返修曾把它写进终态表，
+  那是把一个从未登记的名字当成已覆盖；现在它在两个登记表里都不存在，并由测试锁住。
 - 健康探针本身：`/health/live`、`/health/ready`、`/healthz` 不写任何记录。探针必须纯粹
   只读，"只读"包括不留记录；中间件对这三个路径直接放行（`health.PROBE_PATHS`）。
 - 空闲轮次：后台循环什么都没做时不写记录。空转不是结果，按 0.05 秒/0.5 秒的间隔写空转
@@ -119,6 +124,10 @@
   承诺从来不是持久性，把"没人读的调试流"升级成服务中断并不更诚实。持久通道仍执行严格规则：
   写不进去的记录拒绝业务（见下条）。
 - 文件按实例命名，轮转到 `.jsonl.1`、`.jsonl.2` ……，目录预算是所有分段之和。
+- **终态记录由写者补 fsync**（第二次返修 R3，第三次返修补齐后台接缝）。见第 3 节的终态列：
+  请求/轮次/尝试/投递的结束、后台每一轮的真实工作与失败、取消、延后、鉴权通过、进程停止。
+  成本落在写者线程上（实测合成 0.25 秒的 `fsync` 下事件循环心跳仍是 0.016 秒），业务接缝与
+  权威事务都不等待磁盘。
 - **容量基准在首次受理之前建立**（第二次返修 R1）。适配器在构造时（启动路径，不是请求路径）
   就扫描既有分段，把它们的字节数记为基准；`submit` 用它加"待写字节"加新记录长度一起判预算，
   写者在追加前再用同一条预算复核一次。之前的顺序是"`submit` 先按 0 记账、写者到 `_open` 才
@@ -130,12 +139,23 @@
   选择拒绝业务而不是"再宽容几条"，是因为宽容会让文件超过它自己声明的预算。
 - 写入失败（IO 错误）时：**不向业务抛异常**，记录被丢弃、`log_unavailable` 留在内存、
   标准错误只写一条固定告警。恢复必须靠一次真正成功的写入。
-- **单写者、单期限关闭**（第二次返修 R2）。分段句柄只由写者线程持有和释放。关闭是**一个**
-  有界动作，覆盖排队、等写者、送停止哨兵、join 与释放句柄；超时后返回"未确认"，**不**清零
-  仍在途的计数、**不**把句柄从写者手里抢过来关掉、**不**丢掉写者引用——记录要么被写者写完
-  并由它自己释放句柄，要么被如实计入 `dropped`。`aclose` 取消只停止**等待**，它启动的那一次
-  关闭仍会跑完，不会产生第二个 owner（之前 `aclose` 先 `_join_writer` 再同步 `close`，两次
-  等待后又关闭了活跃句柄，写者随后把 `_pending` 减成 -1）。
+- **单写者、单期限关闭**（第二次返修 R2，第三次返修 R1/R2 收紧）。分段句柄只由写者线程持有
+  和释放。关闭是**一个**有界动作，覆盖排队、停止请求、join 与释放句柄；超时后返回"未确认"，
+  **不**清零仍在途的计数、**不**把句柄从写者手里抢过来关掉、**不**丢掉写者引用——记录要么被
+  写者写完并由它自己释放句柄，要么被如实计入 `dropped`。`aclose` 取消只停止**等待**，它启动的
+  那一次关闭仍会跑完（关闭任务在协程可被取消之前就已提交给执行器，见下），不会产生第二个
+  owner（之前 `aclose` 先 `_join_writer` 再同步 `close`，两次等待后又关闭了活跃句柄，写者随后
+  把 `_pending` 减成 -1）。
+- **停止请求不是队列条目**（第三次返修 R1）。它曾经是一条塞进同一条有界队列的哨兵，队列满时
+  这次 `put` 被直接丢弃——于是"已经接纳的记录都写完了、计数归零，而唯一有权释放句柄的写者
+  永远停在 `get` 上"。现在停止是一份**状态**：关闭先置状态，写者在队列为空时自己读它，
+  哨兵只作为降低延迟的唤醒（塞不进也没关系）。IO 恢复后线程真的退出，无需外部手工补哨兵；
+  重复 `close`/`aclose` 读取**当下**的事实，不再回放上一次超时的 `false`。
+- **关闭期限必须真的可达**（第三次返修 R2）。`stream.close()` 是 IO：它曾经在持有状态锁时
+  执行，于是每个需要该锁的线程（包括正在量自己期限的关闭方）都要等它——30 ms 预算实测变成
+  250 ms。现在锁只用于交换引用，关闭在锁外做；句柄在关闭**之前**就从适配器上摘掉（不会被
+  关第二次），写者线程引用在关闭**返回之后**才清除（关闭进行中写者确实还活着）。超过 250 ms
+  的 owner close 下，`aclose(timeout=0.03)` 实测 **0.031 秒**返回"未确认"。
 - **静默点 = 已写入**（第二次返修 R3）。`flush()` / `await_flush()` 等到的是"每条被接受的记录
   都已被写者处理完"，不是"队列看起来是空的"。待写计数在记录**入队之前**发布，写者处理完才
   清除；因此一条仍在写者手里的记录永远不会被报成静默点，而一条写失败的记录会被计为

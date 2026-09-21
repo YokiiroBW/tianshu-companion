@@ -44,6 +44,7 @@ import secrets
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -136,20 +137,52 @@ EVENTS = frozenset(
     }
 )
 
-# The terminal events: the ones that close out a request, turn, attempt, delivery or the
-# process itself. The contract requires the end of a piece of work to be *persisted*, not merely
-# handed to the kernel, so these are the records the writer fsyncs. They are still written on the
-# writer's thread: the caller (often the event loop) only enqueues, and the acknowledgement the
-# caller can wait for is `flush`/`await_flush`, which is why a terminal event never blocks the
-# work it is describing.
+# The terminal events: the registered events that *are* an outcome - the end of a request,
+# background pass, peer call, turn, attempt, delivery or of the process itself. The contract
+# requires the end of a piece of work to be *persisted*, not merely handed to the kernel, so these
+# are the records the writer fsyncs. They are still written on the writer's thread: the caller
+# (often the event loop) only enqueues, and the acknowledgement it can wait for is
+# `flush`/`await_flush`, which is why a terminal event never blocks the work it is describing.
+#
+# The classification is by *meaning*, not by convenience, and the registered events split cleanly:
+#
+#   * terminal - carries the result of work that has already happened: `...finished`,
+#     `runtime.background_work`/`runtime.background_failed` (one pass really worked, or really
+#     failed), `turn.cancelled`, `direct.request.cancelled`, `direct.delivery.deferred`,
+#     `service.request.authenticated` (a credential was really accepted) and `outbox.flush`.
+#   * not terminal - announces work that has not finished, or reports no result at all:
+#     `runtime.started`/`runtime.stopping`, `service.request.started`, `turn.prepared`,
+#     `turn.queued`, `turn.generation.started`, `turn.delivery.started`,
+#     `direct.request.queued`, `direct.attempt.started`, `direct.delivery.started`.
+#
+# `runtime.log_probe` is deliberately absent: the maintenance probe already writes its own record
+# with `fsync=True`, and it is the one record that is not emitted through this registry.
+#
+# The cost of a terminal record is one `fsync` on the writer's thread, so the event loop and any
+# authoritative transaction never wait for a disk. It is bounded work on a thread that exists to
+# do exactly this, which is why the classification follows the contract rather than the write
+# rate: an unpersisted completion is the thing this registry exists to prevent.
 TERMINAL_EVENTS = frozenset(
     {
+        # process and background loops
+        "runtime.stopped",
+        "runtime.background_work",
+        "runtime.background_failed",
+        # inbound service requests
+        "service.request.authenticated",
         "service.request.finished",
+        # outbound calls to already-existing internal peers
+        "peer.call.finished",
+        # conversation scheduling
+        "turn.generation.finished",
+        "turn.cancelled",
         "turn.delivery.finished",
-        "direct.request.finished",
+        "outbox.flush",
+        # explicit functional commands
+        "direct.request.cancelled",
         "direct.attempt.finished",
         "direct.delivery.finished",
-        "runtime.stopped",
+        "direct.delivery.deferred",
     }
 )
 
@@ -299,6 +332,13 @@ DEFAULT_DRAIN_SECONDS = 5.0
 # How often the awaiting side re-checks whether its record reached the disk. Small enough to
 # be invisible next to a disk write, large enough that the poll is not a busy loop.
 ADMISSION_POLL_SECONDS = 0.001
+
+# How long the owner waits on an empty queue before looking at the stop request again. The stop
+# signal must not depend on finding a free queue slot - a closer that arrives while the queue is
+# full would then have no way to tell the owner to finish, and the owner would sit in `get` for
+# ever. So the owner treats "nothing to write" as a moment to re-read the stop state, and a stop
+# request that cannot be delivered as a wake-up is still observed within this bound.
+OWNER_POLL_SECONDS = 0.001
 
 # The fixed labels an outbound peer call may carry. These are code-level interface names,
 # never a configured URL, host, account or channel identifier.
@@ -859,17 +899,44 @@ class LogAdapter:
 
     # ----------------------------------------------------------------------- writer
 
+    def _next_item(self):
+        """The owner's one wait: the next record, or a reason to stop.
+
+        Two independent ways out, because the stop signal must not depend on the queue having a
+        free slot. A stop request that arrives while the queue is full cannot be enqueued as a
+        sentinel at all, so the owner also re-reads the stop state whenever the queue looks empty.
+        Without that, a shutdown that timed out against a full queue left the owner parked in
+        `queue.get` for ever: the records it still held were written, `pending` reached zero, and
+        the thread - the only thing that can release the handle - never left.
+
+        Returns the next record, or None when this owner should finish.
+        """
+        while True:
+            if self._stop.is_set():
+                # Records accepted before the stop request are still drained: the stop state only
+                # stops *new* admissions, so anything already in the queue is handled here first,
+                # in order, before the owner leaves.
+                try:
+                    return self._queue.get_nowait()
+                except queue.Empty:
+                    return None
+            try:
+                return self._queue.get(timeout=OWNER_POLL_SECONDS)
+            except queue.Empty:
+                continue
+
     def _drain(self):
         """The only place that touches the file. One thread, one handle, no sharing.
 
         This thread also owns the *durability* of what it writes. A terminal record - the end of
-        a request, turn, attempt, delivery or of the process - is followed by `flush` + `fsync`
-        before it is acknowledged, because the contract asks for a persisted terminal event and a
-        successful `write` only means the kernel took the bytes. The cost is paid here, on the
-        writer, never by the event loop or by an authoritative transaction.
+        a request, background pass, peer call, turn, attempt, delivery or of the process - is
+        followed by `flush` + `fsync` before it is acknowledged, because the contract asks for a
+        persisted terminal event and a successful `write` only means the kernel took the bytes.
+        The cost is paid here, on the writer, never by the event loop or by an authoritative
+        transaction.
         """
         while True:
-            item = self._queue.get()
+            item = self._next_item()
             try:
                 if item is None:
                     return
@@ -896,8 +963,13 @@ class LogAdapter:
                     self._outstanding.discard(item.sequence)
                 item.settle(False)
             finally:
-                self._queue.task_done()
-                if item is None:
+                # Only a record that was actually taken from the queue is accounted for. The stop
+                # path can also return "nothing to do", and calling `task_done` for a `get` that
+                # never happened raises inside the owner thread - which would kill the one thread
+                # allowed to release the handle.
+                if item is not None:
+                    self._queue.task_done()
+                else:
                     # The owner releases its own handle on the way out, so a shutdown that timed
                     # out can never close a file this thread is still writing to.
                     self._release_stream()
@@ -909,7 +981,7 @@ class LogAdapter:
         stopped reading, and the completion flag the admission gate polls is published here.
         """
         while True:
-            item = self._queue.get()
+            item = self._next_item()
             try:
                 if item is None:
                     return
@@ -924,7 +996,8 @@ class LogAdapter:
                         self.dropped += 1
                 item.settle(ok)
             finally:
-                self._queue.task_done()
+                if item is not None:
+                    self._queue.task_done()
 
     def _write(self, line, *, fsync):
         """Append one line. Runs on the writer thread only; never on the event loop."""
@@ -1032,6 +1105,19 @@ class LogAdapter:
         it: that is how a shutdown becomes a write into a closed file, or a second writer. The
         handle then stays open and the owner releases it when it finishes - the loss is already
         counted, and a leaked descriptor at process exit is the smaller problem by far.
+
+        The close itself happens *outside* the state lock. Closing a file is IO: a close that a
+        slow filesystem parks (a full disk, a network-backed mount, an antivirus filter) would
+        otherwise hold the lock that every reader of `health()`, `pending` and `settled_quietly()`
+        needs - including the closer measuring its own deadline. That is how a 30 ms shutdown
+        budget turned into 250 ms: the deadline was fine, but the thread checking it could not
+        reach the state it needed to check. The lock here only ever swaps a reference.
+
+        The handle is dropped from the adapter *before* the close is attempted, so a second caller
+        can never close the same descriptor twice. The owner thread reference is dropped only after
+        the close returns: while that close is still in progress the owner is very much alive, and
+        a closer that saw otherwise would report a shutdown that has not happened - and could try
+        to release the same handle a second time.
         """
         with self._state_lock:
             if self._stream is None:
@@ -1039,11 +1125,13 @@ class LogAdapter:
             owner = self._writer
             if owner is not None and owner is not threading.current_thread() and owner.is_alive():
                 return
-            try:
-                self._stream.close()
-            except OSError:
-                pass
+            stream = self._stream
             self._stream = None
+        try:
+            stream.close()
+        except OSError:
+            pass
+        with self._state_lock:
             # This path is only reached once no writer can still be inside the handle - either
             # the owner is calling it on its way out, or the owner has already stopped - so the
             # reference to that finished thread is cleared here rather than left dangling.
@@ -1175,43 +1263,76 @@ class LogAdapter:
     async def aclose(self, timeout=None):
         """`close` without blocking the event loop while the writer drains.
 
-        The whole shutdown - waiting for the queue, the sentinel, the join and the final release -
-        runs as one bounded unit on one thread. The event loop only waits for it, so a cancelled
-        caller cannot leave a second closer behind: cancelling this coroutine stops the *wait*,
-        and the thread it started still finishes the one shutdown that was begun.
+        The whole shutdown - waiting for the queue, the stop request, the join and the final
+        release - runs as one bounded unit on one thread. The event loop only waits for it, so a
+        cancelled caller cannot leave a second closer behind: cancelling this coroutine stops the
+        *wait*, and the thread it started still finishes the one shutdown that was begun.
+
+        "The thread it started" is why the work is submitted here rather than through
+        `run_in_executor`: that call only *schedules* the hand-off onto the loop, so a caller
+        cancelled before the loop gets around to it would cancel the shutdown instead of just its
+        own wait, and the writer would keep running with a handle nobody will release. Submitting
+        the work synchronously closes that window - by the time this coroutine can be cancelled,
+        the shutdown is already committed to the executor.
+
+        A repeated call is answered from the state as it is *now*, never from a cached verdict: an
+        earlier close that timed out reports `False` at that moment, but once the owner has
+        finished the log really is stopped, and replaying the old `False` would tell a later caller
+        that a shutdown failed when it has since completed.
         """
-        if self._shutdown_started:
-            return self._shutdown_confirmed
         bound = self.drain_seconds if timeout is None else timeout
-        return await asyncio.get_running_loop().run_in_executor(None, lambda: self._shutdown(bound))
+        loop = asyncio.get_running_loop()
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tianshu-log-close")
+        pending = loop.run_in_executor(pool, self._shutdown, bound)
+        pending.add_done_callback(lambda _: pool.shutdown(wait=False))
+        try:
+            return await pending
+        except asyncio.CancelledError:
+            # The caller stopped waiting; the shutdown does not. The executor is deliberately not
+            # shut down here: its one worker is inside that shutdown and will exit when it is done.
+            raise
 
     def _shutdown(self, bound):
-        """One deadline covering the whole stop: queue, sentinel, join and release."""
+        """One deadline covering the whole stop: queue, stop request, join and release.
+
+        The deadline is only worth anything if the closer can *reach* the state it needs to check
+        while the bound runs out, so no step here waits on a lock that a slow IO call can hold:
+        the owner's handle release closes the file outside the state lock, and this method only
+        takes that lock for a reference swap or a counter read.
+        """
         with self._state_lock:
             if self._shutdown_started:
-                # A shutdown is already under way or done; a second caller reports the outcome
-                # rather than starting a competing close. If the first one timed out, the answer
-                # is recomputed here instead of being replayed as a stale "no": once the owner has
-                # finished, the log really has been brought to a stop, and saying otherwise would
-                # make a later `close` report a failure that no longer exists.
-                self._shutdown_confirmed = not self._writer_alive() and not self._outstanding
-                return self._shutdown_confirmed
+                # One closer, one shutdown: a second caller must not start a competing stop. It is
+                # answered immediately from the live state rather than waiting behind the first
+                # caller's deadline - its own budget is its own - and never from the stale verdict
+                # the first caller recorded: once the owner has finished, the log really is
+                # stopped, so the recomputed answer is True.
+                return not self._writer_alive() and not self._outstanding
             self._shutdown_started = True
             self.closing = True
         deadline = time.monotonic() + bound
+        # The stop request comes first, and it is a piece of state rather than a queue entry: a
+        # sentinel cannot be delivered into a full queue, so a shutdown must never depend on
+        # finding a free slot. Records accepted before this point are still drained - the owner
+        # checks the queue before it checks the stop state - and nothing new is accepted after it.
+        self._stop.set()
         # Everything already accepted is given its chance to land before the writer is stopped: a
         # record that was admitted must not be discarded merely because shutdown arrived.
         self.flush(max(0.0, deadline - time.monotonic()))
         if self._writer is not None and self._writer.is_alive():
+            # A sentinel is a latency optimisation, not the signal: the owner observes the stop
+            # state on its own, so a sentinel that does not fit costs at most one poll interval.
             try:
-                self._queue.put(None, timeout=max(0.0, deadline - time.monotonic()))
+                self._queue.put_nowait(None)
             except queue.Full:
-                # The queue is still full, so the sentinel cannot be delivered inside the bound.
                 pass
             self._writer.join(timeout=max(0.0, deadline - time.monotonic()))
-        confirmed = not self._writer_alive() and self.settled_quietly()
+        # Both halves are read *after* the join: the owner may have finished inside it, and a
+        # verdict computed before would report a failure that has already been resolved.
+        stopped = not self._writer_alive()
+        confirmed = stopped and self.settled_quietly()
         with self._state_lock:
-            if self._outstanding and not self._writer_alive():
+            if self._outstanding and stopped:
                 # The owner is gone and these records never reached the file: reported, never
                 # hidden - and never zeroed to make the report look clean. While the owner is
                 # still running they are in flight, not lost, so they are not counted here and
@@ -1221,7 +1342,7 @@ class LogAdapter:
             self._shutdown_confirmed = confirmed
             self.closed = True
         # Release the handle only from a position where no writer can still be inside it.
-        if not self._writer_alive():
+        if stopped:
             self._release_stream()
         return confirmed
 
