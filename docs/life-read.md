@@ -31,7 +31,12 @@ Memory/Platform/渠道，也不新增第二套授权存储：授权仍是 `core.
 
 ## 请求与响应
 
-统一信封：请求 `schema_version` 必须为整数 1，未知字段一律 400。四个端口都是 POST。
+统一信封：请求 `schema_version` 必须为整数 1，未知字段一律 400。四个端口都是 POST，
+且都要求 `Content-Type: application/json`（允许带合法的 `charset` 参数，如
+`application/json; charset=utf-8`）。缺失、写成别的媒体类型、写成两个 `Content-Type`
+（无论取值是否相同）或参数不合语法，都在**进入只读端口之前**按 400 `invalid_input` 拒绝——
+媒体类型是被检查的声明，不是靠 `strict_json` 反推的结论。凭据仍然先判定：没有有效 bearer
+头时，媒体类型错误也只会得到 401。此约束只作用于这四个路由，其他内部端口行为不变。
 
 | 路由 | 请求（除 schema_version 外都可选） |
 | --- | --- |
@@ -55,8 +60,11 @@ actor_id，取满一页才有下一页；不返回总数，不做全表扫描。
 `diary_id`、`actor_id`、`day`、`state`（当前真实状态，例如发布后又起草编辑仍是 `draft`）、
 `version`、`published_revision_id`、`fictional`、`captured`。不含正文、不含 `current_revision`、
 不含 `config_version`、不含修改来源。`captured` 的三个字段（`recipe_id`、`recipe_version`、
-`material_version`）来自**日记行冻结的 recipe**，不是当前配方。`next_after` 是
-`{"day": ..., "diary_id": ...}`，是位置键而不是行引用：游标指向的行已被删除也能继续翻页。
+`material_version`）来自**日记行冻结的 recipe**，不是当前配方；并且与 `revision` 走**同一处**
+内容寻址校验：重算 `digest([actor_id, day, 完整 recipe, material_version])` 必须等于该行的 id，
+否则 503。列表既然给出了配方版本，就必须像正文那样证明它；损坏行不会被跳过、也不会被改写。
+`next_after` 是 `{"day": ..., "diary_id": ...}`，是位置键而不是行引用：游标指向的行已被删除
+也能继续翻页。
 
 `revision` 按 `revision_id` 精确读取**已发布指针指向的**修订，绝不回退到当前草稿：
 
@@ -100,6 +108,13 @@ WHERE json_extract(body,'$.published_revision') IS NOT NULL
 也不改共享合同。查询计划是纯索引搜索（`SEARCH life_diaries USING INDEX ...`），无 TEMP B-TREE，
 VM 步数不随无关行数增长。
 
+续页不是一条行值比较，而是同一索引上的两段范围：先取**同一 day 且 `id < 游标 id`**，
+不足一页时再取**更早的 day**（`id` 不受限），两段合计不超过 `limit + 1` 条候选，顺序仍是
+`(day DESC, id DESC)`，同一只读事务内完成。这样代价只跟返回的行数有关，与游标已经翻过的
+同角色同日历史无关：同一天 100 行与 10,000 行、游标固定、同样返回 11 行时，VM 步数都是 **130**
+（旧的行值写法分别是 1,061 与 109,961），计划分别是
+`(conversation_id=? AND <expr>=? AND id<?)` 与 `(conversation_id=? AND <expr><?)`。
+
 打开数据库时先比对 `sqlite_master` 里的同名索引定义：定义不同就拒绝启动（不自动替换、不静默
 改名），且不会留下新的备份。缺少该索引时，必须在任何新 DDL 之前把当前数据库（含 WAL）用 SQLite
 备份到同目录唯一文件 `<database>.pre-life-read-index-<uuid>.bak`；备份失败即中止本次打开，
@@ -124,14 +139,16 @@ TIANSHU_TLS_PYTHON=<具有cryptography的解释器绝对路径> .venv/Scripts/py
 .venv/Scripts/python.exe -m compileall -q src integrations tests scripts
 ```
 
-- `tests/test_life_read.py`：授权映射、身份来源、不泄露、投影、游标、版本先行、捕获证明、
-  预算与“读操作零写入”。其中一个用例用真实 `Life` 链（本地模型替身）生成并发布日记，再用本端口读回。
+- `tests/test_life_read.py`：授权映射、身份来源、不泄露、投影、游标、版本先行、捕获证明
+  （列表与正文用同一处内容寻址校验）、媒体类型边界、预算与“读操作零写入”。
+  其中一个用例用真实 `Life` 链（本地模型替身）生成并发布日记，再用本端口读回。
 - `tests/test_life_read_queries.py`：只读事务（BEGIN/COMMIT、无任何写语句）、异常回滚、
-  索引计划无 TEMP B-TREE、步数有界、keyset 不漏不重。
+  索引计划（含两段续页范围）、同日深页步数恒定、跨日补齐、删游标续页、末页、keyset 不漏不重。
 - `tests/test_life_read_index.py`：同名错误定义拒绝启动、缺索引先备份再建、备份含 WAL、
   备份失败不留新 DDL、v8 复用同一份备份、建索引在初始化事务内、重开不新增备份。
 - `tests/test_life_read_https.py`：真实临时证书下的真实 Core 进程，覆盖四路由、身份 401/403、
-  404/409、请求与响应预算 400/429、客户端中途断开（无写入、服务继续可用）与进程退出；
+  404/409、请求与响应预算 400/429、媒体类型 400（错误/缺失/重复 `Content-Type`，charset 合法）、
+  客户端中途断开（无写入、服务继续可用）与进程退出；
   远端服务是记录型合成替身，断言其零请求，并断言请求前后全部事实行与 `source_head` 逐字节一致。
 
 未验证：真实账号、真实渠道、真实模型、真实 Platform/Memory、生产部署与前端页面。本端口只读，

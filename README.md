@@ -30,4 +30,5 @@ HTTP入口为 `POST /internal/v1/conversation/ingest-actors`、`/internal/v1/sou
 
 Core 图像与衣橱内部端口、ComfyUI 工作流审阅、SQLite v4 恢复及尚未发布的图像候选：[docs/images.md](docs/images.md)。
 
-角色生活与**已发布日记**的授权只读内部端口（`life_readers` 部署、四个只读路由、派生索引与恢复点）：[docs/life-read.md](docs/life-read.md)。
+角色生活与**已发布日记**的授权只读内部端口（`life_readers` 部署、四个只读路由且只收
+`application/json`、索引范围 seek 的续页、派生索引与恢复点）：[docs/life-read.md](docs/life-read.md)。

@@ -406,6 +406,90 @@ def test_http_identity_missing_section_and_request_ceiling():
     asyncio.run(h.core.close())
 
 
+def test_the_read_routes_require_one_json_media_type():
+    """A mislabelled request is refused at the boundary, before the read port sees it.
+
+    A perfectly parseable document sent as `text/plain`, with no `Content-Type` at all, or
+    under two `Content-Type` headers is not a JSON request, and letting `strict_json` be the
+    only judgement would answer it as though it were. Only the four read routes are affected,
+    a syntactically valid `charset` parameter is still allowed, and the credential is settled
+    first so an unauthenticated caller is told nothing about its document.
+    """
+    h = Harness()
+    h.clock.now = FIXED_NOW
+    fixture = Fixture(h.core.store, h.clock)
+    fixture.world()
+    fixture.room()
+    fixture.actor("actor:a")
+    fixture.grant("actor:a")
+    app = create_app(h.core, TOKENS, {SERVICE: DEPLOYED})
+    reader = {"Authorization": "Bearer " + TOKENS[SERVICE]}
+    body = b'{"schema_version":1}'
+    cases = (
+        ("application/json", 200),
+        ("APPLICATION/JSON", 200),
+        ("application/json; charset=utf-8", 200),
+        ("application/json;charset=UTF-8", 200),
+        ('application/json; charset="utf-8"', 200),
+        ("text/plain", 400),
+        ("application/octet-stream", 400),
+        ("application/json; charset", 400),
+        ("application/json; charset=utf-8; charset=utf-8", 400),
+        ("application/json; profile=v1", 400),
+        ("application/json, text/plain", 400),
+        (None, 400),
+    )
+    before = facts(h.core.store)
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://life"
+        ) as client:
+            for media, expected in cases:
+                headers = dict(reader)
+                if media is not None:
+                    headers["Content-Type"] = media
+                response = await client.post(
+                    "/internal/v1/life-read/actors", headers=headers, content=body
+                )
+                assert response.status_code == expected, (media, response.status_code)
+                if expected == 400:
+                    assert response.json()["code"] == "invalid_input"
+                else:
+                    assert [item["actor_id"] for item in response.json()["items"]] == ["actor:a"]
+            for values in (
+                [b"application/json", b"text/plain"],
+                [b"application/json", b"application/json"],
+            ):
+                response = await client.post(
+                    "/internal/v1/life-read/actors",
+                    headers=[
+                        (b"authorization", reader["Authorization"].encode()),
+                        *[(b"content-type", value) for value in values],
+                    ],
+                    content=body,
+                )
+                assert response.status_code == 400 and response.json()["code"] == "invalid_input"
+            anonymous = await client.post(
+                "/internal/v1/life-read/actors",
+                headers={"Content-Type": "text/plain"},
+                content=body,
+            )
+            assert anonymous.status_code == 401 and anonymous.json()["code"] == "unauthorized"
+            # Another internal route keeps answering by its own rules: this boundary did not
+            # become a global media-type filter.
+            untouched = await client.post(
+                "/internal/v1/persona/manage",
+                headers={"Content-Type": "text/plain"},
+                content=b"{}",
+            )
+            assert untouched.status_code == 401 and untouched.json()["code"] == "unauthorized"
+
+    asyncio.run(run())
+    assert facts(h.core.store) == before
+    asyncio.run(h.core.close())
+
+
 # ------------------------------------------------------------------------------ actors
 
 
@@ -602,6 +686,38 @@ def test_diaries_paging_is_keyed_on_day_and_id_and_survives_a_deleted_cursor_row
             fixture.store.delete("life_diaries", deleted)
     assert seen == ordered
     assert deleted in ordered and len(seen) == 7
+
+
+@pytest.mark.parametrize(
+    "damage", ["recipe_id", "recipe_version", "recipe_field", "day", "material"]
+)
+def test_the_list_proves_the_same_capture_the_single_revision_proves(damage):
+    """A diary id is the digest of the capture, so editing the capture must be refused twice.
+
+    The list names a recipe id, a recipe version and a material hash, exactly as the single
+    revision does, and it must prove them the same way: recompute `digest([actor, day, whole
+    recipe, material])` and compare it with the id the row is addressed by. A row whose frozen
+    recipe was edited while its id stayed is no longer a description of that capture, and
+    neither operation may report the edited marker as a real one.
+    """
+    fixture, port = live()
+    diary = published(fixture, day="2026-09-20", content="Proved text.")
+    if damage == "recipe_id":
+        diary["recipe"]["id"] = "weekly"
+    elif damage == "recipe_version":
+        diary["recipe"]["version"] = 987
+    elif damage == "recipe_field":
+        diary["recipe"]["max_chars"] += 1
+    elif damage == "day":
+        diary["day"] = "2026-09-19"
+    else:
+        diary["material_version"] = "material:other"
+    fixture.store.put("life_diaries", diary)
+    assert (
+        refuses(port, "diaries", {"schema_version": 1, "actor_id": "actor:a"})
+        == "dependency_unavailable"
+    )
+    assert refuses(port, "revision", revision_body(diary)) == "dependency_unavailable"
 
 
 @pytest.mark.parametrize(

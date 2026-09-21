@@ -12,12 +12,15 @@ Three properties are load-bearing:
 
 - **The page is an index range seek, not a scan.** The one new derived index is keyed
   `(conversation_id, json_extract(body,'$.day') DESC, id DESC)` over the published rows, and
-  the page statement matches it exactly - same WHERE columns, same ORDER BY, same partial
+  every page statement matches it exactly - same WHERE columns, same ORDER BY, same partial
   predicate - so a page of twenty rows costs a seek instead of visiting every diary of every
   actor. `life_diaries_queue` leads with `status`, which a page read does not constrain, and
   `position` is always 0 for diaries (they carry no sequence), so neither can order by day.
-- **The cursor is a position, never a grant.** `after` is compared as a row value, so a
-  cursor naming a row that has since been deleted still pages correctly and grants nothing.
+  A continuation is two seeks into that same index (see `DIARIES_SAME_DAY` /
+  `DIARIES_EARLIER_DAY`), not one pass over everything the cursor already passed.
+- **The cursor is a position, never a grant.** `after` only selects a range of an index the
+  reader is already allowed to read, so a cursor naming a row that has since been deleted
+  still pages correctly and grants nothing.
 - **Rows are parsed here, judged there.** This module returns the stored documents; the
   consistency rules about what those documents must mean live in `life_read`.
 """
@@ -25,18 +28,37 @@ Three properties are load-bearing:
 import json
 from contextlib import contextmanager
 
-# The page read. `(day,id) < (?,?)` is the keyset step and is written as one row value so it
-# stays a single range seek; `LIMIT ?` is always `page + 1`, and the extra row is only ever
-# used to decide whether a next page exists.
+# The page read, in three statements. `LIMIT ?` is always at most `page + 1`, and the extra
+# row is only ever used to decide whether a next page exists.
+#
+# The continuation after a cursor is deliberately *not* one row-value comparison. Written as
+# `(day,id) < (?,?)` SQLite can only seek on `conversation_id` and then evaluates the tuple
+# once per stored row, so a deep page costs one step per row already passed: 100 and 10,000
+# same-day rows cost 1,061 and 109,961 virtual-machine steps for the same 11-row answer. The
+# cursor is therefore split into the index's own two ranges - the rest of the cursor's day,
+# then strictly older days - each of which the derived index seeks into:
+#
+#   (conversation_id=? AND <day>=? AND id<?)   and   (conversation_id=? AND <day><?)
+#
+# Both keep the index order (`day DESC, id DESC`; with the day pinned by equality the id
+# order is the same) so neither needs a sort, and the earlier-day statement only runs when
+# the same-day range did not already fill the page. The pair returns at most `limit` rows in
+# total and the two ranges are disjoint, so the step is still exact - no repeats, no gaps.
 DIARIES_PAGE = (
     "SELECT body FROM life_diaries WHERE conversation_id=? "
     "AND json_extract(body,'$.published_revision') IS NOT NULL "
     "ORDER BY json_extract(body,'$.day') DESC,id DESC LIMIT ?"
 )
-DIARIES_PAGE_AFTER = (
+DIARIES_SAME_DAY = (
     "SELECT body FROM life_diaries WHERE conversation_id=? "
+    "AND json_extract(body,'$.day')=? "
     "AND json_extract(body,'$.published_revision') IS NOT NULL "
-    "AND (json_extract(body,'$.day'),id)<(?,?) "
+    "AND id<? ORDER BY id DESC LIMIT ?"
+)
+DIARIES_EARLIER_DAY = (
+    "SELECT body FROM life_diaries WHERE conversation_id=? "
+    "AND json_extract(body,'$.day')<? "
+    "AND json_extract(body,'$.published_revision') IS NOT NULL "
     "ORDER BY json_extract(body,'$.day') DESC,id DESC LIMIT ?"
 )
 # One primary-key read per relation. Spelled out rather than assembled, so no statement in
@@ -106,10 +128,16 @@ class LifeReadQueries:
         `limit` is `page + 1` by convention: the caller asks for one row more than it will
         return, which is how it learns whether a next page exists without counting the
         history. `after` is the `(day, diary_id)` position of the last row of the previous
-        page and never widens access.
+        page and never widens access. The continuation is two index ranges - the rest of the
+        cursor's day, then older days if that was not enough - so the cost follows the rows
+        returned rather than the rows already passed.
         """
         if after is None:
             rows = self.db.execute(DIARIES_PAGE, (actor_id, limit)).fetchall()
         else:
-            rows = self.db.execute(DIARIES_PAGE_AFTER, (actor_id, after[0], after[1], limit))
+            day, diary_id = after
+            rows = self.db.execute(DIARIES_SAME_DAY, (actor_id, day, diary_id, limit)).fetchall()
+            remaining = limit - len(rows)
+            if remaining > 0:
+                rows += self.db.execute(DIARIES_EARLIER_DAY, (actor_id, day, remaining)).fetchall()
         return [json.loads(row[0]) for row in rows]

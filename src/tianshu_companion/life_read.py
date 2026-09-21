@@ -381,13 +381,32 @@ class LifeRead:
             LIST_BUDGET,
         )
 
+    def _bound_capture(self, actor_id, diary, diary_id):
+        """The frozen recipe and material of one diary, proved against its content address.
+
+        A diary id *is* the digest of the capture it records - actor, day, the whole frozen
+        recipe and the material hash - so recomputing it is the only way to know the stored
+        row still describes the capture a reader is about to be told about. Both the list and
+        the single revision go through this one check, because a damaged recipe marker must
+        never be reported as a real capture in one place and refused in the other: the list
+        names the recipe version it read, so an unproved recipe version is a false claim just
+        as surely as unproved text would be. The comparison is against the identity the caller
+        really addressed - the primary key the row was read by, or the id the page selected -
+        and nothing here rewrites a fact or falls back to the current recipe table.
+        """
+        recipe, material = _frozen_recipe(diary)
+        if digest([actor_id, diary.get("day"), recipe, material]) != diary_id:
+            _corrupt()
+        return recipe, material
+
     def _diary_entry(self, actor_id, diary):
         """One published diary, proved against the revision it points at.
 
         The row is only projected once its published pointer resolves to a revision of this
-        very diary carrying this very material hash; a row that fails that check is corrupt
-        data, and skipping it would make the page claim to be complete when it is not. The
-        live `state` is kept as stored - a diary that was revised after publication is a
+        very diary carrying this very material hash, and once the recipe it carries is proved
+        to be the capture its id was derived from; a row that fails any of those checks is
+        corrupt data, and skipping it would make the page claim to be complete when it is not.
+        The live `state` is kept as stored - a diary that was revised after publication is a
         draft again - while `current_revision` is never part of the answer, so the reader
         cannot reach unpublished text through the list.
         """
@@ -405,7 +424,7 @@ class LifeRead:
         published = diary.get("published_revision")
         if not isinstance(published, str) or not published:
             _corrupt()
-        recipe, material = _frozen_recipe(diary)
+        recipe, material = self._bound_capture(actor_id, diary, diary_id)
         revision = self.queries.revision(published)
         if revision is None:
             _corrupt()
@@ -456,13 +475,8 @@ class LifeRead:
                 _corrupt()
             if revision.get("conversation_id") != diary_id or revision.get("fictional") is not True:
                 _corrupt()
-            recipe, material = _frozen_recipe(diary)
+            recipe, material = self._bound_capture(actor_id, diary, diary_id)
             if revision.get("material_version") != material:
-                _corrupt()
-            # The diary id is content-addressed over actor, day, the whole frozen recipe and
-            # the material hash, so recomputing it proves the stored row still describes the
-            # capture the reader is about to be told about.
-            if digest([actor_id, diary.get("day"), recipe, material]) != diary_id:
                 _corrupt()
             config_version = self._capture(diary, diary_id, revision_id, revision)
             content = revision.get("content")

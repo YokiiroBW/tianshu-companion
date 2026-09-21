@@ -3,8 +3,9 @@
 These cases are about the storage contract the read feature depends on, not about the read
 rules (those live in `test_life_read.py`): that every operation runs inside a `BEGIN`/`COMMIT`
 read transaction with no write statement anywhere, that a page is answered by the derived
-index without a temporary B-tree and without a cost that grows with unrelated rows, and that
-the keyset step neither repeats nor drops a row.
+index without a temporary B-tree and without a cost that grows with rows it did not return -
+neither other actors' rows nor the same actor's rows the cursor already passed - and that the
+keyset step neither repeats nor drops a row.
 """
 
 import json
@@ -13,8 +14,9 @@ import pytest
 
 from test_life_read import build, equipped, facts
 from tianshu_companion.life_read_queries import (
+    DIARIES_EARLIER_DAY,
     DIARIES_PAGE,
-    DIARIES_PAGE_AFTER,
+    DIARIES_SAME_DAY,
     LifeReadQueries,
 )
 from tianshu_companion.store import Store
@@ -91,6 +93,45 @@ def steps(connection, run):
     return len(counted), result
 
 
+def plan(connection, sql, parameters):
+    """The query plan of one statement, as SQLite reports it."""
+    return " | ".join(
+        str(row[-1]) for row in connection.execute("EXPLAIN QUERY PLAN " + sql, parameters)
+    )
+
+
+def layered(store, actor_id, days):
+    """Published diaries with explicit days and ids, written straight to the store."""
+    with store.transaction():
+        for day, ids in days:
+            for diary_id in ids:
+                store.put(
+                    "life_diaries",
+                    dict(
+                        id=diary_id,
+                        conversation_id=actor_id,
+                        day=day,
+                        published_revision="revision:" + diary_id,
+                        state="published",
+                    ),
+                )
+
+
+def same_day(store, actor_id, count):
+    """One actor, one day, `count` published diaries with increasing ids."""
+    layered(store, actor_id, [("2026-09-20", ["d%06d" % index for index in range(count)])])
+
+
+def deep_page_steps(count, limit=11, after=("2026-09-20", "d000020")):
+    """Steps and page of a same-day continuation over `count` rows of one actor's history."""
+    store = Store(":memory:")
+    same_day(store, "actor:a", count)
+    queries = LifeReadQueries(store.db)
+    cost, rows = steps(store.db, lambda: queries.diaries_page("actor:a", limit, after))
+    store.close()
+    return cost, [row["id"] for row in rows]
+
+
 def page_steps(unrelated):
     store = Store(":memory:")
     bulk(store, "actor:a", published=30, unpublished=40, other_actor=unrelated)
@@ -143,14 +184,106 @@ def test_the_page_read_is_an_index_seek_without_a_temporary_btree():
     queries = LifeReadQueries(recorder)
     queries.diaries_page("actor:a", 21)
     queries.diaries_page("actor:a", 21, ("2026-09-20", "actor:a:p0003"))
-    first, second = (query for query in recorder.statements if "life_diaries" in query[0])
+    first, second, third = (query for query in recorder.statements if "life_diaries" in query[0])
     assert first[0] == " ".join(DIARIES_PAGE.split())
-    assert second[0] == " ".join(DIARIES_PAGE_AFTER.split())
-    for sql, parameters in (first, second):
-        plan = fixture.store.db.execute("EXPLAIN QUERY PLAN " + sql, parameters).fetchall()
-        detail = " | ".join(str(row[-1]) for row in plan)
+    assert second[0] == " ".join(DIARIES_SAME_DAY.split())
+    assert third[0] == " ".join(DIARIES_EARLIER_DAY.split())
+    for sql, parameters in (first, second, third):
+        detail = plan(fixture.store.db, sql, parameters)
         assert INDEX in detail, detail
         assert "TEMP B-TREE" not in detail.upper(), detail
+    # Naming the index is not enough: the plan must constrain the range columns, or SQLite
+    # seeks on the conversation and then judges every stored row of that actor.
+    assert plan(fixture.store.db, DIARIES_SAME_DAY, ("actor:a", "2026-09-20", "x", 21)).endswith(
+        "(conversation_id=? AND <expr>=? AND id<?)"
+    )
+    assert plan(fixture.store.db, DIARIES_EARLIER_DAY, ("actor:a", "2026-09-20", 21)).endswith(
+        "(conversation_id=? AND <expr><?)"
+    )
+
+
+def test_a_same_day_deep_page_costs_the_same_at_every_history_size():
+    """The cost follows the rows returned, not the rows the cursor already passed.
+
+    One actor, one day, the same cursor and the same 11-row answer: a hundred rows of history
+    and ten thousand must cost the same. The row-value comparison this replaced sought only on
+    `conversation_id` and then judged the tuple per row, so the same page cost 1,061 steps over
+    100 rows and 109,961 over 10,000.
+    """
+    small, small_rows = deep_page_steps(100)
+    large, large_rows = deep_page_steps(10000)
+    assert small_rows == large_rows == ["d%06d" % index for index in range(19, 8, -1)]
+    assert large < 1000, large
+    assert large - small < 50, (small, large)
+
+
+def test_the_older_day_range_runs_only_when_the_cursor_day_is_exhausted():
+    fixture = build()
+    same_day(fixture.store, "actor:a", 40)
+    recorder = Recorder(fixture.store.db)
+    queries = LifeReadQueries(recorder)
+    # The cursor's day still holds more rows than the page needs: one statement is enough.
+    assert len(queries.diaries_page("actor:a", 11, ("2026-09-20", "d000030"))) == 11
+    assert [sql for sql, _ in recorder.statements].count(" ".join(DIARIES_EARLIER_DAY.split())) == 0
+    # Near the end of the day the remainder is filled from the next older day, in order.
+    layered(fixture.store, "actor:a", [("2026-09-19", ["e%06d" % index for index in range(30)])])
+    rows = queries.diaries_page("actor:a", 11, ("2026-09-20", "d000003"))
+    assert [(row["day"], row["id"]) for row in rows] == [
+        ("2026-09-20", "d000002"),
+        ("2026-09-20", "d000001"),
+        ("2026-09-20", "d000000"),
+        *[("2026-09-19", "e%06d" % index) for index in range(29, 21, -1)],
+    ]
+
+
+def test_the_two_continuation_ranges_never_exceed_the_requested_limit():
+    fixture = build()
+    layered(
+        fixture.store,
+        "actor:a",
+        [
+            ("2026-09-20", ["d%06d" % index for index in range(4)]),
+            ("2026-09-19", ["e%06d" % index for index in range(20)]),
+        ],
+    )
+    recorder = Recorder(fixture.store.db)
+    queries = LifeReadQueries(recorder)
+    rows = queries.diaries_page("actor:a", 11, ("2026-09-20", "d000003"))
+    limits = [values[-1] for sql, values in recorder.statements if "life_diaries" in sql]
+    assert len(limits) == 2 and limits == [11, 8]  # the older range only asks for the remainder
+    assert len(rows) == 11
+    assert [row["id"] for row in rows][:3] == ["d000002", "d000001", "d000000"]
+    assert all(row["day"] == "2026-09-19" for row in rows[3:])
+    # A page larger than the remaining history returns what exists, with no lookahead row.
+    assert len(queries.diaries_page("actor:a", 40, ("2026-09-20", "d000003"))) == 23
+
+
+def test_paging_continues_after_a_deleted_cursor_row_and_stops_on_the_last_page():
+    fixture = build()
+    layered(
+        fixture.store,
+        "actor:a",
+        [
+            ("2026-09-20", ["d%06d" % index for index in range(5)]),
+            ("2026-09-19", ["e%06d" % index for index in range(5)]),
+            ("2026-09-18", ["f%06d" % index for index in range(3)]),
+        ],
+    )
+    queries = LifeReadQueries(fixture.store.db)
+    whole = [(row["day"], row["id"]) for row in queries.diaries_page("actor:a", 100)]
+    seen, after = [], None
+    while True:
+        rows = queries.diaries_page("actor:a", 4, after)
+        more = len(rows) > 3
+        page = rows[:3]
+        seen.extend((row["day"], row["id"]) for row in page)
+        if not more:
+            break
+        after = (page[-1]["day"], page[-1]["id"])
+        # The cursor is a position: the row it names may be gone and the walk still continues.
+        fixture.store.delete("life_diaries", page[-1]["id"])
+    assert seen == whole and len(seen) == 13
+    assert queries.diaries_page("actor:a", 4, ("2026-09-18", "f000000")) == []
 
 
 def test_page_cost_does_not_grow_with_unrelated_or_unpublished_rows():

@@ -26,6 +26,41 @@ from .short_context import ShortContextPolicy
 
 LOG = logging.getLogger(__name__)
 
+_JSON_MEDIA_TYPE = "application/json"
+_TOKEN = frozenset("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def json_media_type(headers):
+    """One settled `application/json` content type, or a refusal.
+
+    The four authorized read routes accept a JSON document, so the request must say so before
+    anything is parsed: a missing header, a different media type, a repeated header (RFC 9110
+    makes `Content-Type` a single-occurrence field, so two of them are ambiguous however they
+    read), or a parameter that is not a well-formed `charset` are all `invalid_input` - never
+    quietly treated as JSON because the bytes happen to parse. A syntactically valid charset
+    parameter is allowed and does not change the decoding, which stays UTF-8.
+    """
+    values = headers.getlist("content-type")
+    if len(values) != 1:
+        return False
+    parts = values[0].split(";")
+    if parts[0].strip().lower() != _JSON_MEDIA_TYPE:
+        return False
+    charset = False
+    for parameter in parts[1:]:
+        name, separator, value = parameter.partition("=")
+        value = value.strip().strip('"')
+        if (
+            not separator
+            or name.strip().lower() != "charset"
+            or charset
+            or not value
+            or not set(value) <= _TOKEN
+        ):
+            return False
+        charset = True
+    return True
+
 
 def build_runtime(config):
     contracts = Contracts(config["contracts_path"])
@@ -349,10 +384,12 @@ def create_app(core=None, tokens=None, life_readers=None):
     async def life_read_dispatch(request, operation):
         """The authorized read boundary: authenticate, bound the request, then read.
 
-        This adapter does three things and nothing more: it maps the bearer credential to a
-        service name, it refuses a raw body over the documented ceiling before parsing, and
-        it hands the parsed document to the read port. No reader identity is ever taken from
-        the request body, and no fault of the read port's own rules is re-decided here.
+        This adapter does four things and nothing more: it maps the bearer credential to a
+        service name, it requires the request to declare itself as JSON, it refuses a raw body
+        over the documented ceiling before parsing, and it hands the parsed document to the
+        read port. No reader identity is ever taken from the request body, and no fault of the
+        read port's own rules is re-decided here. The credential is still settled first, so an
+        unauthenticated caller learns only that it is unauthenticated.
         """
         request_id = uid("req")
         try:
@@ -371,6 +408,11 @@ def create_app(core=None, tokens=None, life_readers=None):
             )
             if service is None:
                 raise Fault("unauthorized")
+            if not json_media_type(request.headers):
+                # A media type is a claim about the document; refusing it here keeps a
+                # mislabelled request out of the read port entirely instead of leaving the
+                # only content-type judgement to whether the bytes happen to parse.
+                raise Fault("invalid_input")
             content = bytearray()
             async for chunk in request.stream():
                 content.extend(chunk)

@@ -411,6 +411,48 @@ def test_four_routes_identity_budgets_errors_cancellation_and_exit():
                 )
                 assert heavy.status_code == 429 and heavy.json()["code"] == "budget_exceeded"
 
+                # Media types: the same valid document is refused at the boundary under a
+                # wrong, missing or repeated `Content-Type`, and accepted with a charset
+                # parameter. Refusing it here is what keeps the media type a checked claim
+                # rather than something inferred from whether the bytes happen to parse.
+                refused = 0
+                for media, expected in (
+                    ("application/json; charset=utf-8", 200),
+                    ("text/plain", 400),
+                    ("application/octet-stream", 400),
+                    (None, 400),
+                ):
+                    typed = client.post(
+                        url + "/internal/v1/life-read/actors",
+                        headers={**reader} if media is None else {**reader, "Content-Type": media},
+                        content=b'{"schema_version":1}',
+                    )
+                    assert typed.status_code == expected, (media, typed.status_code)
+                    if expected == 400:
+                        assert typed.json()["code"] == "invalid_input"
+                        refused += 1
+                for values in (
+                    (b"application/json", b"text/plain"),
+                    (b"application/json", b"application/json"),
+                ):
+                    repeated = client.post(
+                        url + "/internal/v1/life-read/actors",
+                        headers=[
+                            (b"authorization", ("Bearer " + TOKENS[SERVICE]).encode()),
+                            *[(b"content-type", value) for value in values],
+                        ],
+                        content=b'{"schema_version":1}',
+                    )
+                    assert repeated.status_code == 400
+                    assert repeated.json()["code"] == "invalid_input"
+                    refused += 1
+                unauthenticated = client.post(
+                    url + "/internal/v1/life-read/actors",
+                    headers={"Content-Type": "text/plain"},
+                    content=b'{"schema_version":1}',
+                )
+                assert unauthenticated.status_code == 401  # the credential is settled first
+
             # Cancellation: a client that announces a body and then vanishes must stop that
             # request without writing anything, and the service must keep serving.
             context = ssl.create_default_context(cafile=str(root / "cert.pem"))
@@ -443,8 +485,8 @@ def test_four_routes_identity_budgets_errors_cancellation_and_exit():
             assert not list(root.glob("*.bak")), "a scheduled read must add no restore point"
             print(
                 "TLS life-read: routes=4 actors=1 diaries=%d revision_bytes=%d "
-                "refusals=401/403/404/409/400/429 remote_calls=%d facts_unchanged=True"
-                % (len(listed), len(document.json()["content"].encode()), len(hits))
+                "refusals=401/403/404/409/400/429+%dmedia remote_calls=%d facts_unchanged=True"
+                % (len(listed), len(document.json()["content"].encode()), refused, len(hits))
             )
         finally:
             process.terminate()
