@@ -947,6 +947,75 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(adapter.close())
         self.assertTrue(adapter.close())
 
+    def test_a_shutdown_survives_the_owner_clearing_its_own_reference(self):
+        """The closer must judge and join *one* captured owner, not re-read a mutable attribute.
+
+        The owner clears `self._writer` as it leaves - that is how a finished thread stops being
+        referenced - so a closer that dereferences the attribute twice can be looking at two
+        different things: it checks a live owner, the owner finishes and clears the attribute in
+        between, and the join that follows is called on `None`. That is not a theory: this test
+        schedules exactly that interleaving with real threads and asserts the shutdown still
+        reports the truth, with no exception and no thread left behind.
+
+        The interleaving is deterministic rather than hoped for. The instrumented `put_nowait` is
+        the last thing the closer does before joining, so the owner is released there and the
+        closer is held at the same point until that owner has actually exited and cleared the
+        reference. Every check below then runs against a `None` attribute and a captured owner.
+        """
+        adapter, directory = self._adapter()
+        self.assertTrue(asyncio.run(adapter.admit("service.request.started", "started")))
+        owner = adapter._writer
+        real_next = adapter._next_item
+        real_put = adapter._queue.put_nowait
+        owner_left = threading.Event()
+
+        def next_item():
+            item = real_next()
+            if item is None:
+                # The owner has decided to finish; let the closer reach the wake-up first.
+                owner_left.wait(timeout=30)
+            return item
+
+        def put(item):
+            result = real_put(item)
+            if item is None:
+                # This is the window the AttributeError lived in: wake the owner, wait for it to
+                # finish and clear `self._writer`, and only then let the closer continue to join.
+                owner_left.set()
+                owner.join(timeout=30)
+            return result
+
+        confirmed = None
+        error = None
+        with mock.patch.object(adapter, "_next_item", next_item):
+            with mock.patch.object(adapter._queue, "put_nowait", put):
+                try:
+                    confirmed = asyncio.run(adapter.aclose(timeout=5))
+                except Exception as failure:  # pragma: no cover - the regression under test
+                    error = failure
+        owner_left.set()
+        self.assertIsNone(error, f"the closer raised {error!r} instead of reporting a shutdown")
+        # The owner really did exit inside that window, and really did clear its own reference:
+        # without both, this test would be proving nothing.
+        self.assertFalse(owner.is_alive())
+        self.assertIsNone(adapter._writer)
+        self.assertTrue(confirmed)
+        self.assertTrue(adapter.closed)
+        self.assertEqual(0, adapter.pending)
+        self.assertIsNone(adapter._stream)
+        # A repeat is still answered from the state as it is, and no second closer was started.
+        self.assertTrue(adapter.close())
+        self.assertEqual(
+            ["service.request.started"],
+            [record["event"] for record in _records_in(directory)],
+        )
+        self.assertFalse(
+            any(
+                thread.name == "tianshu-log-writer" and thread.is_alive()
+                for thread in threading.enumerate()
+            )
+        )
+
     def test_a_terminal_event_is_persisted_not_merely_written(self):
         """The end of a request is fsynced by the writer; a plain record need not be.
 

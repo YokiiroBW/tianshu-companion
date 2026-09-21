@@ -1310,6 +1310,14 @@ class LogAdapter:
                 return not self._writer_alive() and not self._outstanding
             self._shutdown_started = True
             self.closing = True
+            # The owner this shutdown is about is captured *once*, and every decision below uses
+            # that same reference. `self._writer` is cleared by the owner itself on its way out -
+            # that is how a finished thread stops being referenced - so a closer that dereferences
+            # the attribute twice can be looking at two different things: it checks a live owner,
+            # the owner finishes and clears the attribute in between, and the join that follows is
+            # called on `None`. The hand-off is a local, not a second read of shared mutable state,
+            # and it is taken under the same lock the owner's exit path uses to clear it.
+            owner = self._writer
         deadline = time.monotonic() + bound
         # The stop request comes first, and it is a piece of state rather than a queue entry: a
         # sentinel cannot be delivered into a full queue, so a shutdown must never depend on
@@ -1319,17 +1327,17 @@ class LogAdapter:
         # Everything already accepted is given its chance to land before the writer is stopped: a
         # record that was admitted must not be discarded merely because shutdown arrived.
         self.flush(max(0.0, deadline - time.monotonic()))
-        if self._writer is not None and self._writer.is_alive():
+        if owner is not None and owner.is_alive():
             # A sentinel is a latency optimisation, not the signal: the owner observes the stop
             # state on its own, so a sentinel that does not fit costs at most one poll interval.
             try:
                 self._queue.put_nowait(None)
             except queue.Full:
                 pass
-            self._writer.join(timeout=max(0.0, deadline - time.monotonic()))
+            owner.join(timeout=max(0.0, deadline - time.monotonic()))
         # Both halves are read *after* the join: the owner may have finished inside it, and a
         # verdict computed before would report a failure that has already been resolved.
-        stopped = not self._writer_alive()
+        stopped = owner is None or not owner.is_alive()
         confirmed = stopped and self.settled_quietly()
         with self._state_lock:
             if self._outstanding and stopped:
@@ -1347,7 +1355,15 @@ class LogAdapter:
         return confirmed
 
     def _writer_alive(self):
-        return self._writer is not None and self._writer.is_alive()
+        """Whether the owner is still running, read from one capture of the reference.
+
+        The owner clears `self._writer` as it leaves, so a read that touched the attribute twice
+        could compare two different values - and a caller deciding whether a shutdown is finished
+        must not be able to see "an owner exists" and "no owner exists" in the same answer. One
+        local read, one answer.
+        """
+        owner = self._writer
+        return owner is not None and owner.is_alive()
 
     def _join_writer(self, bound):
         """Wait for the writer to finish, within a bound, without taking anything from it.
