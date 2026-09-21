@@ -17,6 +17,9 @@ from .clients import Gateway, JsonService, Memory, Origins, Sender, uid
 from .contracts import Contracts, Fault, strict_json
 from .core import Core, Policy
 from .direct import SyntheticPlugin
+from .life_read import MAX_REQUEST_BYTES, LifeRead
+from .life_read import readers as read_reader_map
+from .life_read_queries import LifeReadQueries
 from .store import Store
 from .images import ComfyUI, Workflow
 from .short_context import ShortContextPolicy
@@ -111,21 +114,41 @@ def build_runtime(config):
     )
     for spec in (routing or {}).get("commands", []):
         core.direct.register_command(**spec)
-    return core, incoming, clients
+    # The optional authorized read port. Its deployment mapping is validated here, where the
+    # caller registry is known, so an entry naming a service that was never configured fails
+    # startup instead of becoming a reader that can never authenticate.
+    life_readers = config.get("life_readers")
+    if life_readers is not None:
+        read_reader_map(life_readers, set(config.get("callers", {})))
+    return core, incoming, clients, life_readers
 
 
-def create_app(core=None, tokens=None):
+def create_app(core=None, tokens=None, life_readers=None):
     clients = []
     configured = core is not None
     if core is None and os.environ.get("TIANSHU_COMPANION_CONFIG"):
         config = json.loads(
             Path(os.environ["TIANSHU_COMPANION_CONFIG"]).read_text(encoding="utf-8")
         )
-        core, tokens, clients = build_runtime(config)
+        core, tokens, clients, life_readers = build_runtime(config)
         configured = True
     tokens = tokens or {}
     if len(set(tokens.values())) != len(tokens) or any(not token for token in tokens.values()):
         raise ValueError("Each caller needs its own non-empty service credential")
+    # Authorized life reading is assembled here rather than inside Core: the port needs no
+    # chat state, and Core must not grow a second read path. With no `life_readers` section
+    # the four routes answer 503 and nothing else about the deployment changes.
+    reads = None
+    if core is not None:
+        # The registry is passed in so an entry naming a service that holds no credential is
+        # a startup failure instead of a deployment that silently never authenticates.
+        mapping = read_reader_map(life_readers, set(tokens))
+        if mapping is not None:
+            reads = LifeRead(
+                LifeReadQueries(core.store.db),
+                readers=mapping,
+                contracts=core.contracts,
+            )
 
     async def worker():
         while True:
@@ -322,5 +345,59 @@ def create_app(core=None, tokens=None):
         # configured; with no credential `persona_admin` is not a known caller, so this
         # answers 401 and no unauthenticated remote write is possible.
         return await dispatch(request, "persona")
+
+    async def life_read_dispatch(request, operation):
+        """The authorized read boundary: authenticate, bound the request, then read.
+
+        This adapter does three things and nothing more: it maps the bearer credential to a
+        service name, it refuses a raw body over the documented ceiling before parsing, and
+        it hands the parsed document to the read port. No reader identity is ever taken from
+        the request body, and no fault of the read port's own rules is re-decided here.
+        """
+        request_id = uid("req")
+        try:
+            if reads is None:
+                # No `life_readers` section: the port is not deployed, exactly as an
+                # unconfigured dependency is reported anywhere else in this service.
+                raise Fault("dependency_unavailable")
+            auth = request.headers.get("Authorization", "")
+            service = next(
+                (
+                    name
+                    for name, token in tokens.items()
+                    if hmac.compare_digest(auth.encode(), ("Bearer " + token).encode())
+                ),
+                None,
+            )
+            if service is None:
+                raise Fault("unauthorized")
+            content = bytearray()
+            async for chunk in request.stream():
+                content.extend(chunk)
+                if len(content) > MAX_REQUEST_BYTES:
+                    raise Fault("invalid_input")
+            try:
+                body = strict_json(content)
+            except (ValueError, UnicodeError):
+                raise Fault("invalid_input") from None
+            return JSONResponse(reads.handle(service, operation, body))
+        except Fault as error:
+            return JSONResponse(error.wire(request_id), status_code=error.status)
+
+    @app.post("/internal/v1/life-read/actors")
+    async def life_read_actors(request: Request):
+        return await life_read_dispatch(request, "actors")
+
+    @app.post("/internal/v1/life-read/snapshot")
+    async def life_read_snapshot(request: Request):
+        return await life_read_dispatch(request, "snapshot")
+
+    @app.post("/internal/v1/life-read/diaries")
+    async def life_read_diaries(request: Request):
+        return await life_read_dispatch(request, "diaries")
+
+    @app.post("/internal/v1/life-read/revision")
+    async def life_read_revision(request: Request):
+        return await life_read_dispatch(request, "revision")
 
     return app

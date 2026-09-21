@@ -138,3 +138,44 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(Fault):
             await h.core.ingest("nonebot", request)
         self.assertFalse(h.core.store.list("inbox"))
+
+    async def test_life_readers_deployment_failures_stop_the_app_from_starting(self):
+        """A deployment that means to grant reading must not start half-configured."""
+        h = self.h
+        tokens = {"story": "story-token", "other": "other-token"}
+        entry = {"reader_id": "reader:story", "actor_ids": ["actor:a"]}
+        self.assertTrue(create_app(h.core, tokens, {"story": entry}))
+        for broken in (
+            {"nobody": entry},  # a service that holds no credential
+            {"story": {"reader_id": "reader:story"}},
+            {"story": {"reader_id": "", "actor_ids": ["actor:a"]}},
+            {"story": {"reader_id": "reader:story", "actor_ids": []}},
+            {"story": {"reader_id": "reader:story", "actor_ids": ["actor:a"] * 65}},
+            {"story": {"reader_id": "reader:story", "actor_ids": ["actor:a"] * 2}},
+            {"story": dict(entry, extra=True)},
+            {"story": entry, "other": entry},  # one reader identity per request, never two
+            [entry],
+        ):
+            with self.assertRaises(ValueError):
+                create_app(h.core, tokens, broken)
+
+        async def answer(app, token):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://core"
+            ) as client:
+                return await client.post(
+                    "/internal/v1/life-read/actors",
+                    json={"schema_version": 1},
+                    headers={"Authorization": "Bearer " + token},
+                )
+
+        # Without the section the port is not deployed and says so; with it, only the
+        # registered caller is a reader and nobody is enumerated from an empty grant list.
+        missing = await answer(create_app(h.core, tokens), "story-token")
+        self.assertEqual(503, missing.status_code)
+        self.assertEqual("dependency_unavailable", missing.json()["code"])
+        deployed = create_app(h.core, tokens, {"story": entry})
+        self.assertEqual(403, (await answer(deployed, "other-token")).status_code)
+        listed = await answer(deployed, "story-token")
+        self.assertEqual(200, listed.status_code)
+        self.assertEqual([], listed.json()["items"])

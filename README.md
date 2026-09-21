@@ -24,8 +24,10 @@ HTTP入口为 `POST /internal/v1/conversation/ingest-actors`、`/internal/v1/sou
 
 运行限制、状态表、来源边界与验收层级见 [实现说明](docs/implementation.md)，薄桥接入边界见 [NoneBot 说明](integrations/nonebot/README.md)。真实 QQ/TG、memory/gateway 联合链路和 PostgreSQL 仍未验收；生活、日记、工具执行与网页快照/SSE 留后续任务。
 
-角色生活与日记内部端口、独立写作配置和SQLite v3恢复说明：[docs/life.md](docs/life.md)。
+角色生活与日记内部端口、独立写作配置和SQLite v3恢复说明：[docs/life.md](docs/life.md)。日记的对外读取只经由 `life_readers` 部署的四个只读路由，凭据只在服务端。
 
 网页会话快照与独立Platform发送端：[docs/web-conversation.md](docs/web-conversation.md)。
 
 Core 图像与衣橱内部端口、ComfyUI 工作流审阅、SQLite v4 恢复及尚未发布的图像候选：[docs/images.md](docs/images.md)。
+
+角色生活与**已发布日记**的授权只读内部端口（`life_readers` 部署、四个只读路由、派生索引与恢复点）：[docs/life-read.md](docs/life-read.md)。

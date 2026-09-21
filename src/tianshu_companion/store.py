@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .contracts import canonical
+from .life_read_index import create_page_index, prepare_page_index
 
 LIFE_TABLES = {
     "life_worlds",
@@ -133,6 +134,7 @@ class Store:
         # `.pre-persona-ops-v9-` backup covering the whole chain; it is taken before any DDL,
         # so no intermediate step can start without a restore point. An intermediate restore
         # point requires upgrading one step at a time.
+        backed_up = False
         if 1 <= version <= 8 and str(path) != ":memory:":
             label = {
                 1: ".pre-source-v2-",
@@ -149,6 +151,13 @@ class Store:
                 self.db.backup(backup)
             finally:
                 backup.close()
+            backed_up = True
+        # The life-read page needs one derived index, and adding it to a database that already
+        # holds facts is a structural step like any other: it is detected - and given a
+        # restore point of its own, WAL included - before this open runs any DDL. A database
+        # that already carries the correct index adds no file and no fact, and an open that
+        # already took a complete pre-DDL backup above reuses it instead of adding a second.
+        prepare_page_index(self.db, path, restore_point_taken=backed_up, fresh=version == 0)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
@@ -289,6 +298,10 @@ class Store:
                     f"CREATE INDEX IF NOT EXISTS {table}_page ON "
                     f"{table}(conversation_id,position,id)"
                 )
+            # The one derived index the authorized diary page reads through. Its definition
+            # and its restore point belong to the read module; the create runs here, inside
+            # the initialization transaction, so a request path can never alter the schema.
+            create_page_index(self.db)
             self.db.execute("PRAGMA user_version=9")
 
     @contextmanager
