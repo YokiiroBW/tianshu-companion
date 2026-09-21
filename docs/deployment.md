@@ -95,6 +95,10 @@ python -m tianshu_companion.runtime_cli \
 - 探测请求不带任何凭据，也**从不**读 `/health/ready`：它只回答"进程是否在回答"。
 - 探测地址与端口写错（例如容器里监听 8765 却探测 8080）时，健康检查会失败而不是碰巧通过，
   所以 `TIANSHU_HEALTHCHECK_PORT` 必须与入口的 `--port` 保持一致。
+- 失败输出只有**静态类别**（`tls_verification_failed` / `unreachable` / `unexpected_status` /
+  `unexpected_payload` / `invalid_timeout`），非零退出。异常原文、响应正文、URL 与路径都不
+  输出：这段标准错误会被容器运行时收集，而异常消息或响应体可能携带证书主题、主机名或与存活
+  无关的 payload。类别说明哪一类失败，细节刻意不复述。类别表见 `docs/runtime-events.md` 第 8 节。
 
 就绪回答封闭为 `{status, service, checks}`，检查键固定为
 `configuration` / `logs` / `runtime` / `dependencies`，取值限
@@ -107,10 +111,14 @@ python -m tianshu_companion.runtime_cli \
   报 `logs=non_durable`。
 - 单分段 64 MiB；目录预算默认 1 GiB，可用 `TIANSHU_LOG_DIRECTORY_BYTES` 在 32 MiB –
   64 GiB 之间调整。
+- **重启不会买到容量**：适配器在受理任何业务之前先扫描既有分段，把它们的字节计入同一条预算；
+  一个已经写满的目录在重启后第一次 `admit` 就是拒绝，且既有分段一字节不删、不改。
 - 预算写满 ⇒ 拒绝新业务（503 + `x-tianshu-log-capacity-exhausted: exhausted`），就绪报
   `logs=failed`。这是刻意的：宁可拒绝业务，也不让文件超过它自己声明的预算。
 - 写入失败 ⇒ 不向业务抛异常，内存中降级，标准错误一条固定告警；恢复只能靠一次真正成功
   的写入，或运维显式调用 `LogAdapter.probe()`。
+- 请求/轮次/尝试/投递的**结束事件**由写者在自己的线程上补一次 `fsync` 后再确认（合同要求
+  终态持久）；业务接缝与权威事务都不等待磁盘。
 - **不要用 `subprocess.PIPE` 捕获运行进程的标准错误却不读取它。** 无人读取的管道写满后
   会永久阻塞写入方，所以适配器把标准错误也交给自己的写线程、并把它设为非阻塞：写不进去
   的记录计为 `dropped`，绝不阻塞事件循环。生产部署应让标准错误落到容器运行时可读的地方
@@ -141,8 +149,10 @@ docker run --rm \
 ## 8. 停止
 
 向容器主进程发送 `SIGTERM`（Windows 上是控制台控制事件）。入口把信号转成
-`server.should_exit`，应用 lifespan 依次取消后台任务、关闭 Core、关闭客户端、fsync 关闭
-日志，最后释放 SQLite owner 锁，并写出 `runtime.stopping` 与 `runtime.stopped`。
+`server.should_exit`，应用 lifespan 依次取消后台任务、关闭 Core、关闭客户端、关闭日志，
+最后释放 SQLite owner 锁，并写出 `runtime.stopping` 与 `runtime.stopped`。
+日志关闭是**一个有界动作**：一个总期限覆盖排队、等写者、送停止哨兵与释放句柄；句柄只由写者
+线程持有和释放，超时时返回"未确认"并保留仍在途的计数，而不是把句柄从写者手里抢过来关掉。
 锁释放后可立即重启；锁没释放时第二个进程会以 `Database already has a running owner` 拒绝
 启动，而不是同时写同一个库。
 

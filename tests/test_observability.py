@@ -272,6 +272,15 @@ class RecordTests(unittest.TestCase):
         emitted -= set(obs.PEER_LABELS)
         # Loop names such as `direct.work` are label strings passed to `run_loop`, not events.
         emitted -= {"direct.work"}
+        # The terminal-event registry names which records must be persisted, so each of its names
+        # appears once as a declaration and once at the site that emits it. The declaration is not
+        # an emission site, and it is excluded here by counting how often each name occurs: a name
+        # that appears only inside the declaration block has no emission site, which is exactly
+        # what the check below must keep refusing. The names themselves are read from the loaded
+        # registry, not from the source, so this can never quietly excuse a missing emitter.
+        for name in obs.TERMINAL_EVENTS:
+            if sources.count(f'"{name}"') == 1:
+                emitted.discard(name)
         emitted.discard(obs.SERVICE)
         # Every registered name is emitted somewhere, and nothing is emitted that is not
         # registered - the two directions of the same promise.
@@ -524,6 +533,16 @@ def _drain_pipe(descriptor):
     return b"".join(chunks)
 
 
+def _records_in(directory):
+    """Every valid record line in a log directory, in segment order."""
+    return [
+        json.loads(line)
+        for path in sorted(Path(directory).iterdir(), key=lambda item: item.name)
+        for line in path.read_bytes().splitlines()
+        if line.strip() and line.startswith(b"{")
+    ]
+
+
 class AdmissionTests(unittest.TestCase):
     """Admission is durable, and a refusal happens before any side effect can be lost.
 
@@ -658,12 +677,12 @@ class AdmissionTests(unittest.TestCase):
         adapter, directory = self._adapter()
         for _ in range(20):
             adapter.emit("runtime.background_work", "succeeded")
-        adapter.close()
+        self.assertTrue(adapter.close())
         self.assertTrue(adapter.closed)
         self.assertIsNone(adapter._stream)
         self.assertIsNone(adapter._writer)
         # A second close is a no-op, and no later emit reaches a released handle.
-        adapter.close()
+        self.assertTrue(adapter.close())
         self.assertFalse(adapter.emit("runtime.background_work", "succeeded"))
         self.assertEqual(0, adapter.pending)
         records = [
@@ -673,6 +692,167 @@ class AdmissionTests(unittest.TestCase):
             if line.strip()
         ]
         self.assertEqual(20, len(records))
+
+    def test_a_close_that_times_out_never_steals_the_owners_handle_or_fakes_the_count(self):
+        """One owner, one deadline: a shutdown that cannot finish reports it and stops there.
+
+        The writer is the only thing allowed to touch the segment handle. When it is inside a
+        write, a closer that reaches in anyway is a second owner: it can close a file mid-write
+        and then decrement a counter the writer still owns, which is how `pending` went negative.
+        The timeout is therefore a *report* - the handle stays with its owner, the in-flight count
+        stays true, and the release happens on the owner's way out.
+        """
+        adapter, directory = self._adapter(drain_seconds=0.03)
+        self.assertTrue(asyncio.run(adapter.admit("service.request.started", "started")))
+        owner = adapter._writer
+        stream = adapter._stream
+        calls = []
+        entered, release = threading.Event(), threading.Event()
+        original = adapter._write
+
+        class _Watched:
+            def __getattr__(self, name):
+                return getattr(stream, name)
+
+            def close(self):
+                calls.append(
+                    {
+                        "owner_alive": owner.is_alive(),
+                        "by_owner": threading.current_thread() is owner,
+                    }
+                )
+                return stream.close()
+
+        adapter._stream = _Watched()
+
+        def held(line, *, fsync):
+            entered.set()
+            release.wait(timeout=30)
+            return original(line, fsync=fsync)
+
+        adapter._write = held
+        self.assertTrue(adapter.emit("service.request.finished", "succeeded"))
+        self.assertTrue(entered.wait(timeout=10))
+
+        async def scenario():
+            started = time.monotonic()
+            confirmed = await adapter.aclose(timeout=0.03)
+            return confirmed, time.monotonic() - started
+
+        confirmed, elapsed = asyncio.run(scenario())
+        # Bounded, and honest about not having finished.
+        self.assertFalse(confirmed)
+        self.assertLess(elapsed, 2.0)
+        # Nobody but the owner closed the handle, and nothing was zeroed to look clean.
+        self.assertEqual([], calls)
+        self.assertEqual(1, adapter.pending)
+        self.assertGreaterEqual(adapter.dropped, 0)
+        # Let the owner finish: it releases the handle itself, and the count lands on zero.
+        release.set()
+        owner.join(timeout=30)
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(0, adapter.pending)
+        self.assertIsNone(adapter._stream)
+        self.assertEqual(0, adapter.dropped)
+        # The record the writer was holding is on disk, so the wait was not a lost record.
+        self.assertEqual(
+            ["service.request.started", "service.request.finished"],
+            [record["event"] for record in _records_in(directory)],
+        )
+
+    def test_cancelling_a_close_does_not_produce_a_second_closer(self):
+        """A cancelled caller stops waiting; the one shutdown it started still finishes."""
+        adapter, directory = self._adapter()
+        for _ in range(10):
+            adapter.emit("runtime.background_work", "succeeded")
+
+        async def scenario():
+            task = asyncio.create_task(adapter.aclose(timeout=10))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            # The shutdown that was begun is the only one, and it completes: the writer exits,
+            # the handle is released, and a repeated close is a no-op rather than a second close.
+            for _ in range(2000):
+                if adapter.closed:
+                    break
+                await asyncio.sleep(0.005)
+            return adapter.closed
+
+        self.assertTrue(asyncio.run(scenario()))
+        self.assertFalse(adapter._writer_alive())
+        self.assertIsNone(adapter._stream)
+        self.assertTrue(adapter.close())
+        self.assertEqual(10, len(_records_in(directory)))
+
+    def test_a_terminal_event_is_persisted_not_merely_written(self):
+        """The end of a request is fsynced by the writer; a plain record need not be.
+
+        A successful `write` means the kernel took the bytes. The contract asks the terminal
+        event of a request, turn, attempt or delivery to be *durable*, so the writer confirms it
+        with `fsync` - on its own thread, so the event loop and any authoritative transaction
+        never wait for that disk. `flush` and `await_flush` then mean "written and persisted",
+        which is why draining alone is not the answer.
+        """
+        adapter, directory = self._adapter()
+        real = os.fsync
+        with mock.patch.object(os, "fsync", wraps=real) as sync:
+            # A non-terminal record is written without forcing a disk sync of its own.
+            self.assertTrue(adapter.emit("runtime.background_work", "succeeded"))
+            self.assertTrue(adapter.flush())
+            after_plain = sync.call_count
+            # The terminal event of a request must be durable by the time the quiet point is
+            # reached, and the caller never paid for it.
+            self.assertTrue(adapter.emit("service.request.finished", "succeeded"))
+            started = time.monotonic()
+            self.assertTrue(adapter.flush())
+            elapsed = time.monotonic() - started
+            after_terminal = sync.call_count
+        self.assertGreater(after_terminal, after_plain)
+        self.assertLess(elapsed, 30.0)
+        # And closing adds no unpersisted terminal record: what the quiet point promised is
+        # already on disk, and the file holds every record in order.
+        self.assertTrue(adapter.close())
+        self.assertEqual(
+            ["runtime.background_work", "service.request.finished"],
+            [record["event"] for record in _records_in(directory)],
+        )
+
+    def test_a_terminal_event_still_cannot_become_a_business_retry(self):
+        """A lost completion record is reported, never replayed as business work.
+
+        The completion seam is the one place where a log failure could be turned into a second
+        attempt at work that already happened. The record is refused - the caller learns it did not
+        land - and nothing about the request that was already admitted is re-sent.
+        """
+        adapter, directory = self._adapter()
+        self.assertTrue(asyncio.run(adapter.admit("service.request.started", "started")))
+        self.assertTrue(adapter.flush())
+        before = adapter.dropped
+
+        # Every following append fails, exactly as a disk that has gone away behaves. The failure
+        # is injected where the *writer* meets it: the handle belongs to that thread, so wrapping
+        # it from here would race the write already in flight.
+        def gone(line, *, fsync):
+            raise OSError(28, "no space left on device")
+
+        original = adapter._write
+        adapter._write = gone
+        self.assertFalse(
+            asyncio.run(adapter.admit("service.request.finished", "succeeded")),
+            "a completion record that was not persisted must not be admitted",
+        )
+        self.assertEqual(before + 1, adapter.dropped)
+        # The writer survives the failed append: one record that cannot be written must not take
+        # the only thread that writes with it, or every later admission becomes a silent drop.
+        self.assertTrue(adapter._writer_alive())
+        # Nothing about the request that was already admitted is re-sent, and the record that
+        # could not be written is not silently claimed as written.
+        self.assertEqual(
+            ["service.request.started"], [record["event"] for record in _records_in(directory)]
+        )
+        adapter._write = original
 
 
 class DomainOutcomeTests(unittest.TestCase):
@@ -956,6 +1136,146 @@ class DurabilityTests(unittest.TestCase):
         # The writer thread is a daemon that cannot outlive the interpreter, and it never held
         # the state lock while waiting, so the adapter is still fully readable afterwards.
         self.assertEqual("non_durable", adapter.health())
+
+    def test_an_already_full_directory_refuses_the_very_first_admission(self):
+        """Capacity is measured before anything can be admitted, not discovered on first write.
+
+        This is the shape a restart has: the directory is already at its budget, and the new
+        process must not be able to buy capacity the running one was refused. The baseline was
+        previously taken from the writer's first append, so the *first* admission read the
+        directory as empty and the file stepped over its own declared bound.
+        """
+        with tempfile.TemporaryDirectory(prefix="tianshu-full-", ignore_cleanup_errors=True) as d:
+            # A real, valid segment already holding exactly the whole budget.
+            (Path(d) / "companion.jsonl").write_bytes(b"x" * obs.MIN_DIRECTORY_BYTES)
+            adapter = obs.LogAdapter(d, max_directory_bytes=obs.MIN_DIRECTORY_BYTES, stderr=_Sink())
+            self.addCleanup(adapter.close)
+            self.assertFalse(asyncio.run(adapter.admit("service.request.started", "started")))
+            self.assertFalse(adapter.accepts_business())
+            self.assertEqual("capacity_exhausted", adapter.health())
+            self.assertGreaterEqual(adapter.dropped, 1)
+            # Nothing was appended anywhere, and the existing segment was neither removed nor
+            # rewritten: a refusal is a refusal, not a clean-up.
+            total = sum(path.stat().st_size for path in Path(d).iterdir())
+            self.assertEqual(obs.MIN_DIRECTORY_BYTES, total)
+            self.assertEqual(
+                b"x" * obs.MIN_DIRECTORY_BYTES, (Path(d) / "companion.jsonl").read_bytes()
+            )
+
+    def test_the_budget_is_never_crossed_across_restarts_and_segments(self):
+        """Every byte a restart can see is inside the same budget the adapter declares.
+
+        A segment that already exists is charged to the new process before it admits anything, so
+        a restart cannot buy capacity the previous process was refused - and it cannot delete what
+        that process collected to make room either.
+        """
+        with tempfile.TemporaryDirectory(
+            prefix="tianshu-restart-", ignore_cleanup_errors=True
+        ) as d:
+            budget = obs.MIN_DIRECTORY_BYTES
+            probe = obs.LogAdapter(d, max_directory_bytes=budget, stderr=_Sink())
+            sample = probe.submit("runtime.background_work", "succeeded")
+            self.assertIsNotNone(sample)
+            line_bytes = sample.size
+            self.assertTrue(probe.flush())
+            probe.close()
+            (Path(d) / "companion.jsonl").unlink()
+            # Room for a handful of records, and no more.
+            fits = 6
+            room = budget - fits * line_bytes
+            (Path(d) / "companion.jsonl").write_bytes(b"x" * room)
+            first = obs.LogAdapter(
+                d, max_segment_bytes=1 << 20, max_directory_bytes=budget, stderr=_Sink()
+            )
+            written = 0
+            while asyncio.run(first.admit("runtime.background_work", "succeeded")):
+                written += 1
+                if written > 1000:
+                    break
+            self.assertEqual(fits, written)
+            self.assertFalse(first.accepts_business())
+            self.assertTrue(first.close())
+            total = sum(path.stat().st_size for path in Path(d).iterdir())
+            self.assertLessEqual(total, budget)
+            self.assertEqual(budget, total)
+            self.assertEqual(written, len(_records_in(d)))
+            # The restart meets the same wall: a second process cannot append a single record,
+            # and it does not delete what the first one collected.
+            second = obs.LogAdapter(
+                d, max_segment_bytes=1 << 20, max_directory_bytes=budget, stderr=_Sink()
+            )
+            self.addCleanup(second.close)
+            self.assertFalse(asyncio.run(second.admit("service.request.started", "started")))
+            self.assertEqual(total, sum(path.stat().st_size for path in Path(d).iterdir()))
+            self.assertEqual(written, len(_records_in(d)))
+
+    def test_a_directory_that_cannot_be_measured_is_not_assumed_empty(self):
+        """An unreadable directory refuses business instead of writing into an unknown budget."""
+        with tempfile.TemporaryDirectory(prefix="tianshu-blind-", ignore_cleanup_errors=True) as d:
+            adapter = obs.LogAdapter(d, stderr=_Sink())
+            self.addCleanup(adapter.close)
+            # A measurement that fails is a real condition: the destination cannot be trusted.
+            with mock.patch.object(
+                obs.LogAdapter, "_scan_directory", side_effect=OSError("denied")
+            ):
+                blind = obs.LogAdapter(d, stderr=_Sink())
+                self.addCleanup(blind.close)
+            self.assertFalse(blind.accepts_business())
+            self.assertEqual("log_unavailable", blind.health())
+            self.assertFalse(asyncio.run(blind.admit("service.request.started", "started")))
+
+    def test_reserved_records_are_counted_against_the_budget_before_they_are_written(self):
+        """What is queued already occupies the budget, so a burst cannot overrun the file.
+
+        The writer may be behind on a slow disk; the records waiting for it are still bytes the
+        directory is about to hold, so they are reserved at submit time rather than discovered
+        after the file has grown. The room is made by a segment that already exists, which is also
+        the state a restart meets.
+        """
+        with tempfile.TemporaryDirectory(
+            prefix="tianshu-reserve-", ignore_cleanup_errors=True
+        ) as d:
+            budget = obs.MIN_DIRECTORY_BYTES
+            # Measure one real record first: the reservation has to be checked against actual
+            # bytes, not against the contract's maximum line.
+            probe = obs.LogAdapter(d, max_directory_bytes=budget, stderr=_Sink())
+            sample = probe.submit("runtime.background_work", "succeeded")
+            self.assertIsNotNone(sample)
+            line_bytes = sample.size
+            self.assertTrue(probe.flush())
+            probe.close()
+            (Path(d) / "companion.jsonl").unlink()
+            # Room for a handful of records, and no more.
+            fits = 8
+            room = budget - fits * line_bytes
+            (Path(d) / "companion.jsonl").write_bytes(b"x" * room)
+            adapter = obs.LogAdapter(d, max_directory_bytes=budget, stderr=_Sink())
+            self.addCleanup(adapter.close)
+            self.assertEqual(room, adapter._directory_bytes)
+            gate = threading.Event()
+            original = adapter._write
+
+            def held(line, *, fsync):
+                gate.wait(timeout=60)
+                return original(line, fsync=fsync)
+
+            adapter._write = held
+            accepted = 0
+            for _ in range(200):
+                if adapter.emit("runtime.background_work", "succeeded"):
+                    accepted += 1
+            # The budget was enforced while nothing at all had been written yet: every record
+            # still waiting for the writer was already counted, and the count lands exactly on
+            # what the remaining room can hold.
+            self.assertEqual(fits, accepted)
+            self.assertEqual(accepted * line_bytes, adapter._pending_bytes)
+            self.assertTrue(adapter.capacity_exhausted)
+            gate.set()
+            adapter._write = original
+            self.assertTrue(adapter.flush())
+            total = sum(path.stat().st_size for path in Path(d).iterdir())
+            self.assertLessEqual(total, budget)
+            self.assertEqual(budget, total)
 
     def test_a_quiet_point_is_never_reported_while_a_record_is_still_queued(self):
         """`flush` may only answer True once the writer has really finished the record.

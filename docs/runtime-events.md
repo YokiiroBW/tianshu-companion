@@ -48,34 +48,46 @@
 `EVENTS` 是完整的静态登记表（`observability.py`）。下表列出全部已登记事件、它们的发出点，
 以及它们记录的是"发生了什么"还是"开始/结束"。
 
-| 事件 | 发出点 | outcome | 说明 |
-| --- | --- | --- | --- |
-| `runtime.started` | `app.create_app` lifespan 启动 | `succeeded` | 进程完成装配并开始服务 |
-| `runtime.stopping` | lifespan 关闭开始（fsync） | `started` | 收到停止请求，开始收尾 |
-| `runtime.stopped` | lifespan 关闭结束（fsync） | `succeeded` | 后台任务已取消、库已关闭、owner 锁已释放 |
-| `runtime.log_probe` | `LogAdapter.probe()` | `succeeded` / `failed` | 运维显式发起的日志通道恢复探针（见第 5 节） |
-| `runtime.background_work` | `app.run_loop` 每一轮真实做功 | `succeeded` | 本轮确实处理了工作 |
-| `runtime.background_failed` | `app.run_loop` 每一轮失败 | `failed` | 每次失败都记，不采样、不去重，带失败标签 |
-| `service.request.started` | `RuntimeEvents` 中间件 | `started` | 入站请求开始，带关联号 |
-| `service.request.authenticated` | 入站鉴权通过处 | `succeeded` | 凭据被接受（不写凭据本身） |
-| `service.request.finished` | `RuntimeEvents` 中间件 | `succeeded` / `rejected` | 请求结束，带 `duration_ms`；容量耗尽时为 `rejected` + `log_capacity_exhausted` |
-| `peer.call.started` | `clients.JsonService.call` | `started` | 调用既有内部对端开始，带固定 `peer` 标签 |
-| `peer.call.finished` | `clients.JsonService.call` | `succeeded` / `failed` | 调用结束，带 `duration_ms` 与失败标签 |
-| `turn.prepared` | `core` 准备轮次 | `succeeded` | 快照已固定 |
-| `turn.queued` | `core` 入队 | `succeeded` | 轮次进入调度队列 |
-| `turn.generation.started` | `core` 调用模型前 | `started` | 开始生成 |
-| `turn.generation.finished` | `core` 模型返回后 | `succeeded` / `failed` / `unknown` | 失败带 `error.code`（Fault）或失败标签 |
-| `turn.cancelled` | `core` 取消 | `cancelled` | 轮次被取消 |
-| `turn.delivery.started` | `core` 投递开始 | `started` | 开始出站投递 |
-| `turn.delivery.finished` | `core` 投递结束 | `succeeded` / `failed` / `unknown` | 投递结果 |
-| `outbox.flush` | `core` 出箱扫描 | `succeeded` | 一次出箱处理 |
-| `direct.request.queued` | `direct` 功能指令入队 | `succeeded` | 指令请求进入独立执行单元 |
-| `direct.request.cancelled` | `direct` 取消 | `cancelled` | 指令请求被取消 |
-| `direct.attempt.started` | `direct` 执行开始 | `started` | 一次执行尝试开始 |
-| `direct.attempt.finished` | `direct` 执行结束 | `succeeded` / `failed` / `unknown` | 执行结果 |
-| `direct.delivery.started` | `direct` 投递开始 | `started` | 指令回复开始投递 |
-| `direct.delivery.finished` | `direct` 投递结束 | `succeeded` / `failed` / `unknown` | 指令回复投递结果 |
-| `direct.delivery.deferred` | `direct` 让号等待 | `degraded` | 出站序号仍被在途轮次持有，按 `outbound_band_busy` 延后 |
+**终态列**标记的是 `TERMINAL_EVENTS`：这些事件结束一次请求、轮次、尝试、投递或进程本身，
+合同要求它们**持久**落盘（不只是写进内核），因此写者在写完这类记录后额外做一次
+`fsync`——在**写者自己的线程**上做，业务事件接缝（含持有权威事务的代码）永远不等待磁盘。
+其余事件只保证"已写入"，需要静默点时用 `flush()` / `await_flush()` 等一次真实排空。
+
+| 事件 | 发出点 | outcome | 终态 | 说明 |
+| --- | --- | --- | --- | --- |
+| `runtime.started` | `app.create_app` lifespan 启动 | `succeeded` | | 进程完成装配并开始服务 |
+| `runtime.stopping` | lifespan 关闭开始 | `started` | | 收到停止请求，开始收尾 |
+| `runtime.stopped` | lifespan 关闭结束 | `succeeded` | ✔ | 后台任务已取消、库已关闭、owner 锁已释放 |
+| `runtime.log_probe` | `LogAdapter.probe()` | `succeeded` / `failed` | | 运维显式发起的日志通道恢复探针（见第 5 节） |
+| `runtime.background_work` | `app.run_loop` 每一轮真实做功 | `succeeded` | | 本轮确实处理了工作 |
+| `runtime.background_failed` | `app.run_loop` 每一轮失败 | `failed` | | 每次失败都记，不采样、不去重，带失败标签 |
+| `service.request.started` | `RuntimeEvents` 中间件 | `started` | | 入站请求开始，带关联号 |
+| `service.request.authenticated` | 入站鉴权通过处 | `succeeded` | | 凭据被接受（不写凭据本身） |
+| `service.request.finished` | `RuntimeEvents` 中间件 | `succeeded` / `rejected` | ✔ | 请求结束，带 `duration_ms`；容量耗尽时为 `rejected` + `log_capacity_exhausted` |
+| `peer.call.started` | `clients.JsonService.call` | `started` | | 调用既有内部对端开始，带固定 `peer` 标签 |
+| `peer.call.finished` | `clients.JsonService.call` | `succeeded` / `failed` | | 调用结束，带 `duration_ms` 与失败标签 |
+| `turn.prepared` | `core` 准备轮次 | `succeeded` | | 快照已固定 |
+| `turn.queued` | `core` 入队 | `succeeded` | | 轮次进入调度队列 |
+| `turn.generation.started` | `core` 调用模型前 | `started` | | 开始生成 |
+| `turn.generation.finished` | `core` 模型返回后 | `succeeded` / `failed` / `unknown` | | 失败带 `error.code`（Fault）或失败标签 |
+| `turn.cancelled` | `core` 取消 | `cancelled` | | 轮次被取消 |
+| `turn.delivery.started` | `core` 投递开始 | `started` | | 开始出站投递 |
+| `turn.delivery.finished` | `core` 投递结束 | `succeeded` / `failed` / `unknown` | ✔ | 投递结果 |
+| `outbox.flush` | `core` 出箱扫描 | `succeeded` | | 一次出箱处理 |
+| `direct.request.queued` | `direct` 功能指令入队 | `succeeded` | | 指令请求进入独立执行单元 |
+| `direct.request.cancelled` | `direct` 取消 | `cancelled` | | 指令请求被取消 |
+| `direct.attempt.started` | `direct` 执行开始 | `started` | | 一次执行尝试开始 |
+| `direct.attempt.finished` | `direct` 执行结束 | `succeeded` / `failed` / `unknown` | ✔ | 执行结果 |
+| `direct.delivery.started` | `direct` 投递开始 | `started` | | 指令回复开始投递 |
+| `direct.delivery.finished` | `direct` 投递结束 | `succeeded` / `failed` / `unknown` | ✔ | 指令回复投递结果 |
+| `direct.delivery.deferred` | `direct` 让号等待 | `degraded` | | 出站序号仍被在途轮次持有，按 `outbound_band_busy` 延后 |
+
+`direct.request.finished` 登记在 `EVENTS` 里，但**当前没有发出点**：功能指令请求的结束由
+`direct.attempt.finished` / `direct.delivery.finished` 记录，请求层没有单独的收口事件。它保留
+在登记表中是为了不改变已发布的封闭枚举；这是"登记了但未发出"，不是"已覆盖"。
+
+`runtime.stopping` 是收尾的**开始**而不是终态，所以它不要求额外 `fsync`；进程真正的终态是
+`runtime.stopped`。
 
 **未覆盖项（明确写出，不假装覆盖）**
 
@@ -107,13 +119,29 @@
   承诺从来不是持久性，把"没人读的调试流"升级成服务中断并不更诚实。持久通道仍执行严格规则：
   写不进去的记录拒绝业务（见下条）。
 - 文件按实例命名，轮转到 `.jsonl.1`、`.jsonl.2` ……，目录预算是所有分段之和。
+- **容量基准在首次受理之前建立**（第二次返修 R1）。适配器在构造时（启动路径，不是请求路径）
+  就扫描既有分段，把它们的字节数记为基准；`submit` 用它加"待写字节"加新记录长度一起判预算，
+  写者在追加前再用同一条预算复核一次。之前的顺序是"`submit` 先按 0 记账、写者到 `_open` 才
+  扫目录"，于是一个已经写满的目录在重启后**第一次受理仍然成功**，文件越过自己声明的预算
+  （实测 +356 字节）。现在预满目录的第一次 `admit` 就是 `false`，副作用 0，且既有分段一字节
+  不动。度量不会创建目录——只读探针构造适配器时不会在文件系统上留下任何东西。
 - 容量耗尽（预算写满）时：**拒绝新业务**（业务请求 503 + `x-tianshu-log-capacity-exhausted:
   exhausted`），`/health/ready` 报 `logs=failed`、`status=not_ready`，普通事件被丢弃并计数。
   选择拒绝业务而不是"再宽容几条"，是因为宽容会让文件超过它自己声明的预算。
 - 写入失败（IO 错误）时：**不向业务抛异常**，记录被丢弃、`log_unavailable` 留在内存、
   标准错误只写一条固定告警。恢复必须靠一次真正成功的写入。
-- 待写计数在记录**入队之前**发布：写线程可能在入队瞬间就完成它，若在入队之后才计数，
-  `flush` / `admit` 会读到 0 并把尚未落盘的记录报成"已到静默点"。
+- **单写者、单期限关闭**（第二次返修 R2）。分段句柄只由写者线程持有和释放。关闭是**一个**
+  有界动作，覆盖排队、等写者、送停止哨兵、join 与释放句柄；超时后返回"未确认"，**不**清零
+  仍在途的计数、**不**把句柄从写者手里抢过来关掉、**不**丢掉写者引用——记录要么被写者写完
+  并由它自己释放句柄，要么被如实计入 `dropped`。`aclose` 取消只停止**等待**，它启动的那一次
+  关闭仍会跑完，不会产生第二个 owner（之前 `aclose` 先 `_join_writer` 再同步 `close`，两次
+  等待后又关闭了活跃句柄，写者随后把 `_pending` 减成 -1）。
+- **静默点 = 已写入**（第二次返修 R3）。`flush()` / `await_flush()` 等到的是"每条被接受的记录
+  都已被写者处理完"，不是"队列看起来是空的"。待写计数在记录**入队之前**发布，写者处理完才
+  清除；因此一条仍在写者手里的记录永远不会被报成静默点，而一条写失败的记录会被计为
+  `dropped`，并在 `admit` 上如实返回 `false`。
+- 写者在任何单条记录的异常上都不会退出：一条记录失败只记一次 `dropped` 并置 `log_unavailable`，
+  线程继续跑。否则一次瞬时 IO 错误会让写者死掉，此后每次受理都变成静默丢弃。
 
 ## 5. 探针与恢复
 
@@ -158,3 +186,20 @@
 镜像的 `HEALTHCHECK` 只读 `/health/live`，从不读 `/health/ready`：用就绪状态驱动重启，
 会让一个日志目录写满但本身健康的进程被反复重启，把容量问题变成重启循环。
 检查脚本是 `scripts/container_healthcheck.py`，只用标准库、不依赖本包、不写任何东西。
+
+它的输出是一组**封闭的静态类别**（第二次返修 R4），成功时 `healthy`，失败时非零退出并写
+`unhealthy: <类别>`：
+
+| 类别 | 含义 |
+| --- | --- |
+| `tls_verification_failed` | 证书链或主机名不被信任（`urllib` 会把它包在 `URLError.reason` 里，脚本按根因归类） |
+| `unreachable` | 连不上：拒绝连接、超时、解析失败等 |
+| `unexpected_status` | 连上了但不是 200 |
+| `unexpected_payload` | 连上了、200，但正文不是 `{"status":"alive"}` |
+| `invalid_timeout` | `TIANSHU_HEALTHCHECK_TIMEOUT` 不是合法秒数 |
+
+异常原文、响应正文、URL 与路径**一律不输出**：这段标准错误会被容器运行时收集并被运维阅读，
+而一个异常消息或响应体可能携带证书主题、主机名或与存活无关的 payload。类别说明"哪一类失败"，
+细节刻意不复述。证书与主机名校验始终开启，`TIANSHU_HEALTHCHECK_CA` 只是**增加**信任锚，
+没有任何跳过开关。
+

@@ -136,6 +136,23 @@ EVENTS = frozenset(
     }
 )
 
+# The terminal events: the ones that close out a request, turn, attempt, delivery or the
+# process itself. The contract requires the end of a piece of work to be *persisted*, not merely
+# handed to the kernel, so these are the records the writer fsyncs. They are still written on the
+# writer's thread: the caller (often the event loop) only enqueues, and the acknowledgement the
+# caller can wait for is `flush`/`await_flush`, which is why a terminal event never blocks the
+# work it is describing.
+TERMINAL_EVENTS = frozenset(
+    {
+        "service.request.finished",
+        "turn.delivery.finished",
+        "direct.request.finished",
+        "direct.attempt.finished",
+        "direct.delivery.finished",
+        "runtime.stopped",
+    }
+)
+
 # The static error-code registry. A value that is not registered is replaced by the fixed
 # `internal_error`: an unregistered code must not reach the file, and no exception text
 # (which could quote a secret) may be logged in its place.
@@ -450,13 +467,18 @@ class _Queued:
     waiting side polls cannot be missed, because the waiter is the one doing the checking.
     """
 
-    __slots__ = ("line", "sequence", "size", "fsync", "settled", "ok", "stream")
+    __slots__ = ("line", "sequence", "size", "fsync", "durable", "settled", "ok", "stream")
 
-    def __init__(self, line, sequence, *, fsync, stream=False):
+    def __init__(self, line, sequence, *, fsync, durable=False, stream=False):
         self.line = line
         self.sequence = sequence
         self.size = len(line)
         self.fsync = fsync
+        # Whether this record must be *persisted*, not merely written, before it counts as
+        # settled. The contract requires the terminal event of a request, turn, attempt or
+        # delivery to be durable, so those carry it; the writer honours it with one `fsync`
+        # on its own thread, which is why the caller never waits for a disk.
+        self.durable = durable
         # Which destination this record is for: the segment file, or the diagnostic stream the
         # process was started with when no directory is configured.
         self.stream = stream
@@ -519,6 +541,12 @@ class LogAdapter:
         self._directory_bytes = 0
         self._pending_bytes = 0
         self._pending = 0
+        # The sequences accepted but not yet written. This - not the pending counter - is what
+        # `flush` and `admit` treat as the truth about a quiet point: a record that is still in
+        # the writer's hands stays here, so it can never be reported as drained. A record the
+        # writer could not write leaves the set and is counted as dropped, which `admit` surfaces
+        # as a refusal - the caller of a durable admission is never told a lost record landed.
+        self._outstanding = set()
         self._stderr = stderr
         self.io_failed = False
         self.dropped = 0
@@ -529,9 +557,19 @@ class LogAdapter:
         self.probe_pending = False
         self.closing = False
         self.closed = False
+        self._shutdown_started = False
+        self._shutdown_confirmed = False
         self._writer = None
         self._queue = None
         self._stop = None
+        # The real capacity baseline, measured here - before anything can be admitted - rather
+        # than discovered by the writer on its first append. Measuring late is not a small
+        # ordering detail: `submit` decides capacity from the directory usage, so an unmeasured
+        # directory reads as empty and the first admission of a *full* directory succeeds,
+        # putting the file over the budget it declares. A restart must not be able to buy
+        # capacity that the running process was refused.
+        if self.durable:
+            self._measure()
         if self.durable and writer:
             self._queue = queue.Queue(maxsize=queue_records)
             self._stop = threading.Event()
@@ -660,42 +698,49 @@ class LogAdapter:
                 item = _Queued(line, self._sequence + 1, fsync=False, stream=True)
                 # Counted before it is queued: the writer may consume the record the instant it
                 # is enqueued, and a pending count that briefly reads zero would let `flush`
-                # report a quiet point while this record is still unwritten.
+                # report a quiet point while this record is still unwritten. `_outstanding` is
+                # the same promise kept exactly: a sequence leaves it only once the writer has
+                # really written the record, so a failed append can never look like a quiet point.
+                self._sequence += 1
                 self._pending += 1
                 self._pending_bytes += item.size
+                self._outstanding.add(item.sequence)
                 try:
                     self._queue.put_nowait(item)
                 except queue.Full:
                     self._pending -= 1
                     self._pending_bytes -= item.size
+                    self._outstanding.discard(item.sequence)
                     self.dropped += 1
                     return None
-                self._sequence += 1
                 return item
             if self.closing or self.closed or self.degraded:
                 self.dropped += 1
                 return None
             size = len(line)
             if self._directory_bytes + self._pending_bytes + size > self.max_directory_bytes:
-                # The budget is checked *including* records still waiting for the writer, so
-                # the file can never grow past the bound it declares.
+                # The budget is checked against the *measured* directory usage plus records still
+                # waiting for the writer, so the file can never grow past the bound it declares -
+                # including the first admission after a restart into an already-full directory.
                 self.capacity_exhausted = True
                 self._warn_once("log capacity reached; new business is refused")
                 self.dropped += 1
                 return None
-            item = _Queued(line, self._sequence + 1, fsync=fsync)
+            item = _Queued(line, self._sequence + 1, fsync=fsync, durable=event in TERMINAL_EVENTS)
+            self._sequence += 1
             self._pending += 1
             self._pending_bytes += size
+            self._outstanding.add(item.sequence)
             try:
                 self._queue.put_nowait(item)
             except queue.Full:
                 self._pending -= 1
                 self._pending_bytes -= size
+                self._outstanding.discard(item.sequence)
                 self.queue_full = True
                 self._warn_once("runtime event writer is saturated; new business is refused")
                 self.dropped += 1
                 return None
-            self._sequence += 1
             return item
 
     def emit(self, event, outcome, **fields):
@@ -762,13 +807,18 @@ class LogAdapter:
         return self.accepts_business()
 
     def flush(self, timeout=None):
-        """Wait until every record already accepted has been written, within a bound.
+        """Wait until every record already accepted has really been written, within a bound.
 
         This is the synchronous sibling of `admit`'s wait: it never blocks the writer and never
         takes the state lock while waiting, so a caller may use it to reach a quiet point (a
         test asserting on the file, an operator draining before an action) without racing the
         writer. It applies to both destinations, because the diagnostic stream is written by a
-        thread of its own too. Returns whether the queue really emptied inside the bound.
+        thread of its own too.
+
+        A quiet point means *written*, not *attempted*: a record the writer could not persist -
+        because the disk failed, the directory is out of budget, or the append raised - is
+        counted as dropped and never reported as drained. Returns whether every accepted record
+        landed inside the bound.
         """
         if self._writer is None:
             # No writer thread at all: nothing is ever queued, so there is nothing to drain.
@@ -776,12 +826,23 @@ class LogAdapter:
         bound = self.drain_seconds if timeout is None else timeout
         deadline = time.monotonic() + bound
         while True:
-            with self._state_lock:
-                if self._pending == 0:
-                    return True
+            if self.settled_quietly():
+                return True
             if time.monotonic() > deadline:
                 return False
             time.sleep(ADMISSION_POLL_SECONDS)
+
+    def settled_quietly(self):
+        """Whether every record this adapter accepted has left the writer's hands.
+
+        A quiet point is about the queue, not about success: a record whose append failed has been
+        settled - and counted as dropped, and surfaced to the caller by `admit` - so it is not
+        still queued. What must never be reported as quiet is a record that is *still* waiting,
+        which is why the pending count is published before the record is enqueued and cleared only
+        after the writer has finished with it.
+        """
+        with self._state_lock:
+            return not self._outstanding
 
     async def await_flush(self, timeout=None):
         """`flush` without blocking the event loop while the writer drains."""
@@ -790,9 +851,8 @@ class LogAdapter:
         bound = self.drain_seconds if timeout is None else timeout
         deadline = time.monotonic() + bound
         while True:
-            with self._state_lock:
-                if self._pending == 0:
-                    return True
+            if self.settled_quietly():
+                return True
             if time.monotonic() > deadline:
                 return False
             await asyncio.sleep(ADMISSION_POLL_SECONDS)
@@ -800,13 +860,20 @@ class LogAdapter:
     # ----------------------------------------------------------------------- writer
 
     def _drain(self):
-        """The only place that touches the file. One thread, one handle, no sharing."""
+        """The only place that touches the file. One thread, one handle, no sharing.
+
+        This thread also owns the *durability* of what it writes. A terminal record - the end of
+        a request, turn, attempt, delivery or of the process - is followed by `flush` + `fsync`
+        before it is acknowledged, because the contract asks for a persisted terminal event and a
+        successful `write` only means the kernel took the bytes. The cost is paid here, on the
+        writer, never by the event loop or by an authoritative transaction.
+        """
         while True:
             item = self._queue.get()
             try:
                 if item is None:
                     return
-                ok = self._write(item.line, fsync=item.fsync)
+                ok = self._write(item.line, fsync=item.fsync or item.durable)
                 with self._state_lock:
                     self._pending -= 1
                     self._pending_bytes -= item.size
@@ -814,9 +881,26 @@ class LogAdapter:
                         self.wrote_once = True
                     else:
                         self.dropped += 1
+                    self._outstanding.discard(item.sequence)
                 item.settle(ok)
+            except Exception:  # noqa: BLE001 - the writer must outlive any single bad record
+                # One record that fails unexpectedly must not take the writer with it: a dead
+                # writer turns every later admission into a silent drop, which is exactly the
+                # failure mode this adapter exists to prevent. The record is counted and the
+                # thread carries on, so the next append can still succeed.
+                with self._state_lock:
+                    self._pending = max(0, self._pending - 1)
+                    self._pending_bytes = max(0, self._pending_bytes - item.size)
+                    self.dropped += 1
+                    self.io_failed = True
+                    self._outstanding.discard(item.sequence)
+                item.settle(False)
             finally:
                 self._queue.task_done()
+                if item is None:
+                    # The owner releases its own handle on the way out, so a shutdown that timed
+                    # out can never close a file this thread is still writing to.
+                    self._release_stream()
 
     def _drain_stream(self):
         """The only place that touches the diagnostic stream, for the same reason as `_drain`.
@@ -833,6 +917,7 @@ class LogAdapter:
                 with self._state_lock:
                     self._pending -= 1
                     self._pending_bytes -= item.size
+                    self._outstanding.discard(item.sequence)
                     if ok:
                         self.wrote_once = True
                     else:
@@ -846,9 +931,19 @@ class LogAdapter:
         try:
             self._open()
             size = len(line)
+            # The same budget `submit` enforces, re-checked here against what the file really
+            # holds. `submit` cannot be the last word on capacity: between the measurement and
+            # this append another instance, a rotation or a recovered segment can have taken the
+            # space, and a declared bound that the file can step over is not a bound. The
+            # reserved bytes of everything still queued are already counted, so a healthy
+            # directory never fails this check.
+            if self._directory_bytes + size > self.max_directory_bytes:
+                self.capacity_exhausted = True
+                self._warn_once("log capacity reached; new business is refused")
+                return False
             if self._segment_bytes + size > self.max_segment_bytes:
                 # Sealing a segment costs no extra bytes, so rotation is always allowed; the
-                # directory bound was already enforced at submit time.
+                # directory bound was checked immediately above.
                 self._stream.close()
                 self._segment_index += 1
                 self._open_segment()
@@ -869,32 +964,90 @@ class LogAdapter:
         return self.directory / name
 
     def _scan_directory(self):
+        """Total bytes of this instance's segments, and the highest segment index present.
+
+        `_SEGMENT_SUFFIX` describes the part *after* the `companion` prefix, so it is matched
+        against that part: matching it against the whole name would classify every segment as
+        foreign and report an occupied directory as empty - the exact mistake that let the first
+        admission of a full directory through.
+        """
         total, highest = 0, -1
         for entry in self.directory.iterdir():
-            if not entry.is_file():
+            if not entry.is_file() or not entry.name.startswith("companion"):
                 continue
-            match = _SEGMENT_SUFFIX.match(entry.name)
-            if match is None or not entry.name.startswith("companion"):
+            match = _SEGMENT_SUFFIX.match(entry.name[len("companion") :])
+            if match is None:
                 continue
             total += entry.stat().st_size
             index = int(match.group(1)) if match.group(1) else 0
             highest = max(highest, index)
-        self._directory_bytes = total
-        return highest
+        return total, highest
+
+    def _measure(self):
+        """Establish the real capacity baseline for an existing directory, once, off the loop.
+
+        Called from the constructor (startup, never a request path) and from the writer when it
+        has to open the destination. A directory that cannot be read is not assumed empty: the
+        adapter refuses business until an explicit `probe` proves a real write, because "I could
+        not measure the budget" must never be answered with "then write anyway".
+
+        It deliberately does not *create* the directory. A directory that does not exist yet holds
+        nothing, so there is nothing to measure and nothing to report - and creating it here would
+        make every construction of the adapter, including the one a read-only readiness probe
+        performs, leave a directory behind on a filesystem the probe was told not to touch.
+        """
+        if not self.directory.exists():
+            with self._state_lock:
+                self._directory_bytes = 0
+                self._segment_index = 0
+            return
+        try:
+            total, highest = self._scan_directory()
+        except OSError:
+            self.io_failed = True
+            self._warn_once("runtime event log directory is unavailable")
+            return
+        with self._state_lock:
+            self._directory_bytes = total
+            self._segment_index = highest + 1
 
     def _open(self):
         if self._stream is not None:
             return
+        self._measure()
         self.directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.directory, 0o700)
-        index = self._scan_directory()
-        self._segment_index = index + 1
         self._open_segment()
 
     def _open_segment(self):
         path = self._segment_path(self._segment_index)
         self._stream = open(path, "ab", buffering=0)
         self._segment_bytes = path.stat().st_size
+
+    def _release_stream(self):
+        """Give up the segment handle, unless another thread may still be using it.
+
+        The writer owns the handle, so this is the writer's own exit path - either the writer
+        calling it as it leaves, or a closer that has already watched it stop. A close that timed
+        out while the writer was still inside a write must not reach in and close the handle under
+        it: that is how a shutdown becomes a write into a closed file, or a second writer. The
+        handle then stays open and the owner releases it when it finishes - the loss is already
+        counted, and a leaked descriptor at process exit is the smaller problem by far.
+        """
+        with self._state_lock:
+            if self._stream is None:
+                return
+            owner = self._writer
+            if owner is not None and owner is not threading.current_thread() and owner.is_alive():
+                return
+            try:
+                self._stream.close()
+            except OSError:
+                pass
+            self._stream = None
+            # This path is only reached once no writer can still be inside the handle - either
+            # the owner is calling it on its way out, or the owner has already stopped - so the
+            # reference to that finished thread is cleared here rather than left dangling.
+            self._writer = None
 
     def _warn_once(self, text):
         if self._warned:
@@ -970,9 +1123,18 @@ class LogAdapter:
                 self.probe_pending = False
                 return False
             item = _Queued(line, self._sequence + 1, fsync=True)
+            # Counted and marked outstanding *before* it is queued, for the same reason as
+            # `submit`: the writer can consume the record the moment it appears.
+            self._sequence += 1
+            self._pending += 1
+            self._pending_bytes += item.size
+            self._outstanding.add(item.sequence)
             try:
                 self._queue.put(item, timeout=self.drain_seconds)
             except queue.Full:
+                self._pending -= 1
+                self._pending_bytes -= item.size
+                self._outstanding.discard(item.sequence)
                 self.io_failed, self.capacity_exhausted, self.queue_full = (
                     was_io_failed,
                     was_capacity,
@@ -980,9 +1142,6 @@ class LogAdapter:
                 )
                 self.probe_pending = False
                 return False
-            self._sequence += 1
-            self._pending += 1
-            self._pending_bytes += item.size
         # Waiting for the writer outside the state lock, so a slow disk never blocks a reader
         # of `health()` - the maintenance action may wait, the health endpoint may not. The
         # completion flag is polled rather than awaited, for the same reason `admit` polls it.
@@ -1004,77 +1163,81 @@ class LogAdapter:
     # ---------------------------------------------------------------------- closing
 
     def close(self, *, drain=None):
-        """Stop the writer, drain what it can within the bound, then release the handle.
+        """Stop the writer and release the handle, inside one bound, from the owner's side.
 
-        The order matters: the writer is told to stop and joined *before* the file handle is
-        closed, so nothing ever writes to a handle this method has released. Records still
-        queued when the bound expires are counted as dropped - reported, never silently lost.
+        Returns whether the shutdown was *confirmed*: every accepted record settled and the
+        writer thread finished. A False answer is a report, not a clean-up: the records still in
+        flight stay counted, the handle stays with the writer that owns it, and the caller learns
+        that the log was not brought to a stop rather than being told a comfortable story.
         """
+        return self._shutdown(self.drain_seconds if drain is None else drain)
+
+    async def aclose(self, timeout=None):
+        """`close` without blocking the event loop while the writer drains.
+
+        The whole shutdown - waiting for the queue, the sentinel, the join and the final release -
+        runs as one bounded unit on one thread. The event loop only waits for it, so a cancelled
+        caller cannot leave a second closer behind: cancelling this coroutine stops the *wait*,
+        and the thread it started still finishes the one shutdown that was begun.
+        """
+        if self._shutdown_started:
+            return self._shutdown_confirmed
+        bound = self.drain_seconds if timeout is None else timeout
+        return await asyncio.get_running_loop().run_in_executor(None, lambda: self._shutdown(bound))
+
+    def _shutdown(self, bound):
+        """One deadline covering the whole stop: queue, sentinel, join and release."""
         with self._state_lock:
-            if self.closed:
-                return
+            if self._shutdown_started:
+                # A shutdown is already under way or done; a second caller reports the outcome
+                # rather than starting a competing close. If the first one timed out, the answer
+                # is recomputed here instead of being replayed as a stale "no": once the owner has
+                # finished, the log really has been brought to a stop, and saying otherwise would
+                # make a later `close` report a failure that no longer exists.
+                self._shutdown_confirmed = not self._writer_alive() and not self._outstanding
+                return self._shutdown_confirmed
+            self._shutdown_started = True
             self.closing = True
-        # Everything already accepted is given its chance to land before the writer is stopped:
-        # a record that was admitted must not be discarded merely because shutdown arrived.
-        self.flush(drain)
-        if self._writer is not None:
-            bound = self.drain_seconds if drain is None else drain
-            deadline = time.monotonic() + bound
-            while True:
-                with self._state_lock:
-                    empty = self._pending == 0
-                if empty or time.monotonic() > deadline:
-                    break
-                time.sleep(0.005)
+        deadline = time.monotonic() + bound
+        # Everything already accepted is given its chance to land before the writer is stopped: a
+        # record that was admitted must not be discarded merely because shutdown arrived.
+        self.flush(max(0.0, deadline - time.monotonic()))
+        if self._writer is not None and self._writer.is_alive():
             try:
                 self._queue.put(None, timeout=max(0.0, deadline - time.monotonic()))
             except queue.Full:
+                # The queue is still full, so the sentinel cannot be delivered inside the bound.
                 pass
             self._writer.join(timeout=max(0.0, deadline - time.monotonic()))
-            self._writer = None
+        confirmed = not self._writer_alive() and self.settled_quietly()
         with self._state_lock:
-            if self._pending:
-                self.dropped += self._pending
-                self._pending = 0
-                self._pending_bytes = 0
-            if self._stream is not None:
-                try:
-                    self._stream.close()
-                except OSError:
-                    pass
-                self._stream = None
+            if self._outstanding and not self._writer_alive():
+                # The owner is gone and these records never reached the file: reported, never
+                # hidden - and never zeroed to make the report look clean. While the owner is
+                # still running they are in flight, not lost, so they are not counted here and
+                # the count is not reset either.
+                self.dropped += len(self._outstanding)
+                self._outstanding.clear()
+            self._shutdown_confirmed = confirmed
             self.closed = True
+        # Release the handle only from a position where no writer can still be inside it.
+        if not self._writer_alive():
+            self._release_stream()
+        return confirmed
 
-    async def aclose(self, timeout=None):
-        """`close` without blocking the event loop while the writer drains."""
-        if self._writer is None:
-            self.close()
-            return True
-        bound = self.drain_seconds if timeout is None else timeout
-        drained = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self._join_writer(bound)
-        )
-        self.close()
-        return drained
+    def _writer_alive(self):
+        return self._writer is not None and self._writer.is_alive()
 
     def _join_writer(self, bound):
-        with self._state_lock:
-            self.closing = True
+        """Wait for the writer to finish, within a bound, without taking anything from it.
+
+        Kept as the narrow "wait" half of shutdown so callers that only need a quiet point do not
+        have to close the adapter to get one.
+        """
         deadline = time.monotonic() + bound
-        while True:
-            with self._state_lock:
-                if self._pending == 0:
-                    break
-            if time.monotonic() > deadline:
-                break
+        while not self.settled_quietly() and time.monotonic() <= deadline:
             time.sleep(0.005)
-        try:
-            self._queue.put(None, timeout=max(0.0, deadline - time.monotonic()))
-        except queue.Full:
-            pass
-        self._writer.join(timeout=max(0.0, deadline - time.monotonic()))
-        with self._state_lock:
-            return self._pending == 0
+        return self.settled_quietly()
 
 
 class NullLogAdapter:

@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -52,6 +53,21 @@ def _load_healthcheck():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class _LiveAnswer:
+    """A urlopen stand-in that answers the documented liveness payload."""
+
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *arguments):
+        return False
+
+    def read(self):
+        return json.dumps({"status": "alive"}).encode()
 
 
 class _Recorder:
@@ -857,6 +873,91 @@ class _HealthcheckTests(unittest.TestCase):
             process.terminate()
         process.wait(timeout=30)
 
+    def test_the_check_never_reproduces_a_failure_or_a_payload(self):
+        """The probe's own output is a closed vocabulary, not a copy of what it saw.
+
+        A container runtime collects this stderr and an operator reads it, so anything the check
+        echoes lands in a log: an exception message, a response body, an address or a path can
+        each carry a credential or a hostname that has nothing to do with liveness. A synthetic
+        secret is pushed through every failing branch of the real `main` - a broken payload, a
+        network error, a TLS rejection and a malformed timeout - and must appear nowhere.
+        """
+        module = _load_healthcheck()
+        canary = "REVIEW_CANARY_4f9a1c"
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *arguments):
+                return False
+
+            def read(self):
+                return json.dumps({"synthetic_secret": canary}).encode()
+
+        branches = {
+            "payload": (
+                {"return_value": Response()},
+                {},
+                module.BAD_PAYLOAD,
+            ),
+            "network": (
+                {"side_effect": OSError(canary)},
+                {},
+                module.UNREACHABLE,
+            ),
+            "tls": (
+                {"side_effect": ssl.SSLError(canary)},
+                {},
+                module.TLS_REFUSED,
+            ),
+            "timeout": (
+                {"side_effect": OSError(canary)},
+                {"TIANSHU_HEALTHCHECK_TIMEOUT": canary},
+                module.BAD_TIMEOUT,
+            ),
+        }
+        for name, (stub, environment, category) in branches.items():
+            captured_out, captured_err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(module.urllib.request, "urlopen", **stub),
+                contextlib.redirect_stdout(captured_out),
+                contextlib.redirect_stderr(captured_err),
+            ):
+                code = module.main([], environ=environment)
+            written = captured_out.getvalue() + captured_err.getvalue()
+            self.assertEqual(1, code, name)
+            self.assertEqual(f"unhealthy: {category}", written.strip(), name)
+            self.assertNotIn(canary, written, name)
+            self.assertNotIn("OSError", written, name)
+            self.assertNotIn("SSLError", written, name)
+        # The healthy answer is the same closed vocabulary, so a passing probe cannot leak a
+        # payload either.
+        captured_out, captured_err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(
+                module.urllib.request,
+                "urlopen",
+                return_value=_LiveAnswer(),
+            ),
+            contextlib.redirect_stdout(captured_out),
+            contextlib.redirect_stderr(captured_err),
+        ):
+            self.assertEqual(0, module.main([], environ={}))
+        self.assertEqual("healthy", captured_out.getvalue().strip())
+        self.assertEqual("", captured_err.getvalue())
+        # A certificate rejection is its own category, however `urllib` wraps it: the real library
+        # reports a handshake failure as `URLError(reason=SSLCertVerificationError)`, and calling
+        # that "unreachable" would send an operator to the network instead of the trust store.
+        wrapped = urllib.error.URLError(ssl.SSLCertVerificationError(canary))
+        with mock.patch.object(module.urllib.request, "urlopen", side_effect=wrapped):
+            ok, category = module.check("https://127.0.0.1:1/health/live", timeout=1, environ={})
+        self.assertFalse(ok)
+        self.assertEqual(module.TLS_REFUSED, category)
+        self.assertNotIn(canary, category)
+
     def test_the_check_never_asks_the_authenticated_readiness_question(self):
         # The image's health check must not be able to reach readiness at all: it sends no
         # credential, and the address it actually uses is the public liveness one. The module
@@ -918,8 +1019,7 @@ class _HealthcheckTests(unittest.TestCase):
         # and the probe says so instead of accepting it.
         untrusted = self.check(url)
         self.assertNotEqual(0, untrusted.returncode, untrusted.stdout)
-        self.assertIn(b"unhealthy", untrusted.stderr)
-        self.assertIn(b"SSL", untrusted.stderr)
+        self.assertEqual(b"unhealthy: tls_verification_failed", untrusted.stderr.strip())
         # Trusted: the same address, with the deployment's own CA named explicitly.
         trusted = subprocess.run(
             [

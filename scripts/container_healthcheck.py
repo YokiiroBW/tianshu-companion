@@ -19,6 +19,11 @@ and nothing else:
   package at all, so it also works when the application is failing to import.
 * It exits 0 when the process answered the documented payload, and non-zero otherwise, which
   is the only vocabulary a container health check has.
+* Its output is a **closed set of static categories**, never text from the failure. An exception
+  message, a response body, an address or a path can carry a credential, a hostname or a
+  payload that has nothing to do with liveness - and this script's stderr is collected by the
+  container runtime and read by whoever is debugging. The category says what class of failure
+  happened; the detail is deliberately not reproduced here.
 
 Configuration, all optional, all read from the environment of the container:
 
@@ -46,6 +51,15 @@ DEFAULT_SCHEME = "http"
 DEFAULT_PATH = "/health/live"
 DEFAULT_TIMEOUT = 3.0
 EXPECTED = {"status": "alive"}
+
+# The closed vocabulary this check reports in. Each entry names a class of failure, never the
+# failure's own text: the runtime may print these, so they must stay true for every input.
+HEALTHY = "healthy"
+TLS_REFUSED = "tls_verification_failed"
+UNREACHABLE = "unreachable"
+BAD_ANSWER = "unexpected_status"
+BAD_PAYLOAD = "unexpected_payload"
+BAD_TIMEOUT = "invalid_timeout"
 
 ENVIRONMENT_URL = "TIANSHU_HEALTHCHECK_URL"
 ENVIRONMENT_HOST = "TIANSHU_HEALTHCHECK_HOST"
@@ -84,24 +98,43 @@ def ssl_context(url, ca, environ=None):
     return context
 
 
+def _tls_failure(error):
+    """Whether this failure is a TLS/certificate rejection, however it was wrapped.
+
+    `urllib` reports a handshake problem as `URLError(reason=SSLCertVerificationError)`, so the
+    top-level exception type alone would call every certificate failure "unreachable" - and an
+    operator reading the category would go looking at the network instead of the trust store.
+    """
+    seen = set()
+    while error is not None and id(error) not in seen:
+        if isinstance(error, ssl.SSLError):
+            return True
+        seen.add(id(error))
+        error = getattr(error, "reason", None)
+    return False
+
+
 def check(url, *, ca=None, timeout=DEFAULT_TIMEOUT, environ=None):
-    """Return (ok, message). Never raises for a network or TLS problem."""
+    """Return (ok, category). Never raises, and never reproduces the failure's own text.
+
+    The categories are the whole diagnostic vocabulary: a TLS rejection and a refused connection
+    read differently - which is what an operator needs - without either one carrying a
+    certificate subject, a response body, an address or a path into the container log.
+    """
     try:
         with urllib.request.urlopen(
             url, timeout=timeout, context=ssl_context(url, ca, environ)
         ) as response:
             if response.status != 200:
-                return False, f"liveness answered {response.status}"
+                return False, BAD_ANSWER
             payload = json.loads(response.read())
-    except (OSError, urllib.error.URLError, ValueError, ssl.SSLError) as error:
-        # The message is the container runtime's only diagnostic, so it names the failure
-        # rather than only the address: a TLS rejection and a refused connection read
-        # differently. This text is the probe's own stderr, not the frozen runtime event
-        # stream, and it carries no credential.
-        return False, f"{type(error).__name__}: {error}"
+    except (OSError, urllib.error.URLError, ValueError) as error:
+        # A certificate this process will not trust, or a hostname that does not match it, is its
+        # own category; everything else that could not be reached is "unreachable".
+        return False, TLS_REFUSED if _tls_failure(error) else UNREACHABLE
     if payload != EXPECTED:
-        return False, f"unexpected liveness payload {payload!r}"
-    return True, "healthy"
+        return False, BAD_PAYLOAD
+    return True, HEALTHY
 
 
 def main(argv=None, environ=None):
@@ -121,10 +154,16 @@ def main(argv=None, environ=None):
     configured = environ.get(ENVIRONMENT_TIMEOUT)
     timeout = arguments.timeout
     if timeout is None:
-        timeout = float(configured) if configured else DEFAULT_TIMEOUT
+        try:
+            timeout = float(configured) if configured else DEFAULT_TIMEOUT
+        except ValueError:
+            # A malformed value is reported as a category too: it must not be echoed back, and
+            # it must not be silently replaced by the default either.
+            print(f"unhealthy: {BAD_TIMEOUT}", file=sys.stderr)
+            return 1
     url = arguments.url or probe_url(environ)
-    ok, message = check(url, ca=arguments.ca, timeout=timeout, environ=environ)
-    print(message if ok else f"unhealthy: {message}", file=sys.stdout if ok else sys.stderr)
+    ok, category = check(url, ca=arguments.ca, timeout=timeout, environ=environ)
+    print(category if ok else f"unhealthy: {category}", file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 
 
