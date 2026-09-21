@@ -13,10 +13,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
 
-from .clients import Gateway, JsonService, Memory, Origins, Sender, uid
+from .clients import Gateway, JsonService, Memory, Origins, Sender, set_log_port, uid
 from .contracts import Contracts, Fault, strict_json
 from .core import Core, Policy
 from .direct import SyntheticPlugin
+from . import health as health_module
+from . import observability as obs
 from .life_read import MAX_REQUEST_BYTES, LifeRead
 from .life_read import readers as read_reader_map
 from .life_read_queries import LifeReadQueries
@@ -28,6 +30,12 @@ LOG = logging.getLogger(__name__)
 
 _JSON_MEDIA_TYPE = "application/json"
 _TOKEN = frozenset("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+# Background-loop backoff bounds. A failure is never retried in a tight loop: the delay
+# grows from 50ms to a 30s ceiling, so a permanently broken dependency costs one attempt per
+# 30 seconds instead of twenty per second, and each real failure is still reported.
+BACKOFF_MIN_SECONDS = 0.05
+BACKOFF_MAX_SECONDS = 30.0
 
 
 def json_media_type(headers):
@@ -62,16 +70,233 @@ def json_media_type(headers):
     return True
 
 
+def log_adapter_from_environment(environ=None):
+    """Assemble the runtime event port from the explicit deployment configuration.
+
+    `TIANSHU_LOG_DIR` names the directory; the segment and directory budgets are optional
+    explicit bounds. With no directory the adapter is the honest non-durable stderr channel
+    and readiness says `non_durable`. An unusable value is a startup failure: a deployment
+    that meant to keep full logs must not come up quietly writing nowhere.
+    """
+    environ = os.environ if environ is None else environ
+
+    def count(name, default):
+        raw = environ.get(name)
+        if raw in (None, ""):
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be an integer byte count") from None
+        return value
+
+    directory = environ.get(obs.ENVIRONMENT_LOG_DIR) or None
+    try:
+        return obs.build_log_adapter(
+            directory,
+            max_segment_bytes=count(
+                obs.ENVIRONMENT_LOG_SEGMENT_BYTES, obs.DEFAULT_MAX_SEGMENT_BYTES
+            ),
+            max_directory_bytes=count(
+                obs.ENVIRONMENT_LOG_DIRECTORY_BYTES, obs.DEFAULT_MAX_DIRECTORY_BYTES
+            ),
+        )
+    except ValueError as error:
+        raise ValueError("Invalid runtime log configuration: " + str(error)) from None
+
+
+async def _sleep_interruptibly(seconds, wait):
+    """Cancelable bounded wait: a shutdown request ends the wait immediately."""
+    if wait is None:
+        await asyncio.sleep(seconds)
+        return
+    try:
+        await asyncio.wait_for(wait.wait(), timeout=seconds)
+    except (TimeoutError, asyncio.TimeoutError):
+        pass
+
+
+async def run_loop(
+    name,
+    work,
+    *,
+    port=None,
+    interval=0.05,
+    wait=None,
+    counter=None,
+    clock=time.monotonic,
+    sleep=None,
+):
+    """One background loop: bounded cancelable backoff, and one event per real outcome.
+
+    Each iteration either did real work, did nothing, or failed. A failure is reported every
+    single time it happens - never sampled, never filtered as a duplicate - and the next
+    attempt is delayed by a bounded, cancelable backoff. Nothing is swallowed as "already
+    seen".
+
+    A loop's own lifecycle is not reported: starting, idling and stopping are not outcomes, and
+    a record for each of the seven loops would be written before the process can serve at all -
+    which is precisely where a hard limit on the channel turns noise into a stalled start.
+    """
+    pause = sleep if sleep is not None else _sleep_interruptibly
+
+    def report(event, outcome, **fields):
+        if port is not None:
+            port.emit(event, outcome, **fields)
+
+    failures = 0
+    while True:
+        if wait is not None and wait.is_set():
+            break
+        outcome, error = "idle", None
+        # The baseline belongs to this pass: read it before the work runs, so an idle pass
+        # cannot inherit the previous pass's progress and report work it did not do.
+        before = counter(clock) if counter is not None else None
+        try:
+            await work()
+            outcome = "worked" if counter is None or counter(clock) != before else "idle"
+        except asyncio.CancelledError:
+            # A cancelled pass is a shutdown, not a failure: it is not reported as one, it is
+            # not retried, and the loop ends instead of rewriting the cancellation into a
+            # bounded-delay retry.
+            raise
+        except Exception as failure:  # noqa: BLE001 - every real failure is reported below
+            outcome = "failed"
+            error = failure
+        if outcome == "worked":
+            failures = 0
+            report("runtime.background_work", "succeeded", level="DEBUG")
+        elif outcome == "failed":
+            failures += 1
+            report(
+                "runtime.background_failed",
+                "failed",
+                level="ERROR",
+                error_code=obs.failure_class(error),
+            )
+        # An idle pass is deliberately not reported. Nothing happened, so a record would be a
+        # false account of the pass - and at these intervals idle records would outnumber real
+        # ones by orders of magnitude, filling the declared directory budget with noise while
+        # the events an operator needs to see were crowded out.
+        delay = (
+            # The first failure waits the documented minimum and each further failure doubles
+            # it, so the delay is driven by the earlier failures, not by this one.
+            min(BACKOFF_MAX_SECONDS, BACKOFF_MIN_SECONDS * (2 ** min(failures - 1, 16)))
+            if failures
+            else interval
+        )
+        await pause(delay, wait)
+
+
+class _LogBudgetExhausted(Exception):
+    """Internal signal: the log directory budget filled up before this request ran."""
+
+
+class RuntimeEvents:
+    """Application middleware: one correlation ID, three lifecycle events per request.
+
+    Everything that answers a probe rather than a caller is deliberately excluded. A probe must
+    be purely read-only, which includes not writing a log record, so the middleware never sees
+    it and the log directory is byte-for-byte identical before and after a probe.
+    """
+
+    def __init__(self, app, port, enabled=True):
+        self.app, self.port, self.enabled = app, port, enabled
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path") if scope["type"] == "http" else None
+        if not self.enabled or scope["type"] != "http" or path in health_module.PROBE_PATHS:
+            await self.app(scope, receive, send)
+            return
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers") or []
+        }
+        offered = headers.get(obs.CORRELATION_HEADER.lower())
+        # An invalid value - including one that looks like a secret - is replaced and never
+        # echoed back, so no caller can plant a string of its choosing in the event stream.
+        correlation = offered if obs.valid_correlation_id(offered) else obs.new_correlation_id()
+        started = time.perf_counter()
+        announced = refusal = False
+
+        async def wrapped_receive():
+            if not refusal and self._refused():
+                # The budget filled up before this request read its body, so nothing in the
+                # application has run yet and no side effect can be lost by refusing now.
+                raise _LogBudgetExhausted
+            return await receive()
+
+        async def wrapped_send(message):
+            nonlocal announced
+            if message["type"] == "http.response.start":
+                if refusal:
+                    # The 503 has already been sent; the application's own response is not
+                    # written on top of it, so the caller sees exactly one answer.
+                    return
+                announced = True
+            elif message["type"] == "http.response.body" and not announced:
+                return
+            await send(message)
+
+        with obs.correlation_scope(correlation):
+            obs.emit(self.port, "service.request.started", "started", correlation_id=correlation)
+            try:
+                if self._refused() and headers.get("content-length") not in (None, "0"):
+                    raise _LogBudgetExhausted
+                await self.app(scope, wrapped_receive, wrapped_send)
+            except _LogBudgetExhausted:
+                refusal = True
+                obs.emit(
+                    self.port,
+                    "service.request.finished",
+                    "rejected",
+                    level="ERROR",
+                    correlation_id=correlation,
+                    error_code="log_capacity_exhausted",
+                )
+                await self._refuse(send)
+            finally:
+                if not refusal:
+                    obs.emit(
+                        self.port,
+                        "service.request.finished",
+                        "succeeded",
+                        correlation_id=correlation,
+                        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                        fsync=True,
+                    )
+
+    async def _refuse(self, send):
+        body = json.dumps({"code": "dependency_unavailable"}).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 503,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"x-tianshu-log-capacity", b"exhausted"),
+                    (b"connection", b"close"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    def _refused(self):
+        return self.port is not None and not self.port.accepts_business()
+
+
 def build_runtime(config):
     contracts = Contracts(config["contracts_path"])
     clients = []
 
-    def client(name):
+    def client(name, label=None):
         entry = config.get("services", {}).get(name, {})
         value = JsonService(
             entry.get("url"),
             os.environ.get(entry.get("token_env", "")),
             ca_file=entry.get("ca_file"),
+            label=label,
         )
         clients.append(value)
         return value
@@ -83,7 +308,7 @@ def build_runtime(config):
         if token:
             incoming[service] = token
             if service in {"platform", "nonebot"}:
-                issuers[service] = (entry["issuer"], client(entry["origin_service"]))
+                issuers[service] = (entry["issuer"], client(entry["origin_service"], "origins"))
     # Registered character personas: the deployment mapping seeds one absolute initial
     # version, and every later version is an explicit operator act. The management
     # credential is separate from the chat/ingest credentials so no channel or bridge
@@ -107,7 +332,7 @@ def build_runtime(config):
             workflow=workflow,
             staging=image_config["staging"],
         )
-    outbound = Sender(contracts, client("nonebot"))
+    outbound = Sender(contracts, client("nonebot", "channel"))
     # Explicit functional commands. With no `direct` section nothing is registered, so no
     # text is ever claimed as a command and every message keeps following the chat chain.
     # The delivery port is the existing outbound sender: no second message exit is created.
@@ -127,8 +352,8 @@ def build_runtime(config):
         Store(config["database_path"]),
         contracts,
         Origins(contracts, issuers),
-        Memory(contracts, client("memory")),
-        Gateway(contracts, client("gateway")),
+        Memory(contracts, client("memory", "memory")),
+        Gateway(contracts, client("gateway", "gateway")),
         outbound,
         bindings=config.get("bindings", {}),
         roles=config.get("roles", {}),
@@ -141,7 +366,7 @@ def build_runtime(config):
         writing_options=config.get("writing"),
         proactive_options=config.get("proactive"),
         direct_options=direct_options,
-        web_sender=Sender(contracts, client("platform_sender")),
+        web_sender=Sender(contracts, client("platform_sender", "channel")),
         personas=bool(persona_config),
         # The whole deployment document: the persona module owns the rule for where a
         # character is declared, so startup and the maintenance CLI read it identically.
@@ -185,93 +410,101 @@ def create_app(core=None, tokens=None, life_readers=None):
                 contracts=core.contracts,
             )
 
-    async def worker():
-        while True:
-            try:
-                await core.tick()
-            except Exception as exc:
-                LOG.error("Core tick failed: %s", type(exc).__name__)
-            await asyncio.sleep(0.05)
+    log_port = log_adapter_from_environment()
+    set_log_port(log_port)
+    stopping = asyncio.Event()
 
-    async def publisher():
-        while True:
-            try:
-                await core.flush_outbox()
-            except Exception as exc:
-                LOG.error("Outbox worker failed: %s", type(exc).__name__)
-            await asyncio.sleep(0.5)
+    def _counter(owner, name):
+        """A read-only view of the pass counter the work itself advances."""
+        return lambda clock=None: owner.pass_count(name)
 
-    async def life_worker():
-        while True:
-            try:
-                await core.life.work()
-            except Exception as exc:
-                LOG.error("Life worker failed: %s", type(exc).__name__)
-            await asyncio.sleep(30)
+    def loop(name, work, interval, counter=None):
+        """One background loop, reported and backed off through the shared loop contract.
 
-    async def image_worker():
-        while True:
-            try:
-                await core.images.work()
-            except Exception as exc:
-                LOG.error("Image worker failed: %s", type(exc).__name__)
-            await asyncio.sleep(2)
-
-    async def writing_worker():
-        while True:
-            try:
-                await core.writing.work()
-            except Exception as exc:
-                LOG.error("Writing worker failed: %s", type(exc).__name__)
-            await asyncio.sleep(5)
-
-    async def proactive_worker():
-        while True:
-            try:
-                await core.proactive.work()
-            except Exception as exc:
-                LOG.error("Proactive worker failed: %s", type(exc).__name__)
-            await asyncio.sleep(2)
-
-    async def direct_worker():
-        # Commands execute here, off the chat path and off the ingest route, so a slow
-        # plugin cannot block message admission or the light conversation schedule.
-        while True:
-            try:
-                await core.direct.work()
-            except Exception as exc:
-                LOG.error("Direct command worker failed: %s", type(exc).__name__)
-            await asyncio.sleep(0.5)
+        Each pass reports whether it did real work or was idle, and every real failure is
+        reported as it happens - nothing is swallowed as "already seen". A failure delays the
+        next attempt by a bounded, cancelable backoff instead of retrying in a tight loop.
+        """
+        return asyncio.create_task(
+            run_loop(
+                name,
+                work,
+                port=log_port,
+                interval=interval,
+                wait=stopping,
+                counter=counter,
+                clock=time.monotonic,
+            )
+        )
 
     @asynccontextmanager
     async def lifespan(app):
         jobs = []
-        if core:
-            core.recover()
-            jobs = [
-                asyncio.create_task(worker()),
-                asyncio.create_task(publisher()),
-                asyncio.create_task(life_worker()),
-                asyncio.create_task(image_worker()),
-                asyncio.create_task(writing_worker()),
-                asyncio.create_task(proactive_worker()),
-                asyncio.create_task(direct_worker()),
-            ]
-        yield
-        for job in jobs:
-            job.cancel()
-        await asyncio.gather(*jobs, return_exceptions=True)
-        if core:
-            await core.close()
-        for client in clients:
-            await client.close()
+        try:
+            if core:
+                obs.emit(log_port, "runtime.started", "succeeded", fsync=True)
+                core.recover()
+                jobs = [
+                    loop("core.tick", core.tick, 0.05, _counter(core, "core.tick")),
+                    loop("core.outbox", core.flush_outbox, 0.5, _counter(core, "core.outbox")),
+                    loop("life.work", core.life.work, 30, _counter(core, "life.work")),
+                    loop("images.work", core.images.work, 2, _counter(core, "images.work")),
+                    loop("writing.work", core.writing.work, 5, _counter(core, "writing.work")),
+                    loop(
+                        "proactive.work",
+                        core.proactive.work,
+                        2,
+                        _counter(core, "proactive.work"),
+                    ),
+                    # Commands execute here, off the chat path and off the ingest route, so a
+                    # slow plugin cannot block message admission or the light conversation
+                    # schedule.
+                    loop("direct.work", core.direct.work, 0.5, _counter(core, "direct.work")),
+                ]
+            yield
+        finally:
+            obs.emit(log_port, "runtime.stopping", "started", fsync=True)
+            stopping.set()
+            for job in jobs:
+                job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
+            if core:
+                await core.close()
+            for client in clients:
+                await client.close()
+            log_port.close()
+            obs.emit(log_port, "runtime.stopped", "succeeded", fsync=True)
 
+    health_view = health_module.Health(
+        os.environ.get(health_module.TOKEN_ENV), core=core, log=log_port
+    )
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.core = core
+    app.state.log = log_port
+    app.state.health = health_view
+    app.state.stopping = stopping
 
     @app.get("/healthz")
     async def health():
         return dict(alive=True, configured=configured, external_dependencies="not_verified")
+
+    @app.get("/health/live")
+    async def live():
+        # Public minimum, and purely read-only: no credential, no dependency, no log write.
+        return JSONResponse(health_module.live_payload())
+
+    @app.get("/health/ready")
+    async def ready(request: Request):
+        # Its own credential, never a chat, bridge, ingest or persona-management one. An
+        # undeployed diagnostics credential answers 503; a missing or wrong one answers 401.
+        if not health_view.configured:
+            return JSONResponse(
+                {"code": "dependency_unavailable", "detail": "diagnostics_not_configured"},
+                status_code=503,
+            )
+        if not health_view.authorized(request.headers.get("Authorization")):
+            return JSONResponse({"code": "unauthorized"}, status_code=401)
+        return JSONResponse(health_view.ready())
 
     async def dispatch(request, operation):
         request_id = uid("req")
@@ -442,4 +675,9 @@ def create_app(core=None, tokens=None, life_readers=None):
     async def life_read_revision(request: Request):
         return await life_read_dispatch(request, "revision")
 
+    # Installed last so it wraps every route above, and skipped for the two health probes so
+    # a probe stays purely read-only. Nothing here decides a business question: it supplies a
+    # validated correlation ID, records the request lifecycle, and refuses new business only
+    # while the log budget is full.
+    app.add_middleware(RuntimeEvents, port=log_port)
     return app

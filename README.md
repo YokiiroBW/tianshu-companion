@@ -32,3 +32,9 @@ Core 图像与衣橱内部端口、ComfyUI 工作流审阅、SQLite v4 恢复及
 
 角色生活与**已发布日记**的授权只读内部端口（`life_readers` 部署、四个只读路由且只收
 `application/json`、索引范围 seek 的续页、派生索引与恢复点）：[docs/life-read.md](docs/life-read.md)。
+
+运行进程、容器挂载、健康检查与**本批未构建镜像**的说明：[docs/deployment.md](docs/deployment.md)。
+运行事件日志（`contracts/diagnostics/v1`）的字段、事件覆盖表、轮转预算与降级规则：
+[docs/runtime-events.md](docs/runtime-events.md)。`GET /health/live` 只表示进程存活；
+`GET /health/ready` 需要专用 `TIANSHU_DIAGNOSTICS_TOKEN`，本批 `dependencies` 恒为
+`not_verified`。

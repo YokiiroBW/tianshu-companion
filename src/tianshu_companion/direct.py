@@ -41,6 +41,7 @@ from collections.abc import Callable
 from .clients import command
 from .contracts import Fault, canonical, digest
 from .life import text, timestamp
+from . import observability as obs
 
 ENTRIES = {"command", "capability"}
 # The single reply owner of one request. A request has exactly one of these, for ever.
@@ -273,6 +274,7 @@ class Direct:
         adapter=None,
         deliver=None,
         bands=None,
+        events=None,
         timeout=20,
         request_expiry=600,
         max_commands=256,
@@ -285,6 +287,10 @@ class Direct:
             raise ValueError("A host authority guard is required")
         self.store, self.clock, self.guard = store, clock, guard
         self.adapter, self.delivery_port = adapter, deliver
+        # The injected runtime-event port. Routing, authorization, single execution and the
+        # single reply owner are all decided above and are not restated here; this port only
+        # records what the durable rows already say, and its failure changes no verdict.
+        self.events = events
         # The host's shared outbound coordinator. Without it this engine can only take the
         # conversation's next position for itself, which is honest but cannot wait for a
         # companion turn that is still sending its own segments.
@@ -734,6 +740,9 @@ class Direct:
                     **record,
                 ),
             )
+            # A genuinely new durable request: one admission, one event. A replay or a
+            # second entry on the same request returns above and is not admitted again.
+            obs.emit(self.events, "direct.request.queued", "started")
         return self.request_view(request_key)
 
     def _supersede(self, channel, message_id, keep):
@@ -1049,6 +1058,14 @@ class Direct:
         )
         self.store.put("direct_requests", request)
         self._notify(request["id"])
+        if state == "cancelled":
+            # The durable verdict already exists; the event repeats the stored reason.
+            obs.emit(
+                self.events,
+                "direct.request.cancelled",
+                "cancelled",
+                error_code=(reason or "").split(":", 1)[0] or None,
+            )
         return request
 
     def _notify(self, request_id):
@@ -1230,7 +1247,14 @@ class Direct:
             self.waiters.pop(request_id, None)
 
     async def _execute(self, exchange, bound):
+        # One correlation ID for this attempt: the plugin call and its settled outcome
+        # belong to the same operational trace.
+        with obs.correlation_scope():
+            await self._execute_attempt(exchange, bound)
+
+    async def _execute_attempt(self, exchange, bound):
         attempt_id = exchange["attempt_id"]
+        obs.emit(self.events, "direct.attempt.started", "started")
         try:
             result = await asyncio.wait_for(self.adapter.execute(dict(exchange)), timeout=bound)
             self._check_result(exchange, result)
@@ -1291,6 +1315,7 @@ class Direct:
 
     def settle(self, attempt_id, result):
         """Trusted adapter callback; a late one for a superseded attempt stays on it."""
+        outcome = None
         with self.store.transaction():
             attempt = self.store.get("direct_attempts", attempt_id)
             if attempt is None:
@@ -1318,8 +1343,17 @@ class Direct:
             self.store.put("direct_attempts", attempt)
             if not owns:
                 # A late reply for an older attempt never rewrites the request or a newer one.
-                return self.request_view(request_id)
-            self._apply_result(request, result)
+                outcome = result["state"]
+            else:
+                self._apply_result(request, result)
+        if outcome is None:
+            outcome = result["state"]
+        obs.emit(
+            self.events,
+            "direct.attempt.finished",
+            outcome,
+            level="INFO" if outcome == "completed" else "WARNING",
+        )
         return self.request_view(request_id)
 
     def _apply_result(self, request, result):
@@ -1447,6 +1481,9 @@ class Direct:
                 ),
             )
             self._record_delivery_intent(request, delivery)
+        # The frozen delivery document is durable before this point, so the event can never
+        # be the only record that a send was attempted.
+        obs.emit(self.events, "direct.delivery.started", "started")
         try:
             receipt = await asyncio.wait_for(
                 self.delivery_port.send(delivery), timeout=self.timeout
@@ -1504,6 +1541,14 @@ class Direct:
                     version=request["version"] + 1,
                 )
                 self.store.put("direct_requests", request)
+                # Waiting on a legal message boundary is a real, reportable state, recorded
+                # once per distinct wait rather than on every retry of the same wait.
+                obs.emit(
+                    self.events,
+                    "direct.delivery.deferred",
+                    "degraded",
+                    error_code="outbound_band_busy",
+                )
             return None, waiting
         return band, None
 
@@ -1580,6 +1625,13 @@ class Direct:
                 request.update(state="cancelled", blocked_reason=request["cancel_reason"])
             self.store.put("direct_requests", request)
             self._notify(request_id)
+        # One delivery intent, one reported outcome. An `unknown` receipt stays unknown.
+        obs.emit(
+            self.events,
+            "direct.delivery.finished",
+            receipt["state"],
+            level="INFO" if receipt["state"] == "sent" else "WARNING",
+        )
 
     async def reconcile(self, request_id):
         """Read-only receipt lookup. Never sends again, even while the local state is unknown."""

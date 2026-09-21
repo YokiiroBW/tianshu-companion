@@ -12,6 +12,29 @@ from urllib.parse import urlsplit
 import httpx
 
 from .contracts import Fault, canonical, digest, strict_json
+from . import observability as obs
+
+# The process-wide runtime event port. The host assembles it once, at the same place the
+# clients are built; nothing here creates a destination of its own, and an unassembled port
+# is the no-op adapter so a client used outside the process (a maintenance script, a test)
+# still behaves identically.
+LOG_PORT = obs.NullLogAdapter()
+
+
+def set_log_port(port):
+    """Assemble the runtime event port. Called once by the application factory."""
+    global LOG_PORT
+    LOG_PORT = port if port is not None else obs.NullLogAdapter()
+    return LOG_PORT
+
+
+def _duration_ms(started):
+    return round(max(0.0, (time.perf_counter() - started) * 1000), 3)
+
+
+def _label(value, allowed):
+    """A registered interface label, never a configured value from a deployment document."""
+    return value if isinstance(value, str) and value in allowed else "unknown"
 
 
 def uid(prefix):
@@ -52,7 +75,7 @@ class JsonService:
     )
     QUERY_BUDGET_SECONDS = 15
 
-    def __init__(self, url=None, token=None, *, transport=None, ca_file=None):
+    def __init__(self, url=None, token=None, *, transport=None, ca_file=None, label=None):
         if url and (
             urlsplit(url).scheme != "https"
             or urlsplit(url).username
@@ -62,6 +85,9 @@ class JsonService:
         ):
             raise ValueError("Internal service URL must be an explicitly configured HTTPS URL")
         self.url, self.token = url, token
+        # A registered interface label for the runtime event stream. It is never the
+        # configured URL, host or any other deployment value.
+        self.label = _label(label, obs.PEER_LABELS)
         if ca_file is not None and (not Path(ca_file).is_absolute() or not Path(ca_file).is_file()):
             raise ValueError("CA file must be an existing absolute deployment path")
         verify = ssl.create_default_context(cafile=ca_file) if ca_file else True
@@ -76,17 +102,34 @@ class JsonService:
             body is None
             and re.fullmatch(r"/internal/v1/model-requests/model:[0-9a-f]{32}", path) is not None
         )
+        # One correlation ID for the whole logical call, taken unchanged from the operation
+        # in flight so the caller's other events share it. It is not propagated to a peer
+        # body or credential: only the dedicated header carries it.
+        correlation = obs.current_correlation_id() or obs.new_correlation_id()
+        request_headers = {
+            "Authorization": "Bearer " + self.token,
+            obs.CORRELATION_HEADER: correlation,
+            **(headers or {}),
+        }
+        started, attempts = time.perf_counter(), 0
+        LOG_PORT.emit(
+            "peer.call.started",
+            "started",
+            correlation_id=correlation,
+            duration_ms=None,
+        )
         try:
             request = self.client.build_request(
                 "GET" if body is None else "POST",
                 self.url.rstrip("/") + path,
                 json=body,
-                headers={"Authorization": "Bearer " + self.token, **(headers or {})},
+                headers=request_headers,
             )
             # One wall-clock budget covers both attempts and the response body.
             # Reuse serialized bytes/IDs/headers, never replace the shared client.
             async with asyncio.timeout(self.QUERY_BUDGET_SECONDS if retry_query else None):
                 for attempt in range(2 if retry_query else 1):
+                    attempts = attempt + 1
                     try:
                         response = await self.client.send(request, stream=True)
                         break
@@ -116,9 +159,30 @@ class JsonService:
                 }:
                     raise Fault(code, unknown=value.get("execution_state") == "unknown")
                 raise Fault("dependency_unavailable")
+            self._report("succeeded", correlation, started, attempts)
             return value
-        except (httpx.HTTPError, ValueError, TimeoutError):
+        except (httpx.HTTPError, ValueError, TimeoutError, Fault) as error:
+            # Third-party exception text is never logged; only a fixed failure class.
+            self._report("failed", correlation, started, attempts, error)
+            if isinstance(error, Fault):
+                raise
             raise Fault("dependency_unavailable") from None
+
+    def _report(self, outcome, correlation, started, attempts, error=None):
+        LOG_PORT.emit(
+            "peer.call.finished",
+            outcome,
+            level="INFO" if outcome == "succeeded" else "WARNING",
+            correlation_id=correlation,
+            error_code=(
+                error.code
+                if isinstance(error, Fault)
+                else obs.failure_class(error)
+                if error is not None
+                else None
+            ),
+            duration_ms=_duration_ms(started),
+        )
 
     async def close(self):
         await self.client.aclose()

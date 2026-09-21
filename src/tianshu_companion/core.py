@@ -9,6 +9,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 
 from .clients import command, epoch, uid, utc
+from . import clients
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 from .direct import Direct
 from .life import Life
@@ -16,6 +17,7 @@ from .images import Images
 from .personas import PersonaError, Personas
 from .proactive import Proactive
 from .web_snapshot import snapshot as read_web_snapshot
+from . import observability as obs
 from .context import (
     TEXT_DOMAIN,
     TurnContext,
@@ -45,6 +47,24 @@ ACTIVE = {
     "sending",
     "reconciling",
 }
+
+
+def _elapsed_ms(started):
+    """A wall-clock duration for one event, wrapped so it is not a business quantity."""
+    return round(max(0.0, (time.perf_counter() - started) * 1000), 3)
+
+
+# One counter per background pass kind. The value only ever says "this pass did something",
+# which is what separates a real work event from an idle loop.
+WORK_COUNTERS = (
+    "core.tick",
+    "core.outbox",
+    "life.work",
+    "images.work",
+    "writing.work",
+    "proactive.work",
+    "direct.work",
+)
 
 
 @dataclass(frozen=True)
@@ -86,9 +106,16 @@ class Core:
         direct_options=None,
         personas=False,
         persona_import=None,
+        events=None,
     ):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
+        # The injected runtime-event port. It records what already happened and decides
+        # nothing: no rule is moved here, no table is created, and a port that fails or is
+        # absent cannot change one business outcome. An explicit port is honoured; otherwise
+        # the one the process assembled is resolved when an event is emitted, so a Core built
+        # before the application exists still reports through the application's port.
+        self._events = events
         self.web_sender = web_sender
         self.bindings, self.roles, self.config_version = bindings, roles, config_version
         # Registered persona versions. Left off, `roles` is used as the mutable persona
@@ -106,6 +133,10 @@ class Core:
         contracts.check("conversation#policy", asdict(self.policy))
         self.models = asyncio.Semaphore(model_slots)
         self.jobs, self.send_jobs = {}, {}
+        # Monotonic counters advanced only when a background pass really did something.
+        # They are diagnostics, not business state: they gate no decision and survive no
+        # restart, and losing them changes nothing except that one idle pass is reported.
+        self.pass_counters = {name: 0 for name in WORK_COUNTERS}
         self.short_context_policy = short_context_policy or ShortContextPolicy()
         try:
             self.life = Life(
@@ -120,11 +151,20 @@ class Core:
                 dispatcher=proactive_dispatcher,
                 **(proactive_options or {}),
             )
+            self._counting = (
+                ("life.work", self.life),
+                ("images.work", self.images),
+                ("writing.work", self.writing),
+                ("proactive.work", self.proactive),
+            )
+            for name, unit in self._counting:
+                self._wrap_pass(name, unit)
             self.direct = Direct(
                 store,
                 clock,
                 self._direct_guard,
                 bands=self.open_send_band,
+                events=self.events,
                 **(direct_options or {}),
             )
             migrate_legacy(store)
@@ -136,10 +176,42 @@ class Core:
             store.close()
             raise
 
+    @property
+    def events(self):
+        """The runtime-event port this Core reports through, resolved lazily."""
+        return self._events if self._events is not None else clients.LOG_PORT
+
     def _save_turn(self, turn):
         turn["version"] += 1
         turn["updated_at"] = utc(self.clock())
         self.store.put("turns", turn)
+
+    def pass_count(self, name):
+        """How many changes this kind of background work has observed, or None if unknown."""
+        return self.pass_counters.get(name)
+
+    def counted(self, name):
+        """Record what one background pass observed. A counter, never a decision."""
+        if name in self.pass_counters:
+            self.pass_counters[name] = self.store.db.total_changes
+
+    def _wrap_pass(self, name, unit):
+        """Count a unit's own pass without moving any of its rules into Core.
+
+        "Did it do something" is read from SQLite's own change counter, which advances only
+        when a statement really modified a row. That is an observation of the pass, not a
+        second copy of the unit's judgement, so nothing about what counts as work is decided
+        here.
+        """
+        work = getattr(unit, "work")
+
+        async def counted_work():
+            try:
+                return await work()
+            finally:
+                self.pass_counters[name] = self.store.db.total_changes
+
+        unit.work = counted_work
 
     def turn_wire(self, turn):
         return dict(
@@ -731,6 +803,10 @@ class Core:
             source_deadline=c["source_deadline"],
             bootstrap_until=None,
             retry_at=0,
+            # The request's own correlation ID is recorded on the queued turn so the whole
+            # causal chain - preparation, generation, delivery - keeps one identifier even
+            # though each of those runs later, on its own task, outside this request's scope.
+            correlation_id=obs.current_correlation_id(),
         )
         self.store.put("turns", turn)
 
@@ -770,6 +846,13 @@ class Core:
                 external_actions_rolled_back=False,
             )
             self._remember_command(key, signature, result)
+        # The cancellation verdict is already durable; recording it cannot change it.
+        obs.emit(
+            self.events,
+            "turn.cancelled",
+            "cancelled",
+            error_code=None if state == "too_late" else request["reason"],
+        )
         job = self.jobs.get(turn["id"])
         if job and not job.done():
             job.cancel()
@@ -910,6 +993,7 @@ class Core:
                 )
         self.jobs = {k: v for k, v in self.jobs.items() if not v.done()}
         self.send_jobs = {k: v for k, v in self.send_jobs.items() if not v.done()}
+        before = self.pass_counters["core.tick"]
         with self.store.transaction():
             self._seal_due(self.clock())
             for conv in self.store.list("conversations"):
@@ -945,6 +1029,8 @@ class Core:
                     )
                     turn["timings"]["started_at"] = utc(self.clock())
                     self._save_turn(turn)
+                    # Two turns per conversation at most; each admission is one real event.
+                    obs.emit(self.events, "turn.queued", "started")
                 for turn in self.store.list("turns", cid, ["preparing", "waiting_dependency"]):
                     if turn["id"] not in self.jobs and turn["retry_at"] <= self.clock():
                         self.jobs[turn["id"]] = asyncio.create_task(self._process(turn["id"]))
@@ -964,6 +1050,8 @@ class Core:
                     # instead of waiting for the direct worker's next pass.
                     self.jobs[waiting] = asyncio.create_task(self.direct.work())
         await asyncio.sleep(0)
+        if self.store.db.total_changes > before:
+            self.counted("core.tick")
 
     def _pin_role(self, actor):
         """Snapshot the persona at the turn preparation boundary.
@@ -1025,6 +1113,17 @@ class Core:
             raise Fault("dependency_unavailable") from None
 
     async def _process(self, turn_id):
+        # One correlation ID for this turn's whole processing: the request that queued the
+        # turn accepted an identifier, this later task inherited nothing from that request's
+        # scope, so the persisted turn is what carries it across the boundary. Preparation
+        # calls, the model call and every event along the way share that one identifier.
+        turn = self.store.get("turns", turn_id)
+        accepted = (turn or {}).get("correlation_id")
+        with obs.correlation_scope(accepted):
+            await self._process_turn(turn_id)
+
+    async def _process_turn(self, turn_id):
+        generation_started = time.perf_counter()
         try:
             turn = self.store.get("turns", turn_id)
             if turn["cancelled"] or turn["phase"] in TERMINAL:
@@ -1073,6 +1172,7 @@ class Core:
                         ]
                 with self.store.transaction():
                     self._save_turn(turn)
+                obs.emit(self.events, "turn.prepared", "succeeded")
             dependencies = []
             for item in turn["bundle"]["dependencies"]:
                 previous = self.store.get("turns", item["turn_id"])
@@ -1169,6 +1269,7 @@ class Core:
                     turn["model_calls"] += 1
                     turn["timings"]["model_started_at"] = utc(self.clock())
                     self._save_turn(turn)
+                obs.emit(self.events, "turn.generation.started", "started")
                 segments, usage = await asyncio.wait_for(
                     self.gateway.generate(turn, messages), timeout=60
                 )
@@ -1205,9 +1306,25 @@ class Core:
                     self._save_turn(turn)
                 else:
                     self._finish(turn, "observed", "not_required")
+            obs.emit(
+                self.events,
+                "turn.generation.finished",
+                "succeeded",
+                duration_ms=_elapsed_ms(generation_started),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            # Only a registered code or the exception's own fixed class is reported: the
+            # exception text could quote a request body or a token, so it never travels, and
+            # a failure with no code at all would be a failure nobody can look up.
+            obs.emit(
+                self.events,
+                "turn.generation.finished",
+                "failed",
+                level="ERROR",
+                error_code=error.code if isinstance(error, Fault) else obs.failure_class(error),
+            )
             with self.store.transaction():
                 turn = self.store.get("turns", turn_id)
                 turn["failure"] = error.code if isinstance(error, Fault) else type(error).__name__
@@ -1467,6 +1584,9 @@ class Core:
             self.store.put("replies", reply)
             turn["phase"] = "sending"
             self._save_turn(turn)
+        # The intent is durable before the transport call, so an event recorded here can
+        # never be the only evidence that a send was attempted.
+        obs.emit(self.events, "turn.delivery.started", "started")
         try:
             receipt = await asyncio.wait_for(sender.send(request), timeout=20)
             self._check_receipt(request, receipt)
@@ -1482,6 +1602,14 @@ class Core:
                 observed_at=utc(self.clock()),
                 retry_safe=False,
             )
+        # One reply, one outcome. An `unknown` verdict is recorded as unknown and never
+        # becomes a retry: the log repeats the receipt, it never decides a new one.
+        obs.emit(
+            self.events,
+            "turn.delivery.finished",
+            receipt["state"],
+            level="INFO" if receipt["state"] == "sent" else "WARNING",
+        )
         self.record_receipt(reply["id"], receipt)
 
     def _check_receipt(self, request, receipt):
@@ -1598,6 +1726,8 @@ class Core:
                     self._finish(fresh, "closed_unknown", "unknown")
 
     async def flush_outbox(self):
+        # Only a pass that really attempted something is an event; an idle pass is not.
+        before = {item["id"]: item.get("attempts") for item in self.store.list("outbox")}
         for item in self.store.list("outbox", states=["blocked_scope"]):
             if item["deadline"] > self.clock():
                 continue
@@ -1636,6 +1766,16 @@ class Core:
             item["attempts"] += 1
             with self.store.transaction():
                 self.store.put("outbox", item)
+        self._report_outbox(before)
+        self.counted("core.outbox")
+
+    def _report_outbox(self, before):
+        """One event per pass that really attempted an outbox row; an idle pass is silent."""
+        attempts = {item["id"]: item.get("attempts") for item in self.store.list("outbox")}
+        if any(attempts.get(key) != value for key, value in before.items()) or set(attempts) - set(
+            before
+        ):
+            obs.emit(self.events, "outbox.flush", "succeeded")
 
     async def repair_blocked_scope(self, turn_id, verify_current):
         """Internal repair port, not a new wire endpoint or an assertion bypass.

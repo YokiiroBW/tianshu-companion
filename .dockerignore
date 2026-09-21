@@ -1,0 +1,28 @@
+# Build context hygiene: the image gets the runtime and nothing else.
+#
+# Everything excluded here is either a secret, a local artefact, or a file that only matters on
+# a developer's machine. The coordination repository is excluded by construction: it lives
+# outside this checkout, so it can never be part of this context.
+
+# Version control, caches and local environments
+.git
+.gitignore
+.ruff_cache
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+*.egg-info
+
+# Task-local runtime state: synthetic databases, synthetic logs, delivery scratch
+.runtime
+
+# Tests, fixtures and developer tooling are not part of the image
+tests
+requirements-dev.txt
+
+# Documentation and contracts are mounted, not baked: the deployment loads the published pack
+# from a read-only mount so a stale copy inside the image cannot be used by accident.
+docs
+contracts
+AGENTS.md
