@@ -167,3 +167,51 @@ docker run --rm \
 - 就绪的 `dependencies` 在本批恒为 `not_verified`：没有真实依赖可验证，就不写 `ok`。
 - 空闲的后台轮次与探针不写日志记录；理由见 `docs/runtime-events.md` 第 3 节。
 - 未配置业务请求返回 503；未配置的子系统明确不可用，绝不显示成成功。
+
+## 10. TS-108 首版能力停用接口（产品内 v1）
+
+部署 JSON 顶层字段 `automatic_memory_candidates` 只接受布尔值。省略为 `true`，
+保留自动产生并提交对话候选的已有行为；首次隔离文字试部署必须显式写 `false`。
+这是启动配置，变更需正常停机后重启，不支持运行时热切换。禁用只影响对话结束的
+长期记忆候选事件，不关闭身份、来源验证、记忆读取、短期上下文或聊天投递。
+
+公开只读入口：`GET /internal/v1/runtime/capabilities`，使用独立
+`Authorization: Bearer <TIANSHU_DIAGNOSTICS_TOKEN>`。缺部署凭据 503，
+缺/错请求凭据 401，Core 未装配 503；正常读取 200，**200 仅表示读取成功**。
+该入口不属于跨产品 `diagnostics/v1` 健康/事件文档，不扩展其词汇；
+`/health/ready` 与运行事件的字段、语义保持原合同。
+
+禁用且没有历史候选时返回：
+
+```json
+{
+  "schema_version": 1,
+  "service": "companion",
+  "automatic_memory_candidates": {
+    "enabled": false,
+    "generation": "disabled",
+    "submission": "paused",
+    "backlog_policy": "preserve",
+    "retained_outbox": {
+      "pending": false,
+      "blocked_scope": false,
+      "submitting": false,
+      "unknown": false
+    },
+    "memory_write_verification": "not_verified"
+  },
+  "chat_audit": {"enabled": false, "state": "not_integrated"}
+}
+```
+
+启用时 `enabled=true`、`generation="enabled"`、`submission="enabled"`；其余键不变。
+`retained_outbox` 各布尔值表示该状态是否仍有记录（索引 LIMIT 1，只读，不是全表计数）；
+禁用不修改/清除任何旧候选、不修复其 scope、不启动积压提交，也不为新轮次创建待消费
+事件。再次显式启用才恢复原 `pending` / `blocked_scope` 处理，`unknown` 永不自动重发。
+`submitting` 表示已记提交意图但尚未取得可信结果：禁用重启保持原字节；启用恢复时转为
+`unknown`，不假定未执行。正常接受候选也不等于提炼/写入长期记忆，故这里不宣称成功。
+Chat Audit 尚未接入，恒声明未启用；不生成归档成功回执。
+
+状态入口只反映当前进程实际生效配置与本地持久事实，不写数据库、日志或调用对端，
+也不作为容器重启探针。发布组合应同时校验配置 `false`、运行状态 `disabled/paused`，
+以及超过 256 轮合成对话仍没有新增待消费候选；不能仅凭配置文件认定停用已生效。
