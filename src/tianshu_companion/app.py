@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,6 +27,7 @@ from .store import Store
 from .images import ComfyUI, Workflow
 from .short_context import ShortContextPolicy
 from .worker_health import WorkerHealth
+from . import runtime_capabilities
 
 LOG = logging.getLogger(__name__)
 
@@ -215,7 +217,12 @@ class RuntimeEvents:
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path") if scope["type"] == "http" else None
-        if not self.enabled or scope["type"] != "http" or path in health_module.PROBE_PATHS:
+        if (
+            not self.enabled
+            or scope["type"] != "http"
+            or path in health_module.PROBE_PATHS
+            or path == runtime_capabilities.PATH
+        ):
             await self.app(scope, receive, send)
             return
         headers = {
@@ -327,6 +334,9 @@ class RuntimeEvents:
 
 
 def build_runtime(config):
+    automatic_memory_candidates = runtime_capabilities.candidates_enabled(
+        config.get("automatic_memory_candidates", True)
+    )
     contracts = Contracts(config["contracts_path"])
     clients = []
 
@@ -401,6 +411,7 @@ def build_runtime(config):
         policy=Policy(**config.get("policy", {})),
         short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
         life_writing=config.get("life_writing", False),
+        automatic_memory_candidates=automatic_memory_candidates,
         life_config_version=config.get("life_config_version"),
         image_options=image_options,
         writing_options=config.get("writing"),
@@ -587,6 +598,19 @@ def create_app(core=None, tokens=None, life_readers=None):
         # the response says 200 is exactly the kind of false readiness a load balancer trusts.
         answer = health_view.ready()
         return JSONResponse(answer, status_code=200 if answer["status"] == "ready" else 503)
+
+    @app.get(runtime_capabilities.PATH)
+    async def capabilities(request: Request):
+        if not health_view.configured:
+            return JSONResponse({"code": "dependency_unavailable"}, status_code=503)
+        if not health_view.authorized(request.headers.get("Authorization")):
+            return JSONResponse({"code": "unauthorized"}, status_code=401)
+        if core is None or getattr(core, "closed", False):
+            return JSONResponse({"code": "dependency_unavailable"}, status_code=503)
+        try:
+            return JSONResponse(runtime_capabilities.read_capabilities(core))
+        except sqlite3.Error:
+            return JSONResponse({"code": "dependency_unavailable"}, status_code=503)
 
     async def dispatch(request, operation):
         request_id = uid("req")

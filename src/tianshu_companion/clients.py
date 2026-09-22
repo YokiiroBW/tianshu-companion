@@ -97,7 +97,7 @@ class JsonService:
             timeout=15, follow_redirects=False, trust_env=False, transport=transport, verify=verify
         )
 
-    async def call(self, path, body=None, headers=None):
+    async def call(self, path, body=None, headers=None, *, uncertain_write=False):
         if not self.url or not self.token:
             raise Fault("dependency_unavailable")
         retry_query = (body is not None and path in self.QUERY_PATHS) or (
@@ -115,6 +115,7 @@ class JsonService:
             **(headers or {}),
         }
         started, attempts = time.perf_counter(), 0
+        sent, not_started = False, False
         LOG_PORT.emit(
             "peer.call.started",
             "started",
@@ -136,6 +137,7 @@ class JsonService:
                 for attempt in range(2 if retry_query else 1):
                     attempts = attempt + 1
                     try:
+                        sent = True
                         response = await self.client.send(request, stream=True)
                         break
                     except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError):
@@ -157,6 +159,9 @@ class JsonService:
                     await response.aclose()
             value = strict_json(content)
             if response.status_code >= 300:
+                not_started = (
+                    isinstance(value, dict) and value.get("execution_state") == "not_started"
+                )
                 code = value.get("code") if isinstance(value, dict) else None
                 if code in {
                     "scope_changed",
@@ -176,8 +181,12 @@ class JsonService:
             # Third-party exception text is never logged; only a fixed failure class.
             self._report("failed", correlation, started, attempts, error)
             if isinstance(error, Fault):
+                if uncertain_write and sent and not not_started:
+                    raise Fault(
+                        error.code, unknown=True, current_version=error.current_version
+                    ) from None
                 raise
-            raise Fault("dependency_unavailable") from None
+            raise Fault("dependency_unavailable", unknown=uncertain_write and sent) from None
 
     def _report(self, outcome, correlation, started, attempts, error=None):
         LOG_PORT.emit(
@@ -408,14 +417,19 @@ class Memory:
         return response
 
     async def commit(self, event):
-        value = await self.client.call("/internal/v1/memory/turn-commits", event)
-        self.contracts.check("identity-memory#consume_receipt", value)
+        value = await self.client.call(
+            "/internal/v1/memory/turn-commits", event, uncertain_write=True
+        )
+        try:
+            self.contracts.check("identity-memory#consume_receipt", value)
+        except Fault as error:
+            raise Fault(error.code, unknown=True) from None
         if (
             value["event_id"] != event["event_id"]
             or value["turn_id"] != event["aggregate_id"]
             or value["input_revision"] != event["input_revision"]
         ):
-            raise Fault("invalid_input")
+            raise Fault("invalid_input", unknown=True)
         return value
 
 

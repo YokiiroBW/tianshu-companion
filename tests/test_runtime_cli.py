@@ -606,6 +606,29 @@ class _ProcessTests(unittest.TestCase):
         store = Store(self.database)
         self.addCleanup(store.close)
 
+    def test_actual_startup_exposes_disabled_candidates_and_unintegrated_chat_audit(self):
+        import urllib.request
+
+        config = json.loads(self.config.read_text(encoding="utf-8"))
+        config["automatic_memory_candidates"] = False
+        self.config.write_text(json.dumps(config), encoding="utf-8")
+        self.environment["TIANSHU_DIAGNOSTICS_TOKEN"] = "synthetic-diagnostics"
+        for _ in range(2):
+            process, port = self.start()
+            self.reachable(process, port)
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/internal/v1/runtime/capabilities",
+                headers={"Authorization": "Bearer synthetic-diagnostics"},
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                self.assertEqual(200, response.status)
+                state = json.load(response)
+            self.assertFalse(state["automatic_memory_candidates"]["enabled"])
+            self.assertEqual("disabled", state["automatic_memory_candidates"]["generation"])
+            self.assertEqual("paused", state["automatic_memory_candidates"]["submission"])
+            self.assertEqual({"enabled": False, "state": "not_integrated"}, state["chat_audit"])
+            self.stop(process)
+
     def test_shutdown_is_an_orderly_transition_not_a_crash(self):
         process, port = self.start()
         self.reachable(process, port)

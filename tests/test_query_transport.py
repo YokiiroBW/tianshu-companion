@@ -217,6 +217,48 @@ class QueryTLS(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(service.close)
         return service
 
+    async def test_memory_received_commit_with_lost_tls_response_stays_unknown_after_restart(self):
+        seen = []
+
+        async def drop(reader, writer):
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                length = next(
+                    int(line.split(b":", 1)[1])
+                    for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+                seen.append(json.loads(await reader.readexactly(length)))
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(self.root / "cert.pem", self.root / "key.pem")
+        server = await asyncio.start_server(drop, "127.0.0.1", 0, ssl=tls)
+        async with server:
+            h = Harness(self.root / "synthetic.db", silence_ms=0)
+            try:
+                await h.ingest()
+                await h.cycles()
+                h.core.memory = Memory(
+                    h.contracts, self.service(server.sockets[0].getsockname()[1])
+                )
+                await h.core.flush_outbox()
+                self.assertEqual(1, len(seen))
+                self.assertEqual("unknown", h.core.store.list("outbox")[0]["state"])
+                remote = h.core.memory
+                await h.core.close()
+                h.core = h.new_core()
+                h.core.memory = remote
+                h.core.recover()
+                h.clock.advance(600)
+                await h.core.flush_outbox()
+                self.assertEqual(1, len(seen))
+                self.assertEqual("unknown", h.core.store.list("outbox")[0]["state"])
+            finally:
+                await h.core.close()
+
     async def test_uvicorn_idle_close_recovers_on_new_tls_connection_without_interrupting_t2(self):
         seen, traces = [], []
         t2_entered, release_t2, stalled = asyncio.Event(), asyncio.Event(), asyncio.Event()

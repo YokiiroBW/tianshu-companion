@@ -37,6 +37,7 @@ from .source_sync import ingest as ingest_sources, migrate_legacy, read_facts
 from .source_sync import ensure_channel
 from .source_sync import invalidate_physical
 from .writing import Writing
+from .runtime_capabilities import candidates_enabled
 
 TERMINAL = {"sent", "failed", "cancelled", "observed", "closed_unknown"}
 ACTIVE = {
@@ -111,7 +112,10 @@ class Core:
         personas=False,
         persona_import=None,
         events=None,
+        automatic_memory_candidates=True,
     ):
+        self._automatic_memory_candidates = candidates_enabled(automatic_memory_candidates)
+        self._outbox_lock = asyncio.Lock()
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
         # The injected runtime-event port. It records what already happened and decides
@@ -179,6 +183,11 @@ class Core:
         except BaseException:
             store.close()
             raise
+
+    @property
+    def automatic_memory_candidates(self):
+        """Startup-only policy. Changing it requires orderly shutdown and a new Core."""
+        return self._automatic_memory_candidates
 
     @property
     def events(self):
@@ -897,6 +906,8 @@ class Core:
             result_version=1,
         )
         self._save_turn(turn)
+        if not self.automatic_memory_candidates:
+            return
         # Failure before authoritative scope lookup retains a pending local event;
         # it cannot fabricate scope_version=1 for memory ingestion.
         event = dict(
@@ -954,6 +965,12 @@ class Core:
             # silently rewrite an in-flight turn's persona.
             self.persona_problems = self.personas.recover()
         with self.store.transaction():
+            if self.automatic_memory_candidates:
+                # A persisted intent cannot prove whether Memory accepted it before exit.
+                # Disabled startup preserves even these rows byte-for-byte.
+                for item in self.store.list("outbox", states=["submitting"]):
+                    item.update(state="unknown", last_error="result_unknown")
+                    self.store.put("outbox", item)
             for reply in self.store.list("replies", states=["sending"]):
                 reply.update(state="unknown", unknown_since=reply["attempted_at"])
                 self.store.put("replies", reply)
@@ -1753,12 +1770,19 @@ class Core:
                     self._finish(fresh, "closed_unknown", "unknown")
 
     async def flush_outbox(self):
+        if not self.automatic_memory_candidates:
+            return
+        async with self._outbox_lock:
+            await self._flush_outbox()
+
+    async def _flush_outbox(self):
         # Only due work is materialized; completed history is never read to infer outcomes.
         attempted = False
         for item in self.store.due("outbox", ["blocked_scope", "pending"], self.clock()):
             turn = self.store.get("turns", item["event"]["aggregate_id"])
             with obs.correlation_scope(self._turn_correlation(turn)):
                 outcome, error_code = "succeeded", None
+                attempts = item["attempts"] + 1
                 try:
                     if item["state"] == "blocked_scope":
                         await self.repair_blocked_scope(turn["id"], self.memory.check_sources)
@@ -1775,16 +1799,34 @@ class Core:
                             outcome = "cancelled"
                         else:
                             self.contracts.check("conversation#committed_event", item["event"])
-                            receipt = await self.memory.commit(item["event"])
+                            item["state"] = "submitting"
+                            item["attempts"] = attempts
+                            self.store.put("outbox", item)
+                            try:
+                                receipt = await self.memory.commit(item["event"])
+                            except BaseException:
+                                # Cancellation or an unclassified adapter failure is also
+                                # uncertain. Persist it before propagating to the worker.
+                                item.update(state="unknown", last_error="result_unknown")
+                                self.store.put("outbox", item)
+                                raise
                             item.update(state="delivered", receipt=receipt, last_error=None)
                 except (Fault, OSError, TimeoutError) as error:
-                    outcome = "failed"
+                    uncertain = item["state"] == "unknown" and (
+                        not isinstance(error, Fault)
+                        or error.unknown
+                        or error.code == "result_unknown"
+                    )
+                    outcome = "unknown" if uncertain else "failed"
                     error_code = (
                         error.code if isinstance(error, Fault) else "dependency_unavailable"
                     )
+                    if item["state"] == "unknown" and not uncertain:
+                        # Only an explicit not-started failure can restore retry eligibility.
+                        item["state"] = "pending"
                     item["last_error"] = error_code
-                    item["deadline"] = self.clock() + min(60, 2 ** min(item["attempts"], 6))
-                item["attempts"] += 1
+                    item["deadline"] = self.clock() + min(60, 2 ** min(attempts - 1, 6))
+                item["attempts"] = attempts
                 self.store.put("outbox", item)
                 obs.emit(self.events, "outbox.flush", outcome, error_code=error_code)
                 attempted = True
@@ -1800,6 +1842,8 @@ class Core:
         Runtime supplies the authenticated Memory source-sync/check client.
         The original event ID stays stable.
         """
+        if not self.automatic_memory_candidates:
+            return
         turn = self.store.get("turns", turn_id)
         ensure_channel(self.store, turn["bundle"]["collection_key"]["channel"])
         for item in self.store.turn_outbox(turn_id, "blocked_scope"):

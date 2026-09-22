@@ -129,23 +129,50 @@ python -m tianshu_companion.runtime_cli \
 
 ## 7. 容器镜像
 
-`Dockerfile` 是 `python:3.12-slim`、非 root `10001:10001`、exec 形式入口、固定单 worker、
+`Dockerfile` 固定 `python:3.12.14-slim-bookworm` 及 OCI 索引 digest
+`sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e`，
+非 root `10001:10001`、exec 形式入口、固定单 worker、
 不烘焙凭据、不下载模型。`.dockerignore` 排除版本控制、缓存、`.runtime`、`tests` 与
 `contracts`（合同走挂载）。
 
 ```bash
 # 尚未在本批执行过，此处只是预期用法，不构成"已验证"
-docker build -t tianshu-companion:ts-101 .
+docker build -t tianshu-companion:ts-108 .
 docker run --rm \
   -v /srv/tianshu/config:/config:ro \
   -v /srv/tianshu/contracts:/contracts:ro \
   -v /srv/tianshu/data:/data \
   -v /srv/tianshu/logs:/var/log/tianshu \
   -e TIANSHU_DIAGNOSTICS_TOKEN=... \
-  tianshu-companion:ts-101
+  tianshu-companion:ts-108
 ```
 
 **上面两条命令在本批没有运行过。** 未构建的镜像就是未验证的镜像。
+
+TS-108 从 Docker 官方仓库核得上述索引，其 Linux/amd64 manifest 为
+`sha256:1aaa65a85fda306ffb8b910824d4e93bdce61e212c7e87168123ea3073b41a1a`，
+上游源码修订为 `688a0b86bb44289df16a363e9f41d90514c1a5f9`。依据为
+[官方镜像登记](https://github.com/docker-library/official-images/blob/master/library/python)及
+[固定 Python 镜像源码](https://github.com/docker-library/python/tree/688a0b86bb44289df16a363e9f41d90514c1a5f9/3.12/slim-bookworm)。
+此处固定基础镜像输入，不宣称已拉取其 layers 或启动容器。
+
+运行依赖及传递依赖 22 项使用本产品既有 `requirements-dev.txt` 的版本，完整列在
+Dockerfile，`--only-binary=:all: --no-deps` 禁止现场漂移解析；没有可用 wheel 时直接构建失败。
+四项项目直接依赖未升级。构建后端固定 `setuptools==80.9.0`（与 pyproject 一致），先显式
+安装后端，再用 `pip wheel --no-deps --no-build-isolation` 构建普通 wheel，离线安装 wheel，
+最后卸载后端并执行 `pip check`。不再采用 editable 安装，不让运行环境依赖源码路径。
+构建隔离关闭时必须自行提供后端，见 [pip 构建接口说明](https://pip.pypa.io/en/stable/reference/build-system/)。
+
+可复验的本地安装验证入口（须选不存在的输出目录）：
+
+```bash
+python tests/verify_container_install.py --output .runtime/container-install-review
+```
+
+它从实际 Dockerfile 读取运行 pins，在全新 venv（初始只有 pip）中复现上述正式安装步骤，
+核实两包从 site-packages 导入、CLI 可启动、最终依赖集合/版本完全匹配并记录结果 JSON。
+TS-108 已在 Windows/Python 3.12.14 验证通过，**不等于 Linux 镜像构建、挂载权限或容器运行通过**。
+此安装路径固定版本和基础输入；尚未声称跨平台 wheel 字节或最终镜像字节完全一致。
 
 ## 8. 停止
 
@@ -215,3 +242,10 @@ Chat Audit 尚未接入，恒声明未启用；不生成归档成功回执。
 状态入口只反映当前进程实际生效配置与本地持久事实，不写数据库、日志或调用对端，
 也不作为容器重启探针。发布组合应同时校验配置 `false`、运行状态 `disabled/paused`，
 以及超过 256 轮合成对话仍没有新增待消费候选；不能仅凭配置文件认定停用已生效。
+
+新提交在调用 Memory 前持久记录 `submitting` 与尝试数；并发 flush 串行执行。
+收到可信 `execution_state=not_started` 或提交前未配置服务时仍可按原节奏重试。
+请求发出后响应丢失/超时/非法回执/取消，以及重启发现未结算提交意图，均保守保留为
+`unknown`，不自动再提交。日志仍使用既有 `outbox.flush` / `unknown` 词汇。
+已有旧版本 `pending` 记录无法反推其远端历史，本次不会伪造此证明；禁用保留原字节，
+重新启用前由协调确认旧积压处理范围。数据库结构及版本仍为 9，无新迁移。
