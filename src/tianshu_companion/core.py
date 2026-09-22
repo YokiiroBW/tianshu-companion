@@ -80,6 +80,10 @@ class Policy:
 
 
 class Core:
+    @staticmethod
+    def ingress_correlation():
+        return obs.current_correlation_id() or obs.new_correlation_id()
+
     def __init__(
         self,
         store,
@@ -706,15 +710,8 @@ class Core:
         )
 
     def _seal_due(self, now, cid=None):
-        due = [
-            c
-            for c in self.store.list("collections", cid, ["collecting"])
-            if c["deadline"] <= now
-            and not self.store.get("conversations", digest(c["collection_key"]["channel"])).get(
-                "source_quarantined"
-            )
-        ]
-        for collection in sorted(due, key=lambda c: (c["deadline"], c["sequence"])):
+        due = self.store.due("collections", ["collecting"], now, conversation_id=cid)
+        for collection in due:
             reason = "immediate_submit" if self.policy.silence_ms == 0 else "silence"
             if (
                 self.policy.max_wait_ms is not None
@@ -749,14 +746,7 @@ class Core:
             previous = self.store.get("collections", c["continuation_of"])
             previous["continued_by"] = c["id"]
             self.store.put("collections", previous)
-        context = [
-            i["source"]
-            for i in self.store.list("inbox", c["conversation_id"])
-            if i["sequence"] >= c["sequence"]
-            and i["request"]["author"] != c["collection_key"]["author"]
-            and not i["stale"]
-            and i.get("actor_id") == c["scope"]["actor_id"]
-        ]
+        context = self.store.collector_context(c)
         bundle = dict(
             schema_version=1,
             collection_id=c["id"],
@@ -806,7 +796,7 @@ class Core:
             # The request's own correlation ID is recorded on the queued turn so the whole
             # causal chain - preparation, generation, delivery - keeps one identifier even
             # though each of those runs later, on its own task, outside this request's scope.
-            correlation_id=obs.current_correlation_id(),
+            correlation_id=c.get("correlation_id") or self.ingress_correlation(),
         )
         self.store.put("turns", turn)
 
@@ -993,15 +983,23 @@ class Core:
                 )
         self.jobs = {k: v for k, v in self.jobs.items() if not v.done()}
         self.send_jobs = {k: v for k, v in self.send_jobs.items() if not v.done()}
-        before = self.pass_counters["core.tick"]
+        before = self.store.db.total_changes
         with self.store.transaction():
             self._seal_due(self.clock())
-            for conv in self.store.list("conversations"):
+            cursor = getattr(self, "_work_cursor", "")
+            conversations = self.store.work_conversations(cursor)
+            if not conversations:
+                conversations = self.store.work_conversations()
+            self._work_cursor = conversations[-1] if conversations else ""
+            for cid in conversations:
+                conv = self.store.conversation(cid)
+                if conv is None:
+                    continue
                 if conv.get("source_quarantined"):
                     continue
                 cid = conv["conversation_id"]
-                active = self.store.list("turns", cid, ACTIVE)
-                queued = self.store.list("turns", cid, ["queued"])
+                active = self.store.work_turns(cid, ACTIVE)
+                queued = self.store.work_turns(cid, ["queued"])
                 for turn in queued[: 2 - len(active)]:
                     if not self._responses_released(turn):
                         break
@@ -1030,8 +1028,13 @@ class Core:
                     turn["timings"]["started_at"] = utc(self.clock())
                     self._save_turn(turn)
                     # Two turns per conversation at most; each admission is one real event.
-                    obs.emit(self.events, "turn.queued", "started")
-                for turn in self.store.list("turns", cid, ["preparing", "waiting_dependency"]):
+                    obs.emit(
+                        self.events,
+                        "turn.queued",
+                        "started",
+                        correlation_id=turn.get("correlation_id"),
+                    )
+                for turn in self.store.work_turns(cid, ["preparing", "waiting_dependency"]):
                     if turn["id"] not in self.jobs and turn["retry_at"] <= self.clock():
                         self.jobs[turn["id"]] = asyncio.create_task(self._process(turn["id"]))
                 if cid not in self.send_jobs:
@@ -1118,7 +1121,7 @@ class Core:
         # scope, so the persisted turn is what carries it across the boundary. Preparation
         # calls, the model call and every event along the way share that one identifier.
         turn = self.store.get("turns", turn_id)
-        accepted = (turn or {}).get("correlation_id")
+        accepted = self._turn_correlation(turn) if turn else None
         with obs.correlation_scope(accepted):
             await self._process_turn(turn_id)
 
@@ -1517,13 +1520,34 @@ class Core:
         self._check_input_versions(turn)
 
     async def _deliver(self, cid):
-        turns = self.store.list("turns", cid)
-        for turn in turns:
-            if turn["phase"] == "closed_unknown":
-                await self._reconcile(turn)
-        turn = next((t for t in turns if t["phase"] not in TERMINAL), None)
+        cursors = getattr(self, "_reconcile_cursors", {})
+        self._reconcile_cursors = cursors
+        replies = self.store.unknown_replies(cid, cursors.get(cid, ""))
+        if not replies:
+            replies = self.store.unknown_replies(cid)
+        if replies:
+            cursors[cid] = replies[-1]["id"]
+        else:
+            cursors.pop(cid, None)
+        for turn_id in dict.fromkeys(r["turn_id"] for r in replies):
+            closed = self.store.get("turns", turn_id)
+            if closed and closed["phase"] == "closed_unknown":
+                with obs.correlation_scope(self._turn_correlation(closed)):
+                    await self._reconcile(closed)
+        turn = self.store.first_work_turn(cid)
         if not turn or turn["phase"] not in {"ready_to_send", "sending", "reconciling"}:
             return
+        with obs.correlation_scope(self._turn_correlation(turn)):
+            await self._deliver_turn(turn)
+
+    def _turn_correlation(self, turn):
+        if not obs.valid_correlation_id(turn.get("correlation_id")):
+            turn["correlation_id"] = obs.new_correlation_id()
+            self.store.put("turns", turn)
+        return turn["correlation_id"]
+
+    async def _deliver_turn(self, turn):
+        cid = turn["conversation_id"]
         abandoned = [r for r in self._replies(turn) if r["state"] == "sending"]
         if abandoned:
             with self.store.transaction():
@@ -1729,56 +1753,43 @@ class Core:
                     self._finish(fresh, "closed_unknown", "unknown")
 
     async def flush_outbox(self):
-        # Only a pass that really attempted something is an event; an idle pass is not.
-        before = {item["id"]: item.get("attempts") for item in self.store.list("outbox")}
-        for item in self.store.list("outbox", states=["blocked_scope"]):
-            if item["deadline"] > self.clock():
-                continue
-            try:
-                await self.repair_blocked_scope(
-                    item["event"]["aggregate_id"], self.memory.check_sources
-                )
-            except (Fault, OSError, TimeoutError) as error:
-                item["last_error"] = (
-                    error.code if isinstance(error, Fault) else "dependency_unavailable"
-                )
+        # Only due work is materialized; completed history is never read to infer outcomes.
+        attempted = False
+        for item in self.store.due("outbox", ["blocked_scope", "pending"], self.clock()):
+            turn = self.store.get("turns", item["event"]["aggregate_id"])
+            with obs.correlation_scope(self._turn_correlation(turn)):
+                outcome, error_code = "succeeded", None
+                try:
+                    if item["state"] == "blocked_scope":
+                        await self.repair_blocked_scope(turn["id"], self.memory.check_sources)
+                        item = self.store.get("outbox", item["id"])
+                        if item["state"] != "pending":
+                            outcome = "cancelled"
+                    if item["state"] == "pending":
+                        ensure_channel(self.store, turn["bundle"]["collection_key"]["channel"])
+                        if (
+                            not sources_current(self.store, turn)
+                            or self._event_reality(turn) != item["event"]["reality"]
+                        ):
+                            item["state"] = "discarded_source"
+                            outcome = "cancelled"
+                        else:
+                            self.contracts.check("conversation#committed_event", item["event"])
+                            receipt = await self.memory.commit(item["event"])
+                            item.update(state="delivered", receipt=receipt, last_error=None)
+                except (Fault, OSError, TimeoutError) as error:
+                    outcome = "failed"
+                    error_code = (
+                        error.code if isinstance(error, Fault) else "dependency_unavailable"
+                    )
+                    item["last_error"] = error_code
+                    item["deadline"] = self.clock() + min(60, 2 ** min(item["attempts"], 6))
                 item["attempts"] += 1
-                item["deadline"] = self.clock() + min(60, 2 ** min(item["attempts"], 6))
                 self.store.put("outbox", item)
-        for item in self.store.list("outbox", states=["pending"]):
-            if item["deadline"] > self.clock():
-                continue
-            try:
-                turn = self.store.get("turns", item["event"]["aggregate_id"])
-                ensure_channel(self.store, turn["bundle"]["collection_key"]["channel"])
-                if (
-                    not sources_current(self.store, turn)
-                    or self._event_reality(turn) != item["event"]["reality"]
-                ):
-                    item["state"] = "discarded_source"
-                    self.store.put("outbox", item)
-                    continue
-                self.contracts.check("conversation#committed_event", item["event"])
-                receipt = await self.memory.commit(item["event"])
-                item.update(state="delivered", receipt=receipt)
-            except (Fault, OSError, TimeoutError) as error:
-                item["last_error"] = (
-                    error.code if isinstance(error, Fault) else "dependency_unavailable"
-                )
-                item["deadline"] = self.clock() + min(60, 2 ** min(item["attempts"], 6))
-            item["attempts"] += 1
-            with self.store.transaction():
-                self.store.put("outbox", item)
-        self._report_outbox(before)
-        self.counted("core.outbox")
-
-    def _report_outbox(self, before):
-        """One event per pass that really attempted an outbox row; an idle pass is silent."""
-        attempts = {item["id"]: item.get("attempts") for item in self.store.list("outbox")}
-        if any(attempts.get(key) != value for key, value in before.items()) or set(attempts) - set(
-            before
-        ):
-            obs.emit(self.events, "outbox.flush", "succeeded")
+                obs.emit(self.events, "outbox.flush", outcome, error_code=error_code)
+                attempted = True
+        if attempted:
+            self.counted("core.outbox")
 
     async def repair_blocked_scope(self, turn_id, verify_current):
         """Internal repair port, not a new wire endpoint or an assertion bypass.
@@ -1791,9 +1802,7 @@ class Core:
         """
         turn = self.store.get("turns", turn_id)
         ensure_channel(self.store, turn["bundle"]["collection_key"]["channel"])
-        for item in self.store.list("outbox", states=["blocked_scope"]):
-            if item["event"]["aggregate_id"] != turn_id:
-                continue
+        for item in self.store.turn_outbox(turn_id, "blocked_scope"):
             version = await verify_current(
                 copy.deepcopy(turn), copy.deepcopy(item["event"]["sources"])
             )

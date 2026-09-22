@@ -373,6 +373,7 @@ def accept_actor(
             scope=scope,
             binding_version=binding_version,
             bootstrap_mapping=ctx["allowed_scope"]["conversation_id"] is None,
+            correlation_id=core.ingress_correlation(),
         )
     if (
         len(collection["messages"]) + 1 > core.policy.max_collection_messages
@@ -432,6 +433,7 @@ def accept_actor(
             base=physical["base"],
             revision=physical["revision"],
             collection_id=collection["id"],
+            correlation_id=core.ingress_correlation(),
             signature=digest(data),
             request={
                 **data,

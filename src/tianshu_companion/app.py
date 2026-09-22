@@ -25,6 +25,7 @@ from .life_read_queries import LifeReadQueries
 from .store import Store
 from .images import ComfyUI, Workflow
 from .short_context import ShortContextPolicy
+from .worker_health import WorkerHealth
 
 LOG = logging.getLogger(__name__)
 
@@ -126,6 +127,7 @@ async def run_loop(
     counter=None,
     clock=time.monotonic,
     sleep=None,
+    workers=None,
 ):
     """One background loop: bounded cancelable backoff, and one event per real outcome.
 
@@ -163,8 +165,11 @@ async def run_loop(
         except Exception as failure:  # noqa: BLE001 - every real failure is reported below
             outcome = "failed"
             error = failure
-        if outcome == "worked":
+        if workers is not None:
+            workers.completed(name, failed=outcome == "failed")
+        if outcome != "failed":
             failures = 0
+        if outcome == "worked":
             report("runtime.background_work", "succeeded", level="DEBUG")
         elif outcome == "failed":
             failures += 1
@@ -474,6 +479,7 @@ def create_app(core=None, tokens=None, life_readers=None):
     log_port = log_adapter_from_environment()
     set_log_port(log_port)
     stopping = asyncio.Event()
+    workers = WorkerHealth()
 
     def _counter(owner, name):
         """A read-only view of the pass counter the work itself advances."""
@@ -486,7 +492,7 @@ def create_app(core=None, tokens=None, life_readers=None):
         reported as it happens - nothing is swallowed as "already seen". A failure delays the
         next attempt by a bounded, cancelable backoff instead of retrying in a tight loop.
         """
-        return asyncio.create_task(
+        task = asyncio.create_task(
             run_loop(
                 name,
                 work,
@@ -495,8 +501,11 @@ def create_app(core=None, tokens=None, life_readers=None):
                 wait=stopping,
                 counter=counter,
                 clock=time.monotonic,
+                workers=workers,
             )
         )
+        workers.register(name, interval, task)
+        return task
 
     @asynccontextmanager
     async def lifespan(app):
@@ -524,6 +533,7 @@ def create_app(core=None, tokens=None, life_readers=None):
                 ]
             yield
         finally:
+            workers.stopping = True
             # Shutdown is itself reported durably, and in the only order that makes the
             # records trustworthy: `stopped` is confirmed on the disk *before* the writer is
             # closed, so the last line of the stream is never a record that was still queued
@@ -545,7 +555,7 @@ def create_app(core=None, tokens=None, life_readers=None):
                 log_port.close()
 
     health_view = health_module.Health(
-        os.environ.get(health_module.TOKEN_ENV), core=core, log=log_port
+        os.environ.get(health_module.TOKEN_ENV), core=core, log=log_port, workers=workers
     )
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.core = core

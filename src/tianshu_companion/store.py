@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .contracts import canonical
 from .life_read_index import create_page_index, prepare_page_index
+from . import work_index
 
 LIFE_TABLES = {
     "life_worlds",
@@ -157,6 +158,7 @@ class Store:
         # restore point of its own, WAL included - before this open runs any DDL. A database
         # that already carries the correct index adds no file and no fact, and an open that
         # already took a complete pre-DDL backup above reuses it instead of adding a second.
+        backed_up = work_index.prepare(self.db, path, restored=backed_up, fresh=version == 0)
         prepare_page_index(self.db, path, restore_point_taken=backed_up, fresh=version == 0)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
@@ -302,6 +304,7 @@ class Store:
             # and its restore point belong to the read module; the create runs here, inside
             # the initialization transaction, so a request path can never alter the schema.
             create_page_index(self.db)
+            work_index.create(self.db)
             self.db.execute("PRAGMA user_version=9")
 
     @contextmanager
@@ -388,6 +391,96 @@ class Store:
         self.db.close()
         if self._lock:
             self._lock.close()
+
+    def due(self, table, states, now, limit=64, conversation_id=None):
+        assert table in {"outbox", "collections"}
+        sql = f"SELECT body FROM {table} WHERE status IN ({','.join('?' for _ in states)}) AND deadline<=?"
+        args = [*states, now]
+        if conversation_id is not None:
+            sql += " AND conversation_id=?"
+            args.append(conversation_id)
+        # Quarantined collectors cannot progress, so they must not occupy a page forever.
+        if table == "collections":
+            sql += " AND EXISTS (SELECT 1 FROM conversations c WHERE c.conversation_id=collections.conversation_id AND coalesce(json_extract(c.body,'$.source_quarantined'),0)=0)"
+        sql += (
+            " ORDER BY deadline,position,id LIMIT ?"
+            if table == "collections"
+            else " ORDER BY deadline,id LIMIT ?"
+        )
+        return [json.loads(row[0]) for row in self.db.execute(sql, [*args, limit])]
+
+    def work_conversations(self, after="", limit=64):
+        # Limit each indexed range before merging: neither old facts nor a large
+        # backlog of other conversations is materialized by every worker pass.
+        predicates = {
+            "turns": "status IN ('queued','preparing','generating','waiting_dependency','ready_to_send','sending','reconciling')",
+            "replies": "status='unknown'",
+            "direct_requests": "status IN ('completed','failed') AND json_extract(body,'$.reply_state')='ready_to_deliver' AND json_extract(body,'$.deferred_reason')='outbound_band_busy'",
+        }
+        ids = set()
+        indexes = {
+            "turns": "turns_work",
+            "replies": "replies_unknown",
+            "direct_requests": "direct_waiting_band",
+        }
+        for table, predicate in predicates.items():
+            sql = f"SELECT DISTINCT conversation_id FROM {table} INDEXED BY {indexes[table]} WHERE {predicate} AND conversation_id>? ORDER BY conversation_id LIMIT ?"
+            ids.update(row[0] for row in self.db.execute(sql, (after, limit)))
+        return sorted(ids)[:limit]
+
+    def conversation(self, cid):
+        row = self.db.execute(
+            "SELECT body FROM conversations WHERE conversation_id=? LIMIT 1", (cid,)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def first_work_turn(self, cid):
+        row = self.db.execute(
+            "SELECT body FROM turns INDEXED BY turns_work WHERE conversation_id=? AND status IN ('queued','preparing','generating','waiting_dependency','ready_to_send','sending','reconciling') ORDER BY position,id LIMIT 1",
+            (cid,),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def work_turns(self, cid, states):
+        sql = "SELECT body FROM turns INDEXED BY turns_work WHERE conversation_id=? AND status IN ('queued','preparing','generating','waiting_dependency','ready_to_send','sending','reconciling')"
+        sql += f" AND status IN ({','.join('?' for _ in states)}) ORDER BY position,id"
+        return [json.loads(row[0]) for row in self.db.execute(sql, (cid, *states))]
+
+    def turn_outbox(self, turn_id, state):
+        return [
+            json.loads(row[0])
+            for row in self.db.execute(
+                "SELECT body FROM outbox WHERE json_extract(body,'$.event.aggregate_id')=? AND status=? LIMIT 64",
+                (turn_id, state),
+            )
+        ]
+
+    def unknown_replies(self, cid, after="", limit=32):
+        return [
+            json.loads(row[0])
+            for row in self.db.execute(
+                "SELECT body FROM replies INDEXED BY replies_unknown WHERE conversation_id=? AND status='unknown' AND id>? ORDER BY id LIMIT ?",
+                (cid, after, limit),
+            )
+        ]
+
+    def collector_context(self, collection):
+        author = collection["collection_key"]["author"]
+        rows = self.db.execute(
+            """SELECT body FROM inbox INDEXED BY inbox_context WHERE conversation_id=?
+          AND json_extract(body,'$.actor_id')=? AND json_extract(body,'$.stale')=0
+          AND position>=? AND NOT (json_extract(body,'$.request.author.namespace')=?
+          AND json_extract(body,'$.request.author.immutable_account_id')=?)
+          ORDER BY position DESC,id DESC LIMIT 32""",
+            (
+                collection["conversation_id"],
+                collection["scope"]["actor_id"],
+                collection["sequence"],
+                author["namespace"],
+                author["immutable_account_id"],
+            ),
+        )
+        return [json.loads(row[0])["source"] for row in rows][::-1]
 
     def recent_turns(self, conversation_id, before_sequence, limit):
         rows = self.db.execute(

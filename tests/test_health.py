@@ -54,6 +54,10 @@ class _LogDirectory:
     def attach(self, app):
         """Remember the log port this application assembled, so the case can close it."""
         self.adapters.append(app.state.log)
+        # These synchronous probe tests isolate store/log/credential checks. They do
+        # not start lifespan; a healthy worker projection is an explicit test input.
+        # Real startup/failure/recovery/stall is covered in test_audit_runtime.
+        app.state.health.workers = mock.Mock(healthy=lambda: True)
         return app
 
     @property

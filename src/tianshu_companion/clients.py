@@ -74,6 +74,8 @@ class JsonService:
         }
     )
     QUERY_BUDGET_SECONDS = 15
+    COMMAND_BUDGET_SECONDS = 15
+    MAX_RESPONSE_BYTES = 2_000_000
 
     def __init__(self, url=None, token=None, *, transport=None, ca_file=None, label=None):
         if url and (
@@ -109,6 +111,7 @@ class JsonService:
         request_headers = {
             "Authorization": "Bearer " + self.token,
             obs.CORRELATION_HEADER: correlation,
+            "Accept-Encoding": "identity",
             **(headers or {}),
         }
         started, attempts = time.perf_counter(), 0
@@ -127,7 +130,9 @@ class JsonService:
             )
             # One wall-clock budget covers both attempts and the response body.
             # Reuse serialized bytes/IDs/headers, never replace the shared client.
-            async with asyncio.timeout(self.QUERY_BUDGET_SECONDS if retry_query else None):
+            async with asyncio.timeout(
+                self.QUERY_BUDGET_SECONDS if retry_query else self.COMMAND_BUDGET_SECONDS
+            ):
                 for attempt in range(2 if retry_query else 1):
                     attempts = attempt + 1
                     try:
@@ -139,12 +144,18 @@ class JsonService:
                         if not retry_query or attempt:
                             raise
                 try:
-                    await response.aread()
+                    # The internal JSON port negotiates identity. Reject an encoded body
+                    # before HTTPX can inflate one compressed chunk without a byte bound.
+                    if response.headers.get("content-encoding", "identity").lower() != "identity":
+                        raise Fault("dependency_unavailable")
+                    content = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(content) + len(chunk) > self.MAX_RESPONSE_BYTES:
+                            raise Fault("dependency_unavailable")
+                        content.extend(chunk)
                 finally:
                     await response.aclose()
-            if len(response.content) > 2_000_000:
-                raise Fault("dependency_unavailable")
-            value = strict_json(response.content)
+            value = strict_json(content)
             if response.status_code >= 300:
                 code = value.get("code") if isinstance(value, dict) else None
                 if code in {

@@ -55,11 +55,12 @@ def live_payload():
 class Health:
     """Read-only health view over an assembled runtime and its log port."""
 
-    def __init__(self, token, *, core=None, log=None, clock=time.monotonic):
+    def __init__(self, token, *, core=None, log=None, clock=time.monotonic, workers=None):
         self.token = token or None
         self.core = core
         self.log = log
         self.clock = clock
+        self.workers = workers
 
     @property
     def configured(self):
@@ -102,6 +103,8 @@ class Health:
         core = self.core
         if core is None:
             return "not_configured"
+        if self.workers is not None and not self.workers.healthy():
+            return "failed"
         if getattr(core, "closed", False):
             return "failed"
         store = getattr(core, "store", None)
