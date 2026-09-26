@@ -38,7 +38,7 @@ from .source_sync import ensure_channel
 from .source_sync import invalidate_physical
 from .writing import Writing
 from .runtime_capabilities import candidates_enabled
-from .model_selection import SelectionRequest, resolve_selection, verify_lease
+from .model_selection import verify_lease
 
 TERMINAL = {"sent", "failed", "cancelled", "observed", "closed_unknown"}
 ACTIVE = {
@@ -747,7 +747,8 @@ class Core:
         conv = self.store.get("conversations", digest(c["collection_key"]["channel"]))
         conv["turn_sequence"] += 1
         self.store.put("conversations", conv)
-        turn_id = uid("turn")
+        turn_id = c.get("turn_id") or uid("turn")
+        selected = c.get("model_selection")
         c.update(
             state="sealed",
             turn_id=turn_id,
@@ -792,7 +793,8 @@ class Core:
             origin=c["origin"],
             service=c["service"],
             binding_version=c["binding_version"],
-            config_version=None,
+            config_version=selected["config_version"] if selected else None,
+            model_selection={"expires_at": selected["expires_at"]} if selected else None,
             role=None,
             preparation=None,
             cancelled=False,
@@ -1154,23 +1156,6 @@ class Core:
             turn = self.store.get("turns", turn_id)
             if turn["cancelled"] or turn["phase"] in TERMINAL:
                 return
-            if not turn["config_version"] and self.default_model_selector is not None:
-                selection = await resolve_selection(
-                    self.default_model_selector,
-                    SelectionRequest.from_turn(turn),
-                    self.clock,
-                )
-                # No transaction spans selector IO. Cancellation/retraction wins over late replies.
-                with self.store.transaction():
-                    turn = self.store.get("turns", turn_id)
-                    if turn["cancelled"] or turn["phase"] in TERMINAL:
-                        return
-                    self._check_input_versions(turn)
-                    verify_lease(selection.expires_at, self.clock())
-                    if turn["config_version"] is None:
-                        turn["config_version"] = selection.config_version
-                        turn["model_selection"] = dict(expires_at=selection.expires_at)
-                        self._save_turn(turn)
             if not turn["config_version"]:
                 raise Fault("dependency_unavailable")
             self._check_role(turn)

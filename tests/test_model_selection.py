@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from support import Harness
+from tianshu_companion.contracts import Fault
 from tianshu_companion.model_selection import ModelSelection
 
 
@@ -61,66 +62,65 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_slow_selection_does_not_lock_store_or_drift_other_turn(self):
         h = self.h
         self.selector.gates["actor:a"] = asyncio.Event()
-        await h.ingest(text="slow")
-        await h.cycles(5)
+        slow = asyncio.create_task(h.ingest(text="slow"))
+        async with asyncio.timeout(1):
+            while not self.selector.requests:
+                await asyncio.sleep(0)
+        self.assertFalse(h.core.store.db.in_transaction)
         self.selector.version = 20
-        await h.ingest(text="fast", actor="actor:b")
-        await h.cycles()
-        self.assertEqual([None, 20], [t["config_version"] for t in h.turns()])
+        await h.ingest(text="fast", actor="actor:b", channel="private:b")
+        self.assertFalse(slow.done())
         self.assertEqual(2, len(self.selector.requests))
         self.selector.gates["actor:a"].set()
+        await slow
         await h.cycles(70)
-        self.assertEqual([10, 20], [t["config_version"] for t in h.turns()])
+        self.assertEqual(
+            {"actor:a": 10, "actor:b": 20},
+            {t["scope"]["actor_id"]: t["config_version"] for t in h.turns()},
+        )
         self.assertTrue(all(t["phase"] == "sent" for t in h.turns()))
 
-    async def test_cancel_wins_over_late_selection_failure(self):
+    async def test_cancelled_ingress_does_not_accept_or_route(self):
         h = self.h
-        gate = self.selector.gates["actor:a"] = asyncio.Event()
-        await h.ingest()
-        await h.cycles(5)
-        await h.cancel(h.turns()[0])
-        self.selector.fail = True
-        gate.set()
-        await h.cycles()
-        self.assertEqual("cancelled", h.turns()[0]["phase"])
-        self.assertIsNone(h.turns()[0]["config_version"])
+        self.selector.gates["actor:a"] = asyncio.Event()
+        pending = asyncio.create_task(h.ingest())
+        async with asyncio.timeout(1):
+            while not self.selector.requests:
+                await asyncio.sleep(0)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertFalse(h.turns())
         self.assertFalse(h.gateway.calls)
 
     async def test_revocation_and_short_lease_fail_without_static_fallback(self):
         h = self.h
         for revoked, lease in [(True, 3600), (False, 10)]:
             self.selector.revoked, self.selector.lease = revoked, lease
-            await h.ingest()
-            await h.cycles()
-            turn = h.turns()[-1]
-            self.assertEqual("failed", turn["phase"])
-            self.assertIsNone(turn["config_version"])
+            with self.assertRaises(Fault) as caught:
+                await h.ingest()
+            self.assertEqual("dependency_unavailable", caught.exception.code)
+            self.assertFalse(h.turns())
         self.assertFalse(h.gateway.calls)
 
-    async def test_retraction_wins_over_late_successful_selection(self):
+    async def test_retraction_after_admission_cancels_reserved_turn(self):
         h = self.h
-        gate = self.selector.gates["actor:a"] = asyncio.Event()
         await h.ingest(message="selection:retract")
-        await h.cycles(5)
         await h.ingest(message="selection:retract", revision=2, kind="retract")
-        gate.set()
         await h.cycles()
-        self.assertEqual("cancelled", h.turns()[0]["phase"])
-        self.assertIsNone(h.turns()[0]["config_version"])
+        self.assertTrue(all(t["phase"] == "cancelled" for t in h.turns()))
         self.assertFalse(h.gateway.calls)
 
     async def test_selector_exception_is_sanitized_and_context_comes_from_turn(self):
         h = self.h
         self.selector.fail = True
-        await h.ingest()
-        await h.cycles()
-        turn = h.turns()[0]
-        self.assertEqual("dependency_unavailable", turn["failure"])
-        self.assertNotIn("synthetic-private-secret", str(turn))
+        with self.assertRaises(Fault) as caught:
+            await h.ingest()
+        self.assertEqual("dependency_unavailable", caught.exception.code)
+        self.assertFalse(h.turns())
         request = self.selector.requests[0]
-        self.assertEqual(turn["id"], request.turn_id)
-        for key, value in turn["scope"].items():
-            self.assertEqual(value, getattr(request, key))
+        self.assertTrue(request.turn_id.startswith("turn:"))
+        self.assertEqual("actor:a", request.actor_id)
         self.assertEqual("companion", request.caller_service)
         self.assertEqual("companion.text", request.workload)
 
@@ -128,11 +128,23 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         h = self.h
         self.selector.gates["actor:a"] = asyncio.Event()
         with patch("tianshu_companion.model_selection.SELECTION_TIMEOUT", 0.001):
-            await h.ingest()
-            await h.cycles(70)
-        self.assertEqual("failed", h.turns()[0]["phase"])
-        self.assertEqual("dependency_unavailable", h.turns()[0]["failure"])
+            with self.assertRaises(Fault) as caught:
+                await h.ingest()
+        self.assertEqual("dependency_unavailable", caught.exception.code)
+        self.assertFalse(h.turns())
         self.assertFalse(h.gateway.calls)
+
+    async def test_queued_turn_keeps_admission_version_when_default_switches_before_tick(self):
+        h = self.h
+        await h.ingest(text="queued before switch")
+        with h.core.store.transaction():
+            h.core._seal_due(h.clock())
+        queued = h.turns()[0]
+        self.assertEqual(("queued", 10), (queued["phase"], queued["config_version"]))
+        self.selector.version = 20
+        await h.cycles(70)
+        self.assertEqual(("sent", 10), (h.turns()[0]["phase"], h.turns()[0]["config_version"]))
+        self.assertEqual(1, len(self.selector.requests))
 
     async def test_restart_keeps_pinned_versions_and_does_not_reselect_interrupted(self):
         h = self.h

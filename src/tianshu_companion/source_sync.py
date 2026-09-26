@@ -4,6 +4,7 @@ import copy
 
 from .clients import epoch, uid, utc
 from .contracts import Fault, canonical, digest
+from .model_selection import SelectionRequest, resolve_selection, verify_lease
 
 INPUT_FIELDS = (
     "message_key",
@@ -299,7 +300,19 @@ def invalidate_physical(core, conv, base, kind):
 
 
 def accept_actor(
-    core, service, request, data, physical, conv, actor, ctx, identity, defer, now, authorization
+    core,
+    service,
+    request,
+    data,
+    physical,
+    conv,
+    actor,
+    ctx,
+    identity,
+    defer,
+    now,
+    authorization,
+    reservation=None,
 ):
     store = core.store
     person, binding_version = identity
@@ -341,6 +354,11 @@ def accept_actor(
         collection["scope"] != scope or collection["binding_version"] != binding_version
     ):
         raise Fault("scope_changed")
+    if collection and core.default_model_selector is not None:
+        selected = collection.get("model_selection")
+        if selected is None:
+            raise Fault("dependency_unavailable")
+        verify_lease(selected["expires_at"], now)
     if collection is None:
         if (
             len(groups) >= core.policy.max_collectors_per_conversation
@@ -348,6 +366,11 @@ def accept_actor(
             >= core.policy.max_queued_turns
         ):
             raise Fault("queue_full")
+        if core.default_model_selector is not None:
+            if reservation is None:
+                # A new turn never consults a changed default after its input was accepted.
+                raise Fault("dependency_unavailable")
+            verify_lease(reservation["expires_at"], now)
         continuations = [
             c
             for c in store.list("collections", cid)
@@ -374,6 +397,8 @@ def accept_actor(
             binding_version=binding_version,
             bootstrap_mapping=ctx["allowed_scope"]["conversation_id"] is None,
             correlation_id=core.ingress_correlation(),
+            turn_id=reservation["turn_id"] if reservation else None,
+            model_selection=reservation if reservation else None,
         )
     if (
         len(collection["messages"]) + 1 > core.policy.max_collection_messages
@@ -555,6 +580,23 @@ async def _ingest(core, service, request, defer=False, *, legacy=False):
             core, service, data, ctx, actor, authority["audience"], cid, identity[0], legacy=legacy
         ):
             grants[actor] = ctx
+    # Select before the accepting transaction. A queued turn then carries the exact version
+    # even if the administrator changes the default before tick starts its background work.
+    candidate_cid = cid or uid("conv")
+    reservations = {}
+    if core.default_model_selector is not None and data["kind"] != "retract" and prior is None:
+        for actor in grants:
+            turn_id = uid("turn")
+            selected = await resolve_selection(
+                core.default_model_selector,
+                SelectionRequest(turn_id, actor, identity[0], authority["audience"], candidate_cid),
+                core.clock,
+            )
+            reservations[actor] = dict(
+                turn_id=turn_id,
+                config_version=selected.config_version,
+                expires_at=selected.expires_at,
+            )
     with store.transaction():
         now = core.clock()
         if epoch(request["command"]["deadline_at"]) <= now:
@@ -563,12 +605,14 @@ async def _ingest(core, service, request, defer=False, *, legacy=False):
             raise Fault("forbidden")
         conv = ensure_channel(store, channel) or dict(
             id=digest(channel),
-            conversation_id=uid("conv"),
+            conversation_id=candidate_cid,
             channel=channel,
             ingest_sequence=0,
             turn_sequence=0,
         )
         cid = conv["conversation_id"]
+        if reservations and cid != candidate_cid:
+            raise Fault("dependency_unavailable")
         grants = {
             a: c
             for a, c in grants.items()
@@ -700,6 +744,7 @@ async def _ingest(core, service, request, defer=False, *, legacy=False):
                         input_origin=None if legacy else request["command"]["origin"],
                         authority_digest=digest(authority),
                     ),
+                    reservations.get(actor),
                 )
             )
         for collection in store.list("collections", cid, ["collecting"]):
