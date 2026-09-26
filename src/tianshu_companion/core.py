@@ -38,6 +38,7 @@ from .source_sync import ensure_channel
 from .source_sync import invalidate_physical
 from .writing import Writing
 from .runtime_capabilities import candidates_enabled
+from .model_selection import SelectionRequest, resolve_selection, verify_lease
 
 TERMINAL = {"sent", "failed", "cancelled", "observed", "closed_unknown"}
 ACTIVE = {
@@ -113,8 +114,10 @@ class Core:
         persona_import=None,
         events=None,
         automatic_memory_candidates=True,
+        default_model_selector=None,
     ):
         self._automatic_memory_candidates = candidates_enabled(automatic_memory_candidates)
+        self.default_model_selector = default_model_selector
         self._outbox_lock = asyncio.Lock()
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
@@ -1020,6 +1023,9 @@ class Core:
                 for turn in queued[: 2 - len(active)]:
                     if not self._responses_released(turn):
                         break
+                    config_version = turn["config_version"]
+                    if config_version is None and self.default_model_selector is None:
+                        config_version = self.config_version
                     try:
                         role = self._pin_role(turn["scope"]["actor_id"])
                     except PersonaError as error:
@@ -1032,13 +1038,13 @@ class Core:
                             delivery_state="failed",
                             result_version=1,
                             failure=error.message,
-                            config_version=self.config_version,
+                            config_version=config_version,
                         )
                         self._save_turn(turn)
                         continue
                     turn.update(
                         phase="preparing",
-                        config_version=self.config_version,
+                        config_version=config_version,
                         role=role,
                         bootstrap_until=min(turn["source_deadline"], self.clock() + 5),
                     )
@@ -1148,6 +1154,23 @@ class Core:
             turn = self.store.get("turns", turn_id)
             if turn["cancelled"] or turn["phase"] in TERMINAL:
                 return
+            if not turn["config_version"] and self.default_model_selector is not None:
+                selection = await resolve_selection(
+                    self.default_model_selector,
+                    SelectionRequest.from_turn(turn),
+                    self.clock,
+                )
+                # No transaction spans selector IO. Cancellation/retraction wins over late replies.
+                with self.store.transaction():
+                    turn = self.store.get("turns", turn_id)
+                    if turn["cancelled"] or turn["phase"] in TERMINAL:
+                        return
+                    self._check_input_versions(turn)
+                    verify_lease(selection.expires_at, self.clock())
+                    if turn["config_version"] is None:
+                        turn["config_version"] = selection.config_version
+                        turn["model_selection"] = dict(expires_at=selection.expires_at)
+                        self._save_turn(turn)
             if not turn["config_version"]:
                 raise Fault("dependency_unavailable")
             self._check_role(turn)
@@ -1285,6 +1308,8 @@ class Core:
                     turn["context_revision"] = context_metadata["context_revision"]
                     turn["short_context"] = context_metadata
                     turn["context_budget_used"] = dict(tokens=context.used, bytes=context.used)
+                    if turn.get("model_selection"):
+                        verify_lease(turn["model_selection"]["expires_at"], self.clock())
                     turn["phase"] = "generating"
                     turn["model_calls"] += 1
                     turn["timings"]["model_started_at"] = utc(self.clock())
@@ -1347,6 +1372,8 @@ class Core:
             )
             with self.store.transaction():
                 turn = self.store.get("turns", turn_id)
+                if turn["cancelled"] or turn["phase"] in TERMINAL:
+                    return
                 turn["failure"] = error.code if isinstance(error, Fault) else type(error).__name__
                 self._finish(turn, "failed", "failed")
 
