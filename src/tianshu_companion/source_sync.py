@@ -28,6 +28,21 @@ def actor_key(data, actor):
     return digest([data["message_key"], actor])
 
 
+def needs_model_reservation(core, data, channel, cid, actor, now):
+    """Read-only plan; accept_actor repeats the decision inside its transaction."""
+    if core.store.get("inbox", actor_key(data, actor)):
+        return False
+    if cid is None:
+        return True
+    collection_key = dict(channel=channel, author=data["author"])
+    return not any(
+        c["collection_key"] == collection_key
+        and c["scope"]["actor_id"] == actor
+        and c["deadline"] > now
+        for c in core.store.list("collections", cid, ["collecting"])
+    )
+
+
 def selector(data, actor):
     return dict(key=physical_key(data), actor_id=actor)
 
@@ -368,8 +383,11 @@ def accept_actor(
             raise Fault("queue_full")
         if core.default_model_selector is not None:
             if reservation is None:
-                # A new turn never consults a changed default after its input was accepted.
-                raise Fault("dependency_unavailable")
+                # A collector closed after the read-only plan. Replan outside the
+                # transaction; never select against a changed default here.
+                error = Fault("dependency_unavailable")
+                error.selection_race = True
+                raise error
             verify_lease(reservation["expires_at"], now)
         continuations = [
             c
@@ -488,17 +506,20 @@ def accept_actor(
 
 
 async def ingest(core, service, request, defer=False, *, legacy=False):
-    try:
-        return await _ingest(core, service, request, defer, legacy=legacy)
-    except Fault as error:
-        # The failed fanout has rolled back every new P/A. Close only an existing
-        # full collector so the caller can retry its unaccepted input later.
-        if error.code == "queue_full" and getattr(error, "collection_id", None):
-            with core.store.transaction():
-                collection = core.store.get("collections", error.collection_id)
-                if collection and collection["state"] == "collecting":
-                    core._seal(collection, core.clock(), "resource_limit")
-        raise
+    for attempt in range(3):
+        try:
+            return await _ingest(core, service, request, defer, legacy=legacy)
+        except Fault as error:
+            if getattr(error, "selection_race", False) and attempt < 2:
+                continue
+            # The failed fanout has rolled back every new P/A. Close only an existing
+            # full collector so the caller can retry its unaccepted input later.
+            if error.code == "queue_full" and getattr(error, "collection_id", None):
+                with core.store.transaction():
+                    collection = core.store.get("collections", error.collection_id)
+                    if collection and collection["state"] == "collecting":
+                        core._seal(collection, core.clock(), "resource_limit")
+            raise
 
 
 async def _ingest(core, service, request, defer=False, *, legacy=False):
@@ -586,12 +607,27 @@ async def _ingest(core, service, request, defer=False, *, legacy=False):
     reservations = {}
     if core.default_model_selector is not None and data["kind"] != "retract" and prior is None:
         for actor in grants:
+            # A new command key can still refer to an accepted physical input, or add
+            # a message to an open collection. Both already own a pinned turn grant.
+            if not needs_model_reservation(core, data, channel, cid, actor, core.clock()):
+                continue
             turn_id = uid("turn")
-            selected = await resolve_selection(
-                core.default_model_selector,
-                SelectionRequest(turn_id, actor, identity[0], authority["audience"], candidate_cid),
-                core.clock,
-            )
+            try:
+                selected = await resolve_selection(
+                    core.default_model_selector,
+                    SelectionRequest(
+                        turn_id, actor, identity[0], authority["audience"], candidate_cid
+                    ),
+                    core.clock,
+                )
+            except Fault as error:
+                current = ensure_channel(store, channel)
+                current_cid = current["conversation_id"] if current else None
+                if not needs_model_reservation(
+                    core, data, channel, current_cid, actor, core.clock()
+                ):
+                    error.selection_race = True
+                raise
             reservations[actor] = dict(
                 turn_id=turn_id,
                 config_version=selected.config_version,
@@ -612,7 +648,9 @@ async def _ingest(core, service, request, defer=False, *, legacy=False):
         )
         cid = conv["conversation_id"]
         if reservations and cid != candidate_cid:
-            raise Fault("dependency_unavailable")
+            error = Fault("dependency_unavailable")
+            error.selection_race = True
+            raise error
         grants = {
             a: c
             for a, c in grants.items()
@@ -624,7 +662,9 @@ async def _ingest(core, service, request, defer=False, *, legacy=False):
         if fresh_prior != prior:
             # Another request completed while identity was in flight. Re-enter
             # outside the transaction so frozen routing is reauthorized.
-            raise Fault("dependency_unavailable")
+            error = Fault("dependency_unavailable")
+            error.selection_race = True
+            raise error
         if prior:
             if legacy:
                 receipt = prior["response"]

@@ -13,6 +13,7 @@ from support import Harness
 from tianshu_companion.app import create_app
 from tianshu_companion.clients import JsonService, Memory, Origins, uid, utc
 from tianshu_companion.contracts import Fault, digest
+from tianshu_companion.model_selection import ModelSelection
 from tianshu_companion.source_sync import INPUT_FIELDS, physical_key, selector
 
 
@@ -69,12 +70,178 @@ class SourceHarness(Harness):
         return self.core.source_facts("memory", request)
 
 
+class RecordingModelSelector:
+    def __init__(self, harness):
+        self.harness = harness
+        self.version = 10
+        self.fail = False
+        self.fail_first = False
+        self.gate_first = None
+        self.actor_gates = {}
+        self.requests = []
+
+    async def select(self, request):
+        assert not self.harness.core.store.db.in_transaction
+        self.requests.append(request)
+        version = self.version
+        if len(self.requests) == 1 and self.gate_first is not None:
+            await self.gate_first.wait()
+        if request.actor_id in self.actor_gates:
+            await self.actor_gates[request.actor_id].wait()
+        if self.fail or (len(self.requests) == 1 and self.fail_first):
+            raise RuntimeError("synthetic selector failure")
+        return ModelSelection(version, self.harness.clock() + 3600, False)
+
+
 class SourceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.h = SourceHarness()
 
     async def asyncTearDown(self):
         await self.h.core.close()
+
+    async def dynamic_selector(self):
+        await self.h.core.close()
+        selected = RecordingModelSelector(self.h)
+        self.h.core = self.h.new_core(default_model_selector=selected)
+        return selected
+
+    async def test_dynamic_duplicate_and_collecting_append_reuse_original_selection(self):
+        h = self.h
+        selected = await self.dynamic_selector()
+        first = h.fanout(targets=["actor:a"])
+        admitted = await h.submit(first)
+        original = admitted["outcomes"][0]["receipt"]
+        self.assertEqual(1, len(selected.requests))
+        selected.fail = True
+        replay = copy.deepcopy(first)
+        replay["command"]["idempotency_key"] = uid("new-command")
+        replay["command"]["request_id"] = uid("request")
+        duplicate = await h.submit(replay)
+        self.assertEqual("duplicate", duplicate["outcomes"][0]["state"])
+        self.assertEqual(original["receipt_id"], duplicate["outcomes"][0]["receipt"]["receipt_id"])
+        later = await h.submit(h.fanout(text="Second message", targets=["actor:a"]))
+        appended = later["outcomes"][0]
+        self.assertEqual("accepted", appended["state"])
+        self.assertEqual(original["collection_id"], appended["receipt"]["collection_id"])
+        self.assertEqual(1, len(selected.requests))
+        collections = h.core.store.list("collections")
+        self.assertEqual([2], [len(c["messages"]) for c in collections])
+        self.assertEqual(10, collections[0]["model_selection"]["config_version"])
+        h.clock.advance(5)
+        await h.cycles(70)
+        self.assertEqual([10], [t["config_version"] for t in h.turns()])
+
+    async def test_dynamic_new_actor_on_duplicate_physical_gets_own_selection(self):
+        h = self.h
+        selected = await self.dynamic_selector()
+        first = h.fanout(targets=["actor:a"])
+        admitted = await h.submit(first)
+        replay = copy.deepcopy(first)
+        replay["command"]["idempotency_key"] = uid("new-command")
+        replay["target_actor_ids"] = ["actor:a", "actor:b"]
+        selected.version = 20
+        second = await h.submit(replay)
+        self.assertEqual(["duplicate", "accepted"], [o["state"] for o in second["outcomes"]])
+        self.assertEqual(
+            admitted["outcomes"][0]["receipt"]["receipt_id"],
+            second["outcomes"][0]["receipt"]["receipt_id"],
+        )
+        self.assertEqual(["actor:a", "actor:b"], [r.actor_id for r in selected.requests])
+        collections = h.core.store.list("collections")
+        self.assertEqual(
+            {"actor:a": 10, "actor:b": 20},
+            {c["scope"]["actor_id"]: c["model_selection"]["config_version"] for c in collections},
+        )
+
+    async def test_dynamic_next_turn_after_seal_selects_new_default(self):
+        h = self.h
+        selected = await self.dynamic_selector()
+        first = await h.submit(h.fanout(text="First", targets=["actor:a"]))
+        h.clock.advance(5)
+        await h.cycles(70)
+        self.assertEqual([10], [t["config_version"] for t in h.turns()])
+        selected.version = 20
+        second = await h.submit(h.fanout(text="Next turn", targets=["actor:a"]))
+        self.assertNotEqual(
+            first["outcomes"][0]["receipt"]["collection_id"],
+            second["outcomes"][0]["receipt"]["collection_id"],
+        )
+        self.assertEqual(2, len(selected.requests))
+        collecting = h.core.store.list("collections", states=["collecting"])
+        self.assertEqual([20], [c["model_selection"]["config_version"] for c in collecting])
+
+    async def test_dynamic_competing_first_inputs_recheck_conversation_after_selection(self):
+        h = self.h
+        selected = await self.dynamic_selector()
+        selected.gate_first = asyncio.Event()
+        slow_request = h.fanout(text="Slow", targets=["actor:a"])
+        slow = asyncio.create_task(h.submit(slow_request))
+        async with asyncio.timeout(1):
+            while not selected.requests:
+                await asyncio.sleep(0)
+        selected.version = 20
+        fast = await h.submit(h.fanout(text="Fast", targets=["actor:a"]))
+        self.assertEqual("accepted", fast["outcomes"][0]["state"])
+        selected.gate_first.set()
+        appended = await slow
+        self.assertEqual("accepted", appended["outcomes"][0]["state"])
+        self.assertEqual(2, len(h.core.store.list("inbox")))
+        self.assertEqual(2, len(selected.requests))
+        collections = h.core.store.list("collections")
+        self.assertEqual([2], [len(c["messages"]) for c in collections])
+        self.assertEqual(20, collections[0]["model_selection"]["config_version"])
+
+    async def test_dynamic_competing_duplicate_survives_late_selector_failure(self):
+        h = self.h
+        selected = await self.dynamic_selector()
+        selected.gate_first = asyncio.Event()
+        request = h.fanout(text="Same physical", targets=["actor:a"])
+        slow = asyncio.create_task(h.submit(request))
+        async with asyncio.timeout(1):
+            while not selected.requests:
+                await asyncio.sleep(0)
+        other_key = copy.deepcopy(request)
+        other_key["command"]["idempotency_key"] = uid("new-command")
+        admitted = await h.submit(other_key)
+        self.assertEqual("accepted", admitted["outcomes"][0]["state"])
+        selected.fail_first = True
+        selected.gate_first.set()
+        duplicate = await slow
+        self.assertEqual("duplicate", duplicate["outcomes"][0]["state"])
+        self.assertEqual(
+            admitted["outcomes"][0]["receipt"]["receipt_id"],
+            duplicate["outcomes"][0]["receipt"]["receipt_id"],
+        )
+        self.assertEqual(2, len(selected.requests))
+        self.assertEqual(1, len(h.core.store.list("inbox")))
+        self.assertEqual(1, len(h.core.store.list("collections")))
+
+    async def test_dynamic_collector_seals_during_other_actor_selection_and_replans(self):
+        h = self.h
+        selected = await self.dynamic_selector()
+        await h.submit(h.fanout(text="Original", targets=["actor:a"]))
+        gate = selected.actor_gates["actor:b"] = asyncio.Event()
+        pending = asyncio.create_task(
+            h.submit(h.fanout(text="Both actors", targets=["actor:a", "actor:b"]))
+        )
+        async with asyncio.timeout(1):
+            while len(selected.requests) < 2:
+                await asyncio.sleep(0)
+        h.clock.advance(5)
+        with h.core.store.transaction():
+            h.core._seal_due(h.clock())
+        self.assertEqual([10], [t["config_version"] for t in h.turns()])
+        selected.version = 20
+        gate.set()
+        response = await pending
+        self.assertEqual(["accepted", "accepted"], [o["state"] for o in response["outcomes"]])
+        self.assertEqual(4, len(selected.requests))
+        current = h.core.store.list("collections", states=["collecting"])
+        self.assertEqual(
+            {"actor:a": 20, "actor:b": 20},
+            {c["scope"]["actor_id"]: c["model_selection"]["config_version"] for c in current},
+        )
 
     async def test_same_physical_fanout_and_other_messages_isolate_actor_collectors(self):
         h = self.h
