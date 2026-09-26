@@ -7,6 +7,7 @@ Gateway authorization still independently checks the pinned version at execution
 import asyncio
 import math
 from dataclasses import dataclass
+from dataclasses import asdict
 from typing import Protocol
 
 from .contracts import Fault
@@ -41,6 +42,27 @@ class ModelSelection:
 
 class DefaultModelSelector(Protocol):
     async def select(self, request: SelectionRequest) -> ModelSelection: ...
+
+
+class HttpDefaultModelSelector:
+    """Dedicated companion identity; the platform proves the exact publication."""
+
+    def __init__(self, client):
+        if not client.url or not client.token:
+            raise ValueError("provider selector service is not configured")
+        self.client = client
+
+    async def select(self, request: SelectionRequest) -> ModelSelection:
+        value = await self.client.call("/internal/v1/provider-self-service/select", asdict(request))
+        if not isinstance(value, dict) or set(value) != {
+            "config_version",
+            "expires_at",
+            "revoked",
+            "caller_service",
+            "workload",
+        }:
+            raise Fault("dependency_unavailable")
+        return ModelSelection(**value)
 
 
 def verify_lease(expires_at, now):

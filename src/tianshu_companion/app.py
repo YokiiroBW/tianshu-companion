@@ -26,6 +26,7 @@ from .life_read_queries import LifeReadQueries
 from .store import Store
 from .images import ComfyUI, Workflow
 from .short_context import ShortContextPolicy
+from .model_selection import HttpDefaultModelSelector
 from .worker_health import WorkerHealth
 from . import runtime_capabilities
 
@@ -398,6 +399,9 @@ def build_runtime(config):
             timeout=routing.get("timeout", 20),
             request_expiry=routing.get("request_expiry", 600),
         )
+    provider_selector = None
+    if config.get("provider_self_service", False):
+        provider_selector = HttpDefaultModelSelector(client("provider_selector", "platform"))
     core = Core(
         Store(config["database_path"]),
         contracts,
@@ -408,6 +412,7 @@ def build_runtime(config):
         bindings=config.get("bindings", {}),
         roles=config.get("roles", {}),
         config_version=config.get("config_version"),
+        default_model_selector=provider_selector,
         policy=Policy(**config.get("policy", {})),
         short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
         life_writing=config.get("life_writing", False),
