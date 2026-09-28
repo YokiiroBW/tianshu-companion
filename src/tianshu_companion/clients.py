@@ -537,14 +537,26 @@ class BotSenderRouter:
                 raise ValueError("A platform bot binding must be a registered qq/tg binding")
         if self.selected and not platform.available:
             raise ValueError("A selected platform bot binding requires platform_sender service")
+        self.dynamic = set()
+
+    def select_dynamic(self, binding_id):
+        if not self.platform.available:
+            raise ValueError("A dynamic platform bot binding requires platform_sender service")
+        self.dynamic.add(binding_id)
 
     @property
     def available(self):
-        return self.legacy.available or (bool(self.selected) and self.platform.available)
+        return self.legacy.available or (
+            bool(self.selected or self.dynamic) and self.platform.available
+        )
 
     def _sender(self, request):
         binding_id = request["destination"]["binding_id"]
-        return self.platform if binding_id in self.selected else self.legacy
+        return (
+            self.platform
+            if binding_id in self.selected or binding_id in self.dynamic
+            else self.legacy
+        )
 
     async def send(self, request):
         return await self._sender(request).send(request)

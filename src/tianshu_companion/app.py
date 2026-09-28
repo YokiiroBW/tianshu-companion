@@ -394,6 +394,19 @@ def build_runtime(config):
             staging=image_config["staging"],
         )
     platform_client = client("platform_sender", "channel")
+    bot_binding_management = config.get("bot_binding_management_enabled", False)
+    if type(bot_binding_management) is not bool:
+        raise ValueError("bot_binding_management_enabled must be boolean")
+    if bot_binding_management:
+        if (
+            bot_binding_management is not True
+            or config.get("callers", {}).get("platform", {}).get("issuer") != "platform"
+            or not platform_client.url
+            or not platform_client.token
+        ):
+            raise ValueError(
+                "Bot binding management requires the registered platform issuer and sender"
+            )
     outbound = BotSenderRouter(
         Sender(contracts, client("nonebot", "channel")),
         PlatformBotSender(contracts, platform_client),
@@ -444,6 +457,10 @@ def build_runtime(config):
         # character is declared, so startup and the maintenance CLI read it identically.
         persona_import=config if persona_config else None,
     )
+    if bot_binding_management:
+        from .bot_bindings import BotBindings
+
+        core.bot_bindings = BotBindings(core, outbound, config.get("bindings", {}))
     for spec in (routing or {}).get("commands", []):
         core.direct.register_command(**spec)
     # The optional authorized read port. Its deployment mapping is validated here, where the
@@ -696,6 +713,14 @@ def create_app(core=None, tokens=None, life_readers=None):
                 return core.commands(service)
             if operation == "persona":
                 return core.manage_persona(service, body)
+            if operation == "bot-binding-apply":
+                if not hasattr(core, "bot_bindings"):
+                    raise Fault("dependency_unavailable")
+                return core.bot_bindings.apply(service, body)
+            if operation == "bot-binding-status":
+                if not hasattr(core, "bot_bindings"):
+                    raise Fault("dependency_unavailable")
+                return core.bot_bindings.status(service, body)
             if operation == "capability":
                 return await core.capability(service, body)
             return await core.cancel(service, body)
@@ -713,6 +738,14 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v1/conversation/ingest-actors")
     async def ingest_actors(request: Request):
         return await dispatch(request, "ingest-actors")
+
+    @app.post("/internal/v1/bot-bindings/apply")
+    async def bot_binding_apply(request: Request):
+        return await dispatch(request, "bot-binding-apply")
+
+    @app.post("/internal/v1/bot-bindings/status")
+    async def bot_binding_status(request: Request):
+        return await dispatch(request, "bot-binding-status")
 
     @app.post("/internal/v1/conversation/web-snapshot")
     async def web_snapshot(request: Request):
