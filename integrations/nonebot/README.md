@@ -1,4 +1,6 @@
-# 天枢 NoneBot / OneBot v11 插件
+# 天枢 NoneBot / OneBot v11 旧 pull 插件
+
+新版网页自助适配器安装、密钥与地址说明见 [ADAPTER.md](ADAPTER.md)。以下仅用于加载 `tianshu_nonebot.plugin` 的旧 pull 模式；与新版 `tianshu_nonebot.adapter_plugin` 互斥。
 
 此插件在现有 NoneBot 进程内运行。当前验证组合为 Python 3.12、NoneBot 2.5.0、`nonebot-adapter-onebot` 2.4.0；线上宿主版本未获知，安装前应先读取宿主 manifest 并在隔离环境中验证兼容性。首轮只支持 OneBot v11/NapCat 的私聊或群聊文本；群聊默认仅处理发给本机器人的消息。媒体、任意第三方 @、回复段、编辑、撤回、TG 均未启用。它不启动第二个陪伴 Core，也不使用 NoneBot `matcher.send` 回复。
 

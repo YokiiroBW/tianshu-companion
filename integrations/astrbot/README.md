@@ -1,4 +1,6 @@
-# 天枢 AstrBot 连接器
+# 天枢 AstrBot 旧 pull 连接器
+
+新版网页自助适配器安装、密钥与受控地址说明见 [ADAPTER.md](ADAPTER.md)。以下仅用于已部署的旧 pull 模式，须在 AstrBot 插件配置页显式设置 `enabled=true`；默认运行新版适配器。
 
 此目录中的 `astrbot_plugin_tianshu/` 是可单独放入 AstrBot `data/plugins/` 的插件。它只连接天枢平台，不运行第二套模型、人格或记忆。首轮支持 **AstrBot 4.27.3 + aiocqhttp/OneBot11 的 QQ 私聊与群聊文本**。其他 AstrBot 平台适配器、媒体、编辑、撤回和引用消息没有实现，不会转成纯文本冒充支持。
 
