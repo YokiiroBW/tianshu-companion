@@ -12,10 +12,10 @@
    ```
 
    只在当前终端显示密钥；普通日志、RPC 返回和网页回显均不包含它。保持 SQLite 数据目录私有且跨重启保存。
-3. RPC 挂在 NoneBot 现有 FastAPI driver 的监听端口，路径 `/tianshu/adapter/v1/*`。网页填写该宿主的受控 HTTPS 地址和密钥；本机/局域网 HTTP 需平台显式允许私有 HTTP。插件不启动第二端口或第二套 Core。
+3. RPC 挂在 NoneBot 现有 FastAPI driver 的监听端口，路径 `/tianshu/adapter/v1/*`。网页填写该宿主的私网 HTTP 地址和密钥，平台需允许私有 HTTP；若宿主已经使用受控 HTTPS，也可填写其地址。插件不启动第二端口或第二套 Core。宿主仍需把现有监听端口绑定或发布到平台可访问的私网，且不要向公网发布。
 4. 网页探测从在线 OneBot SDK `get_login_info()` 读取真实 QQ 账号；离线列表为空。管理员选择账号、群或私聊、明确作者、角色，保存后再启用。群没有隐含“所有作者”权限。
 
-入口 `tianshu_nonebot.adapter_plugin` 与历史 `tianshu_nonebot.plugin` 互斥，同一进程同时加载会拒绝第二个。旧 pull 模式及配置/API 保留，见 [README.md](README.md)；切换时先停用旧连接。NoneBot 2.5.0 没有通用插件热卸载 API，本插件路由在 driver shutdown 时移除，宿主重启用于切换插件集合。
+入口 `tianshu_nonebot.adapter_plugin` 与历史 `tianshu_nonebot.plugin` 互斥，同一进程同时加载会拒绝第二个。旧 pull 模式及配置/API 保留，见 [README.md](README.md)；切换时先停用旧连接。NoneBot 2.5.0 没有通用插件热卸载 API，本插件路由在 driver shutdown 时移除，宿主重启用于切换插件集合。NoneBot 没有 AstrBot 式统一插件详情 Page：安装仍需宿主现有插件加载机制；密钥仍由宿主本机命令显示，这是当前候选的两个操作限制。
 
 入站只接受 OneBot v11 真实私聊/群聊纯文本与 bot 自身 @；媒体、第三方 @、引用及匿名消息放行其他插件。消息先持久入队后才由 matcher 阻断下游。发送先持久意图、再调用 SDK 一次；`unknown` 不重试，`sent` 需要真实 `message_id`。停用后不新收发。SQLite 队列与发送历史有硬上限，满后拒绝新工作；不要多进程共用数据目录。
 

@@ -5,9 +5,20 @@
     "default": false
   },
   "adapter_port": {
-    "description": "新版适配器本机回环监听端口（固定只监听 127.0.0.1）",
+    "description": "新版适配器 RPC 端口（总控将容器端口发布到 NAS 私网）",
     "type": "int",
     "default": 18765
+  },
+  "adapter_listen_mode": {
+    "description": "新版适配器监听范围：loopback 本机；lan 指定私网 IP；container 容器全部接口",
+    "type": "string",
+    "options": ["loopback", "lan", "container"],
+    "default": "loopback"
+  },
+  "adapter_lan_host": {
+    "description": "仅 lan 模式填写宿主 10/8、172.16/12 或 192.168/16 私网 IPv4；其他模式留空",
+    "type": "string",
+    "default": ""
   },
   "base_url": {
     "description": "天枢平台 HTTPS 地址",

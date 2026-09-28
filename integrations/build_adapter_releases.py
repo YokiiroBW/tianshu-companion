@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT.parent / ".runtime" / "adapter-artifacts"
 VERSION = "0.2.0"
+ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
 def _files(folder: Path):
@@ -32,6 +33,13 @@ def _wheel_record(entries: dict[str, bytes], record_name: str) -> bytes:
     return stream.getvalue().encode()
 
 
+def _write_entry(archive: zipfile.ZipFile, name: str, data: bytes) -> None:
+    info = zipfile.ZipInfo(name, date_time=ZIP_TIMESTAMP)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16
+    archive.writestr(info, data)
+
+
 def main() -> None:
     source = (ROOT / "shared" / "tianshu_adapter_rpc.py").read_bytes()
     astr = ROOT / "astrbot" / "astrbot_plugin_tianshu"
@@ -43,8 +51,10 @@ def main() -> None:
     astr_zip = OUT / f"astrbot_plugin_tianshu-{VERSION}.zip"
     with zipfile.ZipFile(astr_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in _files(astr):
-            archive.write(path, f"astrbot_plugin_tianshu/{path.relative_to(astr).as_posix()}")
-        archive.write(ROOT / "astrbot" / "ADAPTER.md", "astrbot_plugin_tianshu/README.md")
+            _write_entry(archive, f"astrbot_plugin_tianshu/{path.relative_to(astr).as_posix()}",
+                         path.read_bytes())
+        _write_entry(archive, "astrbot_plugin_tianshu/README.md",
+                     (ROOT / "astrbot" / "ADAPTER.md").read_bytes())
 
     dist = f"tianshu_nonebot_adapter-{VERSION}.dist-info"
     entries = {f"tianshu_nonebot/{path.relative_to(none).as_posix()}": path.read_bytes()
@@ -64,8 +74,8 @@ def main() -> None:
     entries[record] = _wheel_record(entries, record)
     wheel = OUT / f"tianshu_nonebot_adapter-{VERSION}-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, data in entries.items():
-            archive.writestr(name, data)
+        for name, data in sorted(entries.items()):
+            _write_entry(archive, name, data)
     for path in (astr_zip, wheel):
         print(f"{path} sha256={hashlib.sha256(path.read_bytes()).hexdigest()}")
 

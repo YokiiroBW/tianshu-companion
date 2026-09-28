@@ -1,13 +1,14 @@
-"""AstrBot 4.27.3 adapter transport on loopback only.
+"""AstrBot 4.27.3 adapter transport for explicitly selected private networking.
 
-AstrBot's supported plugin Web API is Dashboard-session protected, so it cannot
-serve an independent platform Bearer client. A controlled TLS reverse proxy may
-publish this loopback endpoint; this module never binds a public interface.
+AstrBot's plugin Web API is Dashboard-session protected, so the independent
+platform Bearer client uses this listener. Loopback is the default; LAN and
+container exposure require an explicit plugin configuration choice.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,10 +18,44 @@ from aiohttp import web
 from .rpc import AdapterService, PREFIX
 
 
+PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+))
+
+
+def _private_address(value: str | None) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return isinstance(address, ipaddress.IPv4Address) and (
+        address.is_loopback or any(address in network for network in PRIVATE_NETWORKS)
+    )
+
+
+def _listen_host(mode: str, lan_host: str) -> str:
+    if mode == "loopback":
+        return "127.0.0.1"
+    if mode == "container":
+        return "0.0.0.0"
+    if mode == "lan":
+        try:
+            address = ipaddress.IPv4Address(lan_host)
+        except ipaddress.AddressValueError:
+            pass
+        else:
+            if any(address in network for network in PRIVATE_NETWORKS):
+                return str(address)
+    raise ValueError("invalid adapter listen mode or LAN address")
+
+
 class AstrAdapter:
-    def __init__(self, context, data_dir: Path, port: int):
+    def __init__(self, context, data_dir: Path, port: int,
+                 listen_mode: str = "loopback", lan_host: str = ""):
         if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
             raise ValueError("invalid adapter port")
+        self.listen_host = _listen_host(listen_mode, lan_host)
+        self.listen_mode = listen_mode
         self.context = context
         self.port = port
         self.service = AdapterService(data_dir / "adapter.sqlite3", "astrbot",
@@ -145,13 +180,15 @@ class AstrAdapter:
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         try:
-            await web.TCPSite(runner, "127.0.0.1", self.port).start()
+            await web.TCPSite(runner, self.listen_host, self.port).start()
         except Exception:
             await runner.cleanup()
             raise
         self.runner = runner
 
     async def _http(self, request):
+        if not _private_address(request.remote):
+            return web.json_response({"code": "forbidden", "retryable": False}, status=403)
         if request.content_type != "application/json":
             return web.json_response({"code": "invalid_input", "retryable": False}, status=400)
         if self.semaphore.locked():

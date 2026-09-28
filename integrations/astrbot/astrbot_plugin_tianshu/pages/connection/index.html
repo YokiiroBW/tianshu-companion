@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>天枢适配器连接信息</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; padding: 24px; line-height: 1.55; }
+    main { max-width: 680px; margin: auto; }
+    h1 { font-size: 1.3rem; }
+    .card { border: 1px solid #8886; border-radius: 12px; padding: 18px; margin: 16px 0; }
+    code, output { overflow-wrap: anywhere; user-select: text; }
+    button { cursor: pointer; padding: 9px 16px; border-radius: 8px; }
+    .secret { display: block; margin-top: 12px; font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>天枢适配器连接信息</h1>
+    <p>在天枢网页添加 AstrBot 时，填写插件所在主机的私网地址与下方端口。容器模式的端口由部署者发布到 NAS 私网。</p>
+    <section class="card" aria-live="polite">
+      <div id="state">正在连接 AstrBot 管理页面…</div>
+      <div id="endpoint" hidden></div>
+    </section>
+    <section class="card">
+      <p>连接密钥仅供天枢网页添加适配器使用。请勿发到聊天或日志。</p>
+      <button type="button" id="reveal" disabled>显示连接密钥</button>
+      <button type="button" id="hide" hidden>隐藏</button>
+      <output class="secret" id="key" aria-live="polite"></output>
+    </section>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

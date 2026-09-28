@@ -17,6 +17,7 @@ from .adapter import AstrAdapter
 from .http_port import PlatformHTTP
 from .runtime import BoundaryError, Journal, Runner, Settings
 
+INFO_ROUTE = "/astrbot_plugin_tianshu/connection-info"
 
 class TianshuPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -28,14 +29,24 @@ class TianshuPlugin(Star):
         self._runner: Runner | None = None
         self._adapter: AstrAdapter | None = None
         self._adapter_task: asyncio.Task | None = None
+        self._registered_info = False
         # Adapter mode is the install default. The historical pull connector is
         # still available through enabled=true, but never runs simultaneously.
         if not config or config.get("enabled") is not True:
             try:
                 data_dir = Path(StarTools.get_data_dir("astrbot_plugin_tianshu"))
                 self._adapter = AstrAdapter(
-                    context, data_dir, int((config or {}).get("adapter_port", 18765))
+                    context,
+                    data_dir,
+                    int((config or {}).get("adapter_port", 18765)),
+                    listen_mode=(config or {}).get("adapter_listen_mode", "loopback"),
+                    lan_host=str((config or {}).get("adapter_lan_host") or ""),
                 )
+                context.register_web_api(
+                    INFO_ROUTE, self.connection_info, ["GET"],
+                    "Authenticated administrator view of Tianshu adapter connection details",
+                )
+                self._registered_info = True
             except (ValueError, OSError, sqlite3.Error):
                 logger.warning("tianshu adapter inactive: initialization_failed")
             self._start_adapter()
@@ -87,6 +98,28 @@ class TianshuPlugin(Star):
             await self._adapter.start()
         except Exception:
             self._report("adapter_listen_failed")
+
+    async def connection_info(self):
+        """Dashboard-only key reveal for its configured administrator account."""
+        from astrbot.api.web import json_response, request
+
+        dashboard = self.context.get_config().get("dashboard", {})
+        administrator = dashboard.get("username") if isinstance(dashboard, dict) else None
+        headers = {"Cache-Control": "no-store, private", "Pragma": "no-cache",
+                   "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff"}
+        if not administrator or request.username != administrator:
+            return json_response({"code": "forbidden"}, status_code=403, headers=headers)
+        if self._adapter is None:
+            return json_response({"code": "dependency_unavailable"},
+                                 status_code=503, headers=headers)
+        return json_response({
+            "protocol": "tianshu.bot-adapter/v1",
+            "listen_mode": self._adapter.listen_mode,
+            "listen_host": self._adapter.listen_host,
+            "port": self._adapter.port,
+            "listening": self._adapter.runner is not None,
+            "access_key": self._adapter.service.access_key,
+        }, headers=headers)
 
     def _report(self, code: str) -> None:
         now = time.monotonic()
@@ -191,6 +224,12 @@ class TianshuPlugin(Star):
             await asyncio.sleep(self._runner.settings.poll_seconds)
 
     async def terminate(self) -> None:
+        if self._registered_info:
+            self.context.registered_web_apis[:] = [
+                item for item in self.context.registered_web_apis
+                if not (item[0] == INFO_ROUTE and getattr(item[1], "__self__", None) is self)
+            ]
+            self._registered_info = False
         if self._adapter_task is not None:
             try:
                 await self._adapter_task
