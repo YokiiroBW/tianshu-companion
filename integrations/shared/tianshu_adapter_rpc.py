@@ -16,6 +16,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -27,8 +28,11 @@ MAX_REQUEST = 65536
 MAX_RESPONSE = 65536
 MAX_PENDING = 10000
 MAX_HISTORY = 20000
+OBSERVATION_LEASE_SECONDS = 30
+CLAIM_DECISION_SECONDS = 5
 IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-QQ = re.compile(r"^(group|private):([1-9][0-9]*)$")
+QQ = re.compile(r"^(group|private):([1-9][0-9]{0,19})$")
+QQ_ID = re.compile(r"^[1-9][0-9]{0,19}$")
 
 
 class RpcError(Exception):
@@ -106,6 +110,32 @@ class AdapterService:
                 receipt TEXT NOT NULL,
                 PRIMARY KEY(connection_id,reply_id,attempt_id)
             );
+            CREATE TABLE IF NOT EXISTS observation_accounts (
+                account_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
+                enabled INTEGER NOT NULL, digest TEXT NOT NULL,
+                group_policy TEXT NOT NULL, private_policy TEXT NOT NULL,
+                last_poll REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS observation_requests (
+                request_id TEXT PRIMARY KEY, digest TEXT NOT NULL, response TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS observations (
+                id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
+                conversation TEXT NOT NULL, author TEXT NOT NULL,
+                native_id TEXT NOT NULL, payload TEXT NOT NULL,
+                acked INTEGER NOT NULL DEFAULT 0, eligible INTEGER NOT NULL,
+                claimed INTEGER NOT NULL DEFAULT 0,
+                claim_resolved INTEGER NOT NULL,
+                claim_deadline REAL NOT NULL,
+                created REAL NOT NULL,
+                UNIQUE(account_id,conversation,author,native_id)
+            );
+            CREATE INDEX IF NOT EXISTS observations_pending
+                ON observations(account_id,acked,created,id);
+            CREATE TABLE IF NOT EXISTS observation_health (
+                account_id TEXT PRIMARY KEY, dropped INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT, last_error_at REAL
+            );
             """
         )
         try:
@@ -137,17 +167,28 @@ class AdapterService:
     def _binding(self, connection_id: str) -> tuple | None:
         return self.db.execute(
             "SELECT revision,account_id,conversation,authors,enabled,digest "
-            "FROM bindings WHERE connection_id=?", (connection_id,)
+            "FROM bindings WHERE connection_id=?",
+            (connection_id,),
         ).fetchone()
 
-    async def capture(self, account_id: str, conversation: str, author: str, native_id: str,
-                      sent_at: str, text: str) -> bool:
+    async def capture(
+        self,
+        account_id: str,
+        conversation: str,
+        author: str,
+        native_id: str,
+        sent_at: str,
+        text: str,
+    ) -> bool:
         """Return true only after an enabled, exact-author event is durable."""
         if not isinstance(text, str) or not 1 <= len(text) <= 8000:
             return False
         try:
             account_id, conversation, author, native_id = (
-                _ident(account_id), _qq(conversation), _ident(author), _ident(native_id)
+                _ident(account_id),
+                _qq(conversation),
+                _ident(author),
+                _ident(native_id),
             )
         except RpcError:
             return False
@@ -169,12 +210,18 @@ class AdapterService:
                 return False
             # Message revision belongs to the event contract, not binding updates.
             payload = {
-                "schema_version": 1, "connection_id": connection_id,
-                "platform_id": self.instance_id, "self_id": account_id,
-                "event_id": native_id, "revision": 1,
-                "namespace": "qq", "conversation_id": conversation,
-                "thread_id": None, "account_id": author,
-                "sent_at": sent_at, "text": text,
+                "schema_version": 1,
+                "connection_id": connection_id,
+                "platform_id": self.instance_id,
+                "self_id": account_id,
+                "event_id": native_id,
+                "revision": 1,
+                "namespace": "qq",
+                "conversation_id": conversation,
+                "thread_id": None,
+                "account_id": author,
+                "sent_at": sent_at,
+                "text": text,
             }
             self.db.execute(
                 "INSERT OR IGNORE INTO events(id,connection_id,native_id,author,payload,created) "
@@ -182,6 +229,192 @@ class AdapterService:
                 (uuid.uuid4().hex, connection_id, native_id, author, _json(payload), time.time()),
             )
             return True
+
+    async def capture_observation(
+        self,
+        account_id: str,
+        conversation: str,
+        author: str,
+        native_id: str,
+        sent_at: str,
+        text: str,
+        mentioned: bool,
+        content_state: str = "text",
+    ) -> bool:
+        """Durably observe an enrolled SDK account without claiming a reply."""
+        try:
+            account_id, conversation, author, native_id = (
+                _ident(account_id),
+                _qq(conversation),
+                _ident(author),
+                _ident(native_id),
+            )
+        except RpcError:
+            return False
+        if (
+            author == account_id
+            or not isinstance(sent_at, str)
+            or len(sent_at) > 40
+            or type(mentioned) is not bool
+            or content_state not in {"text", "unsupported"}
+            or not isinstance(text, str)
+            or len(text) > 8000
+            or (content_state == "unsupported" and text)
+            or (conversation.startswith("private:") and (conversation[8:] != author or mentioned))
+        ):
+            return False
+        try:
+            if datetime.fromisoformat(sent_at.replace("Z", "+00:00")).tzinfo is None:
+                return False
+        except ValueError:
+            return False
+        async with self.lock:
+            enrolled = self.db.execute(
+                "SELECT enabled,revision,group_policy,private_policy,last_poll "
+                "FROM observation_accounts WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+            if not enrolled or not enrolled[0]:
+                return False
+            kind, target = conversation.split(":", 1)
+            policy = json.loads(enrolled[2 if kind == "group" else 3])
+            if not policy["observe"]:
+                return False
+            old = self.db.execute(
+                "SELECT 1 FROM observations WHERE account_id=? AND conversation=? "
+                "AND author=? AND native_id=?",
+                (account_id, conversation, author, native_id),
+            ).fetchone()
+            if old:
+                return True
+            if (
+                self.db.execute("SELECT COUNT(*) FROM observations WHERE acked=0").fetchone()[0]
+                >= MAX_PENDING
+            ):
+                self._observation_drop(account_id, "pending_capacity")
+                return False
+            # Acknowledged host rows are transport history, not the authoritative archive.
+            self.db.execute(
+                "DELETE FROM observations WHERE acked=1 AND created<?", (time.time() - 30 * 86400,)
+            )
+            history = self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+            if history >= MAX_HISTORY:
+                self.db.execute(
+                    "DELETE FROM observations WHERE id IN (SELECT id FROM observations "
+                    "WHERE acked=1 ORDER BY created,id LIMIT ?)",
+                    (history - MAX_HISTORY + 1,),
+                )
+            if self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] >= MAX_HISTORY:
+                self._observation_drop(account_id, "history_capacity")
+                return False
+            payload = {
+                "schema_version": 2,
+                "platform_id": self.instance_id,
+                "self_id": account_id,
+                "namespace": "qq",
+                "conversation_id": conversation,
+                "account_id": author,
+                "event_id": native_id,
+                "revision": 1,
+                "sent_at": sent_at,
+                "text": text,
+                "content_state": content_state,
+                "mentioned": mentioned,
+                "scope_revision": enrolled[1],
+            }
+            matched = target in policy["list"]
+            permitted = (policy["mode"] == "whitelist" and matched) or (
+                policy["mode"] == "blacklist" and not matched
+            )
+            eligible = bool(
+                time.time() - enrolled[4] <= OBSERVATION_LEASE_SECONDS
+                and policy["observe"]
+                and permitted
+                and content_state == "text"
+                and text.strip()
+                and (kind == "private" or mentioned)
+            )
+            self.db.execute(
+                "INSERT INTO observations(id,account_id,conversation,author,native_id,payload,"
+                "eligible,claim_resolved,claim_deadline,created) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    uuid.uuid4().hex,
+                    account_id,
+                    conversation,
+                    author,
+                    native_id,
+                    _json(payload),
+                    int(eligible),
+                    int(not eligible),
+                    time.time() + CLAIM_DECISION_SECONDS,
+                    time.time(),
+                ),
+            )
+            return True
+
+    def _observation_drop(self, account_id: str, code: str) -> None:
+        self.db.execute(
+            "INSERT INTO observation_health VALUES(?,1,?,?) "
+            "ON CONFLICT(account_id) DO UPDATE SET dropped=dropped+1,"
+            "last_error=excluded.last_error,last_error_at=excluded.last_error_at",
+            (account_id, code, time.time()),
+        )
+
+    async def observation_claimed(
+        self, account_id: str, conversation: str, author: str, native_id: str
+    ) -> bool:
+        async with self.lock:
+            row = self.db.execute(
+                "SELECT claimed,eligible,payload,claim_resolved,claim_deadline "
+                "FROM observations WHERE account_id=? AND conversation=? "
+                "AND author=? AND native_id=?",
+                (account_id, conversation, author, native_id),
+            ).fetchone()
+            if not row:
+                return False
+            if row[0]:
+                # Ownership was already confirmed and persisted. Redelivery must
+                # not hand the same native message to another reply plugin.
+                return True
+            if row[3]:
+                return False
+            if time.time() >= row[4]:
+                self._resolve_observation_claim(account_id, conversation, author, native_id, False)
+                return False
+            current = self.db.execute(
+                "SELECT enabled,revision,group_policy,private_policy,last_poll "
+                "FROM observation_accounts WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+            if not current or not current[0]:
+                self._resolve_observation_claim(account_id, conversation, author, native_id, False)
+                return False
+            event = json.loads(row[2])
+            if event["scope_revision"] != current[1]:
+                self._resolve_observation_claim(account_id, conversation, author, native_id, False)
+                return False
+            if time.time() - current[4] > OBSERVATION_LEASE_SECONDS:
+                self._resolve_observation_claim(account_id, conversation, author, native_id, False)
+                return False
+            kind, target = conversation.split(":", 1)
+            policy = json.loads(current[2 if kind == "group" else 3])
+            matched = target in policy["list"]
+            permitted = bool(
+                policy["observe"]
+                and (
+                    (policy["mode"] == "whitelist" and matched)
+                    or (policy["mode"] == "blacklist" and not matched)
+                )
+            )
+            self._resolve_observation_claim(account_id, conversation, author, native_id, permitted)
+            return permitted
+
+    def _resolve_observation_claim(self, account_id, conversation, author, native_id, claimed):
+        self.db.execute(
+            "UPDATE observations SET claim_resolved=1,claimed=? WHERE account_id=? "
+            "AND conversation=? AND author=? AND native_id=? AND claim_resolved=0",
+            (int(claimed), account_id, conversation, author, native_id),
+        )
 
     async def handle(self, path: str, authorization: str | None, body: bytes) -> tuple[int, dict]:
         if not hmac.compare_digest(authorization or "", "Bearer " + self.access_key):
@@ -194,6 +427,13 @@ class AdapterService:
                 _bad()
             async with self.lock:
                 routes = {
+                    PREFIX + "/observation/capabilities": self._observation_capabilities,
+                    PREFIX + "/observation/apply": self._observation_apply,
+                    PREFIX + "/observation/status": self._observation_status,
+                    PREFIX + "/observation/poll": self._observation_poll,
+                    PREFIX + "/observation/ack": self._observation_ack,
+                    PREFIX + "/observation/messages/send": self._observation_send,
+                    PREFIX + "/observation/messages/status": self._observation_send_status,
                     PREFIX + "/capabilities": self._capabilities,
                     PREFIX + "/bindings/apply": self._apply,
                     PREFIX + "/bindings/status": self._binding_status,
@@ -231,11 +471,21 @@ class AdapterService:
             except (KeyError, RpcError):
                 continue
             label = item.get("label")
-            accounts.append({"id": identifier, "platform": "qq",
-                             "label": str(label)[:128] if label else identifier})
-        return {"protocol": PROTOCOL, "adapter": self.adapter,
-                "instance_id": self.instance_id, "accounts": accounts,
-                "capabilities": ["text"], "max_outbound_utf8_bytes": 32768}
+            accounts.append(
+                {
+                    "id": identifier,
+                    "platform": "qq",
+                    "label": str(label)[:128] if label else identifier,
+                }
+            )
+        return {
+            "protocol": PROTOCOL,
+            "adapter": self.adapter,
+            "instance_id": self.instance_id,
+            "accounts": accounts,
+            "capabilities": ["text"],
+            "max_outbound_utf8_bytes": 32768,
+        }
 
     async def _apply(self, request: dict) -> dict:
         request_id = _ident(request.get("request_id"))
@@ -255,9 +505,14 @@ class AdapterService:
         enabled = request.get("enabled")
         if not isinstance(enabled, bool) or (enabled and not authors):
             _bad()
-        semantic = {"connection_id": connection_id, "revision": revision,
-                    "account_id": account_id, "conversation": target,
-                    "authors": authors, "enabled": enabled}
+        semantic = {
+            "connection_id": connection_id,
+            "revision": revision,
+            "account_id": account_id,
+            "conversation": target,
+            "authors": authors,
+            "enabled": enabled,
+        }
         digest = _digest(semantic)
         prior_request = self.db.execute(
             "SELECT digest,response FROM apply_requests WHERE request_id=?", (request_id,)
@@ -271,15 +526,23 @@ class AdapterService:
         current = self._binding(connection_id)
         if current and revision <= current[0]:
             if revision == current[0] and digest == current[5]:
-                response = {"connection_id": connection_id, "revision": revision,
-                            "enabled": enabled}
-                self.db.execute("INSERT INTO apply_requests VALUES(?,?,?)",
-                                (request_id, digest, _json(response)))
+                response = {
+                    "connection_id": connection_id,
+                    "revision": revision,
+                    "enabled": enabled,
+                }
+                self.db.execute(
+                    "INSERT INTO apply_requests VALUES(?,?,?)",
+                    (request_id, digest, _json(response)),
+                )
                 return response
             raise RpcError(409, "version_conflict")
         if enabled:
-            online = {str(item["id"]) for item in await self.accounts()
-                      if isinstance(item, dict) and item.get("platform") == "qq" and "id" in item}
+            online = {
+                str(item["id"])
+                for item in await self.accounts()
+                if isinstance(item, dict) and item.get("platform") == "qq" and "id" in item
+            }
             if account_id not in online:
                 raise RpcError(503, "dependency_unavailable", True)
             for other_id, other_authors in self.db.execute(
@@ -300,20 +563,305 @@ class AdapterService:
                 (connection_id, revision, account_id, target, _json(authors), int(enabled), digest),
             )
             # A changed scope invalidates every queued event from the old scope.
-            self.db.execute("DELETE FROM events WHERE connection_id=? AND acked=0", (connection_id,))
-            self.db.execute("INSERT INTO apply_requests VALUES(?,?,?)",
-                            (request_id, digest, _json(response)))
+            self.db.execute(
+                "DELETE FROM events WHERE connection_id=? AND acked=0", (connection_id,)
+            )
+            self.db.execute(
+                "INSERT INTO apply_requests VALUES(?,?,?)", (request_id, digest, _json(response))
+            )
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
         return response
 
+    async def _observation_capabilities(self, request: dict) -> dict:
+        if request:
+            _bad()
+        result = await self._capabilities({})
+        return {
+            "protocol": "tianshu.bot-observation/v2",
+            "adapter": self.adapter,
+            "instance_id": self.instance_id,
+            "accounts": result["accounts"],
+            "content": ["text", "unsupported"],
+            "reply_policy": "platform_owned",
+        }
+
+    async def _observation_apply(self, request: dict) -> dict:
+        if set(request) != {
+            "request_id",
+            "account_id",
+            "revision",
+            "enabled",
+            "group_policy",
+            "private_policy",
+        }:
+            _bad()
+        request_id = _ident(request["request_id"])
+        account_id = _ident(request["account_id"])
+        revision = request["revision"]
+        enabled = request["enabled"]
+        if type(revision) is not int or revision < 1 or type(enabled) is not bool:
+            _bad()
+        policies = {}
+        for kind in ("group", "private"):
+            policy = request[kind + "_policy"]
+            if (
+                not isinstance(policy, dict)
+                or set(policy) != {"observe", "mode", "list"}
+                or type(policy["observe"]) is not bool
+                or policy["mode"] not in {"observe_only", "whitelist", "blacklist"}
+                or not isinstance(policy["list"], list)
+                or len(policy["list"]) > 256
+                or len(set(policy["list"])) != len(policy["list"])
+            ):
+                _bad()
+            for item in policy["list"]:
+                if not isinstance(item, str) or not QQ_ID.fullmatch(item):
+                    _bad()
+            policies[kind + "_policy"] = policy
+        semantic = {"account_id": account_id, "revision": revision, "enabled": enabled, **policies}
+        digest = _digest(semantic)
+        prior = self.db.execute(
+            "SELECT digest,response FROM observation_requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if prior:
+            if prior[0] != digest:
+                raise RpcError(409, "idempotency_conflict")
+            return json.loads(prior[1])
+        current = self.db.execute(
+            "SELECT revision,digest FROM observation_accounts WHERE account_id=?", (account_id,)
+        ).fetchone()
+        if current and revision <= current[0]:
+            if revision != current[0] or digest != current[1]:
+                raise RpcError(409, "version_conflict")
+        if enabled:
+            online = {
+                str(item.get("id"))
+                for item in await self.accounts()
+                if isinstance(item, dict) and item.get("platform") == "qq"
+            }
+            if account_id not in online:
+                raise RpcError(503, "dependency_unavailable", True)
+        response = dict(semantic)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute(
+                "INSERT INTO observation_accounts VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(account_id) DO UPDATE SET revision=excluded.revision,"
+                "enabled=excluded.enabled,digest=excluded.digest,"
+                "group_policy=excluded.group_policy,private_policy=excluded.private_policy,"
+                "last_poll=excluded.last_poll",
+                (
+                    account_id,
+                    revision,
+                    int(enabled),
+                    digest,
+                    _json(policies["group_policy"]),
+                    _json(policies["private_policy"]),
+                    time.time(),
+                ),
+            )
+            self.db.execute(
+                "INSERT INTO observation_requests VALUES(?,?,?)",
+                (request_id, digest, _json(response)),
+            )
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return response
+
+    async def _observation_status(self, request: dict) -> dict:
+        if set(request) != {"account_id"}:
+            _bad()
+        account_id = _ident(request["account_id"])
+        row = self.db.execute(
+            "SELECT revision,enabled,last_poll FROM observation_accounts WHERE account_id=?",
+            (account_id,),
+        ).fetchone()
+        pending = self.db.execute(
+            "SELECT COUNT(*) FROM observations WHERE account_id=? AND acked=0", (account_id,)
+        ).fetchone()[0]
+        health = self.db.execute(
+            "SELECT dropped,last_error,last_error_at FROM observation_health WHERE account_id=?",
+            (account_id,),
+        ).fetchone()
+        return {
+            "found": bool(row),
+            "account": None
+            if not row
+            else {
+                "account_id": account_id,
+                "revision": row[0],
+                "enabled": bool(row[1]),
+                "lease_active": time.time() - row[2] <= OBSERVATION_LEASE_SECONDS,
+                "pending": pending,
+                "dropped": health[0] if health else 0,
+                "last_error": health[1] if health else None,
+                "last_error_at": health[2] if health else None,
+            },
+        }
+
+    async def _observation_poll(self, request: dict) -> dict:
+        if set(request) != {"account_id", "limit"}:
+            _bad()
+        account_id = _ident(request["account_id"])
+        limit = request["limit"]
+        if type(limit) is not int or not 1 <= limit <= 20:
+            _bad()
+        self.db.execute(
+            "UPDATE observation_accounts SET last_poll=? WHERE account_id=? AND enabled=1",
+            (time.time(), account_id),
+        )
+        self.db.execute(
+            "UPDATE observations SET claim_resolved=1 WHERE account_id=? "
+            "AND acked=0 AND claim_resolved=0 AND claim_deadline<=?",
+            (account_id, time.time()),
+        )
+        rows = self.db.execute(
+            "SELECT id,payload,claimed FROM observations WHERE account_id=? AND acked=0 "
+            "AND claim_resolved=1 "
+            "ORDER BY created,id LIMIT ?",
+            (account_id, limit),
+        ).fetchall()
+        events = []
+        size = len(_json({"events": []}).encode("utf-8"))
+        for key, value, claimed in rows:
+            item = {"id": key, "event": json.loads(value), "reply_claimed": bool(claimed)}
+            addition = len(_json(item).encode("utf-8")) + (1 if events else 0)
+            if size + addition > MAX_RESPONSE:
+                if not events:
+                    raise RpcError(503, "dependency_unavailable", True)
+                break
+            events.append(item)
+            size += addition
+        return {"events": events}
+
+    async def _observation_ack(self, request: dict) -> dict:
+        if set(request) != {"account_id", "event_ids"}:
+            _bad()
+        account_id = _ident(request["account_id"])
+        ids = request["event_ids"]
+        if not isinstance(ids, list) or len(ids) > 20:
+            _bad()
+        acknowledged = []
+        for key in dict.fromkeys(_ident(item) for item in ids):
+            if self.db.execute(
+                "SELECT 1 FROM observations WHERE id=? AND account_id=?", (key, account_id)
+            ).fetchone():
+                self.db.execute("UPDATE observations SET acked=1 WHERE id=?", (key,))
+                acknowledged.append(key)
+        return {"acknowledged": acknowledged}
+
+    async def _observation_send(self, request: dict) -> dict:
+        if set(request) != {"connection_id", "account_id", "policy_revision", "delivery"}:
+            _bad()
+        connection_id = _ident(request["connection_id"])
+        account_id = _ident(request["account_id"])
+        revision = request["policy_revision"]
+        delivery = request["delivery"]
+        if (
+            type(revision) is not int
+            or revision < 1
+            or not isinstance(delivery, dict)
+            or set(delivery)
+            != {
+                "reply_id",
+                "attempt_id",
+                "namespace",
+                "conversation_id",
+                "thread_id",
+                "text",
+                "turn_id",
+                "segment_sequence",
+            }
+        ):
+            _bad()
+        reply_id = _ident(delivery.get("reply_id"))
+        attempt_id = _ident(delivery.get("attempt_id"))
+        _ident(delivery.get("turn_id"))
+        if type(delivery.get("segment_sequence")) is not int or delivery["segment_sequence"] < 1:
+            _bad()
+        key = (connection_id, reply_id, attempt_id)
+        semantic = _digest(request)
+        old = self.db.execute(
+            "SELECT digest,receipt FROM deliveries WHERE connection_id=? AND reply_id=? AND attempt_id=?",
+            key,
+        ).fetchone()
+        if old:
+            if old[0] != semantic:
+                raise RpcError(409, "idempotency_conflict")
+            receipt = json.loads(old[1])
+            if receipt["state"] == "inflight":
+                receipt["state"] = "unknown"
+            return receipt
+        if self.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] >= MAX_HISTORY:
+            raise RpcError(429, "busy", True)
+        row = self.db.execute(
+            "SELECT enabled,revision,group_policy,private_policy FROM observation_accounts "
+            "WHERE account_id=?",
+            (account_id,),
+        ).fetchone()
+        if not row or not row[0] or row[1] != revision:
+            raise RpcError(403, "forbidden")
+        target = _qq(delivery.get("conversation_id"))
+        kind, number = target.split(":", 1)
+        policy = json.loads(row[2 if kind == "group" else 3])
+        permitted = (policy["mode"] == "whitelist" and number in policy["list"]) or (
+            policy["mode"] == "blacklist" and number not in policy["list"]
+        )
+        text = delivery.get("text")
+        if (
+            not policy["observe"]
+            or not permitted
+            or delivery.get("namespace") != "qq"
+            or delivery.get("thread_id") is not None
+            or not isinstance(text, str)
+            or not text
+            or len(text.encode("utf-8")) > 32768
+        ):
+            raise RpcError(403, "forbidden")
+        receipt = {
+            "reply_id": reply_id,
+            "attempt_id": attempt_id,
+            "state": "inflight",
+            "channel_message_ids": [],
+        }
+        self.db.execute(
+            "INSERT INTO deliveries VALUES(?,?,?,?,?)", (*key, semantic, _json(receipt))
+        )
+        try:
+            native_id = await asyncio.wait_for(self.send(account_id, target, text), 15)
+            if isinstance(native_id, bool) or not isinstance(native_id, (str, int)):
+                raise ValueError("native receipt missing")
+            native_id = str(native_id)
+            if not native_id or len(native_id) > 128 or any(ch.isspace() for ch in native_id):
+                raise ValueError("native receipt missing")
+            receipt.update(state="sent", channel_message_ids=[native_id])
+        except Exception:
+            receipt["state"] = "unknown"
+        self.db.execute(
+            "UPDATE deliveries SET receipt=? WHERE connection_id=? AND reply_id=? AND attempt_id=?",
+            (_json(receipt), *key),
+        )
+        return receipt
+
+    async def _observation_send_status(self, request: dict) -> dict:
+        if set(request) != {"connection_id", "reply_id", "attempt_id"}:
+            _bad()
+        return await self._send_status(request)
+
     async def _binding_status(self, request: dict) -> dict:
         connection_id = _ident(request.get("connection_id"))
         row = self._binding(connection_id)
-        return {"found": bool(row), "binding": None if not row else {
-            "connection_id": connection_id, "revision": row[0], "enabled": bool(row[4])}}
+        return {
+            "found": bool(row),
+            "binding": None
+            if not row
+            else {"connection_id": connection_id, "revision": row[0], "enabled": bool(row[4])},
+        }
 
     async def _poll(self, request: dict) -> dict:
         connection_id = _ident(request.get("connection_id"))
@@ -327,7 +875,8 @@ class AdapterService:
             return {"events": []}
         rows = self.db.execute(
             "SELECT id,payload FROM events WHERE connection_id=? AND acked=0 "
-            "ORDER BY created,id LIMIT ?", (connection_id, limit),
+            "ORDER BY created,id LIMIT ?",
+            (connection_id, limit),
         ).fetchall()
         # The Platform adapter client rejects responses larger than 64 KiB.
         # Return an ordered prefix so an ACK exposes the next pending rows.
@@ -352,8 +901,9 @@ class AdapterService:
         ids = list(dict.fromkeys(_ident(value) for value in ids))
         acknowledged = []
         for key in ids:
-            row = self.db.execute("SELECT 1 FROM events WHERE id=? AND connection_id=?",
-                                  (key, connection_id)).fetchone()
+            row = self.db.execute(
+                "SELECT 1 FROM events WHERE id=? AND connection_id=?", (key, connection_id)
+            ).fetchone()
             if row:
                 self.db.execute("UPDATE events SET acked=1 WHERE id=?", (key,))
                 acknowledged.append(key)
@@ -384,16 +934,26 @@ class AdapterService:
         binding = self._binding(connection_id)
         if not binding or not binding[4]:
             raise RpcError(403, "forbidden")
-        receipt = {"reply_id": reply_id, "attempt_id": attempt_id,
-                   "state": "failed", "channel_message_ids": []}
+        receipt = {
+            "reply_id": reply_id,
+            "attempt_id": attempt_id,
+            "state": "failed",
+            "channel_message_ids": [],
+        }
         text = delivery.get("text")
         target = delivery.get("conversation_id")
-        valid = (delivery.get("namespace") == "qq" and
-                 delivery.get("thread_id") is None and
-                 target == binding[2] and isinstance(text, str) and bool(text) and
-                 len(text.encode("utf-8")) <= 32768)
+        valid = (
+            delivery.get("namespace") == "qq"
+            and delivery.get("thread_id") is None
+            and target == binding[2]
+            and isinstance(text, str)
+            and bool(text)
+            and len(text.encode("utf-8")) <= 32768
+        )
         if not valid:
-            self.db.execute("INSERT INTO deliveries VALUES(?,?,?,?,?)", (*key, digest, _json(receipt)))
+            self.db.execute(
+                "INSERT INTO deliveries VALUES(?,?,?,?,?)", (*key, digest, _json(receipt))
+            )
             return receipt
         receipt["state"] = "inflight"
         self.db.execute("INSERT INTO deliveries VALUES(?,?,?,?,?)", (*key, digest, _json(receipt)))
@@ -407,13 +967,18 @@ class AdapterService:
             receipt.update(state="sent", channel_message_ids=[native_id])
         except Exception:
             receipt["state"] = "unknown"
-        self.db.execute("UPDATE deliveries SET receipt=? WHERE connection_id=? AND reply_id=? "
-                        "AND attempt_id=?", (_json(receipt), *key))
+        self.db.execute(
+            "UPDATE deliveries SET receipt=? WHERE connection_id=? AND reply_id=? AND attempt_id=?",
+            (_json(receipt), *key),
+        )
         return receipt
 
     async def _send_status(self, request: dict) -> dict:
-        key = (_ident(request.get("connection_id")), _ident(request.get("reply_id")),
-               _ident(request.get("attempt_id")))
+        key = (
+            _ident(request.get("connection_id")),
+            _ident(request.get("reply_id")),
+            _ident(request.get("attempt_id")),
+        )
         row = self.db.execute(
             "SELECT receipt FROM deliveries WHERE connection_id=? AND reply_id=? AND attempt_id=?",
             key,
@@ -427,6 +992,7 @@ class AdapterService:
 def _main() -> None:
     """Local terminal-only reveal; never exposed through RPC or ordinary logs."""
     import argparse
+
     parser = argparse.ArgumentParser(description="Display an installed Tianshu plugin key locally")
     parser.add_argument("command", choices=["show-key"])
     parser.add_argument("database", type=Path)

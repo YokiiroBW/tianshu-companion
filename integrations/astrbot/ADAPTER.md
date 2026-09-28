@@ -1,10 +1,10 @@
-# 天枢 AstrBot 适配器候选 0.2.0
+# 天枢 AstrBot 适配器候选 0.3.0
 
 适用于 AstrBot **4.27.3** 的 aiocqhttp/OneBot v11 QQ 纯文本。插件默认运行 `tianshu.bot-adapter/v1`：平台主动读取事件、提交已授权回复。安装后没有绑定，不接管聊天或发送消息。
 
 ## 安装、监听与获取密钥
 
-1. 从项目根运行 `python integrations/build_adapter_releases.py`。将 `.runtime/adapter-artifacts/astrbot_plugin_tianshu-0.2.0.zip` 通过 AstrBot 插件上传页安装，或解压成 `data/plugins/astrbot_plugin_tianshu/`。在插件配置页保持旧 `enabled=false`。
+1. 从项目根运行 `python integrations/build_adapter_releases.py`。将 `.runtime/adapter-artifacts/astrbot_plugin_tianshu-0.3.0.zip` 通过 AstrBot 插件上传页安装，或解压成 `data/plugins/astrbot_plugin_tianshu/`。在插件配置页保持旧 `enabled=false`。
 2. 在 AstrBot 插件配置页设置 `adapter_port` 和 `adapter_listen_mode`，保存并重载插件：
 
    | 模式 | 监听地址 | 使用场景 |

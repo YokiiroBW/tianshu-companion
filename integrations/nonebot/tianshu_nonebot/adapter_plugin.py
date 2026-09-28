@@ -19,7 +19,7 @@ from nonebot.plugin import PluginMetadata
 from pydantic import BaseModel
 
 from .rpc import AdapterService, MAX_REQUEST, PREFIX
-from .sdk import UnsupportedEvent, text_event
+from .sdk import UnsupportedEvent, observation_event, text_event
 
 
 class Config(BaseModel):
@@ -53,8 +53,13 @@ async def _accounts():
             continue
         if not isinstance(info, dict) or str(info.get("user_id")) != str(bot.self_id):
             continue
-        result.append({"id": str(bot.self_id), "platform": "qq",
-                       "label": str(info.get("nickname") or bot.self_id)[:128]})
+        result.append(
+            {
+                "id": str(bot.self_id),
+                "platform": "qq",
+                "label": str(info.get("nickname") or bot.self_id)[:128],
+            }
+        )
     return result
 
 
@@ -63,6 +68,7 @@ async def _send(self_id: str, target: str, text: str):
     if not isinstance(bot, OneBotBot):
         raise RuntimeError("SDK offline")
     from nonebot.adapters.onebot.v11 import Message, MessageSegment
+
     message = Message(MessageSegment.text(text))
     kind, value = target.split(":", 1)
     if kind == "group":
@@ -74,8 +80,9 @@ async def _send(self_id: str, target: str, text: str):
     return response.get("message_id")
 
 
-service = AdapterService(settings.tianshu_adapter_data_dir / "adapter.sqlite3",
-                         "nonebot", _accounts, _send)
+service = AdapterService(
+    settings.tianshu_adapter_data_dir / "adapter.sqlite3", "nonebot", _accounts, _send
+)
 semaphore = asyncio.Semaphore(8)
 app = get_asgi()
 _routes = []
@@ -92,21 +99,92 @@ async def _rpc(request: Request):
             async for chunk in request.stream():
                 body.extend(chunk)
                 if len(body) > MAX_REQUEST:
-                    return JSONResponse({"code": "invalid_input", "retryable": False}, status_code=400)
+                    return JSONResponse(
+                        {"code": "invalid_input", "retryable": False}, status_code=400
+                    )
             status, payload = await asyncio.wait_for(
-                service.handle(request.url.path, request.headers.get("authorization"), bytes(body)), 20
+                service.handle(request.url.path, request.headers.get("authorization"), bytes(body)),
+                20,
             )
         except asyncio.TimeoutError:
             status, payload = 503, {"code": "dependency_unavailable", "retryable": True}
         return JSONResponse(payload, status_code=status)
 
 
-for suffix in ("capabilities", "bindings/apply", "bindings/status", "events/poll",
-               "events/ack", "messages/send", "messages/status"):
+for suffix in (
+    "capabilities",
+    "bindings/apply",
+    "bindings/status",
+    "events/poll",
+    "events/ack",
+    "messages/send",
+    "messages/status",
+    "observation/capabilities",
+    "observation/apply",
+    "observation/status",
+    "observation/poll",
+    "observation/ack",
+    "observation/messages/send",
+    "observation/messages/status",
+):
     path = f"{PREFIX}/{suffix}"
-    app.add_api_route(path, _rpc, methods=["POST"], include_in_schema=False,
-                      name=f"tianshu-adapter-{suffix.replace('/', '-')}")
+    app.add_api_route(
+        path,
+        _rpc,
+        methods=["POST"],
+        include_in_schema=False,
+        name=f"tianshu-adapter-{suffix.replace('/', '-')}",
+    )
     _routes.append(app.routes[-1])
+
+
+async def _observe(bot: BaseBot, event: BaseEvent) -> bool:
+    if not isinstance(bot, OneBotBot):
+        return False
+    try:
+        value = observation_event(bot, event)
+    except (UnsupportedEvent, ValueError, KeyError, OverflowError, OSError):
+        return False
+    await service.capture_observation(
+        value["account_id"],
+        value["conversation"],
+        value["author"],
+        value["event_id"],
+        value["sent_at"],
+        value["text"],
+        value["mentioned"],
+        value["content_state"],
+    )
+    return False  # Observing never claims reply ownership in NoneBot.
+
+
+observer = on_message(rule=_observe, priority=1, block=False)
+
+
+@observer.handle()
+async def _observed():
+    return None
+
+
+async def _claim_observation_reply(bot: BaseBot, event: BaseEvent) -> bool:
+    if not isinstance(bot, OneBotBot):
+        return False
+    try:
+        value = observation_event(bot, event)
+    except (UnsupportedEvent, ValueError, KeyError, OverflowError, OSError):
+        return False
+    return await service.observation_claimed(
+        value["account_id"], value["conversation"], value["author"], value["event_id"]
+    )
+
+
+# A live Platform lease and the current policy are required for ownership.
+observation_reply = on_message(rule=_claim_observation_reply, priority=2, block=True)
+
+
+@observation_reply.handle()
+async def _claimed_observation_reply():
+    return None
 
 
 async def _scope(bot: BaseBot, event: BaseEvent) -> bool:
@@ -117,8 +195,12 @@ async def _scope(bot: BaseBot, event: BaseEvent) -> bool:
     except (UnsupportedEvent, ValueError, KeyError):
         return False
     return await service.capture(
-        str(bot.self_id), value.conversation_id, value.account_id,
-        value.event_id, value.sent_at, value.text,
+        str(bot.self_id),
+        value.conversation_id,
+        value.account_id,
+        value.event_id,
+        value.sent_at,
+        value.text,
     )
 
 

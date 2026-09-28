@@ -74,6 +74,42 @@ def text_event(bot, event) -> TextEvent:
     )
 
 
+def observation_event(bot, event) -> dict:
+    """Normalize a real inbound SDK event, including unsupported content metadata."""
+    from nonebot.adapters.onebot.v11 import GroupMessageEvent, PrivateMessageEvent
+
+    if not isinstance(event, (GroupMessageEvent, PrivateMessageEvent)):
+        raise UnsupportedEvent("not a OneBot message")
+    if str(event.self_id) != str(bot.self_id) or str(event.user_id) == str(bot.self_id):
+        raise UnsupportedEvent("not an incoming message for this bot")
+    if getattr(event, "sub_type", None) == "anonymous":
+        raise UnsupportedEvent("no stable sender")
+    parts = []
+    mentioned = False
+    unsupported = False
+    for segment in event.get_message():
+        if segment.type == "text":
+            parts.append(str(segment.data.get("text", "")))
+        elif segment.type == "at" and str(segment.data.get("qq")) == str(bot.self_id):
+            mentioned = True
+        else:
+            unsupported = True
+    text = "".join(parts)[:8000]
+    content_state = "unsupported" if unsupported or not text.strip() else "text"
+    return {
+        "account_id": str(bot.self_id),
+        "conversation": conversation_id(event),
+        "author": str(event.user_id),
+        "event_id": str(event.message_id),
+        "sent_at": datetime.fromtimestamp(int(event.time), timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z"),
+        "text": text if content_state == "text" else "",
+        "mentioned": mentioned,
+        "content_state": content_state,
+    }
+
+
 async def send_text(bot, delivery: dict) -> list[str]:
     """Use the connected OneBot Bot and accept only a real SDK message_id."""
     from nonebot.adapters.onebot.v11 import Message, MessageSegment

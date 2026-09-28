@@ -18,9 +18,14 @@ from aiohttp import web
 from .rpc import AdapterService, PREFIX, _json
 
 
-PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
-    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-))
+PRIVATE_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+    )
+)
 
 
 def _private_address(value: str | None) -> bool:
@@ -50,16 +55,18 @@ def _listen_host(mode: str, lan_host: str) -> str:
 
 
 class AstrAdapter:
-    def __init__(self, context, data_dir: Path, port: int,
-                 listen_mode: str = "loopback", lan_host: str = ""):
+    def __init__(
+        self, context, data_dir: Path, port: int, listen_mode: str = "loopback", lan_host: str = ""
+    ):
         if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
             raise ValueError("invalid adapter port")
         self.listen_host = _listen_host(listen_mode, lan_host)
         self.listen_mode = listen_mode
         self.context = context
         self.port = port
-        self.service = AdapterService(data_dir / "adapter.sqlite3", "astrbot",
-                                      self.accounts, self.send)
+        self.service = AdapterService(
+            data_dir / "adapter.sqlite3", "astrbot", self.accounts, self.send
+        )
         self.runner = None
         self.semaphore = asyncio.Semaphore(8)
 
@@ -99,8 +106,13 @@ class AstrAdapter:
                 continue
             if not isinstance(info, dict) or str(info.get("user_id")) != self_id:
                 continue
-            result.append({"id": self_id, "platform": "qq",
-                           "label": str(info.get("nickname") or self_id)[:128]})
+            result.append(
+                {
+                    "id": self_id,
+                    "platform": "qq",
+                    "label": str(info.get("nickname") or self_id)[:128],
+                }
+            )
         return result
 
     async def send(self, self_id: str, target: str, text: str):
@@ -111,10 +123,12 @@ class AstrAdapter:
         message = [{"type": "text", "data": {"text": text}}]
         if kind == "group":
             response = await client.send_group_msg(
-                group_id=int(value), message=message, self_id=self_id)
+                group_id=int(value), message=message, self_id=self_id
+            )
         else:
             response = await client.send_private_msg(
-                user_id=int(value), message=message, self_id=self_id)
+                user_id=int(value), message=message, self_id=self_id
+            )
         if not isinstance(response, dict):
             raise ValueError("SDK receipt missing")
         return response.get("message_id")
@@ -147,26 +161,49 @@ class AstrAdapter:
         if not isinstance(segments, list) or not segments:
             return False
         parts = []
+        mentioned = False
+        unsupported = False
         for segment in segments:
             if not isinstance(segment, Mapping) or not isinstance(segment.get("data"), Mapping):
                 return False
             if segment.get("type") == "text" and isinstance(segment["data"].get("text"), str):
                 parts.append(segment["data"]["text"])
-            elif (segment.get("type") == "at" and group and
-                  str(segment["data"].get("qq")) == self_id):
-                continue
+            elif (
+                segment.get("type") == "at" and group and str(segment["data"].get("qq")) == self_id
+            ):
+                mentioned = True
             else:
-                return False
+                unsupported = True
         text = "".join(parts).strip()
-        if not text or text.startswith("/") or len(text) > 8000:
-            return False
         try:
             when = datetime.fromtimestamp(int(raw["time"]), timezone.utc)
         except (KeyError, TypeError, ValueError, OverflowError, OSError):
             return False
+        stamp = when.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        await self.service.capture_observation(
+            self_id,
+            f"{kind}:{group or author}",
+            author,
+            native_id,
+            stamp,
+            text[:8000] if text and not unsupported else "",
+            mentioned,
+            "unsupported" if unsupported or not text else "text",
+        )
+        if await self.service.observation_claimed(
+            self_id, f"{kind}:{group or author}", author, native_id
+        ):
+            event.stop_event()
+            return True
+        if not text or text.startswith("/") or len(text) > 8000 or unsupported:
+            return False
         captured = await self.service.capture(
-            self_id, f"{kind}:{group or author}", author, native_id,
-            when.isoformat(timespec="milliseconds").replace("+00:00", "Z"), text,
+            self_id,
+            f"{kind}:{group or author}",
+            author,
+            native_id,
+            stamp,
+            text,
         )
         if captured:
             event.stop_event()
@@ -197,7 +234,8 @@ class AstrAdapter:
             try:
                 body = await request.read()
                 status, payload = await asyncio.wait_for(
-                    self.service.handle(request.path, request.headers.get("Authorization"), body), 20
+                    self.service.handle(request.path, request.headers.get("Authorization"), body),
+                    20,
                 )
             except web.HTTPRequestEntityTooLarge:
                 status, payload = 400, {"code": "invalid_input", "retryable": False}

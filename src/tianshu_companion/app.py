@@ -461,6 +461,17 @@ def build_runtime(config):
         from .bot_bindings import BotBindings
 
         core.bot_bindings = BotBindings(core, outbound, config.get("bindings", {}))
+    observe_enabled = config.get("bot_observation_enabled", False)
+    if type(observe_enabled) is not bool:
+        raise ValueError("bot_observation_enabled must be boolean")
+    if observe_enabled:
+        if config.get("callers", {}).get("platform", {}).get("issuer") != "platform":
+            raise ValueError("Bot observation requires the registered Platform caller")
+        from .observation import Observations
+
+        core.observations = Observations(
+            config["database_path"] + ".observations.sqlite", core.memory.client
+        )
     for spec in (routing or {}).get("commands", []):
         core.direct.register_command(**spec)
     # The optional authorized read port. Its deployment mapping is validated here, where the
@@ -580,6 +591,17 @@ def create_app(core=None, tokens=None, life_readers=None):
                     # schedule.
                     loop("direct.work", core.direct.work, 0.5, _counter(core, "direct.work")),
                 ]
+                if hasattr(core, "observations"):
+
+                    async def observation_flush():
+                        while not stopping.is_set():
+                            await core.observations.flush()
+                            try:
+                                await asyncio.wait_for(stopping.wait(), 2)
+                            except asyncio.TimeoutError:
+                                pass
+
+                    jobs.append(asyncio.create_task(observation_flush()))
             yield
         finally:
             workers.stopping = True
@@ -721,6 +743,14 @@ def create_app(core=None, tokens=None, life_readers=None):
                 if not hasattr(core, "bot_bindings"):
                     raise Fault("dependency_unavailable")
                 return core.bot_bindings.status(service, body)
+            if operation == "observation-ingest":
+                if not hasattr(core, "observations"):
+                    raise Fault("dependency_unavailable")
+                return await asyncio.to_thread(core.observations.ingest, service, body)
+            if operation == "observation-query":
+                if not hasattr(core, "observations"):
+                    raise Fault("dependency_unavailable")
+                return await core.observations.query_archive(service, body)
             if operation == "capability":
                 return await core.capability(service, body)
             return await core.cancel(service, body)
@@ -746,6 +776,14 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v1/bot-bindings/status")
     async def bot_binding_status(request: Request):
         return await dispatch(request, "bot-binding-status")
+
+    @app.post("/internal/v2/observations/ingest")
+    async def observation_ingest(request: Request):
+        return await dispatch(request, "observation-ingest")
+
+    @app.post("/internal/v2/observations/query")
+    async def observation_query(request: Request):
+        return await dispatch(request, "observation-query")
 
     @app.post("/internal/v1/conversation/web-snapshot")
     async def web_snapshot(request: Request):

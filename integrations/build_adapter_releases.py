@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT.parent / ".runtime" / "adapter-artifacts"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
@@ -51,14 +51,22 @@ def main() -> None:
     astr_zip = OUT / f"astrbot_plugin_tianshu-{VERSION}.zip"
     with zipfile.ZipFile(astr_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in _files(astr):
-            _write_entry(archive, f"astrbot_plugin_tianshu/{path.relative_to(astr).as_posix()}",
-                         path.read_bytes())
-        _write_entry(archive, "astrbot_plugin_tianshu/README.md",
-                     (ROOT / "astrbot" / "ADAPTER.md").read_bytes())
+            _write_entry(
+                archive,
+                f"astrbot_plugin_tianshu/{path.relative_to(astr).as_posix()}",
+                path.read_bytes(),
+            )
+        _write_entry(
+            archive,
+            "astrbot_plugin_tianshu/README.md",
+            (ROOT / "astrbot" / "ADAPTER.md").read_bytes(),
+        )
 
     dist = f"tianshu_nonebot_adapter-{VERSION}.dist-info"
-    entries = {f"tianshu_nonebot/{path.relative_to(none).as_posix()}": path.read_bytes()
-               for path in _files(none)}
+    entries = {
+        f"tianshu_nonebot/{path.relative_to(none).as_posix()}": path.read_bytes()
+        for path in _files(none)
+    }
     entries[dist + "/WHEEL"] = (
         "Wheel-Version: 1.0\nGenerator: tianshu-adapter-builder\n"
         "Root-Is-Purelib: true\nTag: py3-none-any\n"
