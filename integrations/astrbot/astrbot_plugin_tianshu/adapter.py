@@ -15,7 +15,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from .rpc import AdapterService, PREFIX
+from .rpc import AdapterService, PREFIX, _json
 
 
 PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
@@ -203,7 +203,7 @@ class AstrAdapter:
                 status, payload = 400, {"code": "invalid_input", "retryable": False}
             except asyncio.TimeoutError:
                 status, payload = 503, {"code": "dependency_unavailable", "retryable": True}
-            return web.json_response(payload, status=status)
+            return web.json_response(payload, status=status, dumps=_json)
 
     async def close(self):
         if self.runner is not None:

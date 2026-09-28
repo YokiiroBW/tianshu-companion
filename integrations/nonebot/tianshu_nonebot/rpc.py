@@ -23,7 +23,8 @@ from typing import Any, Awaitable, Callable
 PREFIX = "/tianshu/adapter/v1"
 PROTOCOL = "tianshu.bot-adapter/v1"
 MAX_REQUEST = 65536
-MAX_RESPONSE = 262144
+# The Platform adapter client reads at most 64 KiB of raw JSON response bytes.
+MAX_RESPONSE = 65536
 MAX_PENDING = 10000
 MAX_HISTORY = 20000
 IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -154,22 +155,23 @@ class AdapterService:
             return False
         async with self.lock:
             rows = self.db.execute(
-                "SELECT connection_id,revision,authors FROM bindings "
+                "SELECT connection_id,authors FROM bindings "
                 "WHERE account_id=? AND conversation=? AND enabled=1",
                 (account_id, conversation),
             ).fetchall()
-            matching = [row for row in rows if author in json.loads(row[2])]
+            matching = [row for row in rows if author in json.loads(row[1])]
             if len(matching) != 1:
                 return False
-            connection_id, revision, _ = matching[0]
+            connection_id, _ = matching[0]
             count = self.db.execute("SELECT COUNT(*) FROM events WHERE acked=0").fetchone()[0]
             history = self.db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
             if count >= MAX_PENDING or history >= MAX_HISTORY:
                 return False
+            # Message revision belongs to the event contract, not binding updates.
             payload = {
                 "schema_version": 1, "connection_id": connection_id,
                 "platform_id": self.instance_id, "self_id": account_id,
-                "event_id": native_id, "revision": revision,
+                "event_id": native_id, "revision": 1,
                 "namespace": "qq", "conversation_id": conversation,
                 "thread_id": None, "account_id": author,
                 "sent_at": sent_at, "text": text,
@@ -327,7 +329,20 @@ class AdapterService:
             "SELECT id,payload FROM events WHERE connection_id=? AND acked=0 "
             "ORDER BY created,id LIMIT ?", (connection_id, limit),
         ).fetchall()
-        return {"events": [{"id": key, "event": json.loads(value)} for key, value in rows]}
+        # The Platform adapter client rejects responses larger than 64 KiB.
+        # Return an ordered prefix so an ACK exposes the next pending rows.
+        events = []
+        size = len(_json({"events": []}).encode("utf-8"))
+        for key, value in rows:
+            item = {"id": key, "event": json.loads(value)}
+            addition = len(_json(item).encode("utf-8")) + (1 if events else 0)
+            if size + addition > MAX_RESPONSE:
+                if not events:
+                    raise RpcError(503, "dependency_unavailable", True)
+                break
+            events.append(item)
+            size += addition
+        return {"events": events}
 
     async def _ack(self, request: dict) -> dict:
         connection_id = _ident(request.get("connection_id"))

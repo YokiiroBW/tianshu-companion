@@ -96,6 +96,26 @@ class NoneBotHostTests(unittest.TestCase):
                         self.assertEqual(polled["events"][0]["event"]["event_id"], "2")
                         event_id = polled["events"][0]["id"]
                         self.assertEqual((await post("/events/ack", {"connection_id": "c1", "event_ids": [event_id]})).json()["acknowledged"], [event_id])
+                        for index in range(6):
+                            self.assertTrue(await host.service.capture(
+                                "42", "private:7", "7", f"large-{index}",
+                                "2026-09-28T00:00:00Z", "界" * 8000))
+                        expected_large = [row[0] for row in host.service.db.execute(
+                            "SELECT json_extract(payload,'$.event_id') FROM events "
+                            "WHERE connection_id='c1' AND acked=0 ORDER BY created,id")]
+                        received = []
+                        while True:
+                            response = await post("/events/poll", {"connection_id": "c1", "limit": 20})
+                            self.assertEqual(response.status_code, 200)
+                            self.assertLessEqual(len(response.content), 65536)
+                            batch = response.json()["events"]
+                            if not batch:
+                                break
+                            ids = [item["id"] for item in batch]
+                            received.extend(item["event"]["event_id"] for item in batch)
+                            self.assertEqual((await post("/events/ack", {"connection_id": "c1",
+                                "event_ids": ids})).status_code, 200)
+                        self.assertEqual(received, expected_large)
                         delivery = dict(reply_id="reply", attempt_id="attempt", namespace="qq",
                                         conversation_id="private:7", thread_id=None, text="answer",
                                         turn_id="turn", segment_sequence=1)
