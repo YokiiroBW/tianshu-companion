@@ -6,9 +6,11 @@
 
 1. 在天枢平台的部署配置中预登记 `bot_connections` 槽位及该会话的 Sources input entry、允许作者、角色和 Core binding。平台管理员从连接页面创建 `astrbot` 实例，明确启用并取得一次性连接 ID 和独立令牌。网页不负责安装插件。
 2. 在 AstrBot 4.27.3 主机上，把整个 `astrbot_plugin_tianshu` 文件夹复制到 `data/plugins/astrbot_plugin_tianshu/`。在 AstrBot 插件页加载该目录。插件无需额外 pip 依赖；持久账本写在 AstrBot 标准 `data/plugin_data/astrbot_plugin_tianshu/`，不要放进插件源码目录。
-3. 在插件配置页填写平台 HTTPS 根地址、`connection_id`、一次性 `token`、**aiocqhttp 平台实例 ID**（不是 AstrBot 镜像 ID）、该实例的机器人 QQ `self_id`，以及本地精确会话白名单，如 `private:123456`、`group:123456`。本地白名单应与平台槽位的外部会话键一致。默认空白名单和 `enabled=false`，不会接管消息或领取回复。
+3. 在插件配置页填写平台内部 API 的 HTTPS 根地址、`connection_id`、一次性 `token`、**aiocqhttp 平台实例 ID**（不是 AstrBot 镜像 ID）、该实例的机器人 QQ `self_id`，以及本地精确会话白名单，如 `private:123456`、`group:123456`。本地白名单应与平台槽位的外部会话键一致。默认空白名单和 `enabled=false`，不会接管消息或领取回复。
 4. 默认只接管以 `天枢 ` 开头、位于本地白名单的普通文本，并向天枢提交去掉该前缀后的文本。`/` 开头的 AstrBot 指令始终放行。`capture_all_text=true` 只适用于明确划给天枢的专用会话；在这种模式下，该会话内其他普通文本插件可能无法收到已被本插件接管的消息。
 5. 配置完成后启用平台连接实例和插件。平台连接状态中的“在线”仅代表心跳成功；需要分别检查入站受理、模型结果、领取回执与真实账号收发。本任务没有启用生产连接，也没有向真实会话发送消息。
+
+若平台内部 HTTPS 使用自建 CA，将**签发服务端证书的 CA PEM** 只读挂载进 AstrBot 容器，例如 Compose 卷映射 `/srv/tianshu/certs/platform-ca.pem:/run/secrets/tianshu-platform-ca.pem:ro`，然后把插件的 `ca_file` 设为容器内绝对路径 `/run/secrets/tianshu-platform-ca.pem`。这里只挂载公开 CA 证书，服务端私钥留在平台侧。`base_url` 需填 AstrBot 容器可达的内部 API HTTPS 根地址，例如 `https://platform.internal:<TLS端口>`，主机名必须出现在服务端证书 SAN 中；插件不使用公开 `18446` HTTP 网页入口作为内部 API。平台尚未提供该 HTTPS 入口时，需先在平台侧配置 TLS 终止与内部 API 转发。CA 路径留空时使用系统信任库；不需要修改 AstrBot 宿主的全局 CA。证书链和主机名始终校验，不支持跳过验证。
 
 令牌只给当前连接使用，不要填平台管理员令牌。插件只允许 HTTPS；本地隔离测试可在代码构造的 `allow_http_loopback=true` 下使用 `127.0.0.1`。日志只输出固定错误码，不打印令牌、正文或账号号值。`instance_id` 和入站/出站意图保存在 SQLite WAL 中，复制或恢复插件时要同时保留该数据目录。
 

@@ -95,6 +95,7 @@ class Settings:
     platform_id: str
     self_id: str
     allowed_conversations: frozenset[str]
+    ca_file: str | None = None
     trigger_prefix: str = "天枢 "
     capture_all_text: bool = False
     poll_seconds: float = 2.0
@@ -145,6 +146,11 @@ class Settings:
             raise BoundaryError("invalid_interval") from error
         if not 1 <= poll <= 60 or not 10 <= heartbeat <= 300:
             raise BoundaryError("invalid_interval")
+        raw_ca_file = config.get("ca_file", "")
+        if not isinstance(raw_ca_file, str) or (
+            raw_ca_file and not Path(raw_ca_file).is_absolute()
+        ):
+            raise BoundaryError("invalid_ca_file")
         return cls(
             base_url=url,
             connection_id=connection_id,
@@ -152,6 +158,7 @@ class Settings:
             platform_id=platform_id,
             self_id=self_id,
             allowed_conversations=allowed,
+            ca_file=raw_ca_file or None,
             trigger_prefix=prefix,
             capture_all_text=capture_all,
             poll_seconds=poll,

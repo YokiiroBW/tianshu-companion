@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
+import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,11 +15,58 @@ import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import URLError
 from unittest.mock import patch
 
 
 PLUGIN_PARENT = Path(__file__).resolve().parents[1] / "integrations" / "astrbot"
 sys.path.insert(0, str(PLUGIN_PARENT))
+
+CERT_PROGRAM = """
+import datetime, ipaddress, pathlib, sys
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+root = pathlib.Path(sys.argv[1])
+now = datetime.datetime.now(datetime.timezone.utc)
+
+def name(value):
+    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, value)])
+
+def save_key(path, key):
+    path.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+
+def make_ca(label):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = name(label)
+    cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
+        .public_key(key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .sign(key, hashes.SHA256()))
+    (root / (label + '.pem')).write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    return key, cert
+
+good_key, good_ca = make_ca('good-ca')
+make_ca('wrong-ca')
+server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+server_cert = (x509.CertificateBuilder().subject_name(name('synthetic-platform'))
+    .issuer_name(good_ca.subject).public_key(server_key.public_key())
+    .serial_number(x509.random_serial_number())
+    .not_valid_before(now - datetime.timedelta(minutes=5))
+    .not_valid_after(now + datetime.timedelta(days=1))
+    .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+    .add_extension(x509.SubjectAlternativeName(
+        [x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]), critical=False)
+    .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+    .sign(good_key, hashes.SHA256()))
+(root / 'server.pem').write_bytes(server_cert.public_bytes(serialization.Encoding.PEM))
+save_key(root / 'server-key.pem', server_key)
+"""
 
 from astrbot_plugin_tianshu.runtime import (  # noqa: E402
     ACK_ROUTE,
@@ -139,6 +189,8 @@ class NormalizationTests(unittest.TestCase):
             settings(allowed_conversations=[])
         with self.assertRaises(BoundaryError):
             settings(allowed_conversations=["group:*"])
+        with self.assertRaises(BoundaryError):
+            settings(ca_file="relative/ca.pem")
         self.assertEqual(
             settings(base_url="http://127.0.0.1:8000", allow_http_loopback=True).base_url,
             "http://127.0.0.1:8000",
@@ -426,6 +478,67 @@ class HTTPPortTests(unittest.IsolatedAsyncioTestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+
+@unittest.skipUnless(
+    os.environ.get("TIANSHU_TLS_PYTHON"), "ephemeral TLS certificate runtime required"
+)
+class HTTPSCATests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_ca_succeeds_wrong_ca_and_hostname_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(
+                [os.environ["TIANSHU_TLS_PYTHON"], "-c", CERT_PROGRAM, str(root)],
+                check=True,
+                capture_output=True,
+                timeout=20,
+            )
+            seen = []
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_POST(self):
+                    seen.append(self.path)
+                    content = b'{"state":"online"}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+
+                def log_message(self, *_args):
+                    pass
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(root / "server.pem"), str(root / "server-key.pem"))
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                address = f"https://127.0.0.1:{server.server_port}"
+                good = PlatformHTTP(settings(base_url=address, ca_file=str(root / "good-ca.pem")))
+                self.assertEqual(
+                    await good("/internal/v1/bot/heartbeat", {"connection_id": "conn-1"}),
+                    {"state": "online"},
+                )
+                wrong = PlatformHTTP(settings(base_url=address, ca_file=str(root / "wrong-ca.pem")))
+                with self.assertRaises(URLError) as wrong_ca:
+                    await wrong("/internal/v1/bot/heartbeat", {})
+                self.assertIsInstance(wrong_ca.exception.reason, ssl.SSLCertVerificationError)
+                mismatch = PlatformHTTP(
+                    settings(
+                        base_url=f"https://localhost:{server.server_port}",
+                        ca_file=str(root / "good-ca.pem"),
+                    )
+                )
+                with self.assertRaises(URLError) as wrong_host:
+                    await mismatch("/internal/v1/bot/heartbeat", {})
+                self.assertIsInstance(wrong_host.exception.reason, ssl.SSLCertVerificationError)
+                self.assertEqual(seen, ["/internal/v1/bot/heartbeat"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":
