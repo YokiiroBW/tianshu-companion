@@ -19,6 +19,7 @@
 - 入站从 AstrBot 已认证 aiocqhttp 原事件获取 OneBot `message_id`、原始 `time`、作者、会话和完整文本段；与 AstrBot getter、配置的平台实例与机器人账号交叉核对。遇到媒体/引用/别人的提及、无稳定 ID 或未授权会话就交还 AstrBot 其他插件。
 - 命中本插件的消息先持久记录摘要，随后调用平台 `bot/events`。本地重复事件不再次提交；网络结果未知只查询 `bot/events/status`，不重新发送原事件。平台负责来源登记、角色权限与 Core 调度。
 - 回复由平台 `bot/replies/claim` 提供。插件在调用原 aiocqhttp `send_group_msg` / `send_private_msg` 前落 SQLite 意图；只有渠道 API 返回真实数字 `message_id` 才 ACK `sent`。超时、异常、缺回执和重启中断一律 ACK `unknown`，不自动再次调用 SDK。ACK 丢失只重放同一 attempt 的已持久回执。插件只在配置的 aiocqhttp 平台实例和精确会话上发送。
+- 入站 `events.text` 最多 8000 字符。当前 Core 默认每次生成一段，单段最多 32768 UTF-8 字节；插件对这一区间的出站正文执行一次原生发送。超出 32768 字节的 claim 在调用 SDK 前 ACK `failed`，不会擅自分段；SDK 调用后的异常仍是 `unknown`。QQ 渠道实际上限尚待实机验收，不能由此推定所有合法段都必然送达。
 - 管理员停用连接后，插件不能再受理或领取新消息；此前已领取且可能发出的回复仍用原有效连接凭据结算同一 attempt。轮换令牌后，旧凭据立即失效，需在插件配置中填入新令牌才能重放尚未确认的回执。
 
 ## 版本依据和未验边界

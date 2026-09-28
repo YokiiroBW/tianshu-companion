@@ -312,16 +312,36 @@ class AstrBotPlatformJointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.port(ACK_ROUTE, original_ack))["state"], "unknown")
 
         request6 = self._reply_request(6)
+        request6["text"] = "x" * 8001
         await self._core_send_http(request6)
-        self.platform.bots.change(self.connection_id, "disable")
         runner = Runner(self.settings, self.journal, self.port, self._native)
+        await runner.poll_once()
+        self.assertEqual(self.sent[-1], ("group:123", request6["text"]))
+        self.assertEqual(
+            self.platform.bots.reply_status(self.bearer("COMPANION"), request6)["receipt"]["state"],
+            "sent",
+        )
+
+        request7 = self._reply_request(7)
+        request7["text"] = "x" * 32769
+        await self._core_send_http(request7)
+        await runner.poll_once()
+        self.assertEqual(len(self.sent), 5)
+        self.assertEqual(
+            self.platform.bots.reply_status(self.bearer("COMPANION"), request7)["receipt"]["state"],
+            "failed",
+        )
+
+        request8 = self._reply_request(8)
+        await self._core_send_http(request8)
+        self.platform.bots.change(self.connection_id, "disable")
         revoked = SDKEvent(int(self.now[0]), "103")
         self.assertTrue(await runner.on_event(revoked))
         self.assertTrue(revoked.stopped)
         self.assertEqual(self.platform.sources.dispatch.await_count, 1)
         with self.assertRaises(Exception):
             await runner.poll_once()
-        self.assertEqual(len(self.sent), 4)
+        self.assertEqual(len(self.sent), 5)
 
 
 if __name__ == "__main__":

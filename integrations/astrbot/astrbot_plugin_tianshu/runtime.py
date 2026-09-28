@@ -28,6 +28,7 @@ EVENT_STATUS_ROUTE = "/internal/v1/bot/events/status"
 HEARTBEAT_ROUTE = "/internal/v1/bot/heartbeat"
 CLAIM_ROUTE = "/internal/v1/bot/replies/claim"
 ACK_ROUTE = "/internal/v1/bot/replies/ack"
+MAX_OUTBOUND_TEXT_BYTES = 32768  # Core's per-segment UTF-8 bound (core.py).
 _QQ_CONVERSATION = re.compile(r"^(group|private):([1-9][0-9]*)$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
@@ -569,14 +570,29 @@ class Runner:
                 or conversation not in self.settings.allowed_conversations
                 or delivery.get("thread_id") is not None
                 or not isinstance(text, str)
-                or not 1 <= len(text) <= 8000
+                or not text
             ):
                 raise BoundaryError("delivery_scope_invalid")
-            native_id = await asyncio.wait_for(self.send_native(conversation, text), timeout=15)
-            ids = [_message_id(native_id)]
-            state = "sent"
-        except Exception:
-            self.report("native_result_unknown")
+            encoded_bytes = len(text.encode("utf-8"))
+        except (BoundaryError, UnicodeError):
+            self.report("delivery_scope_invalid")
+        else:
+            if encoded_bytes > MAX_OUTBOUND_TEXT_BYTES:
+                # A known pre-SDK rejection. Do not split one Platform reply into
+                # multiple sends and change its receipt/idempotency identity.
+                state = "failed"
+                self.report("delivery_text_over_limit")
+            else:
+                try:
+                    native_id = await asyncio.wait_for(
+                        self.send_native(conversation, text), timeout=15
+                    )
+                    ids = [_message_id(native_id)]
+                    state = "sent"
+                except Exception:
+                    # Once the native call starts, its outcome is unknown without
+                    # a stable channel ID; never send this reply again automatically.
+                    self.report("native_result_unknown")
         ack = _ack(normalized, self.settings.connection_id, state, ids)
         self.journal.finish_delivery(normalized, ack)
         await self.flush_acks()

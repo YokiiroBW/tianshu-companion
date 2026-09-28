@@ -156,6 +156,10 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(normalize_event(group, config)["conversation_id"], "group:5678")
         group.message_obj.raw_message["message"] += [{"type": "image", "data": {"file": "fixture"}}]
         self.assertIsNone(normalize_event(group, config))
+        self.assertEqual(
+            len(normalize_event(Event(text="天枢 " + "x" * 8000), config)["text"]), 8000
+        )
+        self.assertIsNone(normalize_event(Event(text="天枢 " + "x" * 8001), config))
 
     def test_other_plugin_messages_and_unstable_ids_pass_through(self):
         config = settings()
@@ -354,6 +358,50 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         await runner.poll_once()
         self.assertEqual(calls, [("private:1234", "x")])
         self.assertEqual([x["state"] for x in acks], ["unknown", "unknown"])
+
+    async def test_outbound_core_byte_boundary_and_restart_do_not_resend(self):
+        texts = ["x" * 8001, "x" * 32768, "中" * 10922, "x" * 32769, "中" * 10923]
+        deliveries = [
+            {
+                "reply_id": f"reply-long-{index}",
+                "attempt_id": f"attempt-long-{index}",
+                "namespace": "qq",
+                "conversation_id": "private:1234",
+                "thread_id": None,
+                "text": value,
+            }
+            for index, value in enumerate(texts)
+        ]
+        claims, sends, acks = list(deliveries), [], []
+
+        async def post(path, payload):
+            if path == CLAIM_ROUTE:
+                return {"deliveries": [claims.pop(0)] if claims else []}
+            if path == ACK_ROUTE:
+                acks.append(payload)
+                return {"reply_id": payload["reply_id"], "state": payload["state"]}
+            return {}
+
+        async def send(conversation, text):
+            sends.append((conversation, text))
+            return str(8000 + len(sends))
+
+        runner = Runner(settings(), self.journal, post, send)
+        for _ in deliveries:
+            await runner.poll_once()
+        self.assertEqual([text for _, text in sends], texts[:3])
+        self.assertEqual([ack["state"] for ack in acks], ["sent"] * 3 + ["failed"] * 2)
+        self.assertEqual([ack["channel_message_ids"] for ack in acks][-2:], [[], []])
+
+        # A duplicate claim after restart replays its receipt, never its SDK send.
+        self.journal.close()
+        self.journal = Journal(self.path)
+        claims.extend([deliveries[0], deliveries[-1]])
+        runner = Runner(settings(), self.journal, post, send)
+        await runner.poll_once()
+        await runner.poll_once()
+        self.assertEqual(len(sends), 3)
+        self.assertEqual(acks[-2:], [acks[0], acks[4]])
 
 
 class NativeSDKTests(unittest.IsolatedAsyncioTestCase):
