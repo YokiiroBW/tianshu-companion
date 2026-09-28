@@ -1,6 +1,7 @@
 """Durable RPC behavior, including restart and uncertain native outcomes."""
 
 import asyncio
+import json
 import subprocess
 import sys
 import tempfile
@@ -8,10 +9,105 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations" / "shared"))
-from tianshu_adapter_rpc import AdapterService, PREFIX  # noqa: E402
+from tianshu_adapter_rpc import AdapterService, MAX_RESPONSE, PREFIX, _json  # noqa: E402
 
 
 class AdapterRpcTests(unittest.TestCase):
+    def test_message_revision_is_independent_of_binding_revision(self):
+        from jsonschema import Draft202012Validator, FormatChecker
+        from referencing import Registry, Resource
+
+        contracts = next((parent / "contracts" for parent in Path(__file__).resolve().parents
+                          if (parent / "contracts" / "bot-connection" / "v1" / "schemas" /
+                              "bot-connection.json").is_file()), None)
+        self.assertIsNotNone(contracts, "published bot-connection contract is missing")
+        bot_schema = json.loads((contracts / "bot-connection" / "v1" / "schemas" /
+                                 "bot-connection.json").read_text(encoding="utf-8"))
+        common = json.loads((contracts / "text-dialogue" / "v1" / "schemas" /
+                             "common.json").read_text(encoding="utf-8"))
+        event_schema = {"$schema": bot_schema["$schema"], "$id": bot_schema["$id"],
+                        "$defs": bot_schema["$defs"], **bot_schema["$defs"]["event_request"]}
+        registry = Registry().with_resource(common["$id"], Resource.from_contents(common))
+        validator = Draft202012Validator(event_schema, registry=registry,
+                                         format_checker=FormatChecker())
+
+        async def run():
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+                async def accounts():
+                    return [{"id": "42", "platform": "qq", "label": "42"}]
+                async def send(*args):
+                    return "1"
+                service = AdapterService(Path(directory) / "db", "astrbot", accounts, send)
+                async def post(route, data):
+                    return await service.handle(PREFIX + route, "Bearer " + service.access_key,
+                                                _json(data).encode())
+                binding = dict(connection_id="conn", account_id="42",
+                               conversation={"kind": "private", "id": "7"},
+                               allowed_authors=["7"], enabled=True)
+                for revision in (2, 4):
+                    status, result = await post("/bindings/apply", {
+                        **binding, "request_id": f"revision-{revision}", "revision": revision,
+                    })
+                    self.assertEqual(status, 200, result)
+                    self.assertTrue(await service.capture("42", "private:7", "7",
+                        f"event-{revision}", "2026-09-28T00:00:00Z", "hello"))
+                    status, result = await post("/events/poll", {"connection_id": "conn", "limit": 20})
+                    self.assertEqual(status, 200, result)
+                    self.assertEqual(len(result["events"]), 1)
+                    event = result["events"][0]
+                    validator.validate(event["event"])
+                    self.assertEqual(event["event"]["revision"], 1)
+                    await post("/events/ack", {"connection_id": "conn", "event_ids": [event["id"]]})
+                status, result = await post("/bindings/status", {"connection_id": "conn"})
+                self.assertEqual(status, 200)
+                self.assertEqual(result["binding"]["revision"], 4)
+                service.close()
+        asyncio.run(run())
+
+    def test_large_chinese_events_poll_in_bounded_ackable_batches(self):
+        async def run():
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+                async def accounts():
+                    return [{"id": "42", "platform": "qq", "label": "42"}]
+                async def send(*args):
+                    return "1"
+                service = AdapterService(Path(directory) / "db", "nonebot", accounts, send)
+                async def post(route, data):
+                    return await service.handle(PREFIX + route, "Bearer " + service.access_key,
+                                                _json(data).encode())
+                status, result = await post("/bindings/apply", dict(
+                    request_id="r1", connection_id="conn", revision=1, account_id="42",
+                    conversation={"kind": "private", "id": "7"},
+                    allowed_authors=["7"], enabled=True,
+                ))
+                self.assertEqual(status, 200, result)
+                for index in range(6):
+                    self.assertTrue(await service.capture("42", "private:7", "7",
+                        f"event-{index}", "2026-09-28T00:00:00Z", "界" * 8000))
+                expected = [row[0] for row in service.db.execute(
+                    "SELECT id FROM events WHERE connection_id='conn' ORDER BY created,id")]
+                seen, batches = [], []
+                while True:
+                    status, result = await post("/events/poll", {"connection_id": "conn", "limit": 20})
+                    self.assertEqual(status, 200, result)
+                    self.assertLessEqual(len(_json(result).encode("utf-8")), MAX_RESPONSE)
+                    ids = [item["id"] for item in result["events"]]
+                    if not ids:
+                        break
+                    seen.extend(ids)
+                    batches.append(len(ids))
+                    self.assertEqual(seen, expected[:len(seen)])
+                    status, ack = await post("/events/ack", {"connection_id": "conn",
+                                                   "event_ids": ids})
+                    self.assertEqual(status, 200, ack)
+                    self.assertEqual(ack["acknowledged"], ids)
+                self.assertEqual(seen, expected)
+                self.assertGreater(len(batches), 1)
+                self.assertEqual(service.db.execute(
+                    "SELECT COUNT(*) FROM events WHERE acked=0").fetchone()[0], 0)
+                service.close()
+        asyncio.run(run())
+
     def test_durable_binding_events_send_and_restart(self):
         async def run():
             with tempfile.TemporaryDirectory() as directory:

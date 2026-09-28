@@ -170,6 +170,28 @@ class AstrBotHostTests(unittest.TestCase):
                         events = (await post("/events/poll", {"connection_id": "conn", "limit": 20})).json()["events"]
                         self.assertEqual(len(events), 1)
                         self.assertEqual(events[0]["event"]["event_id"], "9")
+                        self.assertEqual((await post("/events/ack", {"connection_id": "conn",
+                            "event_ids": [events[0]["id"]]})).status_code, 200)
+                        for index in range(6):
+                            self.assertTrue(await plugin._adapter.service.capture(
+                                "42", "private:7", "7", f"large-{index}",
+                                "2026-09-28T00:00:00Z", "界" * 8000))
+                        expected_large = [row[0] for row in plugin._adapter.service.db.execute(
+                            "SELECT json_extract(payload,'$.event_id') FROM events "
+                            "WHERE connection_id='conn' AND acked=0 ORDER BY created,id")]
+                        received = []
+                        while True:
+                            response = await post("/events/poll", {"connection_id": "conn", "limit": 20})
+                            self.assertEqual(response.status_code, 200)
+                            self.assertLessEqual(len(response.content), 65536)
+                            batch = response.json()["events"]
+                            if not batch:
+                                break
+                            ids = [item["id"] for item in batch]
+                            received.extend(item["event"]["event_id"] for item in batch)
+                            self.assertEqual((await post("/events/ack", {"connection_id": "conn",
+                                "event_ids": ids})).status_code, 200)
+                        self.assertEqual(received, expected_large)
                         delivery = dict(reply_id="reply", attempt_id="attempt", namespace="qq",
                             conversation_id="private:7", thread_id=None, text="answer",
                             turn_id="turn", segment_sequence=1)
