@@ -1,21 +1,44 @@
-# NoneBot 薄桥边界
+# 天枢 NoneBot / OneBot v11 插件
 
-`tianshu_nonebot` 随项目安装，核心不导入 NoneBot。归一化只消费已认证的 OneBot11/TG SDK 事件，保留不可变作者、binding、会话/线程、原时间、消息 ID、修订、引用、提及及角色目标。文本 SDK helper 为 `normalize_onebot` / `normalize_telegram`；媒体原生段尚无受管 asset_ref 时明确不可用，不下载 URL 或伪造资源。标准入站合同中的媒体引用在核心中原样保留。
+此插件在现有 NoneBot 进程内运行。当前验证组合为 Python 3.12、NoneBot 2.5.0、`nonebot-adapter-onebot` 2.4.0；线上宿主版本未获知，安装前应先读取宿主 manifest 并在隔离环境中验证兼容性。首轮只支持 OneBot v11/NapCat 的私聊或群聊文本；群聊默认仅处理发给本机器人的消息。媒体、任意第三方 @、回复段、编辑、撤回、TG 均未启用。它不启动第二个陪伴 Core，也不使用 NoneBot `matcher.send` 回复。
 
-`Bridge.capture` 先持久化事件及唯一责任方。明确命令匹配由部署传入（完整命令或命令加空格参数）；direct 只交功能插件，companion 只进入核心，不双重回复。NoneBot matcher 应读取该结果并停止已交出的匹配传播；本任务不注册具体 GsCore 命令，也不启动真实 matcher/机器人。
+## 部署前提
 
-TS-024起明确命令分流有了独立模块 `tianshu_nonebot.routing`：`registry_matcher(command_table)` 由**核心的命令表**（`core.commands("nonebot")` / `POST /internal/v1/direct/commands`）构造平台/受众范围的匹配表，桥接不再自己维护一份命令名；`DirectRouter.capture/submit` 复用 `Bridge.capture` 判责与去重，`submit` 只把 `direct` 认领的消息交给 `POST /internal/v1/conversation/direct-command`（唯一执行仍在核心），核心判定不是命令时调 `Bridge.hand_back` 把该行退回陪伴队列。`BridgeDelivery` 让核心的桥接负责回复走既有 `Bridge.send`（目的地核验、reply_id 去重、unknown 纪律都在其中），没有第二条出站路径。只有 `reply_to="bridge"` 的登记可被认领；`reply_to="core"` 的裸命令文本继续走陪伴链。
+1. 平台部署方先登记对应 `bot_connections` 槽位：adapter=`nonebot`、`platform_id`、QQ 机器人 `self_id`、外部会话 `group:<群号>` 或 `private:<用户号>`、逐作者的 Sources input entry 和角色。未知作者会被平台拒绝。管理员在网页创建并启用连接，选择允许会话和角色，领取只展示一次的**连接专属**令牌。该令牌不是平台管理员或 Core service 凭据。
+2. Core 部署的 `bindings` 中，对这些机器人来源登记 `service=platform`、`namespace=qq` 的 binding；仅将选中的 binding ID 放入 `bot_platform_bindings`，并配置 `services.platform_sender` 指向平台 HTTPS 地址与 **Core 专用** token。该 Companion service principal 需有 `source.input`、`origin.resolve`、`dialogue.send`，其 resolver 对齐 `caller=platform`、`purpose=dialogue`；平台内部登记者另需 `source.register`、`source.dispatch`、`mapping.prepare`。未选中的旧 qq/tg binding 仍走原 `services.nonebot`。跨产品来源登记由部署方核对，不靠网页临时创建。
+3. 在运行 NoneBot/NapCat 的机器安装本仓库包。Python 3.12 隔离环境示例：
 
-`Bridge.flush` 在 429/依赖故障时保留待重试记录、错误原因、下次时间；没有成功受理回执前不删除或宣称已交付。NoneBot 宿主应把 pending/last_error 显示为等待或背压。`refresh_origin` 只能由可信 issuer 从原已登记 SDK 事件续签，不能让用户 payload 自签。未安装续签器时过期来源持续拒绝。
+   ```powershell
+   python -m pip install -r requirements-nonebot.txt
+   python -m pip install --no-deps -e .
+   ```
 
-TS-022的capture同时接受source-sync/v1 fanout_request，按物理版本和原targets保留不同路由意图；SDK归一化默认幂等key也含targets。新接入由受信Platform应用先登记完整physical_input再签发source_input origin，将归一化的物理字段放入input，并保留独立command/target_actor_ids。新信封发往ingest-actors，不能把旧actor origin或raw SDK正文当成source_input授权。
+   发布安装可用 `python -m pip install '.[nonebot]'`；`requirements-nonebot.txt` 是本次实测环境的精确依赖版本。以上命令在 **Companion 项目根目录**执行。不要在生产宿主中盲目覆盖其已有 NoneBot 依赖版本。
+4. 在宿主入口按原有方式注册 `nonebot.adapters.onebot.v11.Adapter`，然后调用 `nonebot.load_plugin("tianshu_nonebot.plugin")`。插件必须在 `nonebot.init()` 后、`nonebot.run()` 前加载。已有适配器不重复注册。插件启动后只监听显式允许的会话；插件本身不会远程安装或开启 NapCat。
 
-fanout模式必须注入真实 `confirm_admissions(request, result)` 应用回调。薄桥先核验完整effective集合、逐actor receipt/admission/physical/scope绑定及无receipt别名，持久冻结首个路由，再由Platform受信prepare/confirm用inline事实回填；返回True才标记accepted，503/失败持续pending。重试同key不重复创建Core受理，不循环查询Core或Memory来源，不新增映射RPC。只有旧单actor模式继续使用下述旧回执映射；旧路径不宣称建立source_input/admission_history，Platform无法核对的旧来源会503。
+## NoneBot 配置
 
-成功受理后，薄桥从已认证核心响应验证 request_id 与 collection_key，再持久保存 conversation_id、原 channel_key 和核心 receipt_id。issuer 用 `channel_mapping(channel_key)` 取得该权威映射，后续 resolve 必须返回具体 conversation_id；首次 resolve/register 可为 null，不阻塞首次登记。既有非空映射冲突则拒绝更新。映射也可供下行目的地核验使用。W=0 的首次 select 可在映射保存前得到暂时 503，由核心有界等待处理；严禁把未知来源 scope 当任意会话授权。
+在宿主的 `.env.prod` / 受控环境变量中设置（JSON 列表遵循 NoneBot 配置格式）：
 
-下行 `Bridge.send` 需要部署注入 `verify_send`（认证服务及实际来源/目标/角色权限核验）、当前 conversation→destination 映射和真实 SDK `send_native`；缺任意关键依赖就不可用。服务端在 TLS 认证入口接收已发布 `POST /internal/v1/conversation/send` 后调用此方法；此任务提供方法边界和测试，不随意增加来源签发/目标授权 HTTP 路由。`send_onebot_text`、`send_telegram_text` 是 SDK 回执映射 helper，只有真实 message_id 才能 sent；文本按纯文本发送，不启用模型返回的富文本指令。
+```dotenv
+TIANSHU_NONEBOT_CONNECTION_ID=网页创建的连接ID
+TIANSHU_NONEBOT_PLATFORM_ID=部署登记的宿主实例ID
+TIANSHU_NONEBOT_BOT_SELF_ID=机器人QQ号
+TIANSHU_NONEBOT_ALLOWED_CONVERSATIONS=["group:已登记群号","private:已登记用户号"]
+TIANSHU_NONEBOT_PLATFORM_URL=https://平台内部服务地址
+TIANSHU_NONEBOT_TOKEN=网页一次展示的连接专属令牌
+TIANSHU_NONEBOT_JOURNAL_PATH=/持久化私有目录/tianshu-nonebot.db
+# 内部私有 CA 时：TIANSHU_NONEBOT_CA_FILE=/绝对路径/ca.pem
+# 可选：TIANSHU_NONEBOT_PRIORITY=5
+# 可选：TIANSHU_NONEBOT_GROUP_REQUIRES_MENTION=true
+```
 
-adapter 自己的数据库在 native 调用前保存 unknown attempt。重复 reply/key 不再次 native send；同键异 payload 冲突。`reconcile` 仅返回本地已确认回执；本地也未知时返回 None。真实 NapCat/TG 的查询机制留部署验收，不能用重发充当核对。SDK helpers 尚未在实际 NoneBot/OneBot/TG 版本组合验证；本任务没有安装或运行机器人适配器。
+Windows 上把 journal 路径改成真实绝对路径。journal 是 SQLite/WAL，需为宿主进程独占且跨重启保留，目录仅授予宿主账号读取权限，不能放入 Git 或共享临时目录。一个连接实例使用一个 journal；多个 NoneBot 进程不能共用一个连接配置并抢占同一个会话。内部 API 地址必须是 HTTPS，且地址中的 DNS/IP 要与服务端证书 SAN 匹配；使用私有 CA 时将 CA PEM 只读挂载到宿主并填写绝对路径，插件仍验证证书链和主机名。公开的 `18446` HTTP 网页入口不能填作插件内部 API 地址。`TIANSHU_NONEBOT_GROUP_REQUIRES_MENTION=false` 只在管理员明确希望该连接接管白名单群内全部纯文本消息时使用。插件仅在本地白名单与平台授权同时匹配时认领事件；NoneBot matcher 以 `block=True` 阻断更低优先级插件，避免同一消息双答。宿主中更高或相同优先级的其他 matcher 仍需运维确认不会对同一会话发消息。
 
-核心包和薄桥包的 `pip install --no-deps -e .` 应在两个源码包都存在后执行。测试验证归一化、目的地边界、责任持久性、429 后重试、发送 unknown 和去重；合成 native callback 仅在 tests 定义，不能作为生产成功证据。
+## 恢复与状态含义
+
+入站事件先写入本地 journal 再请求平台。请求中断后本地标记 `unknown`，仅查平台 `/internal/v1/bot/events/status`；查不到时保持 unknown，不重发。平台返回 accepted 仅代表 Core admission，不代表生成或发送成功。出站先写 `claimed` 意图再调用真实 OneBot SDK；只有 SDK 返回真实 `message_id` 才写 `sent`。SDK 异常/超时、进程在调用中退出均记 `unknown`，重连只补发 ACK，绝不再调 SDK。平台领取同一 reply/attempt 的重复记录也不会重复发。平台禁用/撤权后拒绝新事件和新领取，已经执行的 SDK 发送无法撤回。
+
+插件不会把消息文本、令牌、账号 ID 写入自己的日志；宿主 NoneBot/适配器已有事件日志仍需按其部署配置控制敏感内容。`/heartbeat` 只证明插件近期能认证访问平台；网页“在线”不等于 Core、模型或真实 QQ 发送已通过。当前仅完成本地合成测试，实机安装和收发要等用户指定账号及会话白名单。
+
+历史的 `bridge.py` / `routing.py` 保留原 Core/NoneBot 直连薄桥与测试。新插件只用连接专属平台 HTTP 入口，不在机器人进程签发 Core origin，也不会复用旧桥中的已知授权宽口。

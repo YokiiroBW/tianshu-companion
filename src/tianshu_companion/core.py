@@ -308,7 +308,7 @@ class Core:
             if self.web_sender is None:
                 raise Fault("dependency_unavailable")
             return self.web_sender
-        return self.sender  # Preserve the existing non-web channel path (qq/tg/etc.).
+        return self.sender  # The deployment binding chooses legacy or Platform bot polling.
 
     def open_send_band(self, conversation_key, *, unit_id, current=None, wait_for_turn=False):
         """Place one reply unit in the conversation's single increasing outbound order.

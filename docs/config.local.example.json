@@ -16,6 +16,7 @@
   },
   "personas": {"admin_token_env": "TIANSHU_PERSONA_ADMIN_TOKEN"},
   "bindings": {},
+  "bot_platform_bindings": [],
   "callers": {},
   "services": {}
 }

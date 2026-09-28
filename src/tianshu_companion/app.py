@@ -14,7 +14,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
 
-from .clients import Gateway, JsonService, Memory, Origins, Sender, set_log_port, uid
+from .clients import (
+    BotSenderRouter,
+    Gateway,
+    JsonService,
+    Memory,
+    Origins,
+    PlatformBotSender,
+    Sender,
+    set_log_port,
+    uid,
+)
 from .contracts import Contracts, Fault, strict_json
 from .core import Core, Policy
 from .direct import SyntheticPlugin
@@ -383,7 +393,13 @@ def build_runtime(config):
             workflow=workflow,
             staging=image_config["staging"],
         )
-    outbound = Sender(contracts, client("nonebot", "channel"))
+    platform_client = client("platform_sender", "channel")
+    outbound = BotSenderRouter(
+        Sender(contracts, client("nonebot", "channel")),
+        PlatformBotSender(contracts, platform_client),
+        config.get("bot_platform_bindings", []),
+        config.get("bindings", {}),
+    )
     # Explicit functional commands. With no `direct` section nothing is registered, so no
     # text is ever claimed as a command and every message keeps following the chat chain.
     # The delivery port is the existing outbound sender: no second message exit is created.
@@ -422,7 +438,7 @@ def build_runtime(config):
         writing_options=config.get("writing"),
         proactive_options=config.get("proactive"),
         direct_options=direct_options,
-        web_sender=Sender(contracts, client("platform_sender", "channel")),
+        web_sender=Sender(contracts, platform_client),
         personas=bool(persona_config),
         # The whole deployment document: the persona module owns the rule for where a
         # character is declared, so startup and the maintenance CLI read it identically.

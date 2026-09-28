@@ -71,6 +71,7 @@ class JsonService:
             "/internal/v1/memory/select",
             "/internal/v1/memory/profiles/select",
             "/internal/v1/memory/source-sync/check",
+            "/internal/v1/conversation/reply-status",
         }
     )
     QUERY_BUDGET_SECONDS = 15
@@ -493,3 +494,60 @@ class Sender:
         # No receipt lookup route is frozen in v1. Deployment can supply an audited
         # channel-specific lookup; lack of one must never trigger another send.
         return None
+
+
+class PlatformBotSender(Sender):
+    """Platform bot queue: read the receipt without repeating a possibly sent command."""
+
+    async def reconcile(self, request):
+        self.contracts.check("conversation#send_request", request)
+        value = await self.client.call("/internal/v1/conversation/reply-status", request)
+        if not isinstance(value, dict) or set(value) != {"receipt"}:
+            raise Fault("invalid_input")
+        receipt = value["receipt"]
+        if receipt is None:
+            return None
+        self.contracts.check("conversation#send_receipt", receipt)
+        if (
+            receipt["reply_id"] != request["reply_id"]
+            or receipt["request_id"] != request["command"]["request_id"]
+            or receipt["segment_sequence"] != request["segment_sequence"]
+        ):
+            raise Fault("invalid_input")
+        return receipt
+
+
+class BotSenderRouter:
+    """Only deployment-selected platform-owned bindings use the bot polling queue."""
+
+    def __init__(self, legacy, platform, selected_bindings, bindings):
+        self.legacy, self.platform = legacy, platform
+        if not isinstance(selected_bindings, (list, tuple)) or len(set(selected_bindings)) != len(
+            selected_bindings
+        ):
+            raise ValueError("bot_platform_bindings must be a unique list")
+        self.selected = frozenset(selected_bindings)
+        for binding_id in self.selected:
+            binding = bindings.get(binding_id)
+            if (
+                not binding
+                or binding.get("service") != "platform"
+                or binding.get("namespace") not in {"qq", "tg"}
+            ):
+                raise ValueError("A platform bot binding must be a registered qq/tg binding")
+        if self.selected and not platform.available:
+            raise ValueError("A selected platform bot binding requires platform_sender service")
+
+    @property
+    def available(self):
+        return self.legacy.available or (bool(self.selected) and self.platform.available)
+
+    def _sender(self, request):
+        binding_id = request["destination"]["binding_id"]
+        return self.platform if binding_id in self.selected else self.legacy
+
+    async def send(self, request):
+        return await self._sender(request).send(request)
+
+    async def reconcile(self, request):
+        return await self._sender(request).reconcile(request)
