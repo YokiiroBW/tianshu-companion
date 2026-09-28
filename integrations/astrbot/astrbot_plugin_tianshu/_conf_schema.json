@@ -1,0 +1,64 @@
+{
+  "enabled": {
+    "description": "启用天枢连接器（安装后默认关闭）",
+    "type": "bool",
+    "default": false
+  },
+  "base_url": {
+    "description": "天枢平台 HTTPS 地址",
+    "type": "string",
+    "default": ""
+  },
+  "ca_file": {
+    "description": "可选：容器内只读挂载的平台 CA PEM 绝对路径",
+    "type": "string",
+    "default": ""
+  },
+  "connection_id": {
+    "description": "平台管理员创建的机器人连接 ID",
+    "type": "string",
+    "default": ""
+  },
+  "token": {
+    "description": "该连接的独立 Bearer 凭据",
+    "type": "string",
+    "default": "",
+    "secret": true
+  },
+  "platform_id": {
+    "description": "AstrBot 中 aiocqhttp 平台实例 ID",
+    "type": "string",
+    "default": ""
+  },
+  "self_id": {
+    "description": "该平台实例所用的机器人 QQ 号",
+    "type": "string",
+    "default": ""
+  },
+  "allowed_conversations": {
+    "description": "本地精确会话白名单（必须与平台一致）",
+    "type": "list",
+    "default": [],
+    "hint": "每项形如 private:123456 或 group:123456；默认空列表不接管消息。"
+  },
+  "trigger_prefix": {
+    "description": "只接管此前缀开头的文本",
+    "type": "string",
+    "default": "天枢 "
+  },
+  "capture_all_text": {
+    "description": "在白名单会话内接管所有普通文本（显式专用会话模式）",
+    "type": "bool",
+    "default": false
+  },
+  "poll_seconds": {
+    "description": "回复领取间隔（秒）",
+    "type": "int",
+    "default": 2
+  },
+  "heartbeat_seconds": {
+    "description": "连接心跳间隔（秒）",
+    "type": "int",
+    "default": 30
+  }
+}
