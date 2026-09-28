@@ -1,5 +1,10 @@
 """Load with nonebot.load_plugin('tianshu_nonebot.plugin') after OneBot v11 registration."""
 
+import sys
+
+if "tianshu_nonebot.adapter_plugin" in sys.modules:
+    raise RuntimeError("Tianshu pull and adapter transports cannot share a NoneBot host")
+
 from pathlib import Path
 
 from nonebot import get_bots, get_driver, get_plugin_config, on_message

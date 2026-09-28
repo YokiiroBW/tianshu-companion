@@ -13,6 +13,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
+from .adapter import AstrAdapter
 from .http_port import PlatformHTTP
 from .runtime import BoundaryError, Journal, Runner, Settings
 
@@ -25,8 +26,19 @@ class TianshuPlugin(Star):
         self._task: asyncio.Task | None = None
         self._journal: Journal | None = None
         self._runner: Runner | None = None
+        self._adapter: AstrAdapter | None = None
+        self._adapter_task: asyncio.Task | None = None
+        # Adapter mode is the install default. The historical pull connector is
+        # still available through enabled=true, but never runs simultaneously.
         if not config or config.get("enabled") is not True:
-            logger.info("tianshu connector disabled")
+            try:
+                data_dir = Path(StarTools.get_data_dir("astrbot_plugin_tianshu"))
+                self._adapter = AstrAdapter(
+                    context, data_dir, int((config or {}).get("adapter_port", 18765))
+                )
+            except (ValueError, OSError, sqlite3.Error):
+                logger.warning("tianshu adapter inactive: initialization_failed")
+            self._start_adapter()
             return
         try:
             settings = Settings.from_config(config)
@@ -61,6 +73,21 @@ class TianshuPlugin(Star):
             # The loaded hook or first matching event starts the same one task.
             pass
 
+    def _start_adapter(self) -> None:
+        if self._adapter is None or self._adapter_task is not None:
+            return
+        try:
+            self._adapter_task = asyncio.get_running_loop().create_task(self._serve_adapter())
+        except RuntimeError:
+            pass
+
+    async def _serve_adapter(self) -> None:
+        assert self._adapter is not None
+        try:
+            await self._adapter.start()
+        except Exception:
+            self._report("adapter_listen_failed")
+
     def _report(self, code: str) -> None:
         now = time.monotonic()
         if now - self._last_report.get(code, -1e9) >= 60:
@@ -69,6 +96,13 @@ class TianshuPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def on_message(self, event: AstrMessageEvent) -> None:
+        if self._adapter is not None:
+            self._start_adapter()
+            try:
+                await self._adapter.capture(event)
+            except Exception:
+                self._report("adapter_capture_failed")
+            return
         if self._runner is None:
             return
         self._start_background()
@@ -80,6 +114,7 @@ class TianshuPlugin(Star):
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self) -> None:
+        self._start_adapter()
         self._start_background()
 
     def _client(self):
@@ -156,6 +191,15 @@ class TianshuPlugin(Star):
             await asyncio.sleep(self._runner.settings.poll_seconds)
 
     async def terminate(self) -> None:
+        if self._adapter_task is not None:
+            try:
+                await self._adapter_task
+            except Exception:
+                self._report("adapter_listen_failed")
+            self._adapter_task = None
+        if self._adapter is not None:
+            await self._adapter.close()
+            self._adapter = None
         if self._task is not None:
             self._task.cancel()
             try:

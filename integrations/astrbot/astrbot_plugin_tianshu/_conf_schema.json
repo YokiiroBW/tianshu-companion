@@ -1,8 +1,13 @@
 {
   "enabled": {
-    "description": "启用天枢连接器（安装后默认关闭）",
+    "description": "旧版 pull 传输（仅旧部署继续使用；开启会关闭新版适配器 RPC）",
     "type": "bool",
     "default": false
+  },
+  "adapter_port": {
+    "description": "新版适配器本机回环监听端口（固定只监听 127.0.0.1）",
+    "type": "int",
+    "default": 18765
   },
   "base_url": {
     "description": "天枢平台 HTTPS 地址",
