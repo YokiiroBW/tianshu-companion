@@ -1204,21 +1204,16 @@ class Personas:
             "updated_at": row["updated_at"],
             "last_applied_target": row.get("last_applied_target"),
             "last_applied_profile_revision": row.get("last_applied_profile_revision"),
+            "last_applied_target_revision": row.get("last_applied_target_revision"),
         }
 
     def author_catalog(self):
         # The deployment already caps all personas at 256. Profiles use the same rows and
         # revisions, but never become Core roles merely by existing in this directory.
-        profiles = [
-            self._author_summary(row)
-            for row in self.store.list("persona_personas")
-            if row.get("kind") == "profile"
-        ]
-        roles = [
-            self._author_summary(row)
-            for row in self.store.list("persona_personas")
-            if row.get("kind") != "profile"
-        ]
+        with self.store.transaction():
+            rows = self.store.list("persona_personas")
+            profiles = [self._author_summary(row) for row in rows if row.get("kind") == "profile"]
+            roles = [self._author_summary(row) for row in rows if row.get("kind") != "profile"]
         return (
             sorted(profiles, key=lambda row: (row["name"].casefold(), row["id"])),
             sorted(roles, key=lambda row: row["id"]),
@@ -1422,9 +1417,14 @@ class Personas:
                 _invalid("A retired role cannot be applied")
             source_revision = profile["draft_revision"] or profile["published_revision"]
             source = self._revision_for(profile_id, source_revision)
-            # A role may have scalar extensions outside the four editor fields. Keep them
-            # unless the source profile explicitly carries a value for the same field.
-            normalized = normalize(dict(self._author_base(role), **source["content"]))
+            # Keep target extensions, then take all four editor fields solely from the profile.
+            # An omitted optional field in the profile means cleared, not inherited from role.
+            extensions = {
+                key: value
+                for key, value in self._author_base(role).items()
+                if key not in REVISION_TEXT_FIELDS
+            }
+            normalized = normalize({**extensions, **source["content"]})
             revision = self._write_revision(
                 target,
                 normalized,
@@ -1459,6 +1459,7 @@ class Personas:
                     profile,
                     last_applied_target=target,
                     last_applied_profile_revision=source_revision,
+                    last_applied_target_revision=revision["id"],
                     last_applied_at=self.clock(),
                     updated_at=self.clock(),
                 ),

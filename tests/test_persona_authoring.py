@@ -94,6 +94,10 @@ def test_create_edit_apply_replay_conflict_and_restart(tmp_path):
         )
         first = personas.manage(apply)["item"]
         assert personas.manage(apply)["item"] == first
+        assert (
+            first["profile"]["last_applied_target_revision"]
+            == first["target"]["published_revision"]
+        )
         assert len(personas.publications("actor:a")) == 2
         assert len(personas.approvals("actor:a")) == 1
         assert personas.pin("actor:a")["content"]["custom"] == "keep-me"
@@ -192,6 +196,52 @@ def test_existing_role_can_save_then_apply_without_losing_extensions(tmp_path):
         assert personas.author_view(copied["id"])["content"]["custom"] == "retained"
 
 
+def test_applying_profile_clears_omitted_optional_text_but_keeps_role_extensions(tmp_path):
+    with closing(Store(tmp_path / "clear-optional.sqlite")) as store:
+        personas = Personas(store, lambda: 1000.0)
+        personas.import_config(
+            {
+                "config_version": 1,
+                "roles": {
+                    "actor:a": {
+                        "version": 1,
+                        "persona": "Old",
+                        "tone": "Old tone",
+                        "style": "Old style",
+                        "address": "Old address",
+                        "custom": "retained",
+                    }
+                },
+            }
+        )
+        profile = personas.manage(
+            operation(
+                "create_profile",
+                "clear-create",
+                name="清空可选字段",
+                description="",
+                content={"persona": "New", "tone": "", "style": "", "address": ""},
+            )
+        )["item"]
+        personas.manage(
+            operation(
+                "apply_profile",
+                "clear-apply",
+                subject=profile["id"],
+                expected=profile["version"],
+                target="actor:a",
+                target_expected=personas.get("actor:a")["version"],
+                name="清空可选字段",
+                description="",
+                content={"persona": "New", "tone": "", "style": "", "address": ""},
+            )
+        )
+        pinned = personas.pin("actor:a")["content"]
+        assert pinned["persona"] == "New"
+        assert pinned["custom"] == "retained"
+        assert all(field not in pinned for field in ("tone", "style", "address"))
+
+
 def test_core_preparation_pins_only_the_explicitly_applied_revision():
     async def scenario():
         harness = Harness(personas=persona_config())
@@ -225,6 +275,112 @@ def test_core_preparation_pins_only_the_explicitly_applied_revision():
         assert core._pin_role("actor:a")["persona"] == "Later"
         assert prior["persona"] == "Role A"
         assert core.personas.verify(prior) == prior["revision_id"]
+        await core.close()
+
+    asyncio.run(scenario())
+
+
+def test_core_model_request_uses_all_four_fields_from_each_pinned_revision():
+    async def scenario():
+        harness = Harness(
+            personas=persona_config(
+                **{
+                    "actor:a": {
+                        "version": 1,
+                        "persona": "Old persona",
+                        "tone": "Old tone",
+                        "style": "Old style",
+                        "address": "Old address",
+                    },
+                    "actor:b": {"version": 1, "persona": "Role B"},
+                }
+            )
+        )
+        core = harness.core
+        gate = asyncio.Event()
+        harness.gateway.gates[1] = gate
+        await harness.ingest(text="在途旧轮次")
+        harness.clock.advance(6)
+        await harness.cycles(10)
+        assert len(harness.gateway.calls) == 1
+        first_turn = harness.turns()[0]
+        old_revision = first_turn["role"]["revision_id"]
+
+        created = core.manage_persona(
+            "persona_admin",
+            operation(
+                "create_profile",
+                "prompt-create",
+                name="Catalog metadata only",
+                description="Description stays outside prompt",
+                content={
+                    "persona": "New persona",
+                    "tone": "New tone",
+                    "style": "New style",
+                    "address": "New address",
+                },
+            ),
+        )["item"]
+        applied = core.manage_persona(
+            "persona_admin",
+            operation(
+                "apply_profile",
+                "prompt-apply",
+                subject=created["id"],
+                expected=created["version"],
+                target="actor:a",
+                target_expected=core.personas.get("actor:a")["version"],
+                name="Catalog metadata only",
+                description="Description stays outside prompt",
+                content={
+                    "persona": "New persona",
+                    "tone": "New tone",
+                    "style": "New style",
+                    "address": "New address",
+                },
+            ),
+        )["item"]
+        gate.set()
+        await harness.cycles(80)
+        await harness.ingest(text="新版轮次")
+        harness.clock.advance(6)
+        await harness.cycles(80)
+        prompts = [messages[0]["content"] for _, messages in harness.gateway.calls]
+        assert prompts[0].startswith(
+            "Old persona\nTone: Old tone\nStyle: Old style\nAddress: Old address\n"
+        )
+        assert prompts[1].startswith(
+            "New persona\nTone: New tone\nStyle: New style\nAddress: New address\n"
+        )
+        assert core.personas.verify(first_turn["role"]) == old_revision
+        assert all("Catalog metadata only" not in prompt for prompt in prompts)
+        assert all("Description stays outside prompt" not in prompt for prompt in prompts)
+
+        cleared = core.manage_persona(
+            "persona_admin",
+            operation(
+                "apply_profile",
+                "prompt-clear",
+                subject=created["id"],
+                expected=applied["profile"]["version"],
+                target="actor:a",
+                target_expected=applied["target"]["version"],
+                name="Catalog metadata only",
+                description="Description stays outside prompt",
+                content={"persona": "Cleared persona", "tone": "", "style": "", "address": ""},
+            ),
+        )["item"]
+        assert cleared["target"]["published_revision"] != applied["target"]["published_revision"]
+        await harness.ingest(text="清空后轮次")
+        harness.clock.advance(6)
+        await harness.cycles(80)
+        latest_prompt = harness.gateway.calls[-1][1][0]["content"]
+        assert latest_prompt.startswith("Cleared persona\nInput messages")
+        assert all(
+            value not in latest_prompt
+            for value in ("Old tone", "New tone", "New style", "New address")
+        )
+        assert len(harness.gateway.calls) == 3
         await core.close()
 
     asyncio.run(scenario())

@@ -15,6 +15,10 @@
 只作用于下一次准备的轮次；已有轮次保持原快照。部署导入仍不能覆盖已发布角色，
 档案不在角色导入名单中。此增量不新增表、索引或 `user_version`；部署前仍需按既有
 v9 备份、停写和恢复流程保护权威 SQLite 数据库。
+应用档案时，目标角色原有的四个编辑字段由档案完整替换；档案留空的可选字段会清除，
+目标角色的非编辑扩展字段继续保留。Core 从每轮钉住的修订组装 system 文本：正文、
+非空语气、非空风格、非空称呼；名称/简介不进入模型请求。旧版只有正文时的 system
+文本保持原样。档案摘要还记录上次应用产生的目标发布修订，供网页与当前发布指针核对。
 
 隔离验证：`python -m pytest tests/test_persona_authoring.py tests/test_personas.py
 tests/test_persona_queries.py tests/test_persona_chain.py -q`。线上管理仍只认独立
