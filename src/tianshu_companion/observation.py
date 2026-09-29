@@ -26,7 +26,7 @@ def validate(request):
     }:
         raise Fault("invalid_input")
     event = request["event"]
-    if not isinstance(event, dict) or set(event) != {
+    fields = {
         "schema_version",
         "platform_id",
         "self_id",
@@ -40,10 +40,14 @@ def validate(request):
         "content_state",
         "mentioned",
         "scope_revision",
-    }:
+    }
+    if not isinstance(event, dict) or set(event) != fields | (
+        {"nickname", "group_card"} if event.get("schema_version") == 3 else set()
+    ):
         raise Fault("invalid_input")
     if (
-        event["schema_version"] != 2
+        type(event["schema_version"]) is not int
+        or event["schema_version"] not in (2, 3)
         or event["revision"] != 1
         or event["namespace"] != "qq"
         or not IDENT.fullmatch(str(event["platform_id"]))
@@ -72,6 +76,22 @@ def validate(request):
         or digest(event) != request["source_digest"]
     ):
         raise Fault("invalid_input")
+    if event["schema_version"] == 3:
+        if event["conversation_id"].startswith("private:") and event["group_card"] is not None:
+            raise Fault("invalid_input")
+        for name in (event["nickname"], event["group_card"]):
+            if name is not None and (
+                type(name) is not str
+                or not 1 <= len(name.strip()) <= 80
+                or any(
+                    ord(char) < 32
+                    or ord(char) == 127
+                    or 0x202A <= ord(char) <= 0x202E
+                    or 0x2066 <= ord(char) <= 0x2069
+                    for char in name
+                )
+            ):
+                raise Fault("invalid_input")
     if event["content_state"] == "unsupported" and event["text"]:
         raise Fault("invalid_input")
     if event["conversation_id"].startswith("private:") and (
@@ -248,7 +268,10 @@ class Observations:
             not IDENT.fullmatch(str(instance))
             or type(account) is not str
             or not QQ.fullmatch(account)
-            or (conversation is not None and (type(conversation) is not str or not CONVERSATION.fullmatch(conversation)))
+            or (
+                conversation is not None
+                and (type(conversation) is not str or not CONVERSATION.fullmatch(conversation))
+            )
             or type(request["limit"]) is not int
             or not 1 <= request["limit"] <= 100
             or (type(request["archive_epoch"]) is not int or request["archive_epoch"] < 1)

@@ -149,6 +149,10 @@ def observation_event(bot, event) -> dict:
         "text": text if content_state == "text" else "",
         "mentioned": mentioned,
         "content_state": content_state,
+        "nickname": display_name(getattr(getattr(event, "sender", None), "nickname", None)),
+        "group_card": display_name(getattr(getattr(event, "sender", None), "card", None))
+        if isinstance(event, GroupMessageEvent)
+        else None,
     }
 
 

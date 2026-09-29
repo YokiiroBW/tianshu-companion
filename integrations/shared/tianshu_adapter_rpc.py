@@ -250,6 +250,9 @@ class AdapterService:
         text: str,
         mentioned: bool,
         content_state: str = "text",
+        identity_v3: bool = False,
+        nickname: str | None = None,
+        group_card: str | None = None,
     ) -> bool:
         """Durably observe an enrolled SDK account without claiming a reply."""
         try:
@@ -318,7 +321,7 @@ class AdapterService:
                 self._observation_drop(account_id, "history_capacity")
                 return False
             payload = {
-                "schema_version": 2,
+                "schema_version": 3 if identity_v3 else 2,
                 "platform_id": self.instance_id,
                 "self_id": account_id,
                 "namespace": "qq",
@@ -332,6 +335,8 @@ class AdapterService:
                 "mentioned": mentioned,
                 "scope_revision": enrolled[1],
             }
+            if identity_v3:
+                payload.update(nickname=nickname, group_card=group_card)
             matched = target in policy["list"]
             permitted = (policy["mode"] == "whitelist" and matched) or (
                 policy["mode"] == "blacklist" and not matched

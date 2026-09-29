@@ -75,6 +75,21 @@
         "next_cursor": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/qq_id"}]}
       }
     },
+    "observation_event_v3": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "platform_id", "self_id", "namespace", "conversation_id", "account_id", "event_id", "revision", "sent_at", "text", "content_state", "mentioned", "scope_revision", "nickname", "group_card"],
+      "properties": {
+        "schema_version": {"const": 3}, "platform_id": {"type": "string"},
+        "self_id": {"$ref": "#/$defs/qq_id"}, "namespace": {"const": "qq"},
+        "conversation_id": {"type": "string", "pattern": "^(group|private):[1-9][0-9]*$"},
+        "account_id": {"$ref": "#/$defs/qq_id"}, "event_id": {"type": "string"},
+        "revision": {"const": 1}, "sent_at": {"type": "string", "format": "date-time"},
+        "text": {"type": "string"}, "content_state": {"enum": ["text", "unsupported"]},
+        "mentioned": {"type": "boolean"}, "scope_revision": {"type": "integer", "minimum": 1},
+        "nickname": {"type": ["string", "null"], "maxLength": 80},
+        "group_card": {"type": ["string", "null"], "maxLength": 80}
+      }
+    },
     "bot_event_v2": {
       "type": "object", "additionalProperties": false,
       "required": ["schema_version", "connection_id", "platform_id", "self_id", "event_id", "revision", "namespace", "conversation_id", "thread_id", "account_id", "sent_at", "text", "nickname", "group_card"],

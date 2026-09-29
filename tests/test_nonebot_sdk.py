@@ -9,10 +9,16 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from tianshu_nonebot.journal import Conflict, Journal
 from tianshu_nonebot.platform import PlatformError, PlatformPort
 from tianshu_nonebot.runtime import BotRuntime
-from tianshu_nonebot.sdk import UnsupportedEvent, send_text, text_event, verified_sender
+from tianshu_nonebot.sdk import (
+    UnsupportedEvent,
+    observation_event,
+    send_text,
+    text_event,
+    verified_sender,
+)
 
 
-def group_event(message_id=12, text="hello", user_id=7, segments=None):
+def group_event(message_id=12, text="hello", user_id=7, segments=None, nickname=None, card=None):
     message = segments or [{"type": "text", "data": {"text": text}}]
     return GroupMessageEvent.model_validate(
         {
@@ -27,7 +33,7 @@ def group_event(message_id=12, text="hello", user_id=7, segments=None):
             "original_message": message,
             "raw_message": text,
             "font": 0,
-            "sender": {"user_id": user_id},
+            "sender": {"user_id": user_id, "nickname": nickname, "card": card},
             "group_id": 99,
             "to_me": True,
         }
@@ -87,6 +93,8 @@ def test_real_sdk_event_and_text_sender():
     assert asyncio.run(send_text(bot, delivery())) == ["888"]
     assert bot.calls[0]["group_id"] == 99
     assert [(s.type, s.data) for s in bot.calls[0]["message"]] == [("text", {"text": "answer"})]
+    observed = observation_event(bot, group_event(nickname="同名", card="群名片"))
+    assert (observed["nickname"], observed["group_card"]) == ("同名", "群名片")
     with pytest.raises(UnsupportedEvent):
         text_event(bot, group_event(segments=[{"type": "image", "data": {"file": "x"}}]))
     assert (

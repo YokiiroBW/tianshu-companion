@@ -154,6 +154,9 @@ async def _observe(bot: BaseBot, event: BaseEvent) -> bool:
         value["text"],
         value["mentioned"],
         value["content_state"],
+        True,
+        value["nickname"],
+        value["group_card"],
     )
     return False  # Observing never claims reply ownership in NoneBot.
 

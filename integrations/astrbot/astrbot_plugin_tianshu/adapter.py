@@ -246,6 +246,13 @@ class AstrAdapter:
             text[:8000] if text and not unsupported else "",
             mentioned,
             "unsupported" if unsupported or not text else "text",
+            True,
+            _display(raw.get("sender", {}).get("nickname"))
+            if isinstance(raw.get("sender"), Mapping)
+            else None,
+            _display(raw.get("sender", {}).get("card"))
+            if group and isinstance(raw.get("sender"), Mapping)
+            else None,
         )
         if await self.service.observation_claimed(
             self_id, f"{kind}:{group or author}", author, native_id
