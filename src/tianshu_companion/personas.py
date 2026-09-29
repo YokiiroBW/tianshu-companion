@@ -32,6 +32,7 @@ Rules that hold everywhere in here:
 
 import json
 import re
+import uuid
 
 from .contracts import canonical, digest
 from .persona_queries import (
@@ -74,7 +75,27 @@ REQUEST_FIELDS = (
     "expected",
     "reason",
     "note",
+    "profile_id",
+    "name",
+    "description",
+    "target",
+    "target_expected",
+    "source",
+    "source_expected",
 )
+
+PROFILE_PREFIX = "persona-profile:"
+PROFILE_NAME_LIMIT = 80
+PROFILE_DESCRIPTION_LIMIT = 400
+
+
+def _profile_text(value, limit, required=False):
+    if not isinstance(value, str) or len(value) > limit or any(ord(c) < 32 for c in value):
+        _invalid("Invalid profile metadata")
+    if required and not value.strip():
+        _invalid("Profile name required")
+    return value.strip()
+
 
 # One history, one table. The kind vocabulary is `persona_queries`'; the table names are the
 # domain's, so no adapter can name a table and no pure rule has to know one.
@@ -239,6 +260,8 @@ def resolve_seed(actor, entry):
     resolve; anything else is refused instead of guessed.
     """
     actor_id(actor)
+    if actor.startswith(PROFILE_PREFIX):
+        _invalid("A deployment role cannot use the profile namespace")
     if isinstance(entry, str):
         entry = dict(persona=entry)
     if not isinstance(entry, dict):
@@ -452,6 +475,8 @@ class Personas:
         moved forward by a new deployment document.
         """
         persona = self.store.get("persona_personas", subject)
+        if persona is not None and persona.get("kind") == "profile":
+            _invalid("A profile cannot be imported as a role")
         revision = self._write_revision(
             subject, content, "initial_config", "deployment", None, created_at
         )
@@ -612,13 +637,17 @@ class Personas:
         }
 
     def subjects(self):
-        return [row["subject"] for row in self.store.list("persona_personas")]
+        return [
+            row["subject"]
+            for row in self.store.list("persona_personas")
+            if row.get("kind") != "profile"
+        ]
 
     def _state(self, persona, published, draft):
         if persona["retired"]:
             return "retired"
         if persona["published_revision"] is None:
-            return "unpublished"
+            return "draft" if draft is not None else "unpublished"
         if draft is None or persona["draft_revision"] == persona["published_revision"]:
             return "published"
         if self._approval(draft["id"]) is not None:
@@ -1076,6 +1105,8 @@ class Personas:
         """
         actor_id(subject)
         persona = self.store.get("persona_personas", subject)
+        if persona is not None and persona.get("kind") == "profile":
+            _invalid("A reusable profile is not a registered character")
         if persona is None or persona["published_revision"] is None:
             _invalid("Persona is not published")
         if persona["retired"]:
@@ -1126,6 +1157,318 @@ class Personas:
 
     # --------------------------------------------------------------------- manage
 
+    def _profile(self, profile_id):
+        if not isinstance(profile_id, str) or not profile_id.startswith(PROFILE_PREFIX):
+            _invalid("Invalid profile id")
+        row = self._persona(profile_id)
+        if row.get("kind") != "profile":
+            _invalid("Not a reusable profile")
+        return row
+
+    def _author_content(self, fields, base=None):
+        if not isinstance(fields, dict) or set(fields) - set(REVISION_TEXT_FIELDS):
+            _invalid("Only the four persona text fields may be edited")
+        content = dict(base or {})
+        for field in REVISION_TEXT_FIELDS:
+            if field not in fields:
+                continue
+            value = fields[field]
+            if not isinstance(value, str) or len(value) > REVISION_TEXT_FIELDS[field]:
+                _invalid("Invalid persona text")
+            if value.strip():
+                content[field] = value
+            elif field == "persona":
+                _invalid("A persona string is required")
+            else:
+                content.pop(field, None)
+        return normalize(content)
+
+    def _author_base(self, row):
+        revision_id = row["draft_revision"] or row["published_revision"]
+        return self._revision_for(row["subject"], revision_id)["content"] if revision_id else {}
+
+    def _author_summary(self, row):
+        return {
+            "id": row["subject"],
+            "kind": row.get("kind", "role"),
+            "name": row.get("name") or row["subject"],
+            "description": row.get("description", ""),
+            "version": row["version"],
+            "state": self._state(
+                row,
+                self._revision(row["published_revision"]) if row["published_revision"] else None,
+                self._revision(row["draft_revision"]) if row["draft_revision"] else None,
+            ),
+            "published_revision": row["published_revision"],
+            "draft_revision": row["draft_revision"],
+            "updated_at": row["updated_at"],
+            "last_applied_target": row.get("last_applied_target"),
+            "last_applied_profile_revision": row.get("last_applied_profile_revision"),
+        }
+
+    def author_catalog(self):
+        # The deployment already caps all personas at 256. Profiles use the same rows and
+        # revisions, but never become Core roles merely by existing in this directory.
+        profiles = [
+            self._author_summary(row)
+            for row in self.store.list("persona_personas")
+            if row.get("kind") == "profile"
+        ]
+        roles = [
+            self._author_summary(row)
+            for row in self.store.list("persona_personas")
+            if row.get("kind") != "profile"
+        ]
+        return (
+            sorted(profiles, key=lambda row: (row["name"].casefold(), row["id"])),
+            sorted(roles, key=lambda row: row["id"]),
+        )
+
+    def author_view(self, subject):
+        row = self._persona(subject)
+        summary = self._author_summary(row)
+        summary["content"] = self._author_base(row)
+        return summary
+
+    def create_profile(
+        self, *, name, description, content, operator, reason, source=None, source_expected=None
+    ):
+        identity(operator)
+        _reason(reason)
+        name = _profile_text(name, PROFILE_NAME_LIMIT, True)
+        description = _profile_text(description, PROFILE_DESCRIPTION_LIMIT)
+        with self.store.transaction():
+            base = None
+            if source is not None:
+                actor_id(source)
+                _expected(source_expected)
+                source_row = self._persona(source)
+                if source_row["version"] != source_expected:
+                    _conflict("Stale copy source")
+                base = self._author_base(source_row)
+            elif source_expected is not None:
+                _invalid("Copy source required")
+            normalized = self._author_content(content, base)
+            if len(self.store.list("persona_personas")) >= MAX_PERSONAS:
+                _invalid("Persona capacity reached")
+            subject = PROFILE_PREFIX + uuid.uuid4().hex
+            now = self.clock()
+            row = self._save(
+                "personas",
+                dict(
+                    id=subject,
+                    conversation_id=subject,
+                    sequence=1,
+                    state="unpublished",
+                    subject=subject,
+                    kind="profile",
+                    name=name,
+                    description=description,
+                    published_revision=None,
+                    published_at=None,
+                    publisher=None,
+                    draft_revision=None,
+                    retired=False,
+                    retired_at=None,
+                    imported=None,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            )
+            revision = self._write_revision(subject, normalized, "editor", operator, None, now)
+            row = self._save(
+                "personas", dict(row, draft_revision=revision["id"]), expected=row["version"]
+            )
+        return self._author_summary(row)
+
+    def save_profile(self, profile_id, *, name, description, content, operator, expected, reason):
+        identity(operator)
+        _reason(reason)
+        _expected(expected)
+        name = _profile_text(name, PROFILE_NAME_LIMIT, True)
+        description = _profile_text(description, PROFILE_DESCRIPTION_LIMIT)
+        with self.store.transaction():
+            row = self._profile(profile_id)
+            if row["version"] != expected:
+                _conflict()
+            normalized = self._author_content(content, self._author_base(row))
+            revision = self._write_revision(
+                profile_id,
+                normalized,
+                "editor",
+                operator,
+                row["draft_revision"] or row["published_revision"],
+                self.clock(),
+            )
+            row = self._save(
+                "personas",
+                dict(
+                    row,
+                    name=name,
+                    description=description,
+                    draft_revision=revision["id"],
+                    updated_at=self.clock(),
+                ),
+                expected=row["version"],
+            )
+        return self._author_summary(row)
+
+    def save_role(self, subject, *, name, description, content, operator, expected, reason):
+        identity(operator)
+        _reason(reason)
+        _expected(expected)
+        name = _profile_text(name, PROFILE_NAME_LIMIT, True)
+        description = _profile_text(description, PROFILE_DESCRIPTION_LIMIT)
+        with self.store.transaction():
+            row = self._persona(subject)
+            if row.get("kind") == "profile":
+                _invalid("A profile is not a role")
+            if row["version"] != expected:
+                _conflict()
+            if row["retired"]:
+                _invalid("A retired role cannot be edited")
+            normalized = self._author_content(content, self._author_base(row))
+            revision = self._write_revision(
+                subject,
+                normalized,
+                "editor",
+                operator,
+                row["published_revision"],
+                self.clock(),
+            )
+            row = self._save(
+                "personas",
+                dict(
+                    row,
+                    name=name,
+                    description=description,
+                    draft_revision=revision["id"],
+                    updated_at=self.clock(),
+                ),
+                expected=row["version"],
+            )
+        return self._author_summary(row)
+
+    def apply_role(self, subject, *, name, description, content, operator, expected, reason):
+        # One SQLite transaction contains metadata, immutable draft, explicit approval,
+        # publication pointer and the outer operation ledger. No adapter chains requests.
+        with self.store.transaction():
+            saved = self.save_role(
+                subject,
+                name=name,
+                description=description,
+                content=content,
+                operator=operator,
+                expected=expected,
+                reason=reason,
+            )
+            revision_id = saved["draft_revision"]
+            approved = self.approve(
+                subject,
+                revision_id,
+                operator=operator,
+                expected=saved["version"],
+                reason=reason,
+            )
+            self.publish(
+                subject,
+                revision_id,
+                operator=operator,
+                expected=approved["version"],
+                reason=reason,
+            )
+            return self._author_summary(self._persona(subject))
+
+    def apply_profile(
+        self,
+        profile_id,
+        *,
+        target,
+        target_expected,
+        expected,
+        operator,
+        reason,
+        name=None,
+        description=None,
+        content=None,
+    ):
+        identity(operator)
+        _reason(reason)
+        _expected(expected)
+        _expected(target_expected)
+        actor_id(target)
+        with self.store.transaction():
+            profile = self._profile(profile_id)
+            if profile["version"] != expected:
+                _conflict("Stale profile version")
+            if content is not None:
+                profile = self._profile(
+                    self.save_profile(
+                        profile_id,
+                        name=name,
+                        description=description,
+                        content=content,
+                        operator=operator,
+                        expected=expected,
+                        reason=reason,
+                    )["id"]
+                )
+            role = self._persona(target)
+            if role.get("kind") == "profile":
+                _invalid("A profile cannot be an application target")
+            if role["version"] != target_expected:
+                _conflict("Stale target role version")
+            if role["retired"]:
+                _invalid("A retired role cannot be applied")
+            source_revision = profile["draft_revision"] or profile["published_revision"]
+            source = self._revision_for(profile_id, source_revision)
+            # A role may have scalar extensions outside the four editor fields. Keep them
+            # unless the source profile explicitly carries a value for the same field.
+            normalized = normalize(dict(self._author_base(role), **source["content"]))
+            revision = self._write_revision(
+                target,
+                normalized,
+                "profile_apply",
+                operator,
+                role["published_revision"],
+                self.clock(),
+                note=profile["name"],
+            )
+            role = self._save(
+                "personas",
+                dict(role, draft_revision=revision["id"], updated_at=self.clock()),
+                expected=role["version"],
+            )
+            approved = self.approve(
+                target,
+                revision["id"],
+                operator=operator,
+                expected=role["version"],
+                reason=reason,
+            )
+            self.publish(
+                target,
+                revision["id"],
+                operator=operator,
+                expected=approved["version"],
+                reason=reason,
+            )
+            profile = self._save(
+                "personas",
+                dict(
+                    profile,
+                    last_applied_target=target,
+                    last_applied_profile_revision=source_revision,
+                    last_applied_at=self.clock(),
+                    updated_at=self.clock(),
+                ),
+                expected=profile["version"],
+            )
+        return {
+            "profile": self._author_summary(profile),
+            "target": self._author_summary(self._persona(target)),
+        }
+
     def manage(self, request):
         """The one application entry point for every persona use case.
 
@@ -1148,6 +1491,61 @@ class Personas:
         operation = request.get("operation")
         if not isinstance(operation, str):
             _invalid("Missing operation")
+        if operation == "author_catalog":
+            profiles, roles = self.author_catalog()
+            return dict(schema_version=1, operation=operation, profiles=profiles, roles=roles)
+        if operation == "author_view":
+            subject = actor_id(_required(request, "subject"))
+            return dict(schema_version=1, operation=operation, item=self.author_view(subject))
+        if operation == "create_profile":
+            result = self._perform(
+                operation,
+                request,
+                lambda: self.create_profile(
+                    name=_required(request, "name"),
+                    description=request.get("description", ""),
+                    content=_required(request, "content"),
+                    operator=_required(request, "operator"),
+                    reason=_required(request, "reason"),
+                    source=request.get("source"),
+                    source_expected=request.get("source_expected"),
+                ),
+            )
+            return dict(schema_version=1, operation=operation, item=result)
+        if operation in {"save_profile", "apply_profile", "save_role", "apply_role"}:
+            subject = actor_id(_required(request, "subject"))
+            common = dict(
+                operator=_required(request, "operator"),
+                expected=_required(request, "expected"),
+                reason=_required(request, "reason"),
+            )
+            if operation == "apply_profile":
+                result = self._perform(
+                    operation,
+                    request,
+                    lambda: self.apply_profile(
+                        subject,
+                        target=_required(request, "target"),
+                        target_expected=_required(request, "target_expected"),
+                        name=request.get("name"),
+                        description=request.get("description"),
+                        content=request.get("content"),
+                        **common,
+                    ),
+                )
+            else:
+                result = self._perform(
+                    operation,
+                    request,
+                    lambda: getattr(self, operation)(
+                        subject,
+                        name=_required(request, "name"),
+                        description=request.get("description", ""),
+                        content=_required(request, "content"),
+                        **common,
+                    ),
+                )
+            return dict(schema_version=1, operation=operation, item=result)
         if operation == "list":
             subjects = self.subjects()
             return dict(

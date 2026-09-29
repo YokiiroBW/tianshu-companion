@@ -1,5 +1,25 @@
 # 角色人格版本管理与对话快照（TS-075）
 
+## 人格档案编辑增量（2026-09-29）
+
+`Personas.manage` 现有七个编辑操作：`author_catalog`、`author_view`、
+`create_profile`、`save_profile`、`apply_profile`、`save_role`、`apply_role`。
+可复用档案在同一个 `persona_personas` / `persona_revisions` 库中以
+`persona-profile:<uuid>` 标识；名称、简介是元数据，不进入提示词，也不是角色、
+来源、模型或发送权限。创建与保存只写草稿。已登记角色可以直接保存草稿或明确应用。
+
+`apply_profile` / `apply_role` 在单个 SQLite 事务中写不可变角色修订、显式批准、
+发布指针及操作幂等账本；`expected`（档案版本）、`target_expected`（目标角色版本）
+都在写入前比较。相同 `request_id` 和规范化请求重放返回首次结果，版本冲突不覆盖。
+编辑正文、语气、风格、称呼四个字段时，原修订的其他标量字段继续保留。新的发布
+只作用于下一次准备的轮次；已有轮次保持原快照。部署导入仍不能覆盖已发布角色，
+档案不在角色导入名单中。此增量不新增表、索引或 `user_version`；部署前仍需按既有
+v9 备份、停写和恢复流程保护权威 SQLite 数据库。
+
+隔离验证：`python -m pytest tests/test_persona_authoring.py tests/test_personas.py
+tests/test_persona_queries.py tests/test_persona_chain.py -q`。线上管理仍只认独立
+`personas.admin_token_env`；普通聊天、来源或桥接凭据不能写人格。
+
 本模块把"角色人格"从一个可随手改写的配置字段，变成**版本化、需显式批准、可追溯回退、
 且每轮对话都钉住不可变快照**的受管数据。人格文本永远不是权限、不是来源、不是模型绑定，
 也不是发送资格——它只是一段被钉住的内容。
