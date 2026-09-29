@@ -280,6 +280,24 @@ def test_core_preparation_pins_only_the_explicitly_applied_revision():
     asyncio.run(scenario())
 
 
+def test_core_without_personas_keeps_legacy_model_request():
+    async def scenario():
+        harness = Harness()
+        try:
+            await harness.ingest(text="Legacy role conversation")
+            harness.clock.advance(15)
+            await harness.cycles(80)
+            assert len(harness.gateway.calls) == 1
+            prompt = harness.gateway.calls[0][1][0]["content"]
+            assert prompt.startswith("Role A\nInput messages")
+            assert "content" not in harness.turns()[0]["role"]
+            assert harness.turns()[0]["phase"] != "failed"
+        finally:
+            await harness.core.close()
+
+    asyncio.run(scenario())
+
+
 def test_core_model_request_uses_all_four_fields_from_each_pinned_revision():
     async def scenario():
         harness = Harness(

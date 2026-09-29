@@ -1236,7 +1236,7 @@ class Core:
                 return
             persona_instructions = turn["role"]["persona"]
             for field, label in (("tone", "Tone"), ("style", "Style"), ("address", "Address")):
-                value = turn["role"]["content"].get(field)
+                value = turn["role"].get("content", {}).get(field)
                 if isinstance(value, str) and value.strip():
                     persona_instructions += f"\n{label}: {value}"
             messages = [
