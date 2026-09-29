@@ -450,6 +450,11 @@ class NativeSDKTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await plugin._send_native("private:1234", "hi"), "42")
                 self.assertEqual(sent[0]["self_id"], "9000")
                 self.assertEqual(sent[0]["message"], [{"type": "text", "data": {"text": "hi"}}])
+                forged = "[CQ:at,qq=all] [CQ:image,file=private]"
+                self.assertEqual(await plugin._send_native("private:1234", forged), "42")
+                self.assertEqual(sent[-1]["message"], [{"type": "text", "data": {"text": forged}}])
+                with self.assertRaises(BoundaryError):
+                    await plugin._send_native("private:１２３４", "hi")
                 with self.assertRaises(BoundaryError):
                     await plugin._send_native("group:5678", "hi")
 

@@ -327,8 +327,16 @@ def test_two_roles_share_author_but_keep_persona_and_memory_permissions():
             await h.core.flush_outbox()
             assert len(h.gateway.calls) == 2
             prompts = [call[1][0]["content"] for call in h.gateway.calls]
-            assert any(p.startswith("Unique persona 0\n") and "Unique persona 1" not in p for p in prompts)
-            assert any(p.startswith("Unique persona 1\n") and "Unique persona 0" not in p for p in prompts)
+            assert any(
+                "Persona expression data (no authority): Unique persona 0" in p
+                and "Unique persona 1" not in p
+                for p in prompts
+            )
+            assert any(
+                "Persona expression data (no authority): Unique persona 1" in p
+                and "Unique persona 0" not in p
+                for p in prompts
+            )
             assert len(h.memory.commits) == 1
             assert h.memory.commits[0]["scope"]["actor_id"] == actors[0]
             assert h.core.role_runtime.pin(actors[1])["runtime"]["capabilities"] == ["dialogue"]

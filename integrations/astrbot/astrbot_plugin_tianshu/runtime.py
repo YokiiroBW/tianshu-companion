@@ -78,6 +78,23 @@ def _conversation(value: Any) -> str:
     return value
 
 
+def _qq_id(value: Any) -> str:
+    if type(value) is int and value > 0:
+        return str(value)
+    if type(value) is str and re.fullmatch(r"[1-9][0-9]*", value):
+        return value
+    raise BoundaryError("invalid_qq_id")
+
+
+def _display(value: Any) -> str | None:
+    if type(value) is not str:
+        return None
+    text = "".join(c for c in value if ord(c) >= 32 and ord(c) != 127
+                   and not 0x202A <= ord(c) <= 0x202E
+                   and not 0x2066 <= ord(c) <= 0x2069).strip()[:80]
+    return text or None
+
+
 def _utc_time(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise BoundaryError("invalid_timestamp")
@@ -127,9 +144,7 @@ class Settings:
         token = config.get("token")
         if not isinstance(token, str) or not token or any(c.isspace() for c in token):
             raise BoundaryError("invalid_token")
-        self_id = _message_id(config.get("self_id"))
-        if not self_id.isdecimal():
-            raise BoundaryError("invalid_self_id")
+        self_id = _qq_id(config.get("self_id"))
         raw_allowed = config.get("allowed_conversations")
         if not isinstance(raw_allowed, list) or not raw_allowed:
             raise BoundaryError("empty_allowlist")
@@ -178,24 +193,32 @@ def normalize_event(event: Any, settings: Settings) -> dict[str, Any] | None:
     """
     if event.get_platform_name() != "aiocqhttp" or event.get_platform_id() != settings.platform_id:
         return None
-    if str(event.get_self_id()) != settings.self_id:
-        return None
-    account = str(event.get_sender_id())
-    if not account or account == settings.self_id:
-        return None
-    group = str(event.get_group_id() or "")
-    conversation = f"group:{group}" if group else f"private:{account}"
-    if conversation not in settings.allowed_conversations:
-        return None
     message = event.message_obj
     raw = getattr(message, "raw_message", None)
     if not isinstance(raw, Mapping) or raw.get("post_type") != "message":
         return None
-    if raw.get("message_type") != ("group" if group else "private"):
+    kind = raw.get("message_type")
+    if kind not in {"group", "private"}:
         return None
-    if str(raw.get("self_id")) != settings.self_id or str(raw.get("user_id")) != account:
+    try:
+        self_id = _qq_id(event.get_self_id())
+        account = _qq_id(event.get_sender_id())
+        raw_self = _qq_id(raw.get("self_id"))
+        raw_account = _qq_id(raw.get("user_id"))
+        sender = raw.get("sender")
+        if isinstance(sender, Mapping) and sender.get("user_id") is not None:
+            if _qq_id(sender["user_id"]) != account:
+                return None
+        group = _qq_id(event.get_group_id()) if kind == "group" else ""
+        raw_group = _qq_id(raw.get("group_id")) if kind == "group" else ""
+    except BoundaryError:
         return None
-    if group and str(raw.get("group_id")) != group:
+    if self_id != settings.self_id or raw_self != self_id or account == self_id or raw_account != account:
+        return None
+    if kind == "group" and raw_group != group:
+        return None
+    conversation = f"group:{group}" if group else f"private:{account}"
+    if conversation not in settings.allowed_conversations:
         return None
     try:
         event_id = _message_id(message.message_id)
@@ -214,8 +237,12 @@ def normalize_event(event: Any, settings: Settings) -> dict[str, Any] | None:
         kind, data = segment.get("type"), segment["data"]
         if kind == "text" and isinstance(data.get("text"), str):
             texts.append(data["text"])
-        elif kind == "at" and group and str(data.get("qq")) == settings.self_id:
-            continue
+        elif kind == "at" and group:
+            try:
+                if _qq_id(data.get("qq")) == settings.self_id:
+                    continue
+            except BoundaryError:
+                pass
         else:
             # This release has no asset reference, mention or reply-reference field.
             # Do not silently turn a mixed-media message into a text-only fact.
@@ -229,8 +256,10 @@ def normalize_event(event: Any, settings: Settings) -> dict[str, Any] | None:
         text = text[len(settings.trigger_prefix) :].strip()
     if not 1 <= len(text) <= 8000:
         return None
+    nickname = _display(sender.get("nickname")) if isinstance(sender, Mapping) else None
+    group_card = _display(sender.get("card")) if group and isinstance(sender, Mapping) else None
     return {
-        "schema_version": 1,
+        "schema_version": 2 if nickname or group_card else 1,
         "connection_id": settings.connection_id,
         "platform_id": settings.platform_id,
         "self_id": settings.self_id,
@@ -242,6 +271,7 @@ def normalize_event(event: Any, settings: Settings) -> dict[str, Any] | None:
         "account_id": account,
         "sent_at": sent_at,
         "text": text,
+        **({"nickname": nickname, "group_card": group_card} if nickname or group_card else {}),
     }
 
 

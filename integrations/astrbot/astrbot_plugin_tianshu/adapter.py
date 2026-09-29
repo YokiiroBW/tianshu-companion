@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,28 @@ def _private_address(value: str | None) -> bool:
     return isinstance(address, ipaddress.IPv4Address) and (
         address.is_loopback or any(address in network for network in PRIVATE_NETWORKS)
     )
+
+
+def _qq_id(value):
+    if type(value) is int and value > 0:
+        return str(value)
+    if type(value) is str and re.fullmatch(r"[1-9][0-9]*", value):
+        return value
+    raise ValueError("invalid QQ identifier")
+
+
+def _display(value):
+    if type(value) is not str:
+        return None
+    text = "".join(
+        char
+        for char in value
+        if ord(char) >= 32
+        and ord(char) != 127
+        and not 0x202A <= ord(char) <= 0x202E
+        and not 0x2066 <= ord(char) <= 0x2069
+    ).strip()[:80]
+    return text or None
 
 
 def _listen_host(mode: str, lan_host: str) -> str:
@@ -77,8 +100,14 @@ class AstrAdapter:
                 continue
             client = platform.get_client()
             active = getattr(client, "_wsr_api_clients", {})
-            if isinstance(active, dict) and self_id in active:
-                matches.append(client)
+            if isinstance(active, dict):
+                for key in active:
+                    try:
+                        if _qq_id(key) == self_id:
+                            matches.append(client)
+                            break
+                    except ValueError:
+                        continue
         return matches[0] if len(matches) == 1 else None
 
     async def accounts(self):
@@ -92,8 +121,10 @@ class AstrAdapter:
             if not isinstance(active, dict):
                 continue
             for self_id in tuple(active):
-                if str(self_id).isdecimal():
-                    candidates.add(str(self_id))
+                try:
+                    candidates.add(_qq_id(self_id))
+                except ValueError:
+                    continue
         for self_id in sorted(candidates):
             client = self._client(self_id)
             if client is None:
@@ -104,7 +135,12 @@ class AstrAdapter:
                 )
             except Exception:
                 continue
-            if not isinstance(info, dict) or str(info.get("user_id")) != self_id:
+            if not isinstance(info, dict):
+                continue
+            try:
+                if _qq_id(info.get("user_id")) != self_id:
+                    continue
+            except ValueError:
                 continue
             result.append(
                 {
@@ -119,16 +155,21 @@ class AstrAdapter:
         client = self._client(self_id)
         if client is None:
             raise RuntimeError("SDK offline")
+        if type(target) is not str or ":" not in target:
+            raise ValueError("invalid QQ destination")
         kind, value = target.split(":", 1)
+        value = _qq_id(value)
         message = [{"type": "text", "data": {"text": text}}]
         if kind == "group":
             response = await client.send_group_msg(
                 group_id=int(value), message=message, self_id=self_id
             )
-        else:
+        elif kind == "private":
             response = await client.send_private_msg(
                 user_id=int(value), message=message, self_id=self_id
             )
+        else:
+            raise ValueError("invalid QQ destination")
         if not isinstance(response, dict):
             raise ValueError("SDK receipt missing")
         return response.get("message_id")
@@ -139,20 +180,36 @@ class AstrAdapter:
         platform = self.context.get_platform_inst(event.get_platform_id())
         if platform is None or platform.meta().name != "aiocqhttp":
             return False
-        self_id = str(event.get_self_id())
+        try:
+            self_id = _qq_id(event.get_self_id())
+        except ValueError:
+            return False
         if self._client(self_id) is None:
             return False
         raw = getattr(event.message_obj, "raw_message", None)
         if not isinstance(raw, Mapping) or raw.get("post_type") != "message":
             return False
-        author = str(event.get_sender_id())
-        if not author.isdecimal() or author == self_id:
+        try:
+            author = _qq_id(event.get_sender_id())
+            raw_self = _qq_id(raw.get("self_id"))
+            raw_author = _qq_id(raw.get("user_id"))
+            nested = raw.get("sender")
+            if isinstance(nested, Mapping) and nested.get("user_id") is not None:
+                if _qq_id(nested["user_id"]) != author:
+                    return False
+        except ValueError:
             return False
-        group = str(event.get_group_id() or "")
+        if author == self_id:
+            return False
+        try:
+            group = _qq_id(event.get_group_id()) if event.get_group_id() is not None else ""
+            raw_group = _qq_id(raw.get("group_id")) if group else ""
+        except ValueError:
+            return False
         kind = "group" if group else "private"
-        if raw.get("message_type") != kind or str(raw.get("self_id")) != self_id:
+        if raw.get("message_type") != kind or raw_self != self_id:
             return False
-        if str(raw.get("user_id")) != author or (group and str(raw.get("group_id")) != group):
+        if raw_author != author or (group and raw_group != group):
             return False
         native_id = str(raw.get("message_id"))
         if native_id != str(event.message_obj.message_id) or not native_id.isdecimal():
@@ -204,6 +261,12 @@ class AstrAdapter:
             native_id,
             stamp,
             text,
+            _display(raw.get("sender", {}).get("nickname"))
+            if isinstance(raw.get("sender"), Mapping)
+            else None,
+            _display(raw.get("sender", {}).get("card"))
+            if group and isinstance(raw.get("sender"), Mapping)
+            else None,
         )
         if captured:
             event.stop_event()

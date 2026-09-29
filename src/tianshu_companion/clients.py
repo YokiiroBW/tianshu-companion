@@ -68,6 +68,7 @@ class JsonService:
         {
             "/internal/v1/origins/resolve",
             "/internal/v1/identity/resolve",
+            "/internal/v1/qq-admin/check",
             "/internal/v1/memory/select",
             "/internal/v1/memory/profiles/select",
             "/internal/v1/memory/source-sync/check",

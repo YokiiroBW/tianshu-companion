@@ -431,6 +431,21 @@ def build_runtime(config):
     provider_selector = None
     if config.get("provider_self_service", False):
         provider_selector = HttpDefaultModelSelector(client("provider_selector", "platform"))
+    qq_admin = None
+    qq_admission = (
+        any(binding.get("namespace") == "qq" for binding in config.get("bindings", {}).values())
+        or bot_binding_management
+        or config.get("bot_observation_enabled", False)
+    )
+    if qq_admission and "qq_admin" not in config.get("services", {}):
+        raise ValueError("QQ admission requires the Platform QQ administrator reader")
+    if "qq_admin" in config.get("services", {}):
+        from .qq_identity import QQAdminClient
+
+        qq_client = client("qq_admin", "platform")
+        if not qq_client.url or not qq_client.token:
+            raise ValueError("QQ administrator reader requires a registered HTTPS service")
+        qq_admin = QQAdminClient(qq_client)
     core = Core(
         Store(config["database_path"]),
         contracts,
@@ -442,6 +457,8 @@ def build_runtime(config):
         roles=config.get("roles", {}),
         config_version=config.get("config_version"),
         default_model_selector=provider_selector,
+        qq_admin=qq_admin,
+        qq_identity_required=qq_admission,
         policy=Policy(**config.get("policy", {})),
         short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
         life_writing=config.get("life_writing", False),

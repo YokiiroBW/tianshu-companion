@@ -1,7 +1,7 @@
 name: astrbot_plugin_tianshu
 display_name: 天枢陪伴连接器
 desc: 将指定 QQ 会话的文本交给天枢，并用原 AstrBot 平台适配器发送回复。
-version: 0.3.0
+version: 0.4.0
 author: tianshu
 astrbot_version: "==4.27.3"
 support_platforms:

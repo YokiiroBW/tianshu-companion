@@ -155,7 +155,11 @@ def test_management_gate_and_authenticated_platform_endpoint():
             "platform_sender": {
                 "url": "https://platform.test",
                 "token_env": "TEST_BOT_PLATFORM_SENDER",
-            }
+            },
+            "qq_admin": {
+                "url": "https://platform.test",
+                "token_env": "TEST_BOT_QQ_ADMIN",
+            },
         },
     }
 
@@ -165,6 +169,7 @@ def test_management_gate_and_authenticated_platform_endpoint():
             {
                 "TEST_BOT_PLATFORM_CALLER": "platform-only",
                 "TEST_BOT_PLATFORM_SENDER": "sender-only",
+                "TEST_BOT_QQ_ADMIN": "qq-admin-read-only",
             },
         ):
             core, _, clients, _ = build_runtime(base)
@@ -198,6 +203,11 @@ def test_management_gate_and_authenticated_platform_endpoint():
                 config["bot_binding_management_enabled"] = True
                 with pytest.raises(ValueError, match="Bot binding management requires"):
                     build_runtime(config)
+            missing_reader = copy.deepcopy(base)
+            del missing_reader["services"]["qq_admin"]
+            missing_reader["bot_binding_management_enabled"] = True
+            with pytest.raises(ValueError, match="QQ admission requires"):
+                build_runtime(missing_reader)
             config = {**base, "bot_binding_management_enabled": True}
             core, _, clients, _ = build_runtime(config)
             app = create_app(core, {"platform": "platform-only", "nonebot": "nonebot-only"})

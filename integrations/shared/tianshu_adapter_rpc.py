@@ -31,8 +31,8 @@ MAX_HISTORY = 20000
 OBSERVATION_LEASE_SECONDS = 30
 CLAIM_DECISION_SECONDS = 5
 IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-QQ = re.compile(r"^(group|private):([1-9][0-9]{0,19})$")
-QQ_ID = re.compile(r"^[1-9][0-9]{0,19}$")
+QQ = re.compile(r"^(group|private):([1-9][0-9]*)$")
+QQ_ID = re.compile(r"^[1-9][0-9]*$")
 
 
 class RpcError(Exception):
@@ -53,6 +53,12 @@ def _ident(value: Any) -> str:
 
 def _qq(value: Any) -> str:
     if not isinstance(value, str) or not QQ.fullmatch(value):
+        _bad()
+    return value
+
+
+def _qq_account(value: Any) -> str:
+    if type(value) is not str or not QQ_ID.fullmatch(value):
         _bad()
     return value
 
@@ -179,15 +185,17 @@ class AdapterService:
         native_id: str,
         sent_at: str,
         text: str,
+        nickname: str | None = None,
+        group_card: str | None = None,
     ) -> bool:
         """Return true only after an enabled, exact-author event is durable."""
         if not isinstance(text, str) or not 1 <= len(text) <= 8000:
             return False
         try:
             account_id, conversation, author, native_id = (
-                _ident(account_id),
+                _qq_account(account_id),
                 _qq(conversation),
-                _ident(author),
+                _qq_account(author),
                 _ident(native_id),
             )
         except RpcError:
@@ -210,7 +218,7 @@ class AdapterService:
                 return False
             # Message revision belongs to the event contract, not binding updates.
             payload = {
-                "schema_version": 1,
+                "schema_version": 2 if nickname or group_card else 1,
                 "connection_id": connection_id,
                 "platform_id": self.instance_id,
                 "self_id": account_id,
@@ -223,6 +231,8 @@ class AdapterService:
                 "sent_at": sent_at,
                 "text": text,
             }
+            if nickname or group_card:
+                payload.update(nickname=nickname, group_card=group_card)
             self.db.execute(
                 "INSERT OR IGNORE INTO events(id,connection_id,native_id,author,payload,created) "
                 "VALUES(?,?,?,?,?,?)",
@@ -244,9 +254,9 @@ class AdapterService:
         """Durably observe an enrolled SDK account without claiming a reply."""
         try:
             account_id, conversation, author, native_id = (
-                _ident(account_id),
+                _qq_account(account_id),
                 _qq(conversation),
-                _ident(author),
+                _qq_account(author),
                 _ident(native_id),
             )
         except RpcError:
@@ -493,7 +503,7 @@ class AdapterService:
         revision = request.get("revision")
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
             _bad()
-        account_id = _ident(request.get("account_id"))
+        account_id = _qq_account(request.get("account_id"))
         conversation = request.get("conversation")
         if not isinstance(conversation, dict) or set(conversation) != {"kind", "id"}:
             _bad()
@@ -501,7 +511,7 @@ class AdapterService:
         authors = request.get("allowed_authors")
         if not isinstance(authors, list) or len(authors) > 256:
             _bad()
-        authors = sorted(set(_ident(value) for value in authors))
+        authors = sorted(set(_qq_account(value) for value in authors))
         enabled = request.get("enabled")
         if not isinstance(enabled, bool) or (enabled and not authors):
             _bad()
@@ -599,7 +609,7 @@ class AdapterService:
         }:
             _bad()
         request_id = _ident(request["request_id"])
-        account_id = _ident(request["account_id"])
+        account_id = _qq_account(request["account_id"])
         revision = request["revision"]
         enabled = request["enabled"]
         if type(revision) is not int or revision < 1 or type(enabled) is not bool:
@@ -676,7 +686,7 @@ class AdapterService:
     async def _observation_status(self, request: dict) -> dict:
         if set(request) != {"account_id"}:
             _bad()
-        account_id = _ident(request["account_id"])
+        account_id = _qq_account(request["account_id"])
         row = self.db.execute(
             "SELECT revision,enabled,last_poll FROM observation_accounts WHERE account_id=?",
             (account_id,),
@@ -707,7 +717,7 @@ class AdapterService:
     async def _observation_poll(self, request: dict) -> dict:
         if set(request) != {"account_id", "limit"}:
             _bad()
-        account_id = _ident(request["account_id"])
+        account_id = _qq_account(request["account_id"])
         limit = request["limit"]
         if type(limit) is not int or not 1 <= limit <= 20:
             _bad()
@@ -742,7 +752,7 @@ class AdapterService:
     async def _observation_ack(self, request: dict) -> dict:
         if set(request) != {"account_id", "event_ids"}:
             _bad()
-        account_id = _ident(request["account_id"])
+        account_id = _qq_account(request["account_id"])
         ids = request["event_ids"]
         if not isinstance(ids, list) or len(ids) > 20:
             _bad()
@@ -759,7 +769,7 @@ class AdapterService:
         if set(request) != {"connection_id", "account_id", "policy_revision", "delivery"}:
             _bad()
         connection_id = _ident(request["connection_id"])
-        account_id = _ident(request["account_id"])
+        account_id = _qq_account(request["account_id"])
         revision = request["policy_revision"]
         delivery = request["delivery"]
         if (

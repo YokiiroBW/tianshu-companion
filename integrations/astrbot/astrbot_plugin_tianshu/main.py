@@ -19,6 +19,7 @@ from .runtime import BoundaryError, Journal, Runner, Settings
 
 INFO_ROUTE = "/astrbot_plugin_tianshu/connection-info"
 
+
 class TianshuPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -43,7 +44,9 @@ class TianshuPlugin(Star):
                     lan_host=str((config or {}).get("adapter_lan_host") or ""),
                 )
                 context.register_web_api(
-                    INFO_ROUTE, self.connection_info, ["GET"],
+                    INFO_ROUTE,
+                    self.connection_info,
+                    ["GET"],
                     "Authenticated administrator view of Tianshu adapter connection details",
                 )
                 self._registered_info = True
@@ -105,21 +108,29 @@ class TianshuPlugin(Star):
 
         dashboard = self.context.get_config().get("dashboard", {})
         administrator = dashboard.get("username") if isinstance(dashboard, dict) else None
-        headers = {"Cache-Control": "no-store, private", "Pragma": "no-cache",
-                   "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff"}
+        headers = {
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        }
         if not administrator or request.username != administrator:
             return json_response({"code": "forbidden"}, status_code=403, headers=headers)
         if self._adapter is None:
-            return json_response({"code": "dependency_unavailable"},
-                                 status_code=503, headers=headers)
-        return json_response({
-            "protocol": "tianshu.bot-adapter/v1",
-            "listen_mode": self._adapter.listen_mode,
-            "listen_host": self._adapter.listen_host,
-            "port": self._adapter.port,
-            "listening": self._adapter.runner is not None,
-            "access_key": self._adapter.service.access_key,
-        }, headers=headers)
+            return json_response(
+                {"code": "dependency_unavailable"}, status_code=503, headers=headers
+            )
+        return json_response(
+            {
+                "protocol": "tianshu.bot-adapter/v1",
+                "listen_mode": self._adapter.listen_mode,
+                "listen_host": self._adapter.listen_host,
+                "port": self._adapter.port,
+                "listening": self._adapter.runner is not None,
+                "access_key": self._adapter.service.access_key,
+            },
+            headers=headers,
+        )
 
     def _report(self, code: str) -> None:
         now = time.monotonic()
@@ -172,7 +183,7 @@ class TianshuPlugin(Star):
         client = self._client()
         settings = self._runner.settings
         kind, target = conversation.split(":", 1)
-        if not target.isdecimal():
+        if not target.isascii() or not target.isdecimal() or target.startswith("0"):
             raise BoundaryError("invalid_conversation")
         message = [{"type": "text", "data": {"text": text}}]
         if kind == "group":
@@ -226,7 +237,8 @@ class TianshuPlugin(Star):
     async def terminate(self) -> None:
         if self._registered_info:
             self.context.registered_web_apis[:] = [
-                item for item in self.context.registered_web_apis
+                item
+                for item in self.context.registered_web_apis
                 if not (item[0] == INFO_ROUTE and getattr(item[1], "__self__", None) is self)
             ]
             self._registered_info = False

@@ -9,7 +9,7 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from tianshu_nonebot.journal import Conflict, Journal
 from tianshu_nonebot.platform import PlatformError, PlatformPort
 from tianshu_nonebot.runtime import BotRuntime
-from tianshu_nonebot.sdk import UnsupportedEvent, send_text, text_event
+from tianshu_nonebot.sdk import UnsupportedEvent, send_text, text_event, verified_sender
 
 
 def group_event(message_id=12, text="hello", user_id=7, segments=None):
@@ -47,6 +47,9 @@ class FakeBot:
         if self.failure:
             raise self.failure
         return self.result
+
+    async def send_private_msg(self, **kwargs):
+        return await self.send_group_msg(**kwargs)
 
 
 def delivery(**changes):
@@ -112,6 +115,27 @@ def test_real_sdk_event_and_text_sender():
         text_event(bot, group_event(user_id=42))
     with pytest.raises(ValueError):
         asyncio.run(send_text(FakeBot(result={"message_id": None}), delivery()))
+
+
+def test_sender_conflicts_invalid_qq_and_cq_output_remains_text():
+    from types import SimpleNamespace
+
+    bot = FakeBot()
+    for value in (True, 1.5, "０１００１", "001", None):
+        with pytest.raises(UnsupportedEvent):
+            verified_sender(bot, SimpleNamespace(self_id="42", user_id=value, sender=None))
+    with pytest.raises(UnsupportedEvent):
+        verified_sender(
+            bot,
+            SimpleNamespace(self_id="42", user_id="1001", sender=SimpleNamespace(user_id="1002")),
+        )
+    output = "[CQ:at,qq=all] [CQ:image,file=private]"
+    assert asyncio.run(send_text(bot, delivery(text=output))) == ["888"]
+    assert bot.calls[-1]["message"][0].type == "text"
+    assert "&#91;CQ:at" in str(bot.calls[-1]["message"])
+    for target in ("group:０９９", "group:099", "group:-1", "private:0", "group:99:1"):
+        with pytest.raises(UnsupportedEvent):
+            asyncio.run(send_text(bot, delivery(conversation_id=target)))
 
 
 def test_journal_recovery_dedup_and_unknown(tmp_path):

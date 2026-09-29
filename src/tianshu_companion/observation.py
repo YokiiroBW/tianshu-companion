@@ -10,8 +10,8 @@ from pathlib import Path
 
 from .contracts import Fault, canonical, digest
 
-QQ = re.compile(r"^[1-9][0-9]{0,19}$")
-CONVERSATION = re.compile(r"^(group|private):[1-9][0-9]{0,19}$")
+QQ = re.compile(r"^[1-9][0-9]*$")
+CONVERSATION = re.compile(r"^(group|private):[1-9][0-9]*$")
 IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 MAX_PENDING = 10000
 
@@ -47,9 +47,12 @@ def validate(request):
         or event["revision"] != 1
         or event["namespace"] != "qq"
         or not IDENT.fullmatch(str(event["platform_id"]))
-        or not QQ.fullmatch(str(event["self_id"]))
-        or not CONVERSATION.fullmatch(str(event["conversation_id"]))
-        or not QQ.fullmatch(str(event["account_id"]))
+        or type(event["self_id"]) is not str
+        or not QQ.fullmatch(event["self_id"])
+        or type(event["conversation_id"]) is not str
+        or not CONVERSATION.fullmatch(event["conversation_id"])
+        or type(event["account_id"]) is not str
+        or not QQ.fullmatch(event["account_id"])
         or event["self_id"] == event["account_id"]
         or not IDENT.fullmatch(str(event["event_id"]))
         or not isinstance(event["sent_at"], str)
@@ -243,8 +246,9 @@ class Observations:
         )
         if (
             not IDENT.fullmatch(str(instance))
-            or not QQ.fullmatch(str(account))
-            or (conversation is not None and not CONVERSATION.fullmatch(str(conversation)))
+            or type(account) is not str
+            or not QQ.fullmatch(account)
+            or (conversation is not None and (type(conversation) is not str or not CONVERSATION.fullmatch(conversation)))
             or type(request["limit"]) is not int
             or not 1 <= request["limit"] <= 100
             or (type(request["archive_epoch"]) is not int or request["archive_epoch"] < 1)

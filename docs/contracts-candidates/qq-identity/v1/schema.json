@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tianshu.local/contracts-candidates/qq-identity/v1/schema.json",
+  "$defs": {
+    "qq_id": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "check_request": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "request_id", "assertion_ref", "actor_id", "conversation_id"],
+      "properties": {
+        "schema_version": {"const": 1}, "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "assertion_ref": {"type": "string", "minLength": 1},
+        "actor_id": {"type": "string", "pattern": "^actor:"},
+        "conversation_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "check_response": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "request_id", "version", "is_admin", "capabilities"],
+      "properties": {
+        "schema_version": {"const": 1}, "request_id": {"type": "string"},
+        "version": {"type": "integer", "minimum": 0}, "is_admin": {"type": "boolean"},
+        "capabilities": {"type": "array", "uniqueItems": true, "items": {"const": "identity.explain"}}
+      }
+    },
+    "alias_request": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "request_id", "account_id", "bot_id", "conversation_id", "nickname", "group_card", "event_ref", "observed_at"],
+      "properties": {
+        "schema_version": {"const": 1}, "request_id": {"type": "string", "minLength": 1},
+        "account_id": {"$ref": "#/$defs/qq_id"}, "bot_id": {"$ref": "#/$defs/qq_id"},
+        "conversation_id": {"type": "string", "pattern": "^(group|private):[1-9][0-9]*$"},
+        "nickname": {"type": ["string", "null"], "maxLength": 80},
+        "group_card": {"type": ["string", "null"], "maxLength": 80},
+        "event_ref": {"type": "string", "minLength": 1, "maxLength": 128},
+        "observed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "alias_response": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "request_id", "deduplicated"],
+      "properties": {
+        "schema_version": {"const": 1}, "request_id": {"type": "string"},
+        "deduplicated": {"type": "boolean"}
+      }
+    },
+    "profiles_request": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "request_id", "limit", "after"],
+      "properties": {
+        "schema_version": {"const": 1}, "request_id": {"type": "string", "minLength": 1},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        "after": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/qq_id"}]}
+      }
+    },
+    "profiles_response": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "request_id", "items", "next_cursor"],
+      "properties": {
+        "schema_version": {"const": 1}, "request_id": {"type": "string"},
+        "items": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+          "required": ["qq_id", "person_id", "display_name", "aliases"],
+          "properties": {
+            "qq_id": {"$ref": "#/$defs/qq_id"}, "person_id": {"type": "string"},
+            "display_name": {"type": "string"},
+            "aliases": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+              "required": ["kind", "bot_id", "group_id", "value", "observed_at"],
+              "properties": {
+                "kind": {"enum": ["nickname", "group_card"]},
+                "bot_id": {"$ref": "#/$defs/qq_id"}, "group_id": {"type": "string"},
+                "value": {"type": "string"}, "observed_at": {"type": "string", "format": "date-time"}
+              }
+            }}
+          }
+        }},
+        "next_cursor": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/qq_id"}]}
+      }
+    },
+    "bot_event_v2": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "connection_id", "platform_id", "self_id", "event_id", "revision", "namespace", "conversation_id", "thread_id", "account_id", "sent_at", "text", "nickname", "group_card"],
+      "properties": {
+        "schema_version": {"const": 2}, "connection_id": {"type": "string"},
+        "platform_id": {"type": "string"}, "self_id": {"$ref": "#/$defs/qq_id"},
+        "event_id": {"type": "string"}, "revision": {"const": 1}, "namespace": {"const": "qq"},
+        "conversation_id": {"type": "string", "pattern": "^(group|private):[1-9][0-9]*$"},
+        "thread_id": {"type": "null"}, "account_id": {"$ref": "#/$defs/qq_id"},
+        "sent_at": {"type": "string", "format": "date-time"}, "text": {"type": "string"},
+        "nickname": {"type": ["string", "null"], "maxLength": 80},
+        "group_card": {"type": ["string", "null"], "maxLength": 80}
+      }
+    }
+  }
+}

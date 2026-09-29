@@ -1,0 +1,9 @@
+# QQ identity candidate v1
+
+This is a cross-product candidate, not a published root contract. Platform owns grant writes and the authenticated check endpoint; Companion consumes the check, pins its version for a turn, and rechecks before send. Memory owns the existing account-to-person mapping and alias/profile read endpoints. Runtime code uses dedicated exact-field validators until the coordinator publishes a root package.
+
+`check_request.assertion_ref` must be a live Platform origin for the Companion service. Platform derives the QQ account and source channel from that origin; request fields only narrow the actor and conversation and cannot select a different account. A successful check reports the global grant version, including when no grant matches. `identity.explain` changes only the identity description sent to the model; it grants no tool, read, export, delete, device or management action.
+
+The alias port accepts only an explicitly configured Platform service credential after Platform authenticated a real bot event. `event_ref` is idempotent. It cannot create an account; the existing resolve/register chain must have already created the person. Nickname and group card remain sourced display data and never enter a trusted instruction. `profiles` is a separate service read exposed by Platform only after its web session gate. No cross-platform person merge or association write is in this version.
+
+The OneBot event extension is `schema_version=2` with exactly `nickname` and `group_card` added to the v1 text event; v1 remains accepted. Unsupported media, forwarded and quoted events stay unsupported. Deployment requires a configured HTTPS Platform check reader in Companion, two distinct Memory service credentials for alias write and profile read when those features are enabled, and an explicit guarded Memory alias migration. Existing QQ reply deployments without the check reader fail startup in the production composition.

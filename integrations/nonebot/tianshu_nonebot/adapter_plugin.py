@@ -201,6 +201,8 @@ async def _scope(bot: BaseBot, event: BaseEvent) -> bool:
         value.event_id,
         value.sent_at,
         value.text,
+        value.nickname,
+        value.group_card,
     )
 
 

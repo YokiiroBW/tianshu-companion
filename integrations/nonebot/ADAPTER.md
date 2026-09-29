@@ -1,10 +1,10 @@
-# 天枢 NoneBot 适配器候选 0.3.0
+# 天枢 NoneBot 适配器候选 0.4.0
 
 适用于 NoneBot **2.5.0**、FastAPI driver、OneBot v11 适配器 **2.4.0**。默认没有机器人、会话或作者白名单，安装后不接管消息。网页配置只需插件地址和一次本机显示的连接密钥；平台内置固定 `tianshu.bot-adapter/v1` 协议。
 
 ## 安装与获取密钥
 
-1. 从项目根运行 `python integrations/build_adapter_releases.py`，取得 `.runtime/adapter-artifacts/tianshu_nonebot_adapter-0.3.0-py3-none-any.whl`。在 NoneBot 宿主的隔离环境安装 wheel，不覆盖宿主框架依赖。通过宿主正常插件加载机制加载 `tianshu_nonebot.adapter_plugin`，须在 `nonebot.init()` 和 OneBot v11 Adapter 注册之后、`nonebot.run()` 之前。此为一次插件安装，不需为每个机器人编辑环境变量或配置文件。
+1. 从项目根运行 `python integrations/build_adapter_releases.py`，取得 `.runtime/adapter-artifacts/tianshu_nonebot_adapter-0.4.0-py3-none-any.whl`。在 NoneBot 宿主的隔离环境安装 wheel，不覆盖宿主框架依赖。通过宿主正常插件加载机制加载 `tianshu_nonebot.adapter_plugin`，须在 `nonebot.init()` 和 OneBot v11 Adapter 注册之后、`nonebot.run()` 之前。此为一次插件安装，不需为每个机器人编辑环境变量或配置文件。
 2. 首次加载会在宿主工作目录 `data/tianshu_nonebot/adapter.sqlite3` 生成稳定随机密钥。在宿主本机同一工作目录运行：
 
    ```text
