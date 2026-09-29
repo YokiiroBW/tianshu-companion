@@ -128,7 +128,16 @@ class Core:
         # before the application exists still reports through the application's port.
         self._events = events
         self.web_sender = web_sender
-        self.bindings, self.roles, self.config_version = bindings, roles, config_version
+        self.deployment_roles = frozenset(roles)
+        self.deployment_binding_actors = {
+            binding_id: frozenset(binding.get("actor_ids", []))
+            for binding_id, binding in bindings.items()
+        }
+        self.bindings, self.roles, self.config_version = (
+            copy.deepcopy(bindings),
+            dict(roles),
+            config_version,
+        )
         # Registered persona versions. Left off, `roles` is used as the mutable persona
         # mapping exactly as before; turned on, the deployment mapping becomes the
         # idempotent initial import and every later version is an explicit operator act.
@@ -183,6 +192,9 @@ class Core:
                 # One idempotent initial import of the deployment document. It runs before
                 # the process accepts any traffic and is skipped once this source is known.
                 self.personas.import_config(self.persona_import)
+                from .role_runtime import RoleRuntime
+
+                self.role_runtime = RoleRuntime(self)
         except BaseException:
             store.close()
             raise
@@ -255,6 +267,7 @@ class Core:
             or allowed["audience"] != binding["audience"]
             or allowed["actor_id"] not in binding["actor_ids"]
             or allowed["actor_id"] not in self.roles
+            or not self._role_allows(allowed["actor_id"], "dialogue")
             or (author is not None and author != ctx["verified_account"])
         ):
             raise Fault("forbidden")
@@ -406,7 +419,9 @@ class Core:
                 reasons.append("audience_mismatch")
             if subscription["actor_id"] not in binding["actor_ids"]:
                 reasons.append("actor_not_bound")
-        if subscription["actor_id"] not in self.roles:
+        if subscription["actor_id"] not in self.roles or not self._role_allows(
+            subscription["actor_id"], "dialogue"
+        ):
             reasons.append("unknown_role")
         if conversation is None:
             reasons.append("unknown_conversation")
@@ -480,7 +495,9 @@ class Core:
                 reasons.append("audience_mismatch")
             if request["actor_id"] not in binding["actor_ids"]:
                 reasons.append("actor_not_bound")
-        if request["actor_id"] not in self.roles:
+        if request["actor_id"] not in self.roles or not self._role_allows(
+            request["actor_id"], "direct"
+        ):
             reasons.append("unknown_role")
         if conversation is None:
             reasons.append("unknown_conversation")
@@ -655,6 +672,8 @@ class Core:
         if conversation is None:
             raise Fault("not_found")
         scope = ctx["allowed_scope"]
+        if not self._role_allows(scope["actor_id"], "direct"):
+            raise Fault("forbidden")
         view = self.direct.open_from_capability(
             entry_ref=request["entry_ref"],
             command_id=request["capability_id"],
@@ -795,7 +814,7 @@ class Core:
             binding_version=c["binding_version"],
             config_version=selected["config_version"] if selected else None,
             model_selection={"expires_at": selected["expires_at"]} if selected else None,
-            role=None,
+            role=c.get("role"),
             preparation=None,
             cancelled=False,
             timings={},
@@ -911,7 +930,7 @@ class Core:
             result_version=1,
         )
         self._save_turn(turn)
-        if not self.automatic_memory_candidates:
+        if not self.automatic_memory_candidates or not self._turn_allows(turn, "memory.write"):
             return
         # Failure before authoritative scope lookup retains a pending local event;
         # it cannot fabricate scope_version=1 for memory ingestion.
@@ -1029,8 +1048,10 @@ class Core:
                     if config_version is None and self.default_model_selector is None:
                         config_version = self.config_version
                     try:
-                        role = self._pin_role(turn["scope"]["actor_id"])
-                    except PersonaError as error:
+                        if not self._role_allows(turn["scope"]["actor_id"], "dialogue"):
+                            raise Fault("forbidden")
+                        role = turn["role"] or self._pin_role(turn["scope"]["actor_id"])
+                    except (PersonaError, Fault) as error:
                         # The preparation boundary is where a character's persona becomes
                         # real: a character with no published, non-retired revision has no
                         # persona to pin, so this turn fails here with the reason named
@@ -1039,7 +1060,9 @@ class Core:
                             phase="failed",
                             delivery_state="failed",
                             result_version=1,
-                            failure=error.message,
+                            failure=error.message
+                            if isinstance(error, PersonaError)
+                            else error.code,
                             config_version=config_version,
                         )
                         self._save_turn(turn)
@@ -1091,9 +1114,43 @@ class Core:
         dependency, is generating, or is mid-send. Draft, approval and publication rules
         stay in the persona module; this reads the live revision only.
         """
+        if not self._role_allows(actor, "dialogue"):
+            raise Fault("forbidden")
+        if hasattr(self, "role_runtime"):
+            managed = self.role_runtime.pin(actor)
+            if managed is not None:
+                return managed
         if self.personas is None:
             return copy.deepcopy(self.roles[actor])
         return self.personas.pin(actor)
+
+    def _role_allows(self, actor, capability):
+        return not hasattr(self, "role_runtime") or self.role_runtime.allowed(actor, capability)
+
+    def _turn_allows(self, turn, capability):
+        snapshot = (turn.get("role") or {}).get("runtime")
+        return (snapshot is None or capability in snapshot["capabilities"]) and self._role_allows(
+            turn["scope"]["actor_id"], capability
+        )
+
+    def manage_role(self, service, request):
+        if not hasattr(self, "role_runtime"):
+            raise Fault("dependency_unavailable")
+        if isinstance(request, dict) and request.get("operation") == "list":
+            if service != "platform" or set(request) != {"operation"}:
+                raise Fault("forbidden")
+            profiles, personas = self.personas.author_catalog()
+            legacy = [
+                item for item in personas
+                if item["id"] in self.deployment_roles and self.role_runtime.get(item["id"]) is None
+            ]
+            return {"roles": self.role_runtime.list(), "profiles": profiles,
+                    "legacy_roles": legacy}
+        if not isinstance(request, dict) or request.get("operation") != "apply":
+            raise Fault("invalid_input")
+        return self.role_runtime.apply(
+            service, {k: v for k, v in request.items() if k != "operation"}
+        )
 
     def manage_persona(self, service, request):
         """Trusted same-product management port for registered character personas.
@@ -1167,6 +1224,7 @@ class Core:
                 recall = bool(
                     re.search(r"昨天|之前|上次|记得|安排|yesterday|remember|previous", text, re.I)
                 )
+                recall = recall and self._turn_allows(turn, "memory.read")
                 budget = dict(tokens=2048 if recall else 0, bytes=8192 if recall else 0)
                 try:
                     selection = await self.memory.select(
@@ -1476,7 +1534,10 @@ class Core:
             self.short_context_policy,
             max_bytes=min(self.short_context_policy.max_bytes, context.remaining),
         )
+        memory_read = self._turn_allows(turn, "memory.read")
         recent, metadata = select_recent(self.store, turn, policy, self.clock())
+        if not memory_read:
+            recent = []
         accepted = []
         for group in recent:
             previous = self.store.get("turns", group["turn_id"])
@@ -1496,7 +1557,7 @@ class Core:
             bytes_used=len(canonical(accepted).encode()) if accepted else 0,
         )
         text = self._input_text(turn) or "media"
-        for target, selection in profile_targets(turn, accepted):
+        for target, selection in profile_targets(turn, accepted) if memory_read else []:
             allowance = min(4096, context.remaining)
             if allowance <= 0:
                 break
@@ -1797,6 +1858,8 @@ class Core:
         attempted = False
         for item in self.store.due("outbox", ["blocked_scope", "pending"], self.clock()):
             turn = self.store.get("turns", item["event"]["aggregate_id"])
+            if not self._turn_allows(turn, "memory.write"):
+                continue
             with obs.correlation_scope(self._turn_correlation(turn)):
                 outcome, error_code = "succeeded", None
                 attempts = item["attempts"] + 1

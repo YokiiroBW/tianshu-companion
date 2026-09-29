@@ -735,6 +735,8 @@ def create_app(core=None, tokens=None, life_readers=None):
                 return core.commands(service)
             if operation == "persona":
                 return core.manage_persona(service, body)
+            if operation == "role-runtime":
+                return core.manage_role(service, body)
             if operation == "bot-binding-apply":
                 if not hasattr(core, "bot_bindings"):
                     raise Fault("dependency_unavailable")
@@ -811,6 +813,10 @@ def create_app(core=None, tokens=None, life_readers=None):
         # configured; with no credential `persona_admin` is not a known caller, so this
         # answers 401 and no unauthenticated remote write is possible.
         return await dispatch(request, "persona")
+
+    @app.post("/internal/v1/role-runtime/manage")
+    async def role_runtime_manage(request: Request):
+        return await dispatch(request, "role-runtime")
 
     async def life_read_dispatch(request, operation):
         """The authorized read boundary: authenticate, bound the request, then read.

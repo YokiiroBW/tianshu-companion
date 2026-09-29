@@ -1,0 +1,25 @@
+{
+  "platform_apply": {
+    "client_id": "78e03cc0-4f1f-4fa6-b88a-8a08eb177c75",
+    "actor_id": null, "expected_version": 0, "name": "Synthetic A",
+    "profile_id": "persona-profile:synthetic-a", "profile_version": 1,
+    "provider_id": "provider-synthetic-a", "provider_revision": 1,
+    "enabled": true, "capabilities": ["dialogue", "memory.read"]
+  },
+  "core_apply": {
+    "operation": "apply", "request_id": "78e03cc0-4f1f-4fa6-b88a-8a08eb177c75:pause",
+    "actor_id": "actor:role-78e03cc04f1f4fa6b88a8a08eb177c75",
+    "expected_version": 0, "name": "Synthetic A",
+    "profile_id": "persona-profile:synthetic-a", "profile_version": 1,
+    "enabled": false, "capabilities": ["dialogue", "memory.read"]
+  },
+  "memory_apply": {
+    "request_id": "78e03cc0-4f1f-4fa6-b88a-8a08eb177c75:memory",
+    "actor_id": "actor:role-78e03cc04f1f4fa6b88a8a08eb177c75",
+    "expected_version": 0, "enabled": true, "legacy": false
+  },
+  "memory_result": {
+    "actor_id": "actor:role-78e03cc04f1f4fa6b88a8a08eb177c75",
+    "version": 1, "enabled": true
+  }
+}

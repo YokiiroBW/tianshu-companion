@@ -417,6 +417,11 @@ def accept_actor(
             correlation_id=core.ingress_correlation(),
             turn_id=reservation["turn_id"] if reservation else None,
             model_selection=reservation if reservation else None,
+            role=(
+                core.role_runtime.pin(actor)
+                if hasattr(core, "role_runtime") and core.role_runtime.get(actor)
+                else None
+            ),
         )
     if (
         len(collection["messages"]) + 1 > core.policy.max_collection_messages

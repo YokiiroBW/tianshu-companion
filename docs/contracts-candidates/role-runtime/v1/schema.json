@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "actor": { "type": "string", "pattern": "^actor:[A-Za-z0-9._:-]+$", "maxLength": 128 },
+    "capabilities": {
+      "type": "array", "uniqueItems": true,
+      "items": { "enum": ["dialogue", "memory.read", "memory.write"] }
+    },
+    "platform_apply": {
+      "type": "object", "additionalProperties": false,
+      "required": ["client_id", "actor_id", "expected_version", "name", "profile_id", "profile_version", "provider_id", "provider_revision", "enabled", "capabilities"],
+      "properties": {
+        "client_id": { "type": "string", "format": "uuid" },
+        "actor_id": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/actor" }] },
+        "expected_version": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "profile_id": { "type": ["string", "null"], "pattern": "^persona-profile:" },
+        "profile_version": { "type": ["integer", "null"], "minimum": 1 },
+        "provider_id": { "type": ["string", "null"] },
+        "provider_revision": { "type": ["integer", "null"], "minimum": 1 },
+        "enabled": { "type": "boolean" },
+        "capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "platform_role": {
+      "type": "object",
+      "required": ["actor_id", "version", "state", "stage", "name", "profile_id", "profile_revision", "provider_id", "provider_revision", "enabled", "capabilities", "companion_version", "memory_version"],
+      "properties": {
+        "actor_id": { "$ref": "#/$defs/actor" },
+        "version": { "type": "integer", "minimum": 1 },
+        "state": { "enum": ["pending", "active", "disabled", "failed"] },
+        "stage": { "enum": ["start", "core_paused", "memory_applied", "provider_checked", "complete", "verify"] },
+        "name": { "type": "string" },
+        "profile_id": { "type": ["string", "null"] },
+        "profile_revision": { "type": ["string", "null"] },
+        "provider_id": { "type": ["string", "null"] },
+        "provider_revision": { "type": ["integer", "null"] },
+        "enabled": { "type": "boolean" },
+        "capabilities": { "$ref": "#/$defs/capabilities" },
+        "companion_version": { "type": "integer", "minimum": 0 },
+        "memory_version": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "core_apply": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "request_id", "actor_id", "expected_version", "name", "profile_id", "profile_version", "enabled", "capabilities"],
+      "properties": {
+        "operation": { "const": "apply" }, "request_id": { "type": "string" },
+        "actor_id": { "$ref": "#/$defs/actor" },
+        "expected_version": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string" }, "profile_id": { "type": ["string", "null"] },
+        "profile_version": { "type": ["integer", "null"], "minimum": 1 },
+        "enabled": { "type": "boolean" },
+        "capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "core_result": {
+      "type": "object",
+      "required": ["actor_id", "version", "profile_revision", "persona_revision", "enabled", "capabilities"],
+      "properties": {
+        "actor_id": { "$ref": "#/$defs/actor" },
+        "version": { "type": "integer", "minimum": 1 },
+        "profile_revision": { "type": "string" },
+        "persona_revision": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "memory_apply": {
+      "type": "object", "additionalProperties": false,
+      "required": ["request_id", "actor_id", "expected_version", "enabled", "legacy"],
+      "properties": {
+        "request_id": { "type": "string" },
+        "actor_id": { "$ref": "#/$defs/actor" },
+        "expected_version": { "type": "integer", "minimum": 0 },
+        "enabled": { "type": "boolean" },
+        "legacy": { "type": "boolean" }
+      }
+    },
+    "memory_result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["actor_id", "version", "enabled"],
+      "properties": {
+        "actor_id": { "$ref": "#/$defs/actor" },
+        "version": { "type": "integer", "minimum": 0 },
+        "enabled": { "type": "boolean" }
+      }
+    }
+  }
+}
