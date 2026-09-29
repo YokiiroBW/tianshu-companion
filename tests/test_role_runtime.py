@@ -23,9 +23,12 @@ def validate_contract(name, value):
     Draft202012Validator({**schema, "$ref": f"#/$defs/{name}"}).validate(value)
 
 
-def apply(actor, profile, version, expected, request_id, *, enabled, capabilities):
+def apply(actor, profile, version, expected, request_id, *, enabled, capabilities,
+          application_id=None):
     return {
         "request_id": request_id,
+        "application_id": application_id or actor,
+        "operator": "operator-web",
         "actor_id": actor,
         "expected_version": expected,
         "name": actor,
@@ -84,6 +87,18 @@ def test_role_profile_is_pinned_and_replay_restart_disable(tmp_path):
         assert paused["version"] == 1
         assert runtime.apply("platform", first) == paused
         assert actor not in core.roles
+        for index, changed in enumerate((
+            {"application_id": "other-application"},
+            {"operator": "another-operator"},
+            {"capabilities": ["dialogue"]},
+        )):
+            with pytest.raises(Fault) as mismatch:
+                runtime.apply("platform", {
+                    **first, **changed, "request_id": f"mismatched-{index}",
+                    "expected_version": 1, "enabled": True,
+                })
+            assert mismatch.value.code == "version_conflict"
+            assert runtime.get(actor) == paused
         active = runtime.apply(
             "platform",
             apply(
@@ -102,6 +117,7 @@ def test_role_profile_is_pinned_and_replay_restart_disable(tmp_path):
         assert pinned["persona"] == "First version"
         assert pinned["runtime"]["capabilities"] == ["dialogue", "memory.read"]
         assert personas.pin("actor:household")["persona"] == "Household"
+        pre_save_version = personas._profile(profile["id"])["version"]
         newer = personas.manage(
             {
                 "operation": "save_profile",
@@ -109,7 +125,7 @@ def test_role_profile_is_pinned_and_replay_restart_disable(tmp_path):
                 "operator": "tester",
                 "reason": "synthetic",
                 "subject": profile["id"],
-                "expected": profile["version"],
+                "expected": pre_save_version,
                 "name": "Profile A",
                 "description": "",
                 "content": {"persona": "Second version"},
@@ -122,26 +138,31 @@ def test_role_profile_is_pinned_and_replay_restart_disable(tmp_path):
                 apply(
                     actor,
                     profile,
-                    profile["version"],
+                    pre_save_version,
                     2,
                     "stale",
-                    enabled=True,
+                    enabled=False,
                     capabilities=["dialogue"],
                 ),
             )
         assert stale.value.code == "version_conflict"
-        edited = runtime.apply(
+        revised_pause = runtime.apply(
             "platform",
             apply(
                 actor,
                 profile,
                 newer["version"],
                 2,
-                "edit-a",
-                enabled=True,
+                "edit-a:pause",
+                enabled=False,
                 capabilities=["dialogue"],
             ),
         )
+        edited = runtime.apply("platform", apply(
+            actor, profile, newer["version"], 3, "edit-a:enable",
+            enabled=True, capabilities=["dialogue"],
+        ))
+        assert revised_pause["profile_revision"] == edited["profile_revision"]
         assert edited["profile_revision"] != active["profile_revision"]
         assert runtime.pin(actor)["persona"] == "Second version"
         assert not runtime.allowed(actor, "memory.read")
@@ -151,13 +172,13 @@ def test_role_profile_is_pinned_and_replay_restart_disable(tmp_path):
                 actor,
                 profile,
                 newer["version"],
-                3,
+                4,
                 "disable-a",
                 enabled=False,
                 capabilities=["dialogue"],
             ),
         )
-        assert disabled["version"] == 4
+        assert disabled["version"] == 5
         assert actor not in core.roles
         assert actor not in core.bindings["web"]["actor_ids"]
         assert runtime.apply("platform", {**first, "request_id": "pause-a"}) == paused
@@ -201,22 +222,27 @@ def test_existing_role_adoption_keeps_actor_persona_and_binding(tmp_path):
         original = personas.pin("actor:household")
         runtime = RoleRuntime(core)
         request = {
-            "request_id": "adopt-1", "actor_id": "actor:household", "expected_version": 0,
+            "request_id": "adopt-1", "application_id": "adopt-household",
+            "operator": "operator-web",
+            "actor_id": "actor:household", "expected_version": 0,
             "name": "Household", "profile_id": None, "profile_version": None,
-            "enabled": True, "capabilities": ["dialogue", "memory.read"],
+            "enabled": False, "capabilities": ["dialogue", "memory.read"],
         }
-        active = runtime.apply("platform", request)
+        runtime.apply("platform", request)
+        enable = {**request, "request_id": "adopt-enable", "expected_version": 1,
+                  "enabled": True}
+        active = runtime.apply("platform", enable)
         assert active["persona_revision"] == original["revision_id"]
         assert runtime.pin("actor:household")["persona"] == "Original household"
         assert core.bindings["web"]["actor_ids"] == ["actor:household"]
         disabled = runtime.apply("platform", {
-            **request, "request_id": "adopt-2", "expected_version": 1,
+            **request, "request_id": "adopt-2", "expected_version": 2,
             "enabled": False,
         })
         assert not disabled["enabled"]
         assert "actor:household" not in core.roles
         assert core.bindings["web"]["actor_ids"] == ["actor:household"]
-        assert runtime.apply("platform", request) == active
+        assert runtime.apply("platform", enable) == active
         assert "actor:household" not in core.roles
     with closing(Store(path)) as reopened:
         core.store = reopened
@@ -228,7 +254,7 @@ def test_existing_role_adoption_keeps_actor_persona_and_binding(tmp_path):
         assert restored.get("actor:household") == disabled
         assert "actor:household" not in core.roles
         assert core.bindings["web"]["actor_ids"] == ["actor:household"]
-        assert restored.apply("platform", request) == active
+        assert restored.apply("platform", enable) == active
         assert "actor:household" not in core.roles
         with pytest.raises(Fault):
             restored.pin("actor:household")
@@ -239,7 +265,9 @@ def test_full_core_restart_keeps_adopted_static_role_disabled_and_other_role_liv
         h = Harness(tmp_path / "core.sqlite", personas=persona_config(), silence_ms=0)
         try:
             request = {
-                "actor_id": "actor:a", "name": "Original A", "profile_id": None,
+                "actor_id": "actor:a", "application_id": "adopt-a",
+                "operator": "operator-web",
+                "name": "Original A", "profile_id": None,
                 "profile_version": None, "capabilities": ["dialogue", "memory.read"],
             }
             for version, request_id, enabled in (
@@ -378,6 +406,10 @@ def test_memory_write_revocation_holds_pending_and_blocked_outbox_after_restart(
             h.core.store.put("outbox", blocked)
             h.core.role_runtime.apply("platform", apply(
                 actor, profile, profile["version"], 2, "deny-write",
+                enabled=False, capabilities=["dialogue", "memory.read"],
+            ))
+            h.core.role_runtime.apply("platform", apply(
+                actor, profile, profile["version"], 3, "allow-dialogue",
                 enabled=True, capabilities=["dialogue", "memory.read"],
             ))
             before = [(item["id"], item["state"], item["attempts"])
@@ -394,7 +426,7 @@ def test_memory_write_revocation_holds_pending_and_blocked_outbox_after_restart(
             assert [(item["id"], item["state"], item["attempts"])
                     for item in h.core.store.list("outbox")] == before
             h.core.role_runtime.apply("platform", apply(
-                actor, profile, profile["version"], 3, "disable-outbox",
+                actor, profile, profile["version"], 4, "disable-outbox",
                 enabled=False, capabilities=["dialogue", "memory.read"],
             ))
             await h.core.close()
@@ -428,6 +460,10 @@ def test_memory_read_revocation_before_preparation_keeps_old_snapshot_restricted
             await h.ingest(text="你记得之前的事吗", actor=actor, channel="private:read")
             h.core.role_runtime.apply("platform", apply(
                 actor, profile, profile["version"], 2, "deny-read",
+                enabled=False, capabilities=["dialogue"],
+            ))
+            h.core.role_runtime.apply("platform", apply(
+                actor, profile, profile["version"], 3, "enable-without-read",
                 enabled=True, capabilities=["dialogue"],
             ))
             await h.cycles()
@@ -436,6 +472,51 @@ def test_memory_read_revocation_before_preparation_keeps_old_snapshot_restricted
                        for selection in h.memory.selections)
             prompt = json.loads(h.gateway.calls[0][1][1]["content"])
             assert prompt.get("recent_dialogue", []) == []
+        finally:
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
+def test_profile_application_preserves_role_extensions_and_audits_one_publication():
+    async def scenario():
+        h = Harness(personas=persona_config(**{
+            "actor:a": {"version": 1, "persona": "Original", "tone": "old tone",
+                        "custom": "keep-me"},
+        }))
+        try:
+            profile = h.core.personas.manage({
+                "operation": "create_profile", "request_id": "source-profile",
+                "operator": "tester", "reason": "synthetic", "name": "Clean profile",
+                "description": "", "content": {"persona": "Replaced"},
+            })["item"]
+            request = apply("actor:a", profile, profile["version"], 0,
+                            "role-apply:pause", enabled=False,
+                            capabilities=["dialogue"], application_id="role-apply")
+            paused = h.core.role_runtime.apply("platform", request)
+            enabled = h.core.role_runtime.apply("platform", {
+                **request, "request_id": "role-apply:enable", "expected_version": 1,
+                "enabled": True,
+            })
+            assert enabled["profile_revision"] == paused["profile_revision"]
+            pinned = h.core.role_runtime.pin("actor:a")
+            assert pinned["content"]["custom"] == "keep-me"
+            assert pinned["persona"] == "Replaced"
+            assert "tone" not in pinned["content"]
+            approvals = h.core.store.list("persona_approvals", "actor:a")
+            publications = h.core.store.list("persona_publications", "actor:a")
+            revisions = h.core.store.list("persona_revisions", "actor:a")
+            assert len(approvals) == 1
+            assert len(publications) == 2  # deployment seed, then approved role application
+            assert publications[-1]["kind"] == "publish"
+            assert revisions[-1]["source"] == "profile_apply"
+            assert approvals[0]["operator"] == "operator-web"
+            linked = h.core.personas._profile(profile["id"])
+            assert linked["last_applied_target"] == "actor:a"
+            assert linked["last_applied_profile_revision"] == profile["draft_revision"]
+            assert h.core.role_runtime.apply("platform", request) == paused
+            assert len(h.core.store.list("persona_approvals", "actor:a")) == 1
+            assert len(h.core.store.list("persona_publications", "actor:a")) == 2
         finally:
             await h.core.close()
 

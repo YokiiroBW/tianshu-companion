@@ -6,8 +6,15 @@
     "provider_id": "provider-synthetic-a", "provider_revision": 1,
     "enabled": true, "capabilities": ["dialogue", "memory.read"]
   },
+  "platform_cancel": {
+    "client_id": "1764fe0a-a2a1-4319-bda4-9894fc83460a",
+    "actor_id": "actor:role-78e03cc04f1f4fa6b88a8a08eb177c75",
+    "expected_version": 1
+  },
   "core_apply": {
     "operation": "apply", "request_id": "78e03cc0-4f1f-4fa6-b88a-8a08eb177c75:pause",
+    "application_id": "78e03cc0-4f1f-4fa6-b88a-8a08eb177c75",
+    "operator": "integration-admin",
     "actor_id": "actor:role-78e03cc04f1f4fa6b88a8a08eb177c75",
     "expected_version": 0, "name": "Synthetic A",
     "profile_id": "persona-profile:synthetic-a", "profile_version": 1,

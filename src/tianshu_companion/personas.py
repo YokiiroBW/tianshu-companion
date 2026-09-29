@@ -1225,6 +1225,31 @@ class Personas:
         summary["content"] = self._author_base(row)
         return summary
 
+    def register_runtime_role(self, subject, name, operator):
+        """Create an unpublished target for the normal approve/publish apply path.
+
+        The caller must apply a profile in its enclosing transaction before the
+        role is usable. A deployment seed would publish without an approval row.
+        """
+        actor_id(subject)
+        identity(operator)
+        name = _profile_text(name, PROFILE_NAME_LIMIT, True)
+        if self.store.get("persona_personas", subject) is not None:
+            _invalid("Role already exists")
+        if len(self.store.list("persona_personas")) >= MAX_PERSONAS:
+            _invalid("Persona capacity reached")
+        now = self.clock()
+        return self._save(
+            "personas",
+            dict(
+                id=subject, conversation_id=subject, sequence=1, state="unpublished",
+                subject=subject, kind="role", name=name, description="",
+                published_revision=None, published_at=None, publisher=None,
+                draft_revision=None, retired=False, retired_at=None, imported=None,
+                created_at=now, updated_at=now,
+            ),
+        )
+
     def create_profile(
         self, *, name, description, content, operator, reason, source=None, source_expected=None
     ):

@@ -1,7 +1,7 @@
 """Durable runtime roles. Persona text remains in Personas; this stores only bindings/policy."""
 
 from .contracts import Fault, digest
-from .personas import PersonaError
+from .personas import PersonaError, identity
 
 
 CAPABILITIES = frozenset({"dialogue", "memory.read", "memory.write", "direct"})
@@ -56,6 +56,8 @@ class RoleRuntime:
             raise Fault("forbidden")
         if not isinstance(body, dict) or set(body) != {
             "request_id",
+            "application_id",
+            "operator",
             "actor_id",
             "expected_version",
             "name",
@@ -75,6 +77,10 @@ class RoleRuntime:
             and actor not in self.core.deployment_roles
             or not isinstance(body["request_id"], str)
             or not 1 <= len(body["request_id"]) <= 128
+            or not isinstance(body["application_id"], str)
+            or not 1 <= len(body["application_id"]) <= 128
+            or not isinstance(body["operator"], str)
+            or not 1 <= len(body["operator"]) <= 128
             or type(body["expected_version"]) is not int
             or body["expected_version"] < 0
             or not isinstance(body["name"], str)
@@ -88,8 +94,16 @@ class RoleRuntime:
         ):
             raise Fault("invalid_input")
         signature = digest(body)
+        config_signature = digest({
+            "actor_id": actor,
+            "name": body["name"].strip(),
+            "profile_id": body["profile_id"],
+            "profile_version": body["profile_version"],
+            "capabilities": sorted(body["capabilities"]),
+        })
         op_key = OPERATION + body["request_id"]
         try:
+            identity(body["operator"])
             with self.store.transaction():
                 prior = self.store.get("metadata", op_key)
                 if prior is not None:
@@ -106,7 +120,27 @@ class RoleRuntime:
                     raise Fault(
                         "version_conflict", current_version=(current or {}).get("version", 0)
                     )
-                if body["profile_id"] is None:
+                if body["enabled"] and (
+                    current is None
+                    or current["enabled"]
+                    or current.get("application_id") != body["application_id"]
+                    or current.get("operator") != body["operator"]
+                    or current.get("config_signature") != config_signature
+                ):
+                    raise Fault("version_conflict", current_version=(current or {}).get("version", 0))
+                same_profile = (
+                    current is not None
+                    and current["profile_id"] == body["profile_id"]
+                    and current.get("profile_version", body["profile_version"])
+                    == body["profile_version"]
+                )
+                if same_profile:
+                    # The pause operation has already pinned and published these bytes.
+                    # Enabling or disabling that configuration must not re-read a mutable
+                    # reusable profile after an unrelated edit advances its version.
+                    revision_id = current["profile_revision"]
+                    persona_revision = current["persona_revision"]
+                elif body["profile_id"] is None:
                     if body["profile_version"] is not None or (
                         current is None and actor not in self.core.deployment_roles
                     ):
@@ -114,6 +148,7 @@ class RoleRuntime:
                     revision_id = self.core.personas._persona(actor)["published_revision"]
                     if revision_id is None:
                         raise Fault("invalid_input")
+                    persona_revision = revision_id
                 else:
                     if type(body["profile_version"]) is not int:
                         raise Fault("invalid_input")
@@ -123,38 +158,31 @@ class RoleRuntime:
                     revision_id = profile["draft_revision"] or profile["published_revision"]
                     if not revision_id:
                         raise Fault("invalid_input")
-                    revision = self.core.personas._revision_for(profile["subject"], revision_id)
-                    if current is None or current["profile_revision"] != revision_id:
-                        now = self.core.clock()
-                        if current is None and actor not in self.core.deployment_roles:
-                            self.core.personas._seed(actor, body["name"], revision["content"], now)
-                        else:
-                            role = self.core.personas._persona(actor)
-                            fresh = self.core.personas._write_revision(
-                                actor,
-                                revision["content"],
-                                "profile_apply",
-                                "platform",
-                                role["published_revision"],
-                                now,
-                                note=profile["name"],
-                            )
-                            self.core.personas._publish(
-                                actor,
-                                fresh["id"],
-                                "platform",
-                                "role profile applied",
-                                now,
-                                "profile_apply",
-                            )
+                    if current is None and actor not in self.core.deployment_roles:
+                        role = self.core.personas.register_runtime_role(actor, body["name"], body["operator"])
+                    else:
+                        role = self.core.personas._persona(actor)
+                    self.core.personas.apply_profile(
+                        body["profile_id"],
+                        target=actor,
+                        target_expected=role["version"],
+                        expected=body["profile_version"],
+                        operator=body["operator"],
+                        reason="runtime role application " + body["application_id"],
+                    )
+                    persona_revision = self.core.personas._persona(actor)["published_revision"]
                 item = {
                     "id": PREFIX + actor,
                     "actor_id": actor,
                     "version": body["expected_version"] + 1,
                     "name": body["name"].strip(),
+                    "application_id": body["application_id"],
+                    "operator": body["operator"],
+                    "config_signature": config_signature,
                     "profile_id": body["profile_id"],
+                    "profile_version": body["profile_version"],
                     "profile_revision": revision_id,
-                    "persona_revision": self.core.personas._persona(actor)["published_revision"],
+                    "persona_revision": persona_revision,
                     "enabled": body["enabled"],
                     "capabilities": sorted(body["capabilities"]),
                 }

@@ -22,6 +22,15 @@
         "capabilities": { "$ref": "#/$defs/capabilities" }
       }
     },
+    "platform_cancel": {
+      "type": "object", "additionalProperties": false,
+      "required": ["client_id", "actor_id", "expected_version"],
+      "properties": {
+        "client_id": { "type": "string", "format": "uuid" },
+        "actor_id": { "$ref": "#/$defs/actor" },
+        "expected_version": { "type": "integer", "minimum": 1 }
+      }
+    },
     "platform_role": {
       "type": "object",
       "required": ["actor_id", "version", "state", "stage", "name", "profile_id", "profile_revision", "provider_id", "provider_revision", "enabled", "capabilities", "companion_version", "memory_version"],
@@ -29,7 +38,7 @@
         "actor_id": { "$ref": "#/$defs/actor" },
         "version": { "type": "integer", "minimum": 1 },
         "state": { "enum": ["pending", "active", "disabled", "failed"] },
-        "stage": { "enum": ["start", "core_paused", "memory_applied", "provider_checked", "complete", "verify"] },
+        "stage": { "enum": ["start", "core_paused", "memory_applied", "provider_checked", "complete", "verify", "cancel_reconcile", "cancel_core", "cancel_memory_prepare", "cancel_memory"] },
         "name": { "type": "string" },
         "profile_id": { "type": ["string", "null"] },
         "profile_revision": { "type": ["string", "null"] },
@@ -43,9 +52,11 @@
     },
     "core_apply": {
       "type": "object", "additionalProperties": false,
-      "required": ["operation", "request_id", "actor_id", "expected_version", "name", "profile_id", "profile_version", "enabled", "capabilities"],
+      "required": ["operation", "request_id", "application_id", "operator", "actor_id", "expected_version", "name", "profile_id", "profile_version", "enabled", "capabilities"],
       "properties": {
         "operation": { "const": "apply" }, "request_id": { "type": "string" },
+        "application_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "operator": { "type": "string", "minLength": 1, "maxLength": 128 },
         "actor_id": { "$ref": "#/$defs/actor" },
         "expected_version": { "type": "integer", "minimum": 0 },
         "name": { "type": "string" }, "profile_id": { "type": ["string", "null"] },
