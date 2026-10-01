@@ -1,4 +1,4 @@
-"""Pinned local candidate validation; no schema copy or release claim."""
+"""Pinned published relationship v1 validation without a local schema copy."""
 
 import hashlib
 from pathlib import Path
@@ -7,18 +7,18 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from ..contracts import Fault, strict_json
 
-DOMAIN = "role-relationship/candidate-v1"
-SCHEMA_HASH = "f3b588591411f1ed4b8aa7c9003d201530644d4dfc02294bdd9e9d7f847214a3"
+DOMAIN = "role-relationship/v1"
+SCHEMA_HASH = "e96397bac2b6ad8ff9d23c023d7d3c5ba0701734b27053a05b9d0f65a7ff8ee6"
 
 
 class CandidateContract:
     def __init__(self, path):
         path = Path(path)
         if not path.is_absolute() or not path.is_file():
-            raise ValueError("Relationship candidate schema requires an explicit absolute path")
+            raise ValueError("Relationship schema requires an explicit absolute path")
         data = path.read_bytes().replace(b"\r\n", b"\n")
         if len(data) > 65536 or hashlib.sha256(data).hexdigest() != SCHEMA_HASH:
-            raise ValueError("Unrecognized relationship candidate schema")
+            raise ValueError("Unrecognized published relationship schema")
         schema = strict_json(data)
         self.validators = {
             name: Draft202012Validator(

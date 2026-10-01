@@ -30,7 +30,7 @@ from tianshu_companion.contracts import canonical, digest
 from tianshu_companion.relationships import assemble
 from tianshu_companion.source_sync import read_facts
 
-MEMORY_SHA = "0b82242590c35c5299721ad165bd5f5e9aa0f77e"
+MEMORY_SHA = "1f3121c9758faeb31fc9d0fe2a54974c72505d55"
 
 
 class OwnerTransport:

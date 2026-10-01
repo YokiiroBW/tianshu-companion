@@ -1,5 +1,11 @@
 # TS-115 关系背景与候选事件
 
+## 正式发布绑定（2026-10-01）
+
+发布绑定协调仓库 role-relationship/v1 1.0.0，schema LF SHA256 e96397bac2b6ad8ff9d23c023d7d3c5ba0701734b27053a05b9d0f65a7ff8ee6。配置键 candidate_schema_path 与内部类 CandidateContract 保留为既有兼容名称，其值和版本域只接受正式包，不自动回退候选。旧域 pin 因版本域变化而失效，仍须重新走来源和关系检查。固定 Memory 联合基线为 1f3121c9758faeb31fc9d0fe2a54974c72505d55。领域、授权、自动结算及未知写入不重发规则保持原交付；本轮结果见 docs/handoffs/release-2026.10.01-rc.1.md，生产状态另记。
+
+## 原任务记录（以下候选和此前验收描述保留为历史）
+
 2026-10-01。Companion 是表达消费者；Memory 是 `(actor_id, person_id)` 关系类型、称呼、分数、阶段、冻结和事件账本的唯一权威。没有新增评分算法、关系表、人格权限或聊天入口。
 
 ## 装配与所有权
@@ -12,7 +18,7 @@
 {
   "relationships": {
     "enabled": true,
-    "candidate_schema_path": "/contracts/role-relationship/candidate-v1/schema.json",
+    "candidate_schema_path": "/contracts/role-relationship/v1/schema.json",
     "max_bytes": 2048,
     "timeout_seconds": 5
   }
