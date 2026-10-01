@@ -71,14 +71,10 @@ class AstrBotPlatformJointTests(unittest.IsolatedAsyncioTestCase):
         platform_root = Path(os.environ["TIANSHU_PLATFORM_REPO"])
         sys.path.insert(0, str(platform_root))
         sys.path.insert(0, str(platform_root / "tests" / "backend"))
-        self.contract_env = patch.dict(
-            os.environ,
-            {
-                "TS012_CONTRACT_DIR": str(
-                    platform_root.parents[2] / "contracts" / "text-dialogue" / "v1"
-                )
-            },
+        contract_dir = os.environ.get("TS012_CONTRACT_DIR") or str(
+            platform_root.parents[2] / "contracts" / "text-dialogue" / "v1"
         )
+        self.contract_env = patch.dict(os.environ, {"TS012_CONTRACT_DIR": contract_dir})
         self.contract_env.start()
         self.addCleanup(self.contract_env.stop)
         from fixtures import ENV, bearer, start_http

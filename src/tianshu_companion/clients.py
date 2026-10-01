@@ -70,6 +70,8 @@ class JsonService:
             "/internal/v1/identity/resolve",
             "/internal/v1/qq-admin/check",
             "/internal/v1/memory/select",
+            "/internal/v1/relationships/read",
+            "/internal/v1/relationships/check",
             "/internal/v1/memory/profiles/select",
             "/internal/v1/memory/source-sync/check",
             "/internal/v1/conversation/reply-status",

@@ -446,11 +446,15 @@ def build_runtime(config):
         if not qq_client.url or not qq_client.token:
             raise ValueError("QQ administrator reader requires a registered HTTPS service")
         qq_admin = QQAdminClient(qq_client)
+    from .relationships import assemble as assemble_relationships
+
+    memory = Memory(contracts, client("memory", "memory"))
+    relationships = assemble_relationships(config.get("relationships"), memory.client)
     core = Core(
         Store(config["database_path"]),
         contracts,
         Origins(contracts, issuers),
-        Memory(contracts, client("memory", "memory")),
+        memory,
         Gateway(contracts, client("gateway", "gateway")),
         outbound,
         bindings=config.get("bindings", {}),
@@ -459,6 +463,7 @@ def build_runtime(config):
         default_model_selector=provider_selector,
         qq_admin=qq_admin,
         qq_identity_required=qq_admission,
+        relationships=relationships,
         policy=Policy(**config.get("policy", {})),
         short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
         life_writing=config.get("life_writing", False),
