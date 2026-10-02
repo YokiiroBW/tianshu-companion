@@ -141,13 +141,20 @@ class RoleRuntime:
                     revision_id = current["profile_revision"]
                     persona_revision = current["persona_revision"]
                 elif body["profile_id"] is None:
-                    if body["profile_version"] is not None or (
-                        current is None and actor not in self.core.deployment_roles
-                    ):
+                    if body["profile_version"] is not None:
                         raise Fault("invalid_input")
-                    revision_id = self.core.personas._persona(actor)["published_revision"]
-                    if revision_id is None:
-                        raise Fault("invalid_input")
+                    if actor in self.core.deployment_roles:
+                        # Existing static roles keep their own published persona.
+                        revision_id = self.core.personas._persona(actor)["published_revision"]
+                        if revision_id is None:
+                            raise Fault("invalid_input")
+                    else:
+                        if current is None:
+                            self.core.personas.register_runtime_role(actor, body["name"], body["operator"])
+                        revision_id = self.core.personas.apply_basic_runtime_role(
+                            actor, body["name"], body["operator"],
+                            "runtime role baseline " + body["application_id"],
+                        )
                     persona_revision = revision_id
                 else:
                     if type(body["profile_version"]) is not int:

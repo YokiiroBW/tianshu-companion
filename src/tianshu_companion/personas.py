@@ -1228,7 +1228,7 @@ class Personas:
     def register_runtime_role(self, subject, name, operator):
         """Create an unpublished target for the normal approve/publish apply path.
 
-        The caller must apply a profile in its enclosing transaction before the
+        The caller must publish a profile or the fixed baseline in its transaction before the
         role is usable. A deployment seed would publish without an approval row.
         """
         actor_id(subject)
@@ -1249,6 +1249,24 @@ class Personas:
                 created_at=now, updated_at=now,
             ),
         )
+
+    def apply_basic_runtime_role(self, subject, name, operator, reason):
+        """Publish only the fixed baseline; never reuse another role/profile's fields."""
+        with self.store.transaction():
+            row = self._persona(subject)
+            revision = self._write_revision(
+                subject, {"persona": "Respond to the user's request clearly and accurately."},
+                "runtime_default", operator, row["published_revision"], self.clock(),
+            )
+            saved = self._save("personas", dict(
+                row, name=name.strip(), description="", draft_revision=revision["id"],
+                updated_at=self.clock(),
+            ), expected=row["version"])
+            approved = self.approve(subject, revision["id"], operator=operator,
+                                    expected=saved["version"], reason=reason)
+            self.publish(subject, revision["id"], operator=operator,
+                         expected=approved["version"], reason=reason)
+            return revision["id"]
 
     def create_profile(
         self, *, name, description, content, operator, reason, source=None, source_expected=None
