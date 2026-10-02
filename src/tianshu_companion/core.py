@@ -110,8 +110,9 @@ class Core:
         clock=time.time,
         model_slots=4,
         short_context_policy=None,
-        life_writing=False,
+        life_writing=None,
         life_config_version=None,
+        life_timezone="+08:00",
         web_sender=None,
         image_options=None,
         writing_options=None,
@@ -174,8 +175,17 @@ class Core:
         self.short_context_policy = short_context_policy or ShortContextPolicy()
         try:
             self.life = Life(
-                store, clock, gateway, life_config_version, self.models, writing=life_writing
+                store,
+                clock,
+                gateway,
+                life_config_version,
+                self.models,
+                writing=False if life_writing is None else life_writing,
+                timezone_name=life_timezone,
             )
+            self.life.generation_writing = True if life_writing is None else life_writing
+            self.life.model_selector = default_model_selector
+            self.life.default_config_version = config_version
             self.images = Images(self.life, **(image_options or {}))
             self.writing = Writing(self.life, **(writing_options or {}))
             self.proactive = Proactive(
@@ -209,6 +219,11 @@ class Core:
                 from .role_runtime import RoleRuntime
 
                 self.role_runtime = RoleRuntime(self)
+            self.life.persona_reader = (
+                self.personas.pin if self.personas is not None else self.roles.get
+            )
+            self.life.persona_verifier = self.personas.verify if self.personas is not None else None
+            self.life.dialogue_guard = self.life_dialogue_authorized
         except BaseException:
             store.close()
             raise
@@ -331,6 +346,23 @@ class Core:
 
     async def web_snapshot(self, service, request):
         return await read_web_snapshot(self, service, request)
+
+    async def life_dialogue_authorized(self, source):
+        """Reuse live input authority before extracting a role's own life intention."""
+        scope, admission = source["admission"]["scope"], source["admission"]
+        if scope["actor_id"] not in self.roles or not self._role_allows(
+            scope["actor_id"], "dialogue"
+        ):
+            return False
+        service = source["authorization"]["ingress_service"]
+        _, _, binding = await self._authorize(
+            service,
+            command(admission["accepted_origin"], uid("life-check"), self.clock()),
+            source["request"]["message_key"]["channel"],
+            scope=scope,
+            author=source["request"]["author"],
+        )
+        return binding == admission["binding_version"]
 
     def _sender_for(self, turn):
         namespace = turn["bundle"]["collection_key"]["channel"]["namespace"]
@@ -995,6 +1027,21 @@ class Core:
 
     def recover(self):
         """Invoke once after acquiring the database owner lock, before accepting traffic."""
+        for actor in self.store.list("life_actors"):
+            if actor.get("autonomous") and actor["id"] not in self.roles:
+                self.life.synchronize_role(
+                    actor["id"], enabled=False, personality_version=actor["personality_version"]
+                )
+        for actor_id, role in self.roles.items():
+            self.life.synchronize_role(
+                actor_id,
+                enabled=True,
+                personality_version=(
+                    self.personas.runtime_personality_version(actor_id)
+                    if self.personas is not None
+                    else role.get("version", 1)
+                ),
+            )
         self.life.recover()
         self.images.recover()
         self.writing.recover()
@@ -1170,6 +1217,23 @@ class Core:
         return self.role_runtime.apply(
             service, {k: v for k, v in request.items() if k != "operation"}
         )
+
+    def retry_life_generation(self, service, request):
+        if service != "platform":
+            raise Fault("forbidden")
+        if "life-read" not in self.contracts.schemas:
+            raise Fault("dependency_unavailable")
+        self.contracts.check("life-read#retry_request", request)
+        if request["actor_id"] not in self.roles:
+            raise Fault("not_found")
+        result = self.life.daily.retry_current(
+            request["actor_id"],
+            request["plan_id"],
+            request["phase_id"],
+            request["expected_version"],
+        )
+        self.contracts.check("life-read#retry_response", result)
+        return result
 
     def manage_persona(self, service, request):
         """Trusted same-product management port for registered character personas.

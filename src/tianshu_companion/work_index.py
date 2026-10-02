@@ -12,6 +12,8 @@ INDEXES = {
     "replies_unknown": "CREATE INDEX IF NOT EXISTS replies_unknown ON replies(conversation_id,id,json_extract(body,'$.turn_id')) WHERE status='unknown'",
     "inbox_context": "CREATE INDEX IF NOT EXISTS inbox_context ON inbox(conversation_id,json_extract(body,'$.actor_id'),position,id) WHERE json_extract(body,'$.stale')=0",
     "direct_waiting_band": "CREATE INDEX IF NOT EXISTS direct_waiting_band ON direct_requests(conversation_id,id) WHERE status IN ('completed','failed') AND json_extract(body,'$.reply_state')='ready_to_deliver' AND json_extract(body,'$.deferred_reason')='outbound_band_busy'",
+    "life_generation_due": "CREATE INDEX IF NOT EXISTS life_generation_due ON metadata(conversation_id,deadline,position,id) WHERE status IN ('queued','unavailable','failed') AND json_extract(body,'$.attempt')<3",
+    "metadata_history_page": "CREATE INDEX IF NOT EXISTS metadata_history_page ON metadata(conversation_id,status,position DESC,id DESC)",
 }
 
 

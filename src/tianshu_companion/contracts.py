@@ -12,6 +12,7 @@ PROFILE_MANIFEST_HASH = "488d05438dd5b5abaa43a66a7eab0eb5cf615d5af01a964a7286cd2
 PROFILE_DOMAIN = "profile-memory/v1"
 WEB_MANIFEST_HASH = "e493a1b5d0f4cec8d55995553faf84042f4c33a59365d15423e57f4dc70a6c09"
 SOURCE_MANIFEST_HASH = "178d0ce66210bdfad4cfb85d8b5f0905b0b67f834e2a530efe5636ff0373633d"
+LIFE_READ_MANIFEST_HASH = "7be7507d58f897a739b269de3c096ba948c92b25266888a91fa50130d342c551"
 
 
 class Fault(Exception):
@@ -117,6 +118,27 @@ class Contracts:
         schema = json.loads(read(profile_root / "schemas/profiles.json"))
         self.schemas["profiles"] = schema
         self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
+
+        life_root = root.parent.parent / "life-read/v1"
+        if life_root.exists():
+            manifest = read(life_root / "manifest.json")
+            if hashlib.sha256(manifest).hexdigest() != LIFE_READ_MANIFEST_HASH:
+                raise ValueError("Unrecognized life read release")
+            release = json.loads(manifest)
+            if release.get("version") != "1.0.0" or release.get("package") != "life-read/v1":
+                raise ValueError("Unsupported life read release")
+            for name, expected in release["sha256"].items():
+                path = (life_root / name).resolve()
+                if (
+                    not path.is_relative_to(life_root)
+                    or hashlib.sha256(read(path)).hexdigest() != expected
+                ):
+                    raise ValueError("Life read contract content mismatch")
+            schema = json.loads(read(life_root / "schemas/life.json"))
+            self.schemas["life-read"] = schema
+            self.registry = self.registry.with_resource(
+                schema["$id"], Resource.from_contents(schema)
+            )
         source_root = root.parent.parent / "source-sync/v1"
         manifest = read(source_root / "manifest.json")
         if hashlib.sha256(manifest).hexdigest() != SOURCE_MANIFEST_HASH:

@@ -12,7 +12,8 @@ Five rules are load-bearing:
 - **Authorization is two independent facts, and the reader is never the caller's word.**
   The service is established by the bearer credential at the adapter; this module maps that
   service to one fixed deployment `reader_id`, and an operation is allowed only when the
-  requested actor is inside that entry's deployed `actor_ids` *and* the persisted
+  requested actor is inside that entry's deployed `actor_ids` (or its explicitly deployed
+  `runtime_roles` membership) *and* the persisted
   `life_access` row for that actor already names the reader. A revoked grant is gone on the
   next request because the row is read per request; an unknown actor and an ungranted actor
   answer the same 404, so no caller can probe which actors exist. `life_access` is existing
@@ -89,11 +90,21 @@ def readers(document, services=None):
             raise ValueError("life_readers keys must be caller service names")
         if services is not None and service not in services:
             raise ValueError("life_readers names a service that is not a configured caller")
-        if not isinstance(entry, dict) or set(entry) != {"reader_id", "actor_ids"}:
-            raise ValueError("Each life_readers entry is exactly reader_id and actor_ids")
+        if (
+            not isinstance(entry, dict)
+            or set(entry) - {"reader_id", "actor_ids", "runtime_roles"}
+            or not {"reader_id", "actor_ids"} <= set(entry)
+        ):
+            raise ValueError("Each life_readers entry needs reader_id and actor_ids")
+        runtime_roles = entry.get("runtime_roles", False)
+        if type(runtime_roles) is not bool:
+            raise ValueError("runtime_roles must be boolean")
         reader = identity(entry["reader_id"], "reader_id")
         actors = entry["actor_ids"]
-        if not isinstance(actors, list) or not 1 <= len(actors) <= MAX_DEPLOYED_ACTORS:
+        if (
+            not isinstance(actors, list)
+            or not (0 if runtime_roles else 1) <= len(actors) <= MAX_DEPLOYED_ACTORS
+        ):
             raise ValueError("actor_ids must list between 1 and " + str(MAX_DEPLOYED_ACTORS))
         deployed = [identity(actor, "actor_id") for actor in actors]
         if len(set(deployed)) != len(deployed):
@@ -104,6 +115,8 @@ def readers(document, services=None):
             raise ValueError("reader_id must identify exactly one service")
         seen.add(reader)
         mapping[service] = {"reader_id": reader, "actor_ids": tuple(deployed)}
+        if runtime_roles:
+            mapping[service]["runtime_roles"] = True
     return mapping
 
 
@@ -207,7 +220,7 @@ def _cursor(request):
 
 
 class LifeRead:
-    """The four read operations, over one narrow query port and one deployment mapping."""
+    """Persisted life reads over one narrow query port and one deployment mapping."""
 
     def __init__(self, queries, *, readers, contracts, clock=time.time):
         self.queries, self.readers = queries, readers
@@ -223,6 +236,8 @@ class LifeRead:
             "snapshot": self._snapshot,
             "diaries": self._diaries,
             "revision": self._revision,
+            "today": self._today,
+            "timeline": self._timeline,
         }.get(operation)
         if handler is None:
             raise Fault("not_found")
@@ -231,8 +246,10 @@ class LifeRead:
     # ---------------------------------------------------------------- authorization
 
     def _granted(self, entry, actor_id):
-        """Both authorization facts: deployed for this actor, and granted to this reader."""
-        if actor_id not in entry["actor_ids"]:
+        """Deployed static/runtime membership and an existing grant to this fixed reader."""
+        if actor_id not in entry["actor_ids"] and not (
+            entry.get("runtime_roles") and self.queries.runtime_role(actor_id) is not None
+        ):
             return False
         access = self.queries.access(actor_id)
         if access is None:
@@ -288,11 +305,14 @@ class LifeRead:
         after = None
         if "after_actor_id" in request:
             after = _request_identity(request, "after_actor_id")
-        candidates = sorted(entry["actor_ids"])
-        if after is not None:
-            candidates = [actor for actor in candidates if actor > after]
         items = []
         with self.queries.reading():
+            candidates = set(entry["actor_ids"])
+            if entry.get("runtime_roles"):
+                candidates.update(self.queries.runtime_actor_ids(after, MAX_DEPLOYED_ACTORS + 1))
+                if len(candidates) > MAX_DEPLOYED_ACTORS:
+                    raise Fault("budget_exceeded")
+            candidates = sorted(actor for actor in candidates if after is None or actor > after)
             for actor_id in candidates:
                 if len(items) > limit:
                     break  # One row past the page only decides whether a next page exists.
@@ -380,6 +400,157 @@ class LifeRead:
             ),
             LIST_BUDGET,
         )
+
+    def _today(self, entry, request):
+        """The persisted plan is a set of intentions, never a read-time clock projection."""
+        self._life_contract("today_request", request)
+        request = self._envelope(request, {"schema_version", "actor_id"})
+        actor_id = _request_identity(request, "actor_id")
+        with self.queries.reading():
+            self._require_grant(entry, actor_id)
+            actor = self.queries.actor(actor_id)
+            if actor is None or not actor.get("daily_plan_id"):
+                raise Fault("not_found")
+            plan = self.queries.plan(actor["daily_plan_id"])
+            if plan is None or plan.get("actor_id") != actor_id or not _civil_day(plan.get("day")):
+                _corrupt()
+            if plan.get("state") not in {"active", "paused", "completed", "superseded"}:
+                _corrupt()
+            generation_states = {
+                "queued",
+                "generating",
+                "completed",
+                "unavailable",
+                "failed",
+                "interrupted",
+                "superseded",
+                "skipped",
+            }
+            if plan.get("generation_state") not in generation_states or plan.get(
+                "generated_by"
+            ) not in {"baseline", "gateway"}:
+                _corrupt()
+            phases = plan.get("entries")
+            if not isinstance(phases, list) or not 1 <= len(phases) <= 24:
+                _corrupt()
+            items = []
+            for phase in phases:
+                if (
+                    type(phase.get("minute")) is not int
+                    or not 0 <= phase["minute"] < 1440
+                    or phase.get("state") not in {"planned", "current", "elapsed", "skipped"}
+                    or phase.get("generation_state") not in generation_states
+                    or phase.get("phase_id") != "phase:" + digest([plan["id"], phase["minute"]])
+                ):
+                    _corrupt()
+                items.append(
+                    {
+                        "phase_id": phase["phase_id"],
+                        "minute": phase["minute"],
+                        "activity": _stored_text(phase, "activity"),
+                        "detail": _stored_optional_text(phase, "detail"),
+                        "state": phase["state"],
+                        "generation_state": phase["generation_state"],
+                    }
+                )
+            document = {
+                "schema_version": 1,
+                "fictional": True,
+                "actor_id": actor_id,
+                "day": plan["day"],
+                "timezone": _stored_text(plan, "timezone"),
+                "enabled": actor.get("life_enabled", True),
+                "state_basis": "last_persisted",
+                "observed_at": self._now(),
+                "plan": {
+                    "plan_id": plan["id"],
+                    "version": _stored_version(plan, "version"),
+                    "state": plan["state"],
+                    "generation_state": plan["generation_state"],
+                    "generated_by": plan["generated_by"],
+                    "entries": items,
+                    "current_phase_id": _stored_optional_text(plan, "current_phase_id"),
+                },
+            }
+        self._life_contract("today_response", document, response=True)
+        return self._emit(document, LIST_BUDGET)
+
+    def _timeline(self, entry, request):
+        self._life_contract("timeline_request", request)
+        request = self._envelope(request, {"schema_version", "actor_id", "day", "limit", "after"})
+        actor_id = _request_identity(request, "actor_id")
+        day = request.get("day")
+        if not _civil_day(day):
+            raise Fault("invalid_input")
+        limit, after = _page_limit(request), None
+        if "after" in request:
+            cursor = request["after"]
+            if (
+                not isinstance(cursor, dict)
+                or set(cursor) != {"position", "known_id"}
+                or type(cursor["position"]) is not int
+            ):
+                raise Fault("invalid_input")
+            after = cursor["position"], _request_identity(cursor, "known_id")
+        with self.queries.reading():
+            self._require_grant(entry, actor_id)
+            if self.queries.actor(actor_id) is None:
+                raise Fault("not_found")
+            rows = self.queries.timeline_page(actor_id, day, limit + 1, after)
+            items = []
+            for known in rows[:limit]:
+                if (
+                    known.get("conversation_id") != actor_id
+                    or known.get("state") != day
+                    or type(known.get("sequence")) is not int
+                ):
+                    _corrupt()
+                event = self.queries.event(_stored_text(known, "event_id"))
+                if event is None or event.get("fictional") is not True:
+                    _corrupt()
+                generated_by = event.get(
+                    "generated_by",
+                    "simulation" if event.get("kind") == "simulation" else "baseline",
+                )
+                if generated_by not in {"baseline", "gateway", "simulation"}:
+                    _corrupt()
+                items.append(
+                    {
+                        "event_id": event["id"],
+                        "known_id": _stored_text(known, "id"),
+                        "position": known["sequence"],
+                        "kind": _stored_text(event, "kind"),
+                        "summary": _stored_text(event, "summary"),
+                        "occurred_at": _stored_time(event, "occurred_at"),
+                        "learned_at": _stored_time(known, "learned_at"),
+                        "via": _stored_text(known, "via"),
+                        "phase_id": _stored_optional_text(event, "phase_id"),
+                        "plan_id": _stored_optional_text(event, "plan_id"),
+                        "generated_by": generated_by,
+                    }
+                )
+            more = len(rows) > limit
+        document = {
+            "schema_version": 1,
+            "fictional": True,
+            "actor_id": actor_id,
+            "day": day,
+            "state_basis": "last_persisted",
+            "items": items,
+            "next_after": {"position": items[-1]["position"], "known_id": items[-1]["known_id"]}
+            if more
+            else None,
+        }
+        self._life_contract("timeline_response", document, response=True)
+        return self._emit(document, LIST_BUDGET)
+
+    def _life_contract(self, definition, value, *, response=False):
+        if "life-read" not in self.contracts.schemas:
+            raise Fault("dependency_unavailable")
+        try:
+            self.contracts.check("life-read#" + definition, value)
+        except Fault:
+            raise Fault("dependency_unavailable" if response else "invalid_input") from None
 
     def _bound_capture(self, actor_id, diary, diary_id):
         """The frozen recipe and material of one diary, proved against its content address.

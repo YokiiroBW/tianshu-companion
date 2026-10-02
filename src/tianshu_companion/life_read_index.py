@@ -36,6 +36,11 @@ CREATE_SQL = (
     "conversation_id,json_extract(body,'$.day') DESC,id DESC) "
     "WHERE json_extract(body,'$.published_revision') IS NOT NULL"
 )
+TIMELINE_INDEX = "life_known_timeline_page"
+TIMELINE_CREATE_SQL = (
+    "CREATE INDEX IF NOT EXISTS life_known_timeline_page ON life_known("
+    "conversation_id,status,position DESC,id DESC)"
+)
 BACKUP_LABEL = ".pre-life-read-index-"
 _CLAUSE = re.compile(r"\bif not exists\b", re.IGNORECASE)
 _LITERAL = re.compile(r"'(?:[^']|'')*'")
@@ -83,12 +88,17 @@ def prepare_page_index(connection, path, *, restore_point_taken, fresh):
     already present, or None when this open still has to create it. A same-named index with
     a different definition raises, which stops startup before any structural statement runs.
     """
-    definition = stored_definition(connection)
-    if definition is not None:
-        if shape(definition) != shape(CREATE_SQL):
-            raise RuntimeError(
-                INDEX_NAME + " exists with a different definition; refusing to start"
-            )
+    missing = False
+    for name, expected in ((INDEX_NAME, CREATE_SQL), (TIMELINE_INDEX, TIMELINE_CREATE_SQL)):
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
+        ).fetchone()
+        definition = row[0] if row else None
+        if definition is None:
+            missing = True
+        elif shape(definition) != shape(expected):
+            raise RuntimeError(name + " exists with a different definition; refusing to start")
+    if not missing:
         return INDEX_NAME
     # Missing. A fresh database is being created by this open and there is nothing to
     # restore; an existing one either already has this open's complete pre-DDL backup or
@@ -105,3 +115,4 @@ def create_page_index(connection):
     still reaches this line and changes nothing.
     """
     connection.execute(CREATE_SQL)
+    connection.execute(TIMELINE_CREATE_SQL)

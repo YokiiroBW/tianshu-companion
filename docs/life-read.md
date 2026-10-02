@@ -25,6 +25,55 @@ Memory/Platform/渠道，也不新增第二套授权存储：授权仍是 `core.
 - 段为空对象 → 端口存在但无人登记，任何已认证调用者都是 403。
 - 任何一条不合法都在启动时 `ValueError`，绝不半配置启动；错误只说明配置错误，不掩盖其它故障。
 
+普通RoleRuntime新增角色可由部署一次登记的独立生活读服务自动浏览，不需每角色修改静态配置：
+
+```json
+"callers": {
+  "platform": {"token_env": "PLATFORM_ROLE_TOKEN", "issuer": "platform"},
+  "platform_life": {"token_env": "PLATFORM_LIFE_READ_TOKEN"}
+},
+"life_readers": {
+  "platform_life": {
+    "reader_id": "reader:platform-life", "actor_ids": [], "runtime_roles": true
+  }
+}
+```
+
+`reader_id`由部署选定，与该已配置服务凭据一一对应；不能由HTTP请求自报。
+`runtime_roles`缺省为false；true时actor_ids可空，并授权枚举Platform已受理的持久RoleRuntime角色。
+首次启用创建生活实体时安装该固定reader到原life_access；启动接线也补已有角色的缺失授权。
+已有life_access行一律不覆盖，包括显式readers=[]撤回，重启/角色重放及读取都不会重新授权。
+读路径继续实时检查life_access，不写grant、不tick、不调用模型。静态角色仍要求actor_ids与显式剧情授权。
+动态及静态候选合计最多64，超预算明确拒绝；角色停用可继续读取已授权历史和暂停状态。
+
+### 今日计划与时间线（life-read/v1）
+
+保留四个旧端点，并新增POST`/internal/v1/life-read/today`和`/timeline`，使用同一Bearer/剧情授权、
+媒体类型和16KiB请求预算。部署合同在同根`life-read/v1`；未装包新端点503，旧端点仍可用。
+两端点只返回持久状态，角色启用后由后台生活工作器登记当日计划；手动configure但尚未登记计划返回404。
+
+`today`请求`{schema_version:1,actor_id}`，返回actor/day/timezone/enabled、state_basis与observed_at，
+以及plan_id/version/state/generation_state/generated_by/current_phase_id和最多24条entries。
+entries含稳定phase_id、civil minute、activity、detail、state与generation_state。计划是意图，
+不能把它当作已经发生的体验。plan.state为active/paused/completed/superseded；entry.state为
+planned/current/elapsed/skipped。生成状态封闭为queued/generating/completed/unavailable/failed/
+interrupted/superseded/skipped，generated_by为baseline或gateway。
+
+`timeline`请求`{schema_version:1,actor_id,day,limit?,after?}`，limit为1..50，默认20。
+游标`{position,known_id}`直接完整传回；position是已有life_known.sequence整数（learned_at秒）持久排序键，
+不是请求时补写字段。时间线按角色获知事件时的本地day、position/id降序分页，返回event_id/known_id/
+kind/summary/occurred_at/learned_at/via/phase_id/plan_id/generated_by；occurred_at和learned_at是UTC
+epoch数字，获知日可以与发生日不同。generated_by为baseline/gateway/simulation，next_after空表示末页。
+分页用同position与更早position两个有界索引seek，不用OFFSET/COUNT，不受旧深页长度影响。
+
+管理端`POST /internal/v1/life-generation/retry`复用Platform角色管理凭据，生活读凭据不能调用。
+请求`{actor_id,plan_id,phase_id,expected_version}`：phase_id为null表示日计划，非空必须是当前阶段。
+expected_version来自today.plan.version；过期409，角色未启用/计划不匹配404，当前任务不可重试400。
+只受理unavailable/failed/interrupted，回执含schema_version/actor_id/plan_id/plan_version/state，
+state只为queued或unavailable，不声称已生成。页面管理入口随后沿独立授权读链刷新today/timeline。
+重试为每次模型请求递增持久request_attempt；选模turn_id与Gateway的X-Tianshu-Turn-ID严格一致，
+不会把旧模型授权用于新的attempt。旧回包仍需通过当前角色/内容版本和attempt归属复核。
+
 调用者身份只来自 bearer 凭据（与其它内部端口同一 `tokens` 表）；请求体里的 `reader_id`
 一律 400 `invalid_input`，不能自报身份。若某调用者的凭据环境变量未设置（启动时没有该 token），
 而它又出现在 `life_readers` 里，同样按配置错误启动失败——不接受一个永远无法认证的读者登记。

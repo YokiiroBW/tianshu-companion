@@ -1097,6 +1097,26 @@ class Personas:
 
     # ------------------------------------------------------------------ pinning
 
+    def runtime_role_state(self, subject):
+        """Only the role version and published pointer needed by runtime coordination."""
+        actor_id(subject)
+        row = self._persona(subject)
+        if row.get("kind") == "profile":
+            _invalid("A reusable profile is not a registered character")
+        return {"version": row["version"], "published_revision": row["published_revision"]}
+
+    def runtime_personality_version(self, subject):
+        """An opaque life capture marker; unresolved pointer validation stays in recover."""
+        return self.runtime_role_state(subject)["published_revision"] or "unpublished"
+
+    def runtime_profile_state(self, profile_id):
+        """The version and applicable revision of one reusable profile, without its text."""
+        row = self._profile(profile_id)
+        return {
+            "version": row["version"],
+            "revision_id": row["draft_revision"] or row["published_revision"],
+        }
+
     def pin(self, subject):
         """The published revision a turn must snapshot, or an explicit refusal.
 
@@ -1242,11 +1262,23 @@ class Personas:
         return self._save(
             "personas",
             dict(
-                id=subject, conversation_id=subject, sequence=1, state="unpublished",
-                subject=subject, kind="role", name=name, description="",
-                published_revision=None, published_at=None, publisher=None,
-                draft_revision=None, retired=False, retired_at=None, imported=None,
-                created_at=now, updated_at=now,
+                id=subject,
+                conversation_id=subject,
+                sequence=1,
+                state="unpublished",
+                subject=subject,
+                kind="role",
+                name=name,
+                description="",
+                published_revision=None,
+                published_at=None,
+                publisher=None,
+                draft_revision=None,
+                retired=False,
+                retired_at=None,
+                imported=None,
+                created_at=now,
+                updated_at=now,
             ),
         )
 
@@ -1255,17 +1287,34 @@ class Personas:
         with self.store.transaction():
             row = self._persona(subject)
             revision = self._write_revision(
-                subject, {"persona": "Respond to the user's request clearly and accurately."},
-                "runtime_default", operator, row["published_revision"], self.clock(),
+                subject,
+                {"persona": "Respond to the user's request clearly and accurately."},
+                "runtime_default",
+                operator,
+                row["published_revision"],
+                self.clock(),
             )
-            saved = self._save("personas", dict(
-                row, name=name.strip(), description="", draft_revision=revision["id"],
-                updated_at=self.clock(),
-            ), expected=row["version"])
-            approved = self.approve(subject, revision["id"], operator=operator,
-                                    expected=saved["version"], reason=reason)
-            self.publish(subject, revision["id"], operator=operator,
-                         expected=approved["version"], reason=reason)
+            saved = self._save(
+                "personas",
+                dict(
+                    row,
+                    name=name.strip(),
+                    description="",
+                    draft_revision=revision["id"],
+                    updated_at=self.clock(),
+                ),
+                expected=row["version"],
+            )
+            approved = self.approve(
+                subject, revision["id"], operator=operator, expected=saved["version"], reason=reason
+            )
+            self.publish(
+                subject,
+                revision["id"],
+                operator=operator,
+                expected=approved["version"],
+                reason=reason,
+            )
             return revision["id"]
 
     def create_profile(

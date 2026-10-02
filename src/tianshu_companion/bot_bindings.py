@@ -83,6 +83,12 @@ class BotBindings:
             },
         }
 
+    def reconcile_actor(self, actor_id):
+        """Rebuild role-derived live bindings from their unchanged durable policy."""
+        for item in self.rows.values():
+            if item["actor_id"] == actor_id:
+                self._install(item)
+
     def apply(self, service, body):
         if service != "platform":
             raise Fault("forbidden")
@@ -109,10 +115,7 @@ class BotBindings:
                 c["binding_id"] == binding_id and c["connection_id"] != connection_id
                 for c in self.rows.values()
             )
-            or (
-                body["actor_id"] not in self.core.roles
-                and (body["enabled"] or connection_id not in self.rows)
-            )
+            or (body["actor_id"] not in self.core.roles and connection_id not in self.rows)
             or not isinstance(conversation, dict)
             or set(conversation) != {"kind", "id"}
             or conversation["kind"] not in {"group", "private"}
@@ -131,6 +134,7 @@ class BotBindings:
             if body["revision"] == previous["revision"]:
                 if previous["semantic"] != semantic or previous["request_id"] != body["request_id"]:
                     raise Fault("idempotency_conflict")
+                self._install(previous)
                 return self.status(service, {"connection_id": connection_id})["binding"]
             if body["revision"] != previous["revision"] + 1:
                 raise Fault("version_conflict")
@@ -140,6 +144,8 @@ class BotBindings:
                 raise Fault("scope_changed")
         elif body["revision"] != 1 or body["enabled"]:
             raise Fault("version_conflict")
+        if body["enabled"] and body["actor_id"] not in self.core.roles:
+            raise Fault("invalid_input")
         item = {
             "id": self.PREFIX + connection_id,
             "connection_id": connection_id,

@@ -58,7 +58,17 @@ class Life:
     are persisted here and confer read-only access to published content, never admin rights.
     """
 
-    def __init__(self, store, clock, gateway, config_version, model_slots, *, writing=False):
+    def __init__(
+        self,
+        store,
+        clock,
+        gateway,
+        config_version,
+        model_slots,
+        *,
+        writing=False,
+        timezone_name="+08:00",
+    ):
         self.store, self.clock, self.gateway = store, clock, gateway
         self.config_version, self.model_slots = config_version, model_slots
         if type(writing) is not bool:
@@ -68,6 +78,99 @@ class Life:
         self.writing = writing
         self._writing = asyncio.Lock()
         self._next_tick = 0
+        self.persona_reader = None
+        self.persona_verifier = None
+        self.dialogue_guard = None
+        self.runtime_readers = ()
+        self.generation_writing = writing
+        self.model_selector = None
+        self.default_config_version = None
+        from .life_daily import DailyLife
+        from .life_influences import LifeInfluences
+
+        self.daily = DailyLife(self, timezone_name)
+        self.influences = LifeInfluences(self)
+
+    def synchronize_role(self, actor_id, *, enabled, personality_version):
+        self.daily.synchronize_role(
+            actor_id, enabled=enabled, personality_version=personality_version
+        )
+        if enabled:
+            self._install_runtime_access(actor_id)
+
+    def install_runtime_readers(self, reader_ids):
+        """Deployment-owned derived grants for roles accepted by Platform RoleRuntime."""
+        self.runtime_readers = tuple(reader_ids)
+        for actor in self.store.list("life_actors"):
+            self._install_runtime_access(actor["id"])
+
+    def _install_runtime_access(self, actor_id):
+        if (
+            self.runtime_readers
+            and self.store.get("metadata", "runtime-role:" + actor_id)
+            and not self.store.get("life_access", actor_id)
+        ):
+            # Explicit existing grants/revocations are never overwritten by lifecycle replay.
+            self.set_diary_access(actor_id, readers=self.runtime_readers)
+
+    def generation_available(self):
+        return bool(
+            self.generation_writing
+            and getattr(self.gateway, "available", False)
+            and (
+                self.model_selector is not None
+                or self.config_version
+                or self.default_config_version
+            )
+        )
+
+    async def select_generation(self, task):
+        """Pin the actor's published model choice using the existing selection lease port."""
+        from .model_selection import SelectionRequest, resolve_selection, verify_lease
+
+        if self.model_selector is not None:
+            if (task.get("model_selection") or {}).get("turn_id") != task["generation_turn_id"]:
+                actor = task["actor_id"]
+                chosen = await resolve_selection(
+                    self.model_selector,
+                    SelectionRequest(
+                        turn_id=task["generation_turn_id"],
+                        actor_id=actor,
+                        person_id="person:life:" + digest(actor),
+                        audience="self_private",
+                        conversation_id="life:" + digest(actor),
+                    ),
+                    self.clock,
+                )
+                task["config_version"] = chosen.config_version
+                task["model_selection"] = {
+                    "expires_at": chosen.expires_at,
+                    "turn_id": task["generation_turn_id"],
+                }
+            verify_lease(task["model_selection"]["expires_at"], self.clock())
+        elif task.get("config_version") is None:
+            task["config_version"] = self.config_version or self.default_config_version
+        if task.get("config_version") is None:
+            raise Fault("dependency_unavailable")
+
+    def verify_generation_lease(self, task):
+        if task.get("model_selection"):
+            from .model_selection import verify_lease
+
+            verify_lease(task["model_selection"]["expires_at"], self.clock(), minimum=0)
+
+    def influence_dialogue(self, actor_id, message, source, scope):
+        """Only accepted, actor-scoped dialogue may supply bounded personal interests."""
+        return self.influences.accept(actor_id, message, source, scope)
+
+    def withdraw_dialogue(self, conversation_id, source_base):
+        self.influences.withdraw(conversation_id, source_base)
+
+    def retry_generation(self, task_id, *, expected):
+        expected_version(expected)
+        if task_id.startswith("life-influence-task:"):
+            return self.influences.retry(task_id, expected=expected)
+        return self.daily.retry(task_id, expected=expected)
 
     def _get(self, table, key):
         item = self.store.get("life_" + table, key)
@@ -189,6 +292,21 @@ class Life:
                 manual=(old or {}).get("manual"),
                 recipe=recipe,
                 fictional=True,
+                **{
+                    k: old[k]
+                    for k in (
+                        "autonomous",
+                        "life_enabled",
+                        "daily_plan_id",
+                        "life_interests",
+                        "life_content_version",
+                        "life_runtime_epoch",
+                        "life_interest_day",
+                        "experience",
+                        "experience_event_id",
+                    )
+                    if old and k in old
+                },
             ),
             expected,
         )
@@ -272,15 +390,24 @@ class Life:
             # Deterministic room conflict policy: actor id ascending, later id wins per control.
             wishes = {}
             for actor in self.store.list("life_actors"):
+                if not actor.get("life_enabled", True):
+                    continue
                 phase, cursor = self._phase(actor, now)
+                phase = dict(phase)
                 cursor = f"{self._get('worlds', actor['world_id'])['version']}:{cursor}"
                 manual = actor["manual"]
                 held = manual and (manual["hold_until"] is None or manual["hold_until"] > now)
+                marks = self.daily.reconcile(actor, phase, cursor, now)
                 if not held:
                     wishes.setdefault(actor["room_id"], {}).update(phase["controls"])
                     if actor["cursor"] != cursor or manual:
                         actor.update(
-                            activity=phase["activity"], cursor=cursor, manual=None, changed_at=now
+                            activity=phase["activity"],
+                            cursor=cursor,
+                            manual=None,
+                            changed_at=now,
+                            experience=None,
+                            experience_event_id=None,
                         )
                         self._save("actors", actor)
                         self._event(
@@ -293,6 +420,7 @@ class Life:
                                 occurred_at=now,
                                 fictional=True,
                                 kind="schedule_reconciliation",
+                                **(marks or {}),
                             )
                         )
             for room in self.store.list("life_rooms"):
@@ -406,6 +534,7 @@ class Life:
             mood=actor["mood"],
             outfit_ref=actor["outfit_ref"],
             changed_at=actor["changed_at"],
+            **({"experience": actor["experience"]} if actor.get("experience") else {}),
         )
 
     def put_recipe(self, recipe):
@@ -469,6 +598,10 @@ class Life:
 
     def request_diary(self, actor_id, day):
         self.tick(force=True)
+        return self._prepare_diary(actor_id, day)
+
+    def _prepare_diary(self, actor_id, day):
+        """Prepare one actor after the caller synchronized the world once."""
         actor = self._get("actors", actor_id)
         recipe = self._recipe(actor["recipe"])
         material = self.materials(actor_id, day)
@@ -500,7 +633,7 @@ class Life:
                     current_revision=None,
                     published_revision=None,
                     created_at=self.clock(),
-                    real_chat_sources="excluded: no current source/access proof",
+                    real_chat_sources="excluded: dialogue affects fictional actor intentions, not real user facts",
                 ),
             )
         return self.diary_metadata(key)
@@ -516,7 +649,13 @@ class Life:
         for item in self.store.list("life_diaries", states=["generating"]):
             item.update(state="interrupted")
             self._save("diaries", item)
-        self.tick(force=True)
+        self.daily.recover()
+        self.influences.recover()
+        self.daily.recovering = True
+        try:
+            self.tick(force=True)
+        finally:
+            self.daily.recovering = False
 
     def retry_diary(self, diary_id, *, expected):
         expected_version(expected)
@@ -533,12 +672,16 @@ class Life:
         if self._writing.locked():
             return
         async with self._writing:
+            await self.influences.work()
             self.tick()
+            await self.daily.work()
             # Only yesterday is eligible on restart; never enqueue an entire missed month.
             for actor in self.store.list("life_actors"):
+                if not actor.get("life_enabled", True):
+                    continue
                 world = self._get("worlds", actor["world_id"])
                 day = datetime.fromtimestamp(self.clock(), zone(world["timezone"])).date()
-                self.request_diary(actor["id"], str(day - timedelta(days=1)))
+                self._prepare_diary(actor["id"], str(day - timedelta(days=1)))
             row = self.store.db.execute(
                 "SELECT id FROM life_diaries WHERE status='queued' ORDER BY id LIMIT 1"
             ).fetchone()

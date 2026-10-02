@@ -69,6 +69,20 @@ WORLD = "SELECT body FROM life_worlds WHERE id=?"
 ROOM = "SELECT body FROM life_rooms WHERE id=?"
 DIARY = "SELECT body FROM life_diaries WHERE id=?"
 REVISION = "SELECT body FROM life_revisions WHERE id=?"
+PLAN = "SELECT body FROM metadata WHERE id=?"
+EVENT = "SELECT body FROM life_events WHERE id=?"
+TIMELINE_PAGE = (
+    "SELECT body FROM life_known WHERE conversation_id=? AND status=? "
+    "ORDER BY position DESC,id DESC LIMIT ?"
+)
+TIMELINE_SAME_POSITION = (
+    "SELECT body FROM life_known WHERE conversation_id=? AND status=? AND position=? "
+    "AND id<? ORDER BY id DESC LIMIT ?"
+)
+TIMELINE_EARLIER_POSITION = (
+    "SELECT body FROM life_known WHERE conversation_id=? AND status=? AND position<? "
+    "ORDER BY position DESC,id DESC LIMIT ?"
+)
 
 
 class LifeReadQueries:
@@ -110,6 +124,16 @@ class LifeReadQueries:
         """The persisted story grant for one actor; absent means locked, never default-open."""
         return self._row(ACCESS, actor_id)
 
+    def runtime_role(self, actor_id):
+        return self._row(PLAN, "runtime-role:" + actor_id)
+
+    def runtime_actor_ids(self, after, limit):
+        rows = self.db.execute(
+            "SELECT id FROM metadata WHERE id>? AND id<? ORDER BY id LIMIT ?",
+            ("runtime-role:" + (after or ""), "runtime-role;", limit),
+        ).fetchall()
+        return [row[0][len("runtime-role:") :] for row in rows]
+
     def world(self, world_id):
         return self._row(WORLD, world_id)
 
@@ -121,6 +145,26 @@ class LifeReadQueries:
 
     def revision(self, revision_id):
         return self._row(REVISION, revision_id)
+
+    def plan(self, plan_id):
+        return self._row(PLAN, plan_id)
+
+    def event(self, event_id):
+        return self._row(EVENT, event_id)
+
+    def timeline_page(self, actor_id, day, limit, after=None):
+        if after is None:
+            rows = self.db.execute(TIMELINE_PAGE, (actor_id, day, limit)).fetchall()
+        else:
+            position, known_id = after
+            rows = self.db.execute(
+                TIMELINE_SAME_POSITION, (actor_id, day, position, known_id, limit)
+            ).fetchall()
+            if len(rows) < limit:
+                rows += self.db.execute(
+                    TIMELINE_EARLIER_POSITION, (actor_id, day, position, limit - len(rows))
+                ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def diaries_page(self, actor_id, limit, after=None):
         """One bounded page of published diaries, newest day first.

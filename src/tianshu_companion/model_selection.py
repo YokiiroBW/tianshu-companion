@@ -65,11 +65,12 @@ class HttpDefaultModelSelector:
         return ModelSelection(**value)
 
 
-def verify_lease(expires_at, now):
+def verify_lease(expires_at, now, *, minimum=MINIMUM_LEASE):
     if (
         type(expires_at) not in (int, float)
         or not math.isfinite(expires_at)
-        or expires_at - now < MINIMUM_LEASE
+        or expires_at - now <= 0
+        or expires_at - now < minimum
     ):
         raise Fault("dependency_unavailable")
 

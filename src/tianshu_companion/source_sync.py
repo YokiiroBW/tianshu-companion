@@ -298,6 +298,7 @@ def context_valid(core, service, data, context, actor, audience, cid, person=Non
 def invalidate_physical(core, conv, base, kind):
     """Negative-only propagation reaches every registered actor in the channel."""
     cid = conv["conversation_id"]
+    core.life.withdraw_dialogue(cid, base)
     conv["context_revision"] = conv.get("context_revision", 1) + 1
     core.store.put("conversations", conv)
     for collection in core.store.list("collections", cid):
@@ -507,6 +508,7 @@ def accept_actor(
         ),
     )
     store.put("conversations", conv)
+    core.life.influence_dialogue(actor, data, source, scope)
     return dict(actor_id=actor, state="accepted", receipt=receipt, admission=admission)
 
 

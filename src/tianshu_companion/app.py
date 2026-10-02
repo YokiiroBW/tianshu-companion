@@ -466,9 +466,10 @@ def build_runtime(config):
         relationships=relationships,
         policy=Policy(**config.get("policy", {})),
         short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
-        life_writing=config.get("life_writing", False),
+        life_writing=config.get("life_writing"),
         automatic_memory_candidates=automatic_memory_candidates,
         life_config_version=config.get("life_config_version"),
+        life_timezone=config.get("life_timezone", "+08:00"),
         image_options=image_options,
         writing_options=config.get("writing"),
         proactive_options=config.get("proactive"),
@@ -552,6 +553,9 @@ def create_app(core=None, tokens=None, life_readers=None):
         # a startup failure instead of a deployment that silently never authenticates.
         mapping = read_reader_map(life_readers, set(tokens))
         if mapping is not None:
+            core.life.install_runtime_readers(
+                entry["reader_id"] for entry in mapping.values() if entry.get("runtime_roles")
+            )
             reads = LifeRead(
                 LifeReadQueries(core.store.db),
                 readers=mapping,
@@ -599,7 +603,7 @@ def create_app(core=None, tokens=None, life_readers=None):
                 jobs = [
                     loop("core.tick", core.tick, 0.05, _counter(core, "core.tick")),
                     loop("core.outbox", core.flush_outbox, 0.5, _counter(core, "core.outbox")),
-                    loop("life.work", core.life.work, 30, _counter(core, "life.work")),
+                    loop("life.work", core.life.work, 2, _counter(core, "life.work")),
                     loop("images.work", core.images.work, 2, _counter(core, "images.work")),
                     loop("writing.work", core.writing.work, 5, _counter(core, "writing.work")),
                     loop(
@@ -759,6 +763,8 @@ def create_app(core=None, tokens=None, life_readers=None):
                 return core.manage_persona(service, body)
             if operation == "role-runtime":
                 return core.manage_role(service, body)
+            if operation == "life-generation-retry":
+                return core.retry_life_generation(service, body)
             if operation == "bot-binding-apply":
                 if not hasattr(core, "bot_bindings"):
                     raise Fault("dependency_unavailable")
@@ -840,6 +846,10 @@ def create_app(core=None, tokens=None, life_readers=None):
     async def role_runtime_manage(request: Request):
         return await dispatch(request, "role-runtime")
 
+    @app.post("/internal/v1/life-generation/retry")
+    async def life_generation_retry(request: Request):
+        return await dispatch(request, "life-generation-retry")
+
     async def life_read_dispatch(request, operation):
         """The authorized read boundary: authenticate, bound the request, then read.
 
@@ -900,6 +910,14 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v1/life-read/revision")
     async def life_read_revision(request: Request):
         return await life_read_dispatch(request, "revision")
+
+    @app.post("/internal/v1/life-read/today")
+    async def life_read_today(request: Request):
+        return await life_read_dispatch(request, "today")
+
+    @app.post("/internal/v1/life-read/timeline")
+    async def life_read_timeline(request: Request):
+        return await life_read_dispatch(request, "timeline")
 
     # Installed last so it wraps every route above, and skipped for the two health probes so
     # a probe stays purely read-only. Nothing here decides a business question: it supplies a
