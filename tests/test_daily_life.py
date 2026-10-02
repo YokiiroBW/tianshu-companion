@@ -1127,6 +1127,107 @@ def test_open_specific_dialogue_changes_later_content_and_withdrawal_removes_it(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("regeneration", ["failed", "unavailable"])
+def test_withdrawal_clears_generated_future_details_even_without_a_new_plan(regeneration):
+    async def scenario():
+        h = Harness()
+        try:
+            h.clock.now = datetime(2026, 10, 3, 9, tzinfo=timezone.utc).timestamp()
+            life, model = h.core.life, Model()
+            life.create_world("world:custom", timezone_name="UTC")
+            life.create_room("room:custom", "world:custom")
+            schedule = [
+                {"minute": 0, "activity": "用户设置的休息"},
+                {"minute": 540, "activity": "用户设置的上午安排"},
+                {"minute": 720, "activity": "用户设置的午后安排"},
+                {"minute": 900, "activity": "用户设置的傍晚安排"},
+            ]
+            life.configure_actor("actor:a", "room:custom", schedule=schedule, personality_version=1)
+            h.core.recover()
+            life.gateway, life.config_version = model, 19
+            original = model.generate
+
+            async def influenced_plan(turn, messages):
+                material = json.loads(messages[1]["content"])
+                if "today's fictional intentions" in messages[0]["content"] and any(
+                    "天体物理" in intent for intent in material["interests"]
+                ):
+                    result, receipt = await original(turn, messages)
+                    generated = json.loads(result[0])
+                    for entry in generated["entries"]:
+                        entry.update(
+                            activity="研究天体物理纪录片", detail="后续继续研究天体物理纪录片"
+                        )
+                    return [json.dumps(generated)], receipt
+                return await original(turn, messages)
+
+            model.generate = influenced_plan
+            await h.core.ingest(
+                "nonebot",
+                h.request(text="今天想让你研究天体物理纪录片", message="plan:committed-source"),
+            )
+            for _ in range(6):
+                await life.work()
+            before = plan(life, "actor:a")
+            assert before["generation_state"] == "completed"
+            assert any(
+                "天体物理" in (e["detail"] or "") for e in before["entries"] if e["minute"] > 540
+            )
+            occurred = copy.deepcopy(life.store.list("life_events"))
+            current_phase = copy.deepcopy(next(e for e in before["entries"] if e["minute"] == 540))
+            await h.core.ingest(
+                "nonebot", h.request(message="plan:committed-source", revision=2, kind="retract")
+            )
+            life.tick(force=True)
+            cleared = plan(life, "actor:a")
+            assert (
+                next(e for e in cleared["entries"] if e["minute"] == 540)["detail"]
+                == current_phase["detail"]
+            )
+            for entry in cleared["entries"]:
+                if entry["minute"] > 540:
+                    assert entry["detail"] is None
+                    assert entry["activity"] == next(
+                        e["activity"] for e in schedule if e["minute"] == entry["minute"]
+                    )
+            assert life.store.list("life_events") == occurred
+            assert life.store.get("life_actors", "actor:a")["schedule"] == [
+                dict(e, controls={}) for e in schedule
+            ]
+            if regeneration == "failed":
+                model.plan_failure = True
+            else:
+                model.available = False
+            for _ in range(4):
+                await life.work()
+            h.clock.advance(3 * 3600)
+            life.tick(force=True)
+            model.available = True
+            model.plan_failure = True
+            for _ in range(4):
+                await life.work()
+            later = [
+                material
+                for kind, _, material in model.calls
+                if kind == "stage"
+                and material["day"] == "2026-10-03"
+                and material["stage"]["minute"] == 720
+                and material["schedule"] == [dict(e, controls={}) for e in schedule]
+            ]
+            assert later
+            assert later[-1]["planned_detail"] is None
+            assert later[-1]["stage"]["activity"] == "用户设置的午后安排"
+            assert all(
+                "天体物理" not in (e["detail"] or "")
+                for e in plan(life, "actor:a")["entries"]
+                if e["minute"] > 540
+            )
+        finally:
+            await h.core.close()
+
+    asyncio.run(scenario())
+
+
 def test_role_personas_and_ai_activity_names_reach_current_and_future_projections():
     async def scenario():
         h = Harness(personas=persona_config())

@@ -184,6 +184,21 @@ class DailyLife:
         # An inherited pre-midnight phase does not count as today's last planned phase.
         if current and current["minute"] > minute:
             current = None
+        content_version = actor.get("life_content_version", 0)
+        if plan.get("content_version") != content_version:
+            routine = {scheduled["minute"]: scheduled for scheduled in actor["schedule"]}
+            for entry in plan["entries"]:
+                if entry["minute"] > minute or (
+                    entry is current and entry["generation_state"] != "completed"
+                ):
+                    # Old intentions cease to apply immediately, even if the next model fails.
+                    # The configured routine is authoritative; completed experiences stay put.
+                    entry.update(
+                        activity=routine[entry["minute"]]["activity"],
+                        detail=None,
+                        content_version=content_version,
+                    )
+            plan.update(content_version=content_version, generated_by="baseline")
         plan["current_phase_id"] = current["phase_id"] if current else None
         for entry in plan["entries"]:
             if entry is current:
@@ -317,8 +332,22 @@ class DailyLife:
         # Daily details can enrich a stage but are never requirements for its generation.
         if task["kind"] == "stage":
             entry = next(e for e in plan["entries"] if e["phase_id"] == task["phase_id"])
-            captured["planned_detail"] = entry["detail"]
-            captured["stage"] = {**captured["stage"], "activity": entry["activity"]}
+            fresh_intention = entry.get("content_version") == task["content_version"]
+            activity = (
+                entry["activity"]
+                if fresh_intention
+                else next(
+                    scheduled["activity"]
+                    for scheduled in actor["schedule"]
+                    if scheduled["minute"] == entry["minute"]
+                )
+            )
+            captured["planned_detail"] = entry["detail"] if fresh_intention else None
+            captured["stage"] = {
+                "phase_id": entry["phase_id"],
+                "minute": entry["minute"],
+                "activity": activity,
+            }
         instruction = (
             "Create today's fictional intentions, not already-lived experiences. Return only "
             'JSON {"entries":[{"minute": integer, "activity": string, "detail": string}]}, '
@@ -414,6 +443,7 @@ class DailyLife:
                         for entry, generated in zip(plan["entries"], result, strict=True):
                             if entry["state"] in {"planned", "current"}:
                                 entry["detail"] = generated["detail"]
+                                entry["content_version"] = fresh["content_version"]
                                 # Completed experiences keep their activity identity.
                                 if (
                                     entry["state"] == "planned"

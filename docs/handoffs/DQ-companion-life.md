@@ -72,3 +72,17 @@ life-read/v1固定manifest LF SHA256：7be7507d58f897a739b269de3c096ba948c92b252
 未读写真实数据库/聊天/凭据，未发QQ、调用真实模型、访问NAS、生产迁移、推送或部署。AI内容的语义质量不能由字符串/schema测试保证。停机缺口不补造，unknown须正常管理页重试；read不会救活时钟。实际Platform/Gateway/Memory/Companion四服务HTTPS隔离联合证据及浏览器页面由Platform交接引用，不能称生产L0。
 
 协调者按产品边界串行集成并处理上述既有测试夹具；部署时挂载正式life-read/v1，登记独立生活read映射与现役角色模型选择服务，再验真实环境。参见docs/life.md、docs/life-read.md及根quality-life开发队列。
+
+## 最终窄修补：已提交计划的来源撤回
+
+原实现提交f6e8414be20bfa630abedf300a75b89b83713ff4后，协调者指出已成功AI计划的未来activity/detail
+可能在来源撤回且重生成失败时继续进入阶段planned_detail。新增failed/unavailable两参数合成用例，
+修前均以未来detail仍含撤回主题失败，问题已证实。
+
+DailyLife.reconcile按内容版本使尚未发生阶段的旧AI细节失效，activity回落actor.schedule原值，不写
+固定默认、不覆盖用户手动作息；已发生entry与life_events保持。模型计划回包给详情记录内容版本，
+stage提示仅消费相符版本的detail/activity，stage只提供phase_id/minute/activity，防止captured.stage
+重复夹带旧detail。无需新模型成功才停止旧影响；HTTP投影字段和正式合同均不变。
+
+按协调者要求只补新增及直接生活验证：daily_life（现28项）、life、life_chain、life_read共114 passed，
+3.09秒。未再全量。ruff针对修改Python文件check/format、compileall及git diff --check通过。
