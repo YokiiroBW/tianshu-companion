@@ -31,3 +31,7 @@ AstrBot 4.27.3 的 `Context.register_web_api()` 固定映射到 Dashboard `/api/
 旧 pull 连接器仍在包内：只有在 AstrBot 插件配置页把旧 `enabled=true` 才运行，且新版 RPC 同时关闭。旧配置与行为见 [README.md](README.md)。切换时先停用旧平台连接，避免其他进程重复答复。
 
 隔离验收：`python -m unittest tests.test_adapter_astrbot_host tests.test_adapter_rpc -v`，需 AstrBot 4.27.3 与 `httpx`。真实 `PluginManager` 加载/重载/卸载、Dashboard 登录鉴权、容器与可用 LAN 地址的 HTTP 回环已测；真实 NapCat、QQ 会话、NAS 与端口发布尚未测试。
+
+## 持续运行与历史保留
+
+入站容量只计算尚未 ACK 的事件，上限 10000。ACK 后立即清除传输正文，保留紧凑事件身份，旧 SDK 重放不会重新入队；升级启动也清除旧 ACK 行的正文。发送与绑定操作的幂等回执保留用于重试和状态核对，不计入终身发送次数配额；unknown 回执不会自动重发。紧凑身份和回执随处理量增长，需随适配器数据库备份，不通过清空账本释放容量。观察模式仍沿用已有 30 天及 20000 条传输历史保留策略，未 ACK 事件不清理；正文权威归档位于归档服务。

@@ -27,6 +27,7 @@ MAX_REQUEST = 65536
 # The Platform adapter client reads at most 64 KiB of raw JSON response bytes.
 MAX_RESPONSE = 65536
 MAX_PENDING = 10000
+# Bounds retained observation payloads, not lifetime idempotency receipts.
 MAX_HISTORY = 20000
 OBSERVATION_LEASE_SECONDS = 30
 CLAIM_DECISION_SECONDS = 5
@@ -110,6 +111,7 @@ class AdapterService:
                 UNIQUE(connection_id,native_id,author)
             );
             CREATE INDEX IF NOT EXISTS events_pending ON events(connection_id,acked,created);
+            CREATE INDEX IF NOT EXISTS events_unacknowledged ON events(acked) WHERE acked=0;
             CREATE TABLE IF NOT EXISTS deliveries (
                 connection_id TEXT NOT NULL, reply_id TEXT NOT NULL,
                 attempt_id TEXT NOT NULL, digest TEXT NOT NULL,
@@ -156,6 +158,9 @@ class AdapterService:
             "UPDATE deliveries SET receipt=json_set(receipt,'$.state','unknown') "
             "WHERE json_extract(receipt,'$.state')='inflight'"
         )
+        # ACK means the consumer has durably accepted the payload. Keep only the
+        # event identity so an old SDK replay can never become a new pending event.
+        self.db.execute("UPDATE events SET payload='{}' WHERE acked=1 AND payload<>'{}'")
         self.adapter, self.accounts, self.send = adapter, accounts, send
         self.lock = asyncio.Lock()
 
@@ -212,9 +217,13 @@ class AdapterService:
             if len(matching) != 1:
                 return False
             connection_id, _ = matching[0]
+            if self.db.execute(
+                "SELECT 1 FROM events WHERE connection_id=? AND native_id=? AND author=?",
+                (connection_id, native_id, author),
+            ).fetchone():
+                return True
             count = self.db.execute("SELECT COUNT(*) FROM events WHERE acked=0").fetchone()[0]
-            history = self.db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-            if count >= MAX_PENDING or history >= MAX_HISTORY:
+            if count >= MAX_PENDING:
                 return False
             # Message revision belongs to the event contract, not binding updates.
             payload = {
@@ -536,8 +545,6 @@ class AdapterService:
             if prior_request[0] != digest:
                 raise RpcError(409, "idempotency_conflict")
             return json.loads(prior_request[1])
-        if self.db.execute("SELECT COUNT(*) FROM apply_requests").fetchone()[0] >= MAX_HISTORY:
-            raise RpcError(429, "busy", True)
         current = self._binding(connection_id)
         if current and revision <= current[0]:
             if revision == current[0] and digest == current[5]:
@@ -812,8 +819,6 @@ class AdapterService:
             if receipt["state"] == "inflight":
                 receipt["state"] = "unknown"
             return receipt
-        if self.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] >= MAX_HISTORY:
-            raise RpcError(429, "busy", True)
         row = self.db.execute(
             "SELECT enabled,revision,group_policy,private_policy FROM observation_accounts "
             "WHERE account_id=?",
@@ -920,7 +925,7 @@ class AdapterService:
                 "SELECT 1 FROM events WHERE id=? AND connection_id=?", (key, connection_id)
             ).fetchone()
             if row:
-                self.db.execute("UPDATE events SET acked=1 WHERE id=?", (key,))
+                self.db.execute("UPDATE events SET acked=1,payload='{}' WHERE id=?", (key,))
                 acknowledged.append(key)
         return {"acknowledged": acknowledged}
 
@@ -944,8 +949,6 @@ class AdapterService:
             if receipt["state"] == "inflight":
                 receipt["state"] = "unknown"
             return receipt
-        if self.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] >= MAX_HISTORY:
-            raise RpcError(429, "busy", True)
         binding = self._binding(connection_id)
         if not binding or not binding[4]:
             raise RpcError(403, "forbidden")
