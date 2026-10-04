@@ -42,7 +42,9 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
         await self.say("那你怎么称呼我呢")
         self.assertEqual(2, len(self.prompt()["recent_dialogue"]))
         self.assertIn("你叫小明。", canonical(self.prompt()["recent_dialogue"]))
-        self.assertTrue(all(s["budget"] == dict(tokens=0, bytes=0) for s in h.memory.selections))
+        recalls = [s for s in h.memory.selections if s["budget"]["tokens"] > 0]
+        self.assertEqual(3, len(recalls))  # Natural recall runs on ordinary dialogue too.
+        self.assertTrue(all(s["budget"] == dict(tokens=2048, bytes=8192) for s in recalls))
         self.assertEqual(3, len(h.gateway.calls))
 
     async def test_same_conversation_window_survives_database_reopen(self):

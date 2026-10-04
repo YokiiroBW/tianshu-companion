@@ -211,9 +211,47 @@ class DailyLife:
                 entry.update(state="skipped", generation_state="skipped")
         task = self._task(actor, plan, "plan")
         plan["generation_state"] = task["state"]
-        if current:
-            stage_task = self._task(actor, plan, "stage", dict(current))
-            current["generation_state"] = stage_task["state"]
+        for entry in plan["entries"]:
+            if entry["generation_state"] in {"running", "paused"}:
+                # Older runtime rows confused actual activity state with plan generation.
+                entry["generation_state"] = task["state"]
+        process = self.life.activities.current(actor["id"], actor.get("activity_scope"))
+        if current and not (process and process["state"] in {"running", "paused"}):
+            if (
+                hasattr(self.life.gateway, "complete")
+                and self.life.activities.executor is not None
+                and actor.get("manual") is None
+            ):
+                activity_id = "routine:" + digest(
+                    [plan["id"], current["phase_id"], content_version]
+                )
+                activity = self.store.get("life_activities", activity_id)
+                if activity is None:
+                    activity = self.life.activities.save(
+                        actor["id"],
+                        dict(
+                            id=activity_id,
+                            title=current["activity"],
+                            state="running",
+                            checkpoint=dict(
+                                step=0,
+                                position=0,
+                                unit="step",
+                                note=current["detail"] or "尚未执行",
+                            ),
+                            next_due_at=now,
+                            resume_condition=None,
+                            sources=[],
+                            result_refs=[],
+                            scope=None,
+                        ),
+                        expected=0,
+                    )
+                    actor.update(self.store.get("life_actors", actor["id"]))
+                current["generation_state"] = task["state"]
+            else:
+                stage_task = self._task(actor, plan, "stage", dict(current))
+                current["generation_state"] = stage_task["state"]
             phase["activity"] = current["activity"]
         if self.recovering and actor.get("cursor") != cursor:
             plan["reconciled_after_gap_at"] = now
@@ -254,6 +292,7 @@ class DailyLife:
             != "phase:"
             + digest([plan["id"], self.life._phase(actor, self.life.clock())[0]["minute"]])
             or actor.get("manual") is not None
+            or self.life.activities.current(actor["id"], actor.get("activity_scope")) is not None
         ):
             return None
         return actor, plan
@@ -455,6 +494,10 @@ class DailyLife:
                                     if (
                                         entry["phase_id"] == plan["current_phase_id"]
                                         and actor.get("manual") is None
+                                        and self.life.activities.current(
+                                            actor["id"], actor.get("activity_scope")
+                                        )
+                                        is None
                                     ):
                                         actor["activity"] = entry["activity"]
                                         self.life._save("actors", actor)

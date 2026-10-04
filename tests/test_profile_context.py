@@ -304,7 +304,7 @@ class ProfileContextTests(unittest.IsolatedAsyncioTestCase):
         await self.seed()
         original = self.h.memory.select
 
-        async def ordinary(origin, scope, text, budget, known_version=None):
+        async def ordinary(origin, scope, text, budget, known_version=None, **kwargs):
             result = await original(origin, scope, text, budget, known_version)
             if budget["tokens"]:
                 unit = profile_unit(dict(kind="person", person_id=scope["person_id"]))
@@ -333,6 +333,9 @@ class ProfileContextTests(unittest.IsolatedAsyncioTestCase):
                 "recent_dialogue",
                 "earlier_fragment",
                 "delivered_dependencies",
+                "open_concerns",
+                "current_activity",
+                "short_affect",
             )
         }
         self.assertTrue(all(context[k] for k in ("evidence", "profiles", "recent_dialogue")))

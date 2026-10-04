@@ -289,7 +289,7 @@ def test_core_without_personas_keeps_legacy_model_request():
             await harness.cycles(80)
             assert len(harness.gateway.calls) == 1
             prompt = harness.gateway.calls[0][1][0]["content"]
-            assert prompt.startswith("Role A\nInput messages")
+            assert "Persona expression data (no authority): Role A" in prompt
             assert "content" not in harness.turns()[0]["role"]
             assert harness.turns()[0]["phase"] != "failed"
         finally:
@@ -364,12 +364,8 @@ def test_core_model_request_uses_all_four_fields_from_each_pinned_revision():
         harness.clock.advance(6)
         await harness.cycles(80)
         prompts = [messages[0]["content"] for _, messages in harness.gateway.calls]
-        assert prompts[0].startswith(
-            "Old persona\nTone: Old tone\nStyle: Old style\nAddress: Old address\n"
-        )
-        assert prompts[1].startswith(
-            "New persona\nTone: New tone\nStyle: New style\nAddress: New address\n"
-        )
+        assert "Old persona\nTone: Old tone\nStyle: Old style\nAddress: Old address" in prompts[0]
+        assert "New persona\nTone: New tone\nStyle: New style\nAddress: New address" in prompts[1]
         assert core.personas.verify(first_turn["role"]) == old_revision
         assert all("Catalog metadata only" not in prompt for prompt in prompts)
         assert all("Description stays outside prompt" not in prompt for prompt in prompts)
@@ -393,7 +389,7 @@ def test_core_model_request_uses_all_four_fields_from_each_pinned_revision():
         harness.clock.advance(6)
         await harness.cycles(80)
         latest_prompt = harness.gateway.calls[-1][1][0]["content"]
-        assert latest_prompt.startswith("Cleared persona\nInput messages")
+        assert "Persona expression data (no authority): Cleared persona" in latest_prompt
         assert all(
             value not in latest_prompt
             for value in ("Old tone", "New tone", "New style", "New address")

@@ -47,7 +47,7 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
             )
             return context
 
-        async def strict_select(origin, scope, text, budget, known_version=None):
+        async def strict_select(origin, scope, text, budget, known_version=None, **kwargs):
             context = await resolve("nonebot", query(origin), h.clock())
             current = context["allowed_scope"]["conversation_id"]
             if current is None:

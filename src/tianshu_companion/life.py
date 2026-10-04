@@ -90,6 +90,13 @@ class Life:
 
         self.daily = DailyLife(self, timezone_name)
         self.influences = LifeInfluences(self)
+        from .life_activities import Activities
+        from .life_work import LifeWork
+        from .life_affect import Affect
+
+        self.activities = Activities(self)
+        self.concerns = LifeWork(self)
+        self.affect = Affect(self)
 
     def synchronize_role(self, actor_id, *, enabled, personality_version):
         self.daily.synchronize_role(
@@ -304,6 +311,8 @@ class Life:
                         "life_interest_day",
                         "experience",
                         "experience_event_id",
+                        "activity_id",
+                        "activity_scope",
                     )
                     if old and k in old
                 },
@@ -398,7 +407,8 @@ class Life:
                 manual = actor["manual"]
                 held = manual and (manual["hold_until"] is None or manual["hold_until"] > now)
                 marks = self.daily.reconcile(actor, phase, cursor, now)
-                if not held:
+                process = self.activities.current(actor["id"], actor.get("activity_scope"))
+                if not held and not (process and process["state"] in {"running", "paused"}):
                     wishes.setdefault(actor["room_id"], {}).update(phase["controls"])
                     if actor["cursor"] != cursor or manual:
                         actor.update(
@@ -470,6 +480,8 @@ class Life:
         if self.store.get("life_events", event["id"]):
             return
         self.store.put("life_events", event)
+        if getattr(self, "event_observer", None):
+            self.event_observer(event)
         for actor_id in sorted(set(event["participants"] + event["visible_to"])):
             via = "participated" if actor_id in event["participants"] else "witnessed"
             self._learn(event, actor_id, via, None)
@@ -507,7 +519,10 @@ class Life:
             self._learn(event, recipient, "told_by", source_actor)
 
     def snapshot(self, actor_id):
-        self.tick(force=True)
+        self.tick()
+        return self.observed_snapshot(actor_id)
+
+    def observed_snapshot(self, actor_id):
         actor = self._get("actors", actor_id)
         return dict(
             actor=actor,
@@ -516,11 +531,18 @@ class Life:
             observed_at=self.clock(),
         )
 
-    def summary(self, actor_id):
+    def summary(self, actor_id, scope=None):
         if not self.store.get("life_actors", actor_id):
             return None
-        state = self.snapshot(actor_id)
+        state = self.observed_snapshot(actor_id)
         actor = state["actor"]
+        from .life_work import visible
+
+        activity = (
+            actor["activity"]
+            if visible({"scope": actor.get("activity_scope")}, scope)
+            else "处理个人事项"
+        )
         return dict(
             fictional=True,
             actor_id=actor_id,
@@ -530,7 +552,7 @@ class Life:
             room_id=actor["room_id"],
             room_version=state["room"]["version"],
             timezone=state["world"]["timezone"],
-            activity=actor["activity"],
+            activity=activity,
             mood=actor["mood"],
             outfit_ref=actor["outfit_ref"],
             changed_at=actor["changed_at"],
@@ -583,6 +605,9 @@ class Life:
         for row in rows:
             known = json.loads(row[0])
             event = self._get("events", known["event_id"])
+            if event.get("scope") is not None:
+                # Published fictional diaries cannot disclose a person's private process.
+                continue
             material.append(
                 dict(
                     event_id=event["id"],
@@ -646,6 +671,7 @@ class Life:
         return self._available()
 
     def recover(self):
+        self.activities.recover()
         for item in self.store.list("life_diaries", states=["generating"]):
             item.update(state="interrupted")
             self._save("diaries", item)
@@ -675,6 +701,7 @@ class Life:
             await self.influences.work()
             self.tick()
             await self.daily.work()
+            await self.activities.work()
             # Only yesterday is eligible on restart; never enqueue an entire missed month.
             for actor in self.store.list("life_actors"):
                 if not actor.get("life_enabled", True):

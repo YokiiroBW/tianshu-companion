@@ -5,12 +5,48 @@ import copy
 import json
 import os
 import time
+import httpx
 from pathlib import Path
 
 from tianshu_companion.clients import command, uid, utc
 from tianshu_companion.contracts import Contracts, Fault
 from tianshu_companion.core import Core, Policy
 from tianshu_companion.store import Store
+
+
+def native_sse(handler):
+    """Present synthetic completion fixtures on the actual native streaming boundary."""
+    import inspect
+
+    def convert(request, response):
+        if request.url.path != "/v1/chat/completions" or response.status_code != 200:
+            return response
+        value = response.json()
+        chunks = []
+        for index, choice in enumerate(value["choices"]):
+            chunks.append(
+                dict(choices=[dict(index=index, delta=choice["message"], finish_reason=None)])
+            )
+            chunks.append(
+                dict(choices=[dict(index=index, delta={}, finish_reason=choice["finish_reason"])])
+            )
+        body = "".join(
+            "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n" for chunk in chunks
+        )
+        return httpx.Response(
+            200, text=body + "data: [DONE]\n\n", headers={"Content-Type": "text/event-stream"}
+        )
+
+    if inspect.iscoroutinefunction(handler):
+
+        async def stream(request):
+            return convert(request, await handler(request))
+    else:
+
+        def stream(request):
+            return convert(request, handler(request))
+
+    return stream
 
 
 def contracts():
@@ -63,7 +99,12 @@ class FakeMemory:
         key = tuple(sorted(account.items()))
         return self.accounts.setdefault(key, uid("person")), 1
 
-    async def select(self, origin, scope, text, budget, known_version=None):
+    async def resolve_identity(self, origin, account):
+        return self.accounts.get(tuple(sorted(account.items())))
+
+    async def select(
+        self, origin, scope, text, budget, known_version=None, *, known=None, time_range=None
+    ):
         if self.unavailable:
             raise Fault("dependency_unavailable")
         if known_version is not None and known_version != self.scope_version:
@@ -73,6 +114,24 @@ class FakeMemory:
         )
         return dict(
             schema_version=1,
+            version_domain="memory-context/v1",
+            association_version=1,
+            scope_checks=[
+                dict(
+                    scope=scope,
+                    scope_version=self.scope_version,
+                    association_id=None,
+                    association_version=1,
+                )
+            ],
+            coverage=dict(
+                matched_groups=0,
+                returned_groups=0,
+                complete=True,
+                time_basis="source_sent_at",
+                history_complete=False,
+                missing_source_times=0,
+            ),
             request_id=uid("req"),
             effective_scope=scope,
             scope_version=self.scope_version,

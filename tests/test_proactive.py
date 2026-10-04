@@ -1341,10 +1341,10 @@ def test_v5_migration_backup_rollback_and_source_preservation(tmp_path):
         db.commit()
     with closing(Store(path)) as store:
         assert store.source_head() == head
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 10
         assert store.get("conversations", "synthetic")["private"] == "synthetic preserved"
         assert store.list("proactive_candidates") == []
-    backups = sorted(tmp_path.glob("*.pre-proactive-v6-*.bak"))
+    backups = sorted(tmp_path.glob("*.pre-life-runtime-v10-*.bak"))
     assert len(backups) == 2  # the failed attempt and the retry each took one
     # Both attempts started below v7, so the persona step is crossed inside those same
     # migrations: a multi-version jump takes one recovery backup, at the highest structural

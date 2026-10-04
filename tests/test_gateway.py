@@ -1,3 +1,4 @@
+from support import native_sse
 import json
 import unittest
 
@@ -63,7 +64,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         client = JsonService(
             "https://gateway.synthetic.invalid",
             "synthetic-only",
-            transport=httpx.MockTransport(handler),
+            transport=httpx.MockTransport(native_sse(handler)),
         )
         try:
             gateway = Gateway(h.contracts, client)

@@ -6,7 +6,7 @@ import json
 import httpx
 import pytest
 
-from support import Harness
+from support import Harness, native_sse
 from tianshu_companion.clients import Gateway, JsonService, utc
 from tianshu_companion.contracts import Fault
 from tianshu_companion.qq_identity import QQAdminClient
@@ -114,13 +114,13 @@ async def _projection_and_revoke():
         client = JsonService(
             "https://gateway.synthetic.invalid",
             "synthetic-only",
-            transport=httpx.MockTransport(handler),
+            transport=httpx.MockTransport(native_sse(handler)),
         )
         try:
             await Gateway(h.contracts, client).generate(h.turns()[0], messages)
         finally:
             await client.close()
-        assert native == [{"messages": messages, "stream": False}]
+        assert native == [{"messages": messages, "stream": True}]
         assert "model" not in native[0] and "tools" not in native[0]
     finally:
         await h.core.close()

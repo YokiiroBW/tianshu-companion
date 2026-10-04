@@ -312,6 +312,9 @@ def invalidate_physical(core, conv, base, kind):
                 collection["state"] = "cancelled"
             core.store.put("collections", collection)
         elif collection.get("turn_id"):
+            core.life.concerns.invalidate(
+                "companion", collection["turn_id"], collection["revision"]
+            )
             core._cancel_turn(core.store.get("turns", collection["turn_id"]), kind)
 
 

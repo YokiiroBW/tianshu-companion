@@ -386,6 +386,14 @@ def test_selected_attempt_identity_matches_real_gateway_header_and_retry():
                 previous = headers_seen[-1]
                 return receipt(43, clock(), previous["X-Request-ID"])
 
+            async def stream(self, path, body, headers=None):
+                response = await self.call(path, body, headers)
+                yield dict(
+                    choices=[
+                        dict(index=0, delta=response["choices"][0]["message"], finish_reason="stop")
+                    ]
+                )
+
         try:
             life.model_selector = Selector()
             life.gateway = Gateway(contracts(), Transport())
@@ -743,11 +751,17 @@ def test_dialogue_influence_is_deduplicated_impersonal_and_actor_isolated():
             life.gateway, life.writing, life.config_version = model, True, 19
             await life.work()
             old_events = copy.deepcopy(life.store.list("life_events"))
-            request = h.request(text="Secret person 123456 wants to play music and read a book")
+            request = h.request(text="Secret person 123456 想研究天体物理纪录片")
             await h.core.ingest("nonebot", request)
             actor = life.store.get("life_actors", "actor:a")
             version = actor["life_content_version"]
-            assert actor["life_interests"] == ["music", "reading"]
+            assert (
+                actor["life_interests"] == []
+            )  # Accepted source is queued, never a keyword-derived intention.
+            await life.work()
+            actor = life.store.get("life_actors", "actor:a")
+            version = actor["life_content_version"]
+            assert actor["life_interests"] == ["研究天体物理纪录片中的恒星演化"]
             await h.core.ingest("nonebot", request)
             assert life.store.get("life_actors", "actor:a")["life_content_version"] == version
             assert life.store.get("life_actors", "actor:b").get("life_interests", []) == []
@@ -755,7 +769,7 @@ def test_dialogue_influence_is_deduplicated_impersonal_and_actor_isolated():
             for _ in range(4):
                 await life.work()
             calls = [c for c in model.calls if c[0] == "stage"]
-            assert any(c[2]["interests"] == ["music", "reading"] for c in calls)
+            assert any(c[2]["interests"] == ["研究天体物理纪录片中的恒星演化"] for c in calls)
             assert "123456" not in json.dumps(calls)
             assert "Secret person" not in json.dumps(life.store.list("life_events"))
             assert all(life.store.get("life_events", e["id"]) == e for e in old_events)

@@ -510,7 +510,7 @@ def test_a_database_without_the_index_is_still_served_after_its_restore_point():
             connection.execute("DROP INDEX life_diaries_published_page")
         store = Store(path)  # the real open: restore point, then the derived index
         try:
-            assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert store.db.execute("PRAGMA user_version").fetchone()[0] == 10
             assert store.db.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
                 ("life_diaries_published_page",),

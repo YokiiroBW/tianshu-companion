@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.background import BackgroundTask
 
 from .clients import (
@@ -380,7 +380,11 @@ def build_runtime(config):
         persona_token = os.environ.get(persona_config["admin_token_env"])
         if persona_token:
             incoming["persona_admin"] = persona_token
-    image_options = None
+    image_options = dict(
+        staging=config.get(
+            "image_staging", str(Path(config["database_path"]).parent / "image-originals")
+        )
+    )
     if config.get("images") is not None:
         image_config = config["images"]
         workflow = Workflow(
@@ -464,6 +468,11 @@ def build_runtime(config):
         qq_admin=qq_admin,
         qq_identity_required=qq_admission,
         relationships=relationships,
+        knowledge_client=(
+            client("knowledge", "knowledge")
+            if "knowledge" in config.get("services", {})
+            else memory.client
+        ),
         policy=Policy(**config.get("policy", {})),
         short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
         life_writing=config.get("life_writing"),
@@ -474,11 +483,16 @@ def build_runtime(config):
         writing_options=config.get("writing"),
         proactive_options=config.get("proactive"),
         direct_options=direct_options,
-        web_sender=Sender(contracts, platform_client),
+        web_sender=PlatformBotSender(contracts, platform_client),
         personas=bool(persona_config),
         # The whole deployment document: the persona module owns the rule for where a
         # character is declared, so startup and the maintenance CLI read it identically.
         persona_import=config if persona_config else None,
+    )
+    core.image_backend.credentials = (
+        client("image_credentials", "platform")
+        if "image_credentials" in config.get("services", {})
+        else platform_client
     )
     if bot_binding_management:
         from .bot_bindings import BotBindings
@@ -561,6 +575,7 @@ def create_app(core=None, tokens=None, life_readers=None):
                 readers=mapping,
                 contracts=core.contracts,
             )
+        core.life_runtime.reader = reads
 
     log_port = log_adapter_from_environment()
     set_log_port(log_port)
@@ -600,6 +615,7 @@ def create_app(core=None, tokens=None, life_readers=None):
             if core:
                 await obs.admit(log_port, "runtime.started", "succeeded")
                 core.recover()
+                await core.image_backend.restore()
                 jobs = [
                     loop("core.tick", core.tick, 0.05, _counter(core, "core.tick")),
                     loop("core.outbox", core.flush_outbox, 0.5, _counter(core, "core.outbox")),
@@ -714,6 +730,8 @@ def create_app(core=None, tokens=None, life_readers=None):
             )
             if service is None:
                 raise Fault("unauthorized")
+            if operation.startswith("life-runtime-") and not json_media_type(request.headers):
+                raise Fault("invalid_input")
             content = bytearray()
             async for chunk in request.stream():
                 content.extend(chunk)
@@ -765,6 +783,29 @@ def create_app(core=None, tokens=None, life_readers=None):
                 return core.manage_role(service, body)
             if operation == "life-generation-retry":
                 return core.retry_life_generation(service, body)
+            if operation == "life-runtime-manage":
+                return await core.life_runtime.manage(service, body)
+            if operation == "life-runtime-conversation":
+                return await core.life_runtime.ensure_conversation(service, body)
+            if operation == "life-runtime-control":
+                return core.life_runtime.proactive_control(service, body)
+            if operation == "life-runtime-read":
+                return JSONResponse(
+                    await core.life_runtime.read(service, body),
+                    headers={"Cache-Control": "no-store"},
+                )
+            if operation == "life-runtime-media":
+                data, media = await core.life_runtime.media(service, body)
+                return Response(
+                    data,
+                    media_type=media.get("media_type", "image/png"),
+                    headers={"Cache-Control": "no-store", "X-Content-SHA256": media["sha256"]},
+                )
+            if operation == "life-runtime-content":
+                return JSONResponse(
+                    await core.life_runtime.content(service, body),
+                    headers={"Cache-Control": "no-store"},
+                )
             if operation == "bot-binding-apply":
                 if not hasattr(core, "bot_bindings"):
                     raise Fault("dependency_unavailable")
@@ -849,6 +890,30 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v1/life-generation/retry")
     async def life_generation_retry(request: Request):
         return await dispatch(request, "life-generation-retry")
+
+    @app.post("/internal/v2/life/manage")
+    async def life_runtime_manage(request: Request):
+        return await dispatch(request, "life-runtime-manage")
+
+    @app.post("/internal/v2/life/read")
+    async def life_runtime_read(request: Request):
+        return await dispatch(request, "life-runtime-read")
+
+    @app.post("/internal/v2/life/conversation/ensure")
+    async def life_conversation_ensure(request: Request):
+        return await dispatch(request, "life-runtime-conversation")
+
+    @app.post("/internal/v2/life/proactive/control")
+    async def life_proactive_control(request: Request):
+        return await dispatch(request, "life-runtime-control")
+
+    @app.post("/internal/v2/life/media/read")
+    async def life_runtime_media(request: Request):
+        return await dispatch(request, "life-runtime-media")
+
+    @app.post("/internal/v2/life/content/read")
+    async def life_runtime_content(request: Request):
+        return await dispatch(request, "life-runtime-content")
 
     async def life_read_dispatch(request, operation):
         """The authorized read boundary: authenticate, bound the request, then read.

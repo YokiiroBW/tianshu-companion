@@ -131,6 +131,21 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
                     schema_version=1,
                     request_id=body["query"]["request_id"],
                     effective_scope=scope,
+                    version_domain="memory-context/v1",
+                    association_version=1,
+                    scope_checks=[
+                        dict(
+                            scope=scope, scope_version=1, association_id=None, association_version=1
+                        )
+                    ],
+                    coverage=dict(
+                        matched_groups=0,
+                        returned_groups=0,
+                        complete=True,
+                        time_basis="source_sent_at",
+                        history_complete=False,
+                        missing_source_times=0,
+                    ),
                     scope_version=1,
                     verified_at=utc(h.clock()),
                     valid_until=utc(h.clock() + 3600),
@@ -201,6 +216,19 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
         response = dict(
             schema_version=1,
             effective_scope=scope,
+            version_domain="memory-context/v1",
+            association_version=1,
+            scope_checks=[
+                dict(scope=scope, scope_version=1, association_id=None, association_version=1)
+            ],
+            coverage=dict(
+                matched_groups=0,
+                returned_groups=0,
+                complete=True,
+                time_basis="source_sent_at",
+                history_complete=False,
+                missing_source_times=0,
+            ),
             scope_version=1,
             verified_at=utc(h.clock()),
             valid_until=utc(h.clock() + 3600),
