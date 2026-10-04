@@ -18,7 +18,7 @@ from nonebot.adapters.onebot.v11 import Bot as OneBotBot
 from nonebot.plugin import PluginMetadata
 from pydantic import BaseModel
 
-from .rpc import AdapterService, MAX_REQUEST, PREFIX
+from .rpc import PREFIX, AdapterService, onebot_media, request_limit
 from .sdk import UnsupportedEvent, observation_event, text_event
 
 
@@ -63,13 +63,15 @@ async def _accounts():
     return result
 
 
-async def _send(self_id: str, target: str, text: str):
+async def _send(self_id: str, target: str, text: str, media=None):
     bot = get_bots().get(self_id)
     if not isinstance(bot, OneBotBot):
         raise RuntimeError("SDK offline")
     from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
     message = Message(MessageSegment.text(text))
+    for segment in onebot_media(media or []):
+        message += MessageSegment(segment["type"], segment["data"])
     kind, value = target.split(":", 1)
     if kind == "group":
         response = await bot.send_group_msg(group_id=int(value), message=message)
@@ -81,7 +83,7 @@ async def _send(self_id: str, target: str, text: str):
 
 
 service = AdapterService(
-    settings.tianshu_adapter_data_dir / "adapter.sqlite3", "nonebot", _accounts, _send
+    settings.tianshu_adapter_data_dir / "adapter.sqlite3", "nonebot", _accounts, _send, _send
 )
 semaphore = asyncio.Semaphore(8)
 app = get_asgi()
@@ -89,6 +91,8 @@ _routes = []
 
 
 async def _rpc(request: Request):
+    if not service.authorized(request.headers.get("authorization")):
+        return JSONResponse({"code": "unauthorized", "retryable": False}, status_code=401)
     if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/json":
         return JSONResponse({"code": "invalid_input", "retryable": False}, status_code=400)
     if semaphore.locked():
@@ -98,7 +102,7 @@ async def _rpc(request: Request):
             body = bytearray()
             async for chunk in request.stream():
                 body.extend(chunk)
-                if len(body) > MAX_REQUEST:
+                if len(body) > request_limit(request.url.path):
                     return JSONResponse(
                         {"code": "invalid_input", "retryable": False}, status_code=400
                     )

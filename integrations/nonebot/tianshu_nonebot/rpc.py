@@ -7,6 +7,8 @@ no Companion, AstrBot, NoneBot, or web-framework imports.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -20,10 +22,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-
 PREFIX = "/tianshu/adapter/v1"
 PROTOCOL = "tianshu.bot-adapter/v1"
 MAX_REQUEST = 65536
+MAX_MEDIA_REQUEST = 45 * 1024 * 1024
 # The Platform adapter client reads at most 64 KiB of raw JSON response bytes.
 MAX_RESPONSE = 65536
 MAX_PENDING = 10000
@@ -50,6 +52,81 @@ def _ident(value: Any) -> str:
     if not isinstance(value, str) or not IDENT.fullmatch(value):
         _bad()
     return value
+
+
+def request_limit(path: str) -> int:
+    return (
+        MAX_MEDIA_REQUEST
+        if path in {PREFIX + "/messages/send", PREFIX + "/observation/messages/send"}
+        else MAX_REQUEST
+    )
+
+
+def media_parts(delivery: dict) -> list[dict]:
+    """Already-authorized inline bytes only; never fetch private URLs in a host."""
+    media = delivery.get("media", [])
+    refs = delivery.get("content_refs", [])
+    if not isinstance(media, list) or len(media) > 4 or not isinstance(refs, list):
+        _bad()
+    total = 0
+    for item in media:
+        if not isinstance(item, dict) or set(item) != {
+            "content_ref",
+            "media_type",
+            "encoding",
+            "data",
+            "sha256",
+        }:
+            _bad()
+        ref, mime = item["content_ref"], item["media_type"]
+        if (
+            not isinstance(ref, dict)
+            or ref not in refs
+            or item["encoding"] != "base64"
+            or not isinstance(item["data"], str)
+        ):
+            _bad()
+        if mime not in {
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "audio/wav",
+            "audio/mpeg",
+            "audio/ogg",
+            "video/mp4",
+        }:
+            _bad()
+        kind = mime.split("/", 1)[0]
+        if ref.get("kind") != kind or ref.get("sha256") != item["sha256"]:
+            _bad()
+        try:
+            raw = base64.b64decode(item["data"], validate=True)
+        except (ValueError, binascii.Error):
+            _bad()
+        total += len(raw)
+        if not raw or total > 32 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != item["sha256"]:
+            _bad()
+    if any(
+        isinstance(ref, dict)
+        and ref.get("kind") in {"image", "audio", "video"}
+        and not any(item["content_ref"] == ref for item in media)
+        for ref in refs
+    ):
+        _bad()
+    return media
+
+
+def onebot_media(media: list[dict]) -> list[dict]:
+    """OneBot v11 native image/record/video file segments with exact original bytes."""
+    return [
+        {
+            "type": "record"
+            if item["media_type"].startswith("audio/")
+            else item["media_type"].split("/", 1)[0],
+            "data": {"file": "base64://" + item["data"]},
+        }
+        for item in media
+    ]
 
 
 def _qq(value: Any) -> str:
@@ -83,6 +160,7 @@ class AdapterService:
         adapter: str,
         accounts: Callable[[], Awaitable[list[dict[str, str]]]],
         send: Callable[[str, str, str], Awaitable[str | int]],
+        send_media: Callable[[str, str, str, list[dict]], Awaitable[str | int]] | None = None,
     ):
         if adapter not in {"astrbot", "nonebot"}:
             raise ValueError("adapter")
@@ -162,6 +240,7 @@ class AdapterService:
         # event identity so an old SDK replay can never become a new pending event.
         self.db.execute("UPDATE events SET payload='{}' WHERE acked=1 AND payload<>'{}'")
         self.adapter, self.accounts, self.send = adapter, accounts, send
+        self.send_media = send_media
         self.lock = asyncio.Lock()
 
     def _meta(self, key: str, maker: Callable[[], str]) -> str:
@@ -440,10 +519,15 @@ class AdapterService:
             (int(claimed), account_id, conversation, author, native_id),
         )
 
+    def authorized(self, authorization):
+        return hmac.compare_digest(
+            (authorization or "").encode("utf-8"), ("Bearer " + self.access_key).encode("utf-8")
+        )
+
     async def handle(self, path: str, authorization: str | None, body: bytes) -> tuple[int, dict]:
-        if not hmac.compare_digest(authorization or "", "Bearer " + self.access_key):
+        if not self.authorized(authorization):
             return 401, {"code": "unauthorized", "retryable": False}
-        if len(body) > MAX_REQUEST:
+        if len(body) > request_limit(path):
             return 400, {"code": "invalid_input", "retryable": False}
         try:
             request = json.loads(body)
@@ -788,7 +872,7 @@ class AdapterService:
             type(revision) is not int
             or revision < 1
             or not isinstance(delivery, dict)
-            or set(delivery)
+            or set(delivery) - {"content_refs", "media"}
             != {
                 "reply_id",
                 "attempt_id",
@@ -833,6 +917,7 @@ class AdapterService:
             policy["mode"] == "blacklist" and number not in policy["list"]
         )
         text = delivery.get("text")
+        media = media_parts(delivery)
         if (
             not policy["observe"]
             or not permitted
@@ -852,8 +937,20 @@ class AdapterService:
         self.db.execute(
             "INSERT INTO deliveries VALUES(?,?,?,?,?)", (*key, semantic, _json(receipt))
         )
+        if media and self.send_media is None:
+            receipt["state"] = "failed"
+            self.db.execute(
+                "UPDATE deliveries SET receipt=? WHERE connection_id=? AND reply_id=? AND attempt_id=?",
+                (_json(receipt), *key),
+            )
+            return receipt
         try:
-            native_id = await asyncio.wait_for(self.send(account_id, target, text), 15)
+            action = (
+                self.send_media(account_id, target, text, media)
+                if media
+                else self.send(account_id, target, text)
+            )
+            native_id = await asyncio.wait_for(action, 15)
             if isinstance(native_id, bool) or not isinstance(native_id, (str, int)):
                 raise ValueError("native receipt missing")
             native_id = str(native_id)
@@ -959,6 +1056,7 @@ class AdapterService:
             "channel_message_ids": [],
         }
         text = delivery.get("text")
+        media = media_parts(delivery)
         target = delivery.get("conversation_id")
         valid = (
             delivery.get("namespace") == "qq"
@@ -968,7 +1066,7 @@ class AdapterService:
             and bool(text)
             and len(text.encode("utf-8")) <= 32768
         )
-        if not valid:
+        if not valid or media and self.send_media is None:
             self.db.execute(
                 "INSERT INTO deliveries VALUES(?,?,?,?,?)", (*key, digest, _json(receipt))
             )
@@ -976,7 +1074,12 @@ class AdapterService:
         receipt["state"] = "inflight"
         self.db.execute("INSERT INTO deliveries VALUES(?,?,?,?,?)", (*key, digest, _json(receipt)))
         try:
-            native_id = await asyncio.wait_for(self.send(binding[1], target, text), 15)
+            action = (
+                self.send_media(binding[1], target, text, media)
+                if media
+                else self.send(binding[1], target, text)
+            )
+            native_id = await asyncio.wait_for(action, 15)
             if isinstance(native_id, bool) or not isinstance(native_id, (str, int)):
                 raise ValueError("native receipt missing")
             native_id = str(native_id)

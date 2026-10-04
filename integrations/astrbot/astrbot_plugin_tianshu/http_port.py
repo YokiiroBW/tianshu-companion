@@ -51,9 +51,10 @@ class PlatformHTTP:
 
         # Exceptions and response bodies are never logged: they may contain
         # credentials or user text.
+        limit = 45 * 1024 * 1024 if path == "/internal/v1/bot/replies/claim" else 262144
         with self.opener.open(request, timeout=10) as response:
-            raw = response.read(262145)
-        if len(raw) > 262144:
+            raw = response.read(limit + 1)
+        if len(raw) > limit:
             raise BoundaryError("response_too_large")
         if not raw:
             return {}

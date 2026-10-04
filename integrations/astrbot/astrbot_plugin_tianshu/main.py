@@ -177,7 +177,7 @@ class TianshuPlugin(Star):
             raise BoundaryError("platform_unavailable")
         return client
 
-    async def _send_native(self, conversation: str, text: str) -> str:
+    async def _send_native(self, conversation: str, text: str, media=None) -> str:
         if self._runner is None:
             raise BoundaryError("connector_inactive")
         client = self._client()
@@ -186,6 +186,9 @@ class TianshuPlugin(Star):
         if not target.isascii() or not target.isdecimal() or target.startswith("0"):
             raise BoundaryError("invalid_conversation")
         message = [{"type": "text", "data": {"text": text}}]
+        from .rpc import onebot_media
+
+        message.extend(onebot_media(media or []))
         if kind == "group":
             result = await client.send_group_msg(
                 group_id=int(target), message=message, self_id=settings.self_id

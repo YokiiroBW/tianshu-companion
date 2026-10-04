@@ -1,6 +1,7 @@
 """Real NoneBot 2.5/OneBot 2.4 plugin load and loopback ASGI server."""
 
 import asyncio
+import base64
 import importlib
 import importlib.util
 import os
@@ -229,6 +230,51 @@ class NoneBotHostTests(unittest.TestCase):
                             receipt,
                         )
                         self.assertEqual(len(sent), 1)
+                        from adapter_media_fixture import original_png
+
+                        raw, reference, media = original_png()
+                        self.assertGreater(len(raw), 2 * 1024 * 1024)
+                        attachment = {
+                            **delivery,
+                            "reply_id": "original-png",
+                            "attempt_id": "original-png",
+                            "content_refs": [reference],
+                            "media": [media],
+                        }
+                        response = await post(
+                            "/messages/send", {"connection_id": "c1", "delivery": attachment}
+                        )
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(response.json()["state"], "sent")
+                        image = next(part for part in sent[-1]["message"] if part.type == "image")
+                        self.assertEqual(
+                            base64.b64decode(image.data["file"].removeprefix("base64://")), raw
+                        )
+                        self.assertEqual(
+                            (
+                                await post(
+                                    "/messages/send",
+                                    {"connection_id": "c1", "delivery": attachment},
+                                )
+                            ).json(),
+                            response.json(),
+                        )
+                        self.assertEqual(len(sent), 2)
+                        missing = {
+                            **attachment,
+                            "reply_id": "missing-original",
+                            "attempt_id": "missing-original",
+                            "media": [],
+                        }
+                        self.assertEqual(
+                            (
+                                await post(
+                                    "/messages/send", {"connection_id": "c1", "delivery": missing}
+                                )
+                            ).status_code,
+                            400,
+                        )
+                        self.assertEqual(len(sent), 2)
                         failed_calls = []
 
                         async def uncertain_send(**kwargs):

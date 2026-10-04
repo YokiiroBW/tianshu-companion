@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
+from .rpc import RpcError, media_parts
 
 EVENT_ROUTE = "/internal/v1/bot/events"
 EVENT_STATUS_ROUTE = "/internal/v1/bot/events/status"
@@ -89,9 +90,14 @@ def _qq_id(value: Any) -> str:
 def _display(value: Any) -> str | None:
     if type(value) is not str:
         return None
-    text = "".join(c for c in value if ord(c) >= 32 and ord(c) != 127
-                   and not 0x202A <= ord(c) <= 0x202E
-                   and not 0x2066 <= ord(c) <= 0x2069).strip()[:80]
+    text = "".join(
+        c
+        for c in value
+        if ord(c) >= 32
+        and ord(c) != 127
+        and not 0x202A <= ord(c) <= 0x202E
+        and not 0x2066 <= ord(c) <= 0x2069
+    ).strip()[:80]
     return text or None
 
 
@@ -213,7 +219,12 @@ def normalize_event(event: Any, settings: Settings) -> dict[str, Any] | None:
         raw_group = _qq_id(raw.get("group_id")) if kind == "group" else ""
     except BoundaryError:
         return None
-    if self_id != settings.self_id or raw_self != self_id or account == self_id or raw_account != account:
+    if (
+        self_id != settings.self_id
+        or raw_self != self_id
+        or account == self_id
+        or raw_account != account
+    ):
         return None
     if kind == "group" and raw_group != group:
         return None
@@ -603,8 +614,9 @@ class Runner:
                 or not text
             ):
                 raise BoundaryError("delivery_scope_invalid")
+            media = media_parts(delivery)
             encoded_bytes = len(text.encode("utf-8"))
-        except (BoundaryError, UnicodeError):
+        except (BoundaryError, UnicodeError, RpcError):
             self.report("delivery_scope_invalid")
         else:
             if encoded_bytes > MAX_OUTBOUND_TEXT_BYTES:
@@ -614,9 +626,12 @@ class Runner:
                 self.report("delivery_text_over_limit")
             else:
                 try:
-                    native_id = await asyncio.wait_for(
-                        self.send_native(conversation, text), timeout=15
+                    action = (
+                        self.send_native(conversation, text, media)
+                        if media
+                        else self.send_native(conversation, text)
                     )
+                    native_id = await asyncio.wait_for(action, timeout=15)
                     ids = [_message_id(native_id)]
                     state = "sent"
                 except Exception:

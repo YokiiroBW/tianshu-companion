@@ -16,8 +16,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from .rpc import AdapterService, PREFIX, _json
-
+from .rpc import PREFIX, AdapterService, _json, onebot_media, request_limit
 
 PRIVATE_NETWORKS = tuple(
     ipaddress.ip_network(value)
@@ -88,7 +87,7 @@ class AstrAdapter:
         self.context = context
         self.port = port
         self.service = AdapterService(
-            data_dir / "adapter.sqlite3", "astrbot", self.accounts, self.send
+            data_dir / "adapter.sqlite3", "astrbot", self.accounts, self.send, self.send
         )
         self.runner = None
         self.semaphore = asyncio.Semaphore(8)
@@ -151,7 +150,7 @@ class AstrAdapter:
             )
         return result
 
-    async def send(self, self_id: str, target: str, text: str):
+    async def send(self, self_id: str, target: str, text: str, media=None):
         client = self._client(self_id)
         if client is None:
             raise RuntimeError("SDK offline")
@@ -160,6 +159,7 @@ class AstrAdapter:
         kind, value = target.split(":", 1)
         value = _qq_id(value)
         message = [{"type": "text", "data": {"text": text}}]
+        message.extend(onebot_media(media or []))
         if kind == "group":
             response = await client.send_group_msg(
                 group_id=int(value), message=message, self_id=self_id
@@ -282,7 +282,7 @@ class AstrAdapter:
     async def start(self):
         if self.runner is not None:
             return
-        app = web.Application(client_max_size=65536)
+        app = web.Application(client_max_size=45 * 1024 * 1024)
         app.router.add_post(PREFIX + "/{tail:.*}", self._http)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
@@ -296,15 +296,25 @@ class AstrAdapter:
     async def _http(self, request):
         if not _private_address(request.remote):
             return web.json_response({"code": "forbidden", "retryable": False}, status=403)
+        if not self.service.authorized(request.headers.get("Authorization")):
+            return web.json_response({"code": "unauthorized", "retryable": False}, status=401)
         if request.content_type != "application/json":
             return web.json_response({"code": "invalid_input", "retryable": False}, status=400)
         if self.semaphore.locked():
             return web.json_response({"code": "busy", "retryable": True}, status=429)
         async with self.semaphore:
             try:
-                body = await request.read()
+                body = bytearray()
+                async for chunk in request.content.iter_chunked(65536):
+                    body.extend(chunk)
+                    if len(body) > request_limit(request.path):
+                        return web.json_response(
+                            {"code": "invalid_input", "retryable": False}, status=400
+                        )
                 status, payload = await asyncio.wait_for(
-                    self.service.handle(request.path, request.headers.get("Authorization"), body),
+                    self.service.handle(
+                        request.path, request.headers.get("Authorization"), bytes(body)
+                    ),
                     20,
                 )
             except web.HTTPRequestEntityTooLarge:

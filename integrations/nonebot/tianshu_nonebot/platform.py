@@ -50,7 +50,8 @@ class PlatformPort:
             response = await self.client.post(self.base_url + path, json=body)
         except (httpx.HTTPError, TimeoutError) as error:
             raise PlatformError() from error
-        if response.status_code != 200 or len(response.content) > 1_000_000:
+        limit = 45 * 1024 * 1024 if path == "/internal/v1/bot/replies/claim" else 1_000_000
+        if response.status_code != 200 or len(response.content) > limit:
             raise PlatformError(response.status_code)
         try:
             value = response.json()

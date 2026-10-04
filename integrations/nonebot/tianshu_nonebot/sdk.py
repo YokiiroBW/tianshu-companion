@@ -1,8 +1,8 @@
 """The verified OneBot v11 SDK boundary. No raw event upload or synthetic sender lives here."""
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import re
 
 
 class UnsupportedEvent(ValueError):
@@ -160,6 +160,8 @@ async def send_text(bot, delivery: dict) -> list[str]:
     """Use the connected OneBot Bot and accept only a real SDK message_id."""
     from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
+    from .rpc import RpcError, media_parts, onebot_media
+
     if delivery.get("namespace") != "qq" or delivery.get("thread_id") is not None:
         raise UnsupportedEvent("The delivery is not a OneBot v11 text destination")
     text = delivery.get("text")
@@ -167,6 +169,12 @@ async def send_text(bot, delivery: dict) -> list[str]:
         raise UnsupportedEvent("The delivery is not text")
     target = delivery.get("conversation_id", "")
     message = Message(MessageSegment.text(text))
+    try:
+        media = media_parts(delivery)
+    except RpcError:
+        raise UnsupportedEvent("Invalid inline media") from None
+    for segment in onebot_media(media):
+        message += MessageSegment(segment["type"], segment["data"])
     if type(target) is str and target.startswith("group:"):
         result = await bot.send_group_msg(group_id=int(qq_id(target[6:])), message=message)
     elif type(target) is str and target.startswith("private:"):
