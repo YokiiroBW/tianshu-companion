@@ -67,12 +67,25 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         )
         try:
             gateway = Gateway(h.contracts, client)
-            turn = dict(id="turn:synthetic", config_version=7)
+            turn = dict(
+                id="turn:synthetic",
+                config_version=7,
+                conversation_id="conversation:synthetic",
+                scope={"actor_id": "actor:synthetic"},
+            )
             messages = [dict(role="user", content="Hello")]
             segments, route = await gateway.generate(turn, messages)
             self.assertEqual(["合成网关回复"], segments)
             self.assertIsNone(route["usage"])
             self.assertEqual(2, len(requests))
+            session = requests[0].headers["X-Tianshu-Provider-Session"]
+            self.assertNotIn("actor:synthetic", session)
+            await gateway.generate({**turn, "id": "turn:next"}, messages)
+            self.assertEqual(requests[2].headers["X-Tianshu-Provider-Session"], session)
+            await gateway.generate({**turn, "conversation_id": "conversation:other"}, messages)
+            self.assertNotEqual(requests[4].headers["X-Tianshu-Provider-Session"], session)
+            await gateway.generate({**turn, "scope": {"actor_id": "actor:other"}}, messages)
+            self.assertNotEqual(requests[6].headers["X-Tianshu-Provider-Session"], session)
             receipt_override["config_version"] = 8
             with self.assertRaises(Fault):
                 await gateway.generate(turn, messages)

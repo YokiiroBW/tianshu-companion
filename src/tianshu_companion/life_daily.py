@@ -420,6 +420,8 @@ class DailyLife:
                             {
                                 "id": task["generation_turn_id"],
                                 "config_version": task["config_version"],
+                                "actor_id": task["actor_id"],
+                                "conversation_id": "life:" + digest(task["actor_id"]),
                             },
                             self._messages(task, actor, plan),
                         ),

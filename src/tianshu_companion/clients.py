@@ -453,6 +453,15 @@ class Gateway:
             "X-Tianshu-Workload": "companion.text",
             "X-Tianshu-Turn-ID": turn["id"],
         }
+        scope = turn.get("scope") or {}
+        role = turn.get("role") or {}
+        actor = scope.get("actor_id") or role.get("actor_id") or turn.get("actor_id")
+        conversation = turn.get("conversation_id") or scope.get("conversation_id")
+        if actor and conversation:
+            # Stable routing metadata across turns, independent of execution authorization.
+            headers["X-Tianshu-Provider-Session"] = digest(
+                ["provider-session", actor, conversation]
+            )
         # Model is intentionally absent: only the gateway's published workload binding selects it.
         body = dict(messages=messages, stream=False)
         self.contracts.check("model#native_request", body)

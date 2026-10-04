@@ -846,6 +846,8 @@ class Writing:
                             dict(
                                 id="chapter:" + request["id"],
                                 config_version=basis["config_version"],
+                                actor_id=work["actor_id"],
+                                conversation_id="writing:" + digest(work["id"]),
                             ),
                             messages,
                         ),

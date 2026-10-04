@@ -720,7 +720,12 @@ class Life:
                 async with self.model_slots:
                     output, receipt = await asyncio.wait_for(
                         self.gateway.generate(
-                            dict(id="diary:" + item["id"], config_version=item["config_version"]),
+                            dict(
+                                id="diary:" + item["id"],
+                                config_version=item["config_version"],
+                                actor_id=item["conversation_id"],
+                                conversation_id="diary:" + digest(item["conversation_id"]),
+                            ),
                             messages,
                         ),
                         60,
