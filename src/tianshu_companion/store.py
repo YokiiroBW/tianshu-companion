@@ -25,6 +25,18 @@ LIFE_TABLES = {
 
 IMAGE_TABLES = {"image_outfits", "image_jobs"}
 
+RUNTIME_TABLES = {
+    "life_activities",
+    "life_concerns",
+    "life_affect",
+    "life_album",
+    "image_media",
+    "delivery_contacts",
+    "proactive_motives",
+    "life_reading",
+    "life_content_refs",
+}
+
 WRITING_TABLES = {
     "write_works",
     "write_chapters",
@@ -75,6 +87,7 @@ TABLES = (
     | PROACTIVE_TABLES
     | DIRECT_TABLES
     | PERSONA_TABLES
+    | RUNTIME_TABLES
     | {
         "conversations",
         "collections",
@@ -123,7 +136,7 @@ class Store:
 
     def _initialize(self, path):
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
             raise RuntimeError("Unsupported database schema version")
         # Backup the complete SQLite view (including WAL) before structural migration.
         # A unique file never overwrites earlier recovery evidence.
@@ -136,17 +149,8 @@ class Store:
         # so no intermediate step can start without a restore point. An intermediate restore
         # point requires upgrading one step at a time.
         backed_up = False
-        if 1 <= version <= 8 and str(path) != ":memory:":
-            label = {
-                1: ".pre-source-v2-",
-                2: ".pre-life-v3-",
-                3: ".pre-images-v4-",
-                4: ".pre-writing-v5-",
-                5: ".pre-proactive-v6-",
-                6: ".pre-routing-v7-",
-                7: ".pre-persona-v8-",
-                8: ".pre-persona-ops-v9-",
-            }[version]
+        if 1 <= version <= 9 and str(path) != ":memory:":
+            label = ".pre-life-runtime-v10-"
             backup = sqlite3.connect(str(path) + label + uuid.uuid4().hex + ".bak")
             try:
                 self.db.backup(backup)
@@ -171,6 +175,7 @@ class Store:
             - PROACTIVE_TABLES
             - DIRECT_TABLES
             - PERSONA_TABLES
+            - RUNTIME_TABLES
         ):
             self.db.execute(
                 f"CREATE TABLE IF NOT EXISTS {table} ("
@@ -223,6 +228,7 @@ class Store:
                 | PROACTIVE_TABLES
                 | DIRECT_TABLES
                 | PERSONA_TABLES
+                | RUNTIME_TABLES
             ):
                 self.db.execute(
                     f"CREATE TABLE IF NOT EXISTS {table} ("
@@ -305,7 +311,11 @@ class Store:
             # the initialization transaction, so a request path can never alter the schema.
             create_page_index(self.db)
             work_index.create(self.db)
-            self.db.execute("PRAGMA user_version=9")
+            for table in sorted(RUNTIME_TABLES):
+                self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS {table}_page ON {table}(conversation_id,id)"
+                )
+            self.db.execute("PRAGMA user_version=10")
 
     @contextmanager
     def transaction(self):

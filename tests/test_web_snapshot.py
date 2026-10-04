@@ -33,6 +33,7 @@ class WebHarness(Harness):
                 policy_version=1,
             ),
         )
+        self.options["bindings"]["web-self"] = copy.deepcopy(self.core.bindings["web-self"])
 
     def web_request(self, **kwargs):
         value = self.request(**kwargs)

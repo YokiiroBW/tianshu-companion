@@ -24,10 +24,10 @@ class SourceBridgeTests(unittest.IsolatedAsyncioTestCase):
         original_select = h.memory.select
         mapping = {}
 
-        async def select(origin, scope, text, budget, known=None):
+        async def select(origin, scope, text, budget, known_version=None, **kwargs):
             if not mapping:
                 raise Fault("dependency_unavailable")
-            return await original_select(origin, scope, text, budget, known)
+            return await original_select(origin, scope, text, budget, known_version, **kwargs)
 
         h.memory.select = select
 

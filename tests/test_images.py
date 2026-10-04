@@ -423,8 +423,8 @@ def test_v3_migration_backup_rollback_and_source_preservation(tmp_path):
         db.commit()
     with closing(Store(path)) as store:
         assert store.source_head() == head
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
-    assert len(list(tmp_path.glob("*.pre-images-v4-*.bak"))) == 2  # attempt and retry
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert len(list(tmp_path.glob("*.pre-life-runtime-v10-*.bak"))) == 2  # attempt and retry
     # Both attempts started below v7, so the persona step is crossed inside those same
     # migrations: a multi-version jump takes one recovery backup, at the highest structural
     # step, and never a second one for an earlier step in the same run.

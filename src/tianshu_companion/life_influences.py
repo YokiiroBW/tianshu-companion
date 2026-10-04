@@ -2,7 +2,7 @@
 
 The model extracts open-ended personal intentions from current, authorized input. Raw
 dialogue is read only for that extraction and never becomes an event, plan or diary source.
-Small keyword interests remain a fallback while independent life generation is unavailable.
+Unavailable generation leaves the source queued/unavailable; it invents no keyword interests.
 """
 
 import asyncio
@@ -13,16 +13,6 @@ from .contracts import Fault, canonical, digest, strict_json
 from .life import text, zone
 from .short_context import message_current
 
-TOPICS = {
-    "reading": ("阅读", "看书", "读书", "小说", "reading", "book"),
-    "music": ("音乐", "唱歌", "钢琴", "吉他", "music", "song"),
-    "cooking": ("烹饪", "做饭", "菜谱", "料理", "cooking", "recipe"),
-    "gardening": ("园艺", "种花", "花园", "gardening", "garden"),
-    "drawing": ("画画", "绘画", "素描", "drawing", "painting"),
-    "exercise": ("运动", "散步", "锻炼", "exercise", "walk"),
-    "writing": ("写作", "写诗", "writing", "poem"),
-    "reflection": ("烦恼", "难过", "开心", "心情", "reflection", "feeling"),
-}
 PREFIX = "life-influence:"
 WORK_SCOPE = "life:influence-generation"
 
@@ -44,8 +34,6 @@ class LifeInfluences:
             return old
         world = self.life._get("worlds", actor["world_id"])
         day = str(datetime.fromtimestamp(self.life.clock(), zone(world["timezone"])).date())
-        prose = " ".join(p["text"] for p in message["parts"] if p["kind"] == "text").lower()
-        topics = [topic for topic, keywords in TOPICS.items() if any(k in prose for k in keywords)]
         channel = source["message_key"]["channel"]
         source_base = digest(
             {"channel": channel, "message_id": source["message_key"]["message_id"]}
@@ -62,7 +50,7 @@ class LifeInfluences:
             "input_id": digest([source["message_key"], actor_id]),
             "scope": scope,
             "day": day,
-            "topics": topics,
+            "topics": [],
             "active": True,
             "created_at": self.life.clock(),
         }
@@ -97,8 +85,7 @@ class LifeInfluences:
         intentions = list(
             dict.fromkeys(intent for item in active for intent in item.get("intentions", []))
         )[:8]
-        topics = sorted({topic for item in active for topic in item["topics"]})
-        topics = intentions + [topic for topic in topics if topic not in intentions]
+        topics = intentions
         if actor.get("life_interest_day") == day and actor.get("life_interests", []) == topics:
             return
         actor.update(

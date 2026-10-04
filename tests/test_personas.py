@@ -1017,13 +1017,13 @@ def test_v7_database_migrates_to_v9_with_backup_and_failed_migration_recovery(tm
         db.commit()
     with closing(Store(path)) as store:
         assert store.source_head() == head
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 10
         assert store.get("conversations", "synthetic")["private"] == "synthetic preserved"
         assert store.list("persona_personas") == []
         assert store.list("persona_operations") == []
     # One backup per open, labelled with the version the process started from: this file was
     # at v7, so the persona step is the label even though the open also applies the v9 step.
-    backups = sorted(tmp_path.glob("*.pre-persona-v8-*.bak"))
+    backups = sorted(tmp_path.glob("*.pre-life-runtime-v10-*.bak"))
     assert len(backups) == 2
     for backup in backups:
         with closing(sqlite3.connect(backup)) as db:
@@ -1058,7 +1058,7 @@ def test_import_on_a_migrated_legacy_database_registers_the_deployed_roles(tmp_p
 
     asyncio.run(scenario())
     with closing(Store(path)) as store:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 10
         assert len(store.list("persona_personas")) == 2
 
 

@@ -287,6 +287,7 @@ class Direct:
             raise ValueError("A host authority guard is required")
         self.store, self.clock, self.guard = store, clock, guard
         self.adapter, self.delivery_port = adapter, deliver
+        self.delivery_v2 = None
         # The injected runtime-event port. Routing, authorization, single execution and the
         # single reply owner are all decided above and are not restated here; this port only
         # records what the durable rows already say, and its failure changes no verdict.
@@ -939,8 +940,8 @@ class Direct:
         return self.adapter is not None and bool(getattr(self.adapter, "available", False))
 
     def _deliver_available(self):
-        return self.delivery_port is not None and bool(
-            getattr(self.delivery_port, "available", False)
+        return bool(self.delivery_v2 and self.delivery_v2.available) or (
+            self.delivery_port is not None and bool(getattr(self.delivery_port, "available", False))
         )
 
     # --------------------------------------------------------------- authorization
@@ -1090,6 +1091,15 @@ class Direct:
                 await self.dispatch(row[0])
             for request_id in self._deliverable():
                 await self.deliver(request_id)
+            if self.delivery_v2:
+                rows = self.store.db.execute(
+                    "SELECT body FROM direct_requests WHERE json_extract(body,'$.reply_state') IN ('queued','sending','unknown') AND json_extract(body,'$.delivery_v2') IS NOT NULL ORDER BY position,id LIMIT 4"
+                ).fetchall()
+                for row in rows:
+                    try:
+                        await self.delivery_v2.reconcile_direct(json.loads(row[0]))
+                    except (Fault, OSError):
+                        pass
 
     def _deliverable(self):
         rows = self.store.db.execute(
@@ -1438,6 +1448,9 @@ class Direct:
         """One delivery intent per request; an `unknown` outcome is never resent."""
         if not self._deliver_available():
             return self.request_view(request_id)
+        current = self.store.get("direct_requests", request_id)
+        if self.delivery_v2 and current and self.delivery_v2.direct_available(current):
+            return await self.delivery_v2.deliver_direct(request_id)
         with self.store.transaction():
             request = self.store.get("direct_requests", request_id)
             if request is None or request["reply_state"] != "ready_to_deliver":
@@ -1666,7 +1679,12 @@ class Direct:
                 raise KeyError(request_id)
             if expected is not None and request["version"] != expected:
                 raise ValueError("Stale version")
-            if request["state"] in SETTLED:
+            native_pending = (
+                self.delivery_v2
+                and request.get("delivery_v2")
+                and request["reply_state"] in {"queued", "sending", "submitting", "unknown"}
+            )
+            if request["state"] in SETTLED and not native_pending:
                 raise ValueError("Request is already settled")
             if request["state"] == "pending":
                 self._settle_request(request, "cancelled", reason=reason)

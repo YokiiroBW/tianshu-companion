@@ -1,38 +1,4 @@
-"""Core-owned proactive contact: explicit subscriptions, goals, reminders, scheduling.
-
-Trusted in-process port. No HTTP route, no new cross-product contract, no Memory
-database access, no other product's database. The host authenticates the caller before
-calling any mutation or admin method here; a model reply or an ordinary chat message can
-never register a subscription, a goal or a reminder.
-
-Scope of the schedule
----------------------
-Only explicitly registered reminders and character goals become candidates. Nothing is
-inferred from chat text, profile fields, health data or guessed real-world experience.
-Every decision is one of: defer, suppress, expire, cancel or ready, decided by the
-actor, the recipient, the conversation permission, the subscription timezone's quiet
-window, cooldown, the daily quota, unanswered-contact suppression and the due time.
-
-Every state change happens in one owner transaction, so a quota slot is checked and
-consumed atomically with the submit intent, and a restarted process reconstructs every
-pending decision from absolute UTC timestamps plus the registered timezone. Cross-midnight
-windows and clock adjustments are therefore recomputed, never guessed from a stored local
-time.
-
-Delivery gap (recorded, not papered over)
------------------------------------------
-The published `text-dialogue/v1` release has exactly one outbound document,
-`conversation#send_request`, and it is keyed by `turn_id`/`turn_sequence`/`reply_id` of a
-turn that already exists. A turn only exists after a real inbound collection was sealed,
-so Core cannot use that document for a contact the user never prompted without forging
-inbound input or source proof - both forbidden by this task. This module therefore owns
-the schedule, the candidate and the delivery attempt, and calls an injected `dispatcher`
-port. With no dispatcher (today's production default) candidates stay `ready` and are
-reported with an explicit contract gap; nothing is ever reported as delivered. A
-dispatcher that declares `adapter="synthetic"` may settle an attempt as `sent`, and the
-candidate still reports `delivered=False` with
-`delivery_evidence="synthetic_adapter_receipt"`.
-"""
+"""Source-backed opportunities, independent expression and actual shared delivery receipts."""
 
 import asyncio
 import json
@@ -43,14 +9,16 @@ from .clients import uid, utc
 from .contracts import Fault, digest
 from .life import expected_version, text, timestamp, zone
 
-KINDS = {"reminder", "goal"}
+KINDS = {"reminder", "goal", "motive"}
 SUBJECT_STATES = {"active", "paused", "completed", "cancelled", "expired"}
 CANDIDATE_STATES = {
     "pending",
     "deferred",
     "suppressed",
     "ready",
+    "queued",
     "sending",
+    "partial",
     "sent",
     "failed",
     "unknown",
@@ -61,7 +29,16 @@ OPEN_CANDIDATE = {"pending", "deferred", "suppressed", "ready"}
 SETTLED_CANDIDATE = {"sent", "failed", "unknown", "expired", "cancelled"}
 # Explicit retry is the only path back to dispatch after one of these.
 RETRYABLE_CANDIDATE = {"failed", "unknown"}
-ATTEMPT_STATES = {"submitted", "sent", "failed", "unknown"}
+ATTEMPT_STATES = {
+    "submitted",
+    "queued",
+    "sending",
+    "partial",
+    "sent",
+    "failed",
+    "unknown",
+    "cancelled",
+}
 # Only an adapter that speaks a published, per-product delivery contract may report a
 # verified delivery. Anything else is recorded but never called delivered.
 ADAPTERS = {"contract", "synthetic", "unknown"}
@@ -150,6 +127,7 @@ class Proactive:
         guard,
         *,
         dispatcher=None,
+        expression=None,
         timeout=20,
         max_subjects=200,
         max_candidates=500,
@@ -160,6 +138,7 @@ class Proactive:
             raise ValueError("A host authority guard is required")
         self.store, self.clock, self.guard = store, clock, guard
         self.dispatcher = dispatcher
+        self.expression = expression
         for name, value, ceiling in (
             ("timeout", timeout, 600),
             ("max_subjects", max_subjects, 2000),
@@ -194,7 +173,8 @@ class Proactive:
     def _subject(self, kind, subject_id):
         assert kind in KINDS
         return self.store.get(
-            "proactive_" + ("goals" if kind == "goal" else "reminders"), subject_id
+            "proactive_" + {"goal": "goals", "reminder": "reminders", "motive": "motives"}[kind],
+            subject_id,
         )
 
     # ------------------------------------------------------------------ templates
@@ -545,7 +525,44 @@ class Proactive:
         return self.reminder_metadata(reminder_id)
 
     def _save_subject(self, kind, item, expected=None):
-        return self._save("goals" if kind == "goal" else "reminders", item, expected)
+        return self._save(
+            {"goal": "goals", "reminder": "reminders", "motive": "motives"}[kind], item, expected
+        )
+
+    def register_motive(self, actor_id, value, *, expected=0):
+        from .life_work import require_version, source_refs
+
+        subscription = self._get("subscriptions", value["subscription_id"])
+        if subscription["actor_id"] != actor_id or subscription["state"] != "active":
+            raise Fault("not_found")
+        source_refs(value["sources"])
+        if not value["sources"] and not value["content_refs"]:
+            raise Fault("invalid_input")
+        text(value["summary"], 4000)
+        timestamp(value["due_at"])
+        timestamp(value["expires_at"])
+        if value["expires_at"] <= value["due_at"] or not 0.1 <= value["weight"] <= 3:
+            raise Fault("invalid_input")
+        with self.store.transaction():
+            current = self.store.get("proactive_motives", value["id"])
+            if current and current["actor_id"] != actor_id:
+                raise Fault("not_found")
+            require_version(current, expected)
+            item = dict(
+                value,
+                actor_id=actor_id,
+                conversation_id=subscription["conversation_id"],
+                state="active",
+                deadline=value["due_at"],
+                blocked_reason=None,
+                created_at=(current or {}).get("created_at", self.clock()),
+                runtime_epoch=(self.store.get("life_actors", actor_id) or {}).get(
+                    "life_runtime_epoch", 0
+                ),
+            )
+            self._save("motives", item)
+        self.tick(force=True)
+        return item
 
     def cancel_subject(self, kind, subject_id, *, reason, expected=None):
         """Stop a goal or reminder. Pending candidates for it are cancelled by the tick."""
@@ -705,6 +722,13 @@ class Proactive:
             return "cancelled", None, "subject_changed"
         if now >= candidate["expires_at"]:
             return "expired", None, "due_window_passed"
+        if getattr(self.dispatcher, "native_delivery", False):
+            conversation = self.store.db.execute(
+                "SELECT 1 FROM turns WHERE conversation_id=? AND status NOT IN ('sent','failed','cancelled','observed','closed_unknown') LIMIT 1",
+                (candidate["conversation_id"],),
+            ).fetchone()
+            if conversation:
+                return "deferred", min(now + 30, candidate["expires_at"]), "conversation_active"
         local = self._local(subscription, now)
         minute = local.hour * 60 + local.minute
         quiet = subscription["quiet"]
@@ -821,7 +845,11 @@ class Proactive:
 
     def _materialize(self, now):
         """Create one durable candidate per due occurrence; never a duplicate one."""
-        for table, kind in (("proactive_goals", "goal"), ("proactive_reminders", "reminder")):
+        for table, kind in (
+            ("proactive_goals", "goal"),
+            ("proactive_reminders", "reminder"),
+            ("proactive_motives", "motive"),
+        ):
             for subject_id in self._due_subjects(table, kind, now):
                 subject = self._subject(kind, subject_id)
                 if subject is None:
@@ -848,12 +876,17 @@ class Proactive:
         if seen is not None:
             # An occurrence is dispatched at most once; only explicit retry reopens one.
             return None
-        template = self._template(subject["template_id"], subject["template_version"])
-        values = self._values(subscription, subject["summary"], occurrence)
-        content = self._render(template, values)
-        content_version = digest(
-            [template["template_id"], template["template_version"], values, content]
-        )
+        if kind == "motive":
+            template = {"template_id": None, "template_version": None}
+            content = ""
+            content_version = digest([subject["id"], subject["version"]])
+        else:
+            template = self._template(subject["template_id"], subject["template_version"])
+            values = self._values(subscription, subject["summary"], occurrence)
+            content = self._render(template, values)
+            content_version = digest(
+                [template["template_id"], template["template_version"], values, content]
+            )
         candidate_id = digest(
             [kind, subject["id"], occurrence, subject["version"], subscription["config_version"]]
         )
@@ -877,7 +910,10 @@ class Proactive:
                 audience=subscription["audience"],
                 channel=subscription["channel"],
                 due_at=occurrence,
-                expires_at=occurrence + subscription["expiry_seconds"],
+                expires_at=min(
+                    occurrence + subscription["expiry_seconds"],
+                    subject.get("expires_at", float("inf")),
+                ),
                 defer_until=None,
                 decision=None,
                 template_id=template["template_id"],
@@ -898,6 +934,19 @@ class Proactive:
                 real_user_sources="excluded",
                 version=1,
                 sequence=1,
+                summary=subject["summary"],
+                sources=subject.get("sources")
+                or [dict(owner="companion", object_id=subject["id"], version=subject["version"])],
+                runtime_epoch=subject.get(
+                    "runtime_epoch",
+                    (self.store.get("life_actors", subscription["actor_id"]) or {}).get(
+                        "life_runtime_epoch", 0
+                    ),
+                ),
+                content_refs=subject.get("content_refs", []),
+                weight=subject.get("weight", 1.0),
+                expression_state="pending" if kind == "motive" else "completed",
+                expression_attempts=0,
             ),
         )
         self._prune(kind, subject["id"])
@@ -963,7 +1012,8 @@ class Proactive:
         if (
             result.get("request_id") != request["request_id"]
             or result.get("attempt_id") != request["attempt_id"]
-            or result.get("state") not in {"sent", "failed", "unknown"}
+            or result.get("state")
+            not in {"queued", "sending", "partial", "sent", "failed", "unknown", "cancelled"}
             or result.get("adapter") not in ADAPTERS
         ):
             raise Fault("invalid_input")
@@ -972,7 +1022,7 @@ class Proactive:
             raise Fault("invalid_input")
         if result["state"] == "sent" and not ids:
             raise Fault("invalid_input")
-        if result["state"] != "sent" and ids:
+        if result["state"] not in {"sent", "partial", "sending", "unknown"} and ids:
             raise Fault("invalid_input")
 
     @staticmethod
@@ -992,15 +1042,63 @@ class Proactive:
         if self.lock.locked():
             return
         async with self.lock:
+            if getattr(self.dispatcher, "native_delivery", False):
+                self.dispatcher.offer_pending_events()
+                self.dispatcher.feedback_for_contacts()
             self.tick(force=True)
+            if getattr(self.dispatcher, "native_delivery", False):
+                rows = self.store.db.execute(
+                    "SELECT body FROM proactive_attempts WHERE (status IN ('queued','sending','unknown') OR (status='partial' AND json_extract(body,'$.unresolved')=1)) AND json_extract(body,'$.delivery') IS NOT NULL ORDER BY position,id LIMIT 4"
+                ).fetchall()
+                for row in rows:
+                    attempt = json.loads(row[0])
+                    try:
+                        result = await self.dispatcher.reconcile_proactive(attempt)
+                        if result:
+                            self.settle(attempt["id"], result)
+                    except (Fault, OSError):
+                        pass
             if not self._dispatcher_available():
                 return
             row = self.store.db.execute(
                 "SELECT id FROM proactive_candidates WHERE status='ready' "
-                "ORDER BY deadline,position,id LIMIT 1"
+                "ORDER BY json_extract(body,'$.weight') DESC,deadline,position,id LIMIT 1"
             ).fetchone()
             if row is None:
                 return
+            candidate = self.store.get("proactive_candidates", row[0])
+            if candidate["kind"] == "motive" and candidate.get("expression_state") != "completed":
+                if self.expression is None:
+                    return
+                candidate.update(
+                    expression_state="generating",
+                    expression_attempts=candidate["expression_attempts"] + 1,
+                )
+                self._save("candidates", candidate)
+                try:
+                    content, receipt = await self.expression(candidate)
+                except Exception:
+                    candidate.update(
+                        expression_state="unknown", state="unknown", decision="expression_unknown"
+                    )
+                    self._save("candidates", candidate)
+                    return
+                fresh = self.store.get("proactive_candidates", candidate["id"])
+                if (
+                    fresh["state"] != "ready"
+                    or fresh["subject_version"] != candidate["subject_version"]
+                ):
+                    return
+                if content is None:
+                    self._apply(fresh, "cancelled", None, "expression_declined", self.clock())
+                    return
+                fresh.update(
+                    content=text(content, 4000),
+                    content_version=digest([content, receipt]),
+                    expression_state="completed",
+                    expression_receipt=receipt,
+                )
+                self._save("candidates", fresh)
             await self.dispatch(row[0])
 
     async def dispatch(self, candidate_id):
@@ -1083,11 +1181,8 @@ class Proactive:
             )
             # The submit intent lands before the transport call: from here on a crash is
             # an unknown outcome and is never retried automatically.
-            self._consume_quota(subscription, now)
-            subscription.update(
-                last_contact_at=now, unanswered_count=subscription["unanswered_count"] + 1
-            )
-            self._save("subscriptions", subscription)
+            if not getattr(self.dispatcher, "native_delivery", False):
+                self._consume_quota(subscription, now)
             candidate.update(
                 state="sending",
                 attempt=request_id,
@@ -1100,12 +1195,21 @@ class Proactive:
         try:
             result = await asyncio.wait_for(self.dispatcher.dispatch(request), timeout=self.timeout)
             self._check_result(request, result)
-        except Exception:
+        except Exception as exc:
+            attempt = self.store.get("proactive_attempts", request_id)
+            # Source/permission checks precede the persisted native envelope. Only
+            # crossing that boundary makes the actual send outcome uncertain.
+            known_rejection = (
+                getattr(self.dispatcher, "native_delivery", False)
+                and isinstance(exc, Fault)
+                and not exc.unknown
+                and not attempt.get("delivery")
+            )
             result = dict(
                 adapter="unknown",
                 request_id=request_id,
                 attempt_id=attempt_id,
-                state="unknown",
+                state="failed" if known_rejection else "unknown",
                 channel_message_ids=[],
                 observed_at=utc(self.clock()),
             )
@@ -1129,6 +1233,10 @@ class Proactive:
             now = self.clock()
             candidate = self.store.get("proactive_candidates", attempt["candidate_id"])
             owns = candidate is not None and candidate.get("attempt") == attempt["id"]
+            previously_delivered = candidate and candidate.get("delivered", False)
+            actual_contact = result["adapter"] == VERIFYING_ADAPTER and bool(
+                result["channel_message_ids"]
+            )
             attempt.update(
                 state=result["state"],
                 adapter=result["adapter"],
@@ -1137,6 +1245,11 @@ class Proactive:
                 settled_at=now,
                 stale=not owns,
                 verified_delivery=self._verified(result["adapter"], result["state"]),
+                unresolved=result["state"] in {"queued", "sending", "unknown"}
+                or any(
+                    segment["state"] in {"queued", "sending", "unknown"}
+                    for segment in result.get("native_receipt", {}).get("segments", [])
+                ),
             )
             self._save("attempts", attempt)
             if not owns:
@@ -1144,15 +1257,30 @@ class Proactive:
                 # never rewrites the candidate or the newer attempt.
                 return self.attempt_metadata(request_id)
             candidate.update(
-                state=result["state"],
+                state="cancelled"
+                if candidate.get("cancel_requested") and result["state"] in {"queued", "sending"}
+                else result["state"],
                 receipt=result,
-                delivered=self._verified(result["adapter"], result["state"]),
+                delivered=bool(previously_delivered or actual_contact),
                 delivery_evidence=self._evidence(result["adapter"], result["state"]),
-                unresolved=result["state"] == "unknown",
-                closed_at=now,
+                unresolved=attempt["unresolved"],
+                closed_at=now if result["state"] not in {"queued", "sending"} else None,
             )
             self._save("candidates", candidate)
-            if result["state"] == "sent":
+            simulated_contact = result["state"] == "sent" and not getattr(
+                self.dispatcher, "native_delivery", False
+            )
+            if (candidate["delivered"] and not previously_delivered) or simulated_contact:
+                subscription = self._get("subscriptions", candidate["subscription_id"])
+                if getattr(self.dispatcher, "native_delivery", False):
+                    self._consume_quota(subscription, now)
+                subscription.update(
+                    last_contact_at=now, unanswered_count=subscription["unanswered_count"] + 1
+                )
+                self._save("subscriptions", subscription)
+            if result["state"] in {"sent", "partial"} and (
+                candidate["delivered"] or simulated_contact
+            ):
                 self._advance(candidate)
         return self.candidate_view(attempt["candidate_id"])
 
@@ -1183,6 +1311,12 @@ class Proactive:
         candidate = self._get("candidates", candidate_id)
         if candidate["state"] not in RETRYABLE_CANDIDATE:
             raise ValueError("Candidate is not retryable")
+        if getattr(self.dispatcher, "native_delivery", False) and candidate.get("attempt"):
+            attempt = self.store.get("proactive_attempts", candidate["attempt"])
+            if attempt and attempt.get("delivery"):
+                # Reconcile the original expression. Its stable id must not be
+                # repurposed after finalization, even for an explicit retry.
+                raise ValueError("Submitted expression must be reconciled, not resent")
         if expected is not None and candidate["version"] != expected:
             raise ValueError("Stale version")
         if self.clock() >= candidate["expires_at"]:
@@ -1205,15 +1339,19 @@ class Proactive:
         return self.candidate_view(candidate_id)
 
     def cancel_candidate(self, candidate_id, *, reason, expected=None):
-        """Cancel before any transport submit. A submitted attempt settles itself."""
+        """Cancel pending work or request native queue cancellation without undoing ACKs."""
         text(reason, 256)
         candidate = self._get("candidates", candidate_id)
-        if candidate["state"] == "sending":
+        native = getattr(self.dispatcher, "native_delivery", False)
+        if candidate["state"] == "sending" and not native:
             raise ValueError("Attempt already submitted; wait for its outcome")
-        if candidate["state"] in SETTLED_CANDIDATE:
+        if candidate["state"] in SETTLED_CANDIDATE and not (
+            native and candidate["state"] == "unknown"
+        ):
             raise ValueError("Candidate is already settled")
         if expected is not None and candidate["version"] != expected:
             raise ValueError("Stale version")
+        candidate["cancel_requested"] = True
         self._apply(candidate, "cancelled", None, reason, self.clock())
         return self.candidate_view(candidate_id)
 

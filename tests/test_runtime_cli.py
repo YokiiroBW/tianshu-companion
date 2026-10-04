@@ -435,7 +435,7 @@ class _DeploymentPathTests(unittest.TestCase):
         # The real store opened the deployed path, and it is a real database file.
         self.assertEqual(self.deployed_database.resolve(), self.opened_database())
         self.assertTrue(self.deployed_database.is_file())
-        self.assertEqual(9, self.core.store.db.execute("PRAGMA user_version").fetchone()[0])
+        self.assertEqual(10, self.core.store.db.execute("PRAGMA user_version").fetchone()[0])
         # The path the document named was never touched: no file, no owner lock, no side file.
         self.assertFalse(self.stale_database.exists())
         self.assertEqual([], sorted(self.root.glob("stale.db*")))

@@ -86,7 +86,7 @@ def test_a_fresh_database_gets_the_index_without_a_restore_point(tmp_path):
         assert shape(definition(path)) == shape(CREATE_SQL)
         assert backups(path) == []
         assert definition(path).endswith("IS NOT NULL")
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 10
     finally:
         store.close()
     memory = Store(":memory:")
@@ -200,12 +200,12 @@ def test_a_v8_open_reuses_its_migration_backup_and_adds_no_second_copy(tmp_path)
     reopened = Store(path)
     try:
         assert stored_definition(reopened.db) is not None
-        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 10
     finally:
         reopened.close()
     names = sorted(item.name for item in tmp_path.iterdir())
     assert [name for name in names if BACKUP_LABEL in name] == []
-    assert [name for name in names if ".pre-persona-ops-v9-" in name]
+    assert [name for name in names if ".pre-life-runtime-v10-" in name]
 
 
 def test_the_index_is_created_inside_the_initialization_transaction(tmp_path):
@@ -242,7 +242,7 @@ def test_reopening_a_correct_index_changes_no_fact_and_no_file(tmp_path):
         try:
             assert reopened.source_head() == head
             assert stored_definition(reopened.db) is not None
-            assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 10
         finally:
             reopened.close()
     assert rows(path) == before

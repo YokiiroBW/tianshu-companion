@@ -7,12 +7,15 @@ from pathlib import Path
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 
-MANIFEST_HASH = "81e6cc4ddef7c6f82e055d4cb04b090db036dd5c52763473ce697aa02db478a1"
-PROFILE_MANIFEST_HASH = "488d05438dd5b5abaa43a66a7eab0eb5cf615d5af01a964a7286cd23e68f7eb7"
+from .contract_releases import RELEASES
+
+
+MANIFEST_HASH = RELEASES["text-dialogue/v1"]
 PROFILE_DOMAIN = "profile-memory/v1"
-WEB_MANIFEST_HASH = "e493a1b5d0f4cec8d55995553faf84042f4c33a59365d15423e57f4dc70a6c09"
-SOURCE_MANIFEST_HASH = "178d0ce66210bdfad4cfb85d8b5f0905b0b67f834e2a530efe5636ff0373633d"
-LIFE_READ_MANIFEST_HASH = "7be7507d58f897a739b269de3c096ba948c92b25266888a91fa50130d342c551"
+PROFILE_MANIFEST_HASH = RELEASES[PROFILE_DOMAIN]
+WEB_MANIFEST_HASH = RELEASES["web-conversation/v1"]
+SOURCE_MANIFEST_HASH = RELEASES["source-sync/v1"]
+LIFE_READ_MANIFEST_HASH = RELEASES["life-read/v1"]
 
 
 class Fault(Exception):
@@ -79,110 +82,81 @@ def strict_json(data):
 class Contracts:
     def __init__(self, directory):
         root = Path(directory).resolve()
+        packages = root.parent.parent
+        self.schemas = {}
+        self.registry = Registry()
 
         def read(path):
             return path.read_bytes().replace(b"\r\n", b"\n")
 
-        manifest = read(root / "manifest.json")
-        if hashlib.sha256(manifest).hexdigest() != MANIFEST_HASH:
-            raise ValueError("Unrecognized contract release")
-        release = json.loads(manifest)
-        if release["version"] != "1.0.0":
-            raise ValueError("Unsupported contract version")
-        for name, expected in release["sha256"].items():
-            path = (root.parent.parent / name).resolve()
-            if not path.is_relative_to(root) or hashlib.sha256(read(path)).hexdigest() != expected:
-                raise ValueError(f"Contract content mismatch: {name}")
-        self.schemas = {p.stem: json.loads(read(p)) for p in (root / "schemas").glob("*.json")}
-        self.registry = Registry().with_resources(
-            (s["$id"], Resource.from_contents(s)) for s in self.schemas.values()
-        )
-        profile_root = root.parent.parent / PROFILE_DOMAIN
-        manifest = read(profile_root / "manifest.json")
-        if hashlib.sha256(manifest).hexdigest() != PROFILE_MANIFEST_HASH:
-            raise ValueError("Unrecognized profile contract release")
-        release = json.loads(manifest)
-        if (
-            release["version"] != "1.0.0"
-            or release["version_domain"] != PROFILE_DOMAIN
-            or release["dependency"]["manifest_sha256"] != MANIFEST_HASH
-        ):
-            raise ValueError("Unsupported profile contract version")
-        for name, expected in release["sha256"].items():
-            path = (profile_root / name).resolve()
-            if (
-                not path.is_relative_to(profile_root)
-                or hashlib.sha256(read(path)).hexdigest() != expected
-            ):
-                raise ValueError(f"Profile contract content mismatch: {name}")
-        schema = json.loads(read(profile_root / "schemas/profiles.json"))
-        self.schemas["profiles"] = schema
-        self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
+        def dependency(package, expected):
+            if package not in RELEASES:
+                matches = [name for name in RELEASES if name.split("/")[0] == package]
+                if len(matches) != 1:
+                    raise ValueError("Unknown contract dependency")
+                package = matches[0]
+            if expected != RELEASES[package]:
+                raise ValueError("Unsupported contract dependency")
 
-        life_root = root.parent.parent / "life-read/v1"
-        if life_root.exists():
-            manifest = read(life_root / "manifest.json")
-            if hashlib.sha256(manifest).hexdigest() != LIFE_READ_MANIFEST_HASH:
-                raise ValueError("Unrecognized life read release")
+        aliases = {
+            "profile-memory/v1": "profiles",
+            "life-read/v1": "life-read",
+            "life-runtime/v2": "life-runtime",
+            "bot-delivery/v2": "bot-delivery",
+            "web-conversation/v1": "web-conversation",
+            "memory-context/v1": "memory-context",
+            "knowledge-content/v1": "knowledge-content",
+        }
+        for package in (
+            "text-dialogue/v1",
+            "profile-memory/v1",
+            "source-sync/v1",
+            "web-conversation/v1",
+            "life-read/v1",
+            "memory-context/v1",
+            "life-runtime/v2",
+            "bot-delivery/v2",
+            "knowledge-content/v1",
+        ):
+            package_root = (packages / package).resolve()
+            manifest = read(package_root / "manifest.json")
+            if hashlib.sha256(manifest).hexdigest() != RELEASES[package]:
+                raise ValueError("Unrecognized contract release: " + package)
             release = json.loads(manifest)
-            if release.get("version") != "1.0.0" or release.get("package") != "life-read/v1":
-                raise ValueError("Unsupported life read release")
+            expected_version = "2.0.0" if package.endswith("/v2") else "1.0.0"
+            if release.get("version") != expected_version:
+                raise ValueError("Unsupported contract version")
+            dependencies = release.get("dependencies", [])
+            if isinstance(dependencies, dict):
+                for name, expected in dependencies.items():
+                    dependency(name, expected)
+            else:
+                for item in dependencies:
+                    dependency(item["package"], item["manifest_sha256"])
+            if release.get("dependency"):
+                item = release["dependency"]
+                dependency(item["package"], item["manifest_sha256"])
             for name, expected in release["sha256"].items():
-                path = (life_root / name).resolve()
+                path = (
+                    packages / name if name.startswith(package + "/") else package_root / name
+                ).resolve()
                 if (
-                    not path.is_relative_to(life_root)
+                    not path.is_relative_to(package_root)
                     or hashlib.sha256(read(path)).hexdigest() != expected
                 ):
-                    raise ValueError("Life read contract content mismatch")
-            schema = json.loads(read(life_root / "schemas/life.json"))
-            self.schemas["life-read"] = schema
-            self.registry = self.registry.with_resource(
-                schema["$id"], Resource.from_contents(schema)
-            )
-        source_root = root.parent.parent / "source-sync/v1"
-        manifest = read(source_root / "manifest.json")
-        if hashlib.sha256(manifest).hexdigest() != SOURCE_MANIFEST_HASH:
-            raise ValueError("Unrecognized source contract release")
-        release = json.loads(manifest)
-        if release["version"] != "1.0.0" or {
-            d["package"]: d["manifest_sha256"] for d in release["dependencies"]
-        } != {"text-dialogue/v1": MANIFEST_HASH, PROFILE_DOMAIN: PROFILE_MANIFEST_HASH}:
-            raise ValueError("Unsupported source contract dependencies")
-        for name, expected in release["sha256"].items():
-            path = (source_root / name).resolve()
-            if (
-                not path.is_relative_to(source_root)
-                or hashlib.sha256(read(path)).hexdigest() != expected
-            ):
-                raise ValueError(f"Source contract content mismatch: {name}")
-        for path in (source_root / "schemas").glob("*.json"):
-            schema = json.loads(read(path))
-            self.schemas[path.stem] = schema
-            self.registry = self.registry.with_resource(
-                schema["$id"], Resource.from_contents(schema)
-            )
-
-        web_root = root.parent.parent / "web-conversation/v1"
-        manifest = read(web_root / "manifest.json")
-        if hashlib.sha256(manifest).hexdigest() != WEB_MANIFEST_HASH:
-            raise ValueError("Unrecognized web conversation release")
-        release = json.loads(manifest)
-        if (
-            release["version"] != "1.0.0"
-            or release["package"] != "web-conversation/v1"
-            or release["dependency"]["manifest_sha256"] != MANIFEST_HASH
-        ):
-            raise ValueError("Unsupported web conversation dependencies")
-        for name, expected in release["sha256"].items():
-            path = (web_root / name).resolve()
-            if (
-                not path.is_relative_to(web_root)
-                or hashlib.sha256(read(path)).hexdigest() != expected
-            ):
-                raise ValueError(f"Web conversation content mismatch: {name}")
-        schema = json.loads(read(web_root / "schema.json"))
-        self.schemas["web-conversation"] = schema
-        self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
+                    raise ValueError("Contract content mismatch: " + name)
+                if path.suffix != ".json":
+                    continue
+                schema = json.loads(read(path))
+                if not isinstance(schema, dict) or "$id" not in schema:
+                    continue
+                key = path.stem if "dependencies" in path.parts else aliases.get(package, path.stem)
+                if key in self.schemas and self.schemas[key]["$id"] != schema["$id"]:
+                    raise ValueError("Contract alias collision")
+                self.schemas[key] = schema
+                self.registry = self.registry.with_resource(
+                    schema["$id"], Resource.from_contents(schema)
+                )
 
     def check(self, name, value):
         file, definition = name.split("#")

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from support import Clock, Harness, contracts
+from support import Clock, Harness, contracts, native_sse
 from tianshu_companion.app import create_app
 from tianshu_companion.clients import Gateway, JsonService, utc
 from tianshu_companion.contracts import Fault, digest
@@ -1131,7 +1131,7 @@ def test_the_port_reads_rows_the_life_engine_wrote():
         return httpx.Response(200, json=payload)
 
     client = JsonService(
-        "https://synthetic.invalid", "fixture", transport=httpx.MockTransport(handler)
+        "https://synthetic.invalid", "fixture", transport=httpx.MockTransport(native_sse(handler))
     )
     life = Life(store, clock, Gateway(contracts(), client), 19, asyncio.Semaphore(4), writing=True)
 

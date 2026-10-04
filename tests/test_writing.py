@@ -122,8 +122,8 @@ def test_work_needs_fictional_actor_and_versioned_canon_updates(env):
         "work", ["A: synthetic protagonist", "B: synthetic rival"], author="admin", expected=2
     )
     assert characters["characters_version"] == 2
-    with pytest.raises(ValueError):
-        port.update_characters("work", [], author="admin", expected=3)
+    cleared = port.update_characters("work", [], author="admin", expected=3)
+    assert cleared["characters"] == [] and cleared["characters_version"] == 3
     assert port.works("a")[0]["chapters"] == 2
     assert port.works("b") == []
     with pytest.raises(KeyError):
@@ -1025,9 +1025,9 @@ def test_v4_migration_backup_rollback_and_source_preservation(tmp_path):
         db.commit()
     with closing(Store(path)) as store:
         assert store.source_head() == head
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 10
         assert store.get("conversations", "synthetic")["private"] == "synthetic preserved"
-    backups = sorted(tmp_path.glob("*.pre-writing-v5-*.bak"))
+    backups = sorted(tmp_path.glob("*.pre-life-runtime-v10-*.bak"))
     assert len(backups) == 2  # the failed attempt and the retry each took one
     # Both attempts started below v7, so the persona step is crossed inside those same
     # migrations: a multi-version jump takes one recovery backup, at the highest structural
