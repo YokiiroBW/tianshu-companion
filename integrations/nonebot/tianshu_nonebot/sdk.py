@@ -165,7 +165,7 @@ async def send_text(bot, delivery: dict) -> list[str]:
     if delivery.get("namespace") != "qq" or delivery.get("thread_id") is not None:
         raise UnsupportedEvent("The delivery is not a OneBot v11 text destination")
     text = delivery.get("text")
-    if not isinstance(text, str) or not text or len(text.encode("utf-8")) > 32768:
+    if not isinstance(text, str) or len(text.encode("utf-8")) > 32768:
         raise UnsupportedEvent("The delivery is not text")
     target = delivery.get("conversation_id", "")
     message = Message(MessageSegment.text(text))
@@ -173,6 +173,8 @@ async def send_text(bot, delivery: dict) -> list[str]:
         media = media_parts(delivery)
     except RpcError:
         raise UnsupportedEvent("Invalid inline media") from None
+    if not (text or media):
+        raise UnsupportedEvent("The delivery is empty")
     for segment in onebot_media(media):
         message += MessageSegment(segment["type"], segment["data"])
     if type(target) is str and target.startswith("group:"):

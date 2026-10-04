@@ -924,7 +924,7 @@ class AdapterService:
             or delivery.get("namespace") != "qq"
             or delivery.get("thread_id") is not None
             or not isinstance(text, str)
-            or not text
+            or not (text or media)
             or len(text.encode("utf-8")) > 32768
         ):
             raise RpcError(403, "forbidden")
@@ -1063,7 +1063,7 @@ class AdapterService:
             and delivery.get("thread_id") is None
             and target == binding[2]
             and isinstance(text, str)
-            and bool(text)
+            and bool(text or media)
             and len(text.encode("utf-8")) <= 32768
         )
         if not valid or media and self.send_media is None:

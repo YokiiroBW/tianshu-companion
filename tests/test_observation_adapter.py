@@ -122,7 +122,11 @@ def test_send_rechecks_tightened_policy(tmp_path):
         calls.append((self_id, target, text))
         return "555"
 
-    service = AdapterService(tmp_path / "adapter.sqlite", "astrbot", accounts, send)
+    async def send_media(self_id, target, text, media):
+        calls.append((self_id, target, text, media))
+        return "556"
+
+    service = AdapterService(tmp_path / "adapter.sqlite", "astrbot", accounts, send, send_media)
 
     async def rpc(name, body):
         return await service.handle(
@@ -159,12 +163,37 @@ def test_send_rechecks_tightened_policy(tmp_path):
     status, receipt = run(rpc("messages/send", command))
     assert status == 200 and receipt["state"] == "sent" and len(calls) == 1
     assert run(rpc("messages/send", command))[1] == receipt
+    from adapter_media_fixture import original_png
+
+    _, reference, media = original_png()
+    image_command = {
+        **command,
+        "delivery": {
+            **delivery,
+            "reply_id": "pure-image",
+            "attempt_id": "pure-image",
+            "text": "",
+            "content_refs": [reference],
+            "media": [media],
+        },
+    }
+    status, image_receipt = run(rpc("messages/send", image_command))
+    assert status == 200 and image_receipt["state"] == "sent"
+    assert image_receipt["channel_message_ids"] == ["556"]
+    assert run(rpc("messages/send", image_command))[1] == image_receipt
+    assert len(calls) == 2 and calls[-1][2] == ""
+    empty = {
+        **command,
+        "delivery": {**delivery, "reply_id": "empty", "text": ""},
+    }
+    assert run(rpc("messages/send", empty))[0] == 403
+    assert len(calls) == 2
     request = {**request, "request_id": "tighten", "revision": 2, "group_policy": policy()}
     assert run(rpc("apply", request))[0] == 200
     command["delivery"] = {**delivery, "reply_id": "reply-2"}
     command["policy_revision"] = 2
     assert run(rpc("messages/send", command))[0] == 403
-    assert len(calls) == 1
+    assert len(calls) == 2
     service.close()
 
 

@@ -236,6 +236,7 @@ class NoneBotHostTests(unittest.TestCase):
                         self.assertGreater(len(raw), 2 * 1024 * 1024)
                         attachment = {
                             **delivery,
+                            "text": "",
                             "reply_id": "original-png",
                             "attempt_id": "original-png",
                             "content_refs": [reference],
@@ -276,6 +277,17 @@ class NoneBotHostTests(unittest.TestCase):
                         )
                         self.assertEqual(len(sent), 2)
                         failed_calls = []
+                        from tianshu_nonebot.sdk import send_text
+
+                        self.assertEqual(await send_text(bot, attachment), ["88"])
+                        self.assertEqual(
+                            base64.b64decode(
+                                next(part for part in sent[-1]["message"] if part.type == "image")
+                                .data["file"]
+                                .removeprefix("base64://")
+                            ),
+                            raw,
+                        )
 
                         async def uncertain_send(**kwargs):
                             failed_calls.append(kwargs)

@@ -27,7 +27,7 @@ class AstrBotHostTests(unittest.TestCase):
                 Path(__file__).resolve().parents[1]
                 / ".runtime"
                 / "adapter-artifacts"
-                / "astrbot_plugin_tianshu-0.4.0.zip"
+                / "astrbot_plugin_tianshu-0.5.0.zip"
             )
             with tempfile.TemporaryDirectory() as root:
                 before = os.getcwd()
@@ -350,6 +350,7 @@ class AstrBotHostTests(unittest.TestCase):
                         self.assertGreater(len(raw), 2 * 1024 * 1024)
                         attachment = {
                             **delivery,
+                            "text": "",
                             "reply_id": "original-png",
                             "attempt_id": "original-png",
                             "content_refs": [reference],

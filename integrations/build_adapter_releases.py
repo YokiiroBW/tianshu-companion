@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT.parent / ".runtime" / "adapter-artifacts"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
