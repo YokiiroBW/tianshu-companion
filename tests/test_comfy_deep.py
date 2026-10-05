@@ -338,7 +338,7 @@ def test_native_image_tool_translation_single_slot_replay_and_no_outfit(tmp_path
                                                 value={
                                                     key: value
                                                     for key, value in image_value().items()
-                                                    if key not in {"scope", "query"}
+                                                    if key not in {"id", "scope", "query"}
                                                 },
                                             )
                                         ),
@@ -355,17 +355,19 @@ def test_native_image_tool_translation_single_slot_replay_and_no_outfit(tmp_path
             h.core.models = asyncio.Semaphore(1)
             async with h.core.models:
                 output, _ = await asyncio.wait_for(h.core._respond_native(turn, []), timeout=2)
-            job = h.core.images.get("image:fixture")
+            job = h.core.store.list("image_jobs")[0]
             assert job["outfit"] is None and job["state"] == "queued"
             assert len(model.calls) == 1
             assert "translated pose" in job["graph"]["35"]["inputs"]["text"]
             assert job["graph"]["32"]["inputs"]["character_tags"] == "fixed character"
-            await h.core.life_runtime.prepare_action("actor:a", "image.request", image_value(), 0)
+            await h.core.life_runtime.prepare_action(
+                "actor:a", "image.request", image_value(id=job["id"]), 0
+            )
             assert len(model.calls) == 1
             await h.core.images.work()
             fixture.complete = True
             await h.core.images.work()
-            assert h.core.images.get("image:fixture")["state"] == "completed"
+            assert h.core.images.get(job["id"])["state"] == "completed"
             assert len([call for call in fixture.calls if call == ("POST", "/prompt")]) == 1
         finally:
             await h.core.close()

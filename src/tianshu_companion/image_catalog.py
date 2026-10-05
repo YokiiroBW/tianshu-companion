@@ -61,6 +61,44 @@ class ImageCatalog:
             bindings={},
         )
 
+    def capability(self, actor):
+        """Local configuration facts for dialogue; this is not a live network probe."""
+        connection, profile = self.connection(), self.actor(actor)
+        enabled = (
+            bool(connection["enabled"])
+            if connection
+            else bool(self.images.transport and self.images.workflow)
+        )
+        configured = bool(profile["workflow_id"] or self.images.workflow)
+        state = (
+            "not_configured"
+            if not connection and not enabled
+            else "disabled"
+            if not enabled
+            else "configured"
+            if configured
+            else "workflow_required"
+        )
+        checked = self.checked_at if self.checked_at is not None else self.backend.checked
+        error = self.error_code if self.checked_at is not None else self.backend.error
+        return dict(
+            state=state,
+            enabled=enabled,
+            configured=configured,
+            can_request=enabled and configured and self.images.staging is not None,
+            network_observation="not_checked"
+            if checked is None
+            else "last_check_failed"
+            if error
+            else "last_check_succeeded",
+            checked_at=checked,
+            default_dimensions={
+                key: profile["defaults"][key]
+                for key in ("width", "height")
+                if key in profile["defaults"]
+            },
+        )
+
     async def transport(self):
         current = self.connection()
         if not current or not current["enabled"]:
