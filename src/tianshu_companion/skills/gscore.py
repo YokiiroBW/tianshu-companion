@@ -195,6 +195,8 @@ class GSCoreSkill:
                 "companion.skills",
                 contracts=core.contracts,
             )
+            await core._preflight(core.store.get("turns", turn_id))
+            registry.check_selected(core.store.get("turns", turn_id), "game_query")
             response = await request(config, token, body)
             await core._preflight(core.store.get("turns", turn_id))
             registry.check_selected(core.store.get("turns", turn_id), "game_query")

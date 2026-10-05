@@ -247,3 +247,74 @@ def test_unknown_and_unsupported_outputs_are_not_retried(mode, monkeypatch):
             await h.core.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["disable", "update"])
+def test_change_during_credential_resolution_prevents_http_request(change, monkeypatch):
+    async def run():
+        h = Harness(silence_ms=0)
+        started, release = asyncio.Event(), asyncio.Event()
+        task = None
+        try:
+            turn = await source_turn(h)
+            await configured_game(h)
+            credentials = h.core.image_backend.credentials
+
+            class DelayedCredential:
+                async def call(self, path, request):
+                    started.set()
+                    await release.wait()
+                    return await credentials.call(path, request)
+
+            h.core.image_backend.credentials = DelayedCredential()
+            calls = []
+
+            async def request(config, token, body):
+                calls.append(body)
+                return dict(status_code=-100, data=None)
+
+            monkeypatch.setattr("tianshu_companion.skills.gscore.request", request)
+            task = asyncio.create_task(
+                h.core.role_actions.execute(
+                    turn["id"],
+                    dict(
+                        id="query",
+                        function=dict(
+                            name="game_query",
+                            arguments=json.dumps(
+                                dict(game="nte", operation="guide", character="角色甲")
+                            ),
+                        ),
+                    ),
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=2)
+            if change == "disable":
+                await manage(h, "skill.disable", dict(skill_id="game.guides"))
+            else:
+                definition = copy.deepcopy(h.core.skills.definitions("actor:a")["game.guides"])
+                definition.pop("source_id")
+                config = copy.deepcopy(
+                    h.core.skills.actor("actor:a")["skills"]["game.guides"]["config"]
+                )
+                config["base_url"] = "http://replacement.invalid:28765"
+                await manage(
+                    h,
+                    "skill.update",
+                    dict(definition=definition, enabled=True, config=config),
+                )
+            release.set()
+            result, _ = await asyncio.wait_for(task, timeout=2)
+            assert result["error_code"] == (
+                "dependency_unavailable" if change == "disable" else "scope_changed"
+            )
+            assert calls == []
+            assert not result["content_refs"] and not h.core.store.list("image_media")
+        finally:
+            release.set()
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await h.core.close()
+
+    asyncio.run(run())
