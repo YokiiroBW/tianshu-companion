@@ -494,10 +494,9 @@ class RuntimeExecution:
             life=self.core.life.summary(candidate["actor_id"], current["scope"]),
             short_affect=self.core.life.affect.snapshot(candidate["actor_id"], current["scope"]),
             photo_available=not self.photos.from_image_event(candidate)
-            and bool(
-                self.core.image_backend.catalog.actor(candidate["actor_id"])["workflow_id"]
-                or self.core.images.workflow
-            ),
+            and self.core.skills.result(candidate["actor_id"], "detail", "image.generate")[
+                "skills"
+            ][0]["availability"]["can_execute"],
         )
         recall = await self.core.memory.select(
             current["origin"], current["scope"], candidate["summary"], dict(tokens=2048, bytes=8192)

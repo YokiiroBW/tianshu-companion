@@ -415,46 +415,87 @@ class Images:
     async def _artifacts(self, item, descriptors):
         if not 0 < len(descriptors) <= self.max_files:
             raise ValueError("Artifact count budget")
-        self.staging.mkdir(parents=True, exist_ok=True)
-        used = sum(p.stat().st_size for p in self.staging.iterdir() if p.is_file())
         artifacts = []
         for descriptor in descriptors:
             data, width, height = await self.transport.image(descriptor, self.max_bytes)
-            sha = hashlib.sha256(data).hexdigest()
-            name = "original_" + sha + ".png"
-            path = self.staging / name
-            if not path.exists():
-                used += len(data)
-                if used > self.max_storage:
-                    raise ValueError("Staging storage budget")
-                temporary = self.staging / (name + "." + uuid.uuid4().hex + ".tmp")
-                try:
-                    with temporary.open("xb") as handle:
-                        handle.write(data)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temporary, path)
-                finally:
-                    temporary.unlink(missing_ok=True)
-            elif hashlib.sha256(path.read_bytes()).hexdigest() != sha:
-                raise ValueError("Original media identity mismatch")
-            media_id = "media:" + digest([item["id"], len(artifacts), sha])
-            artifacts.append(
-                dict(
-                    staging_name=name,
-                    sha256=sha,
-                    size=len(data),
-                    media_type="image/png",
-                    width=width,
-                    height=height,
-                    archived=False,
-                    media_id=media_id,
-                )
+            artifact = self._stage_original(data, width, height)
+            artifact["media_id"] = "media:" + digest(
+                [item["id"], len(artifacts), artifact["sha256"]]
             )
+            artifacts.append(artifact)
         item["artifacts"] = artifacts
         with self.store.transaction():
             for artifact in artifacts:
                 self._record_original(item, artifact)
+
+    def _stage_original(self, data, width, height):
+        if self.staging is None or len(data) > self.max_bytes:
+            raise ValueError("Original media storage unavailable or byte budget exceeded")
+        self.staging.mkdir(parents=True, exist_ok=True)
+        sha = hashlib.sha256(data).hexdigest()
+        name = "original_" + sha + ".png"
+        path = self.staging / name
+        if not path.exists():
+            used = sum(p.stat().st_size for p in self.staging.iterdir() if p.is_file())
+            if used + len(data) > self.max_storage:
+                raise ValueError("Staging storage budget")
+            temporary = self.staging / (name + "." + uuid.uuid4().hex + ".tmp")
+            try:
+                with temporary.open("xb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != sha:
+            raise ValueError("Original media identity mismatch")
+        return dict(
+            staging_name=name,
+            sha256=sha,
+            size=len(data),
+            media_type="image/png",
+            width=width,
+            height=height,
+            archived=False,
+        )
+
+    def receive_external(self, actor, data, scope, operation_ref, index, source):
+        """Receive a real query fragment; no generated job, daily album or life event."""
+        from .image_formats import png
+
+        self.life._get("actors", actor)
+        if scope["actor_id"] != actor:
+            raise ValueError("Original scope actor mismatch")
+        data, width, height = png(data, self.max_bytes)
+        artifact = self._stage_original(data, width, height)
+        media_id = "media:external:" + digest([actor, operation_ref, index, artifact["sha256"]])
+        reference = dict(
+            owner="companion",
+            object_id=media_id,
+            version=1,
+            kind="image",
+            sha256=artifact["sha256"],
+            sources=[],
+            coverage=dict(unit="bytes", start=0, end=artifact["size"], total=artifact["size"]),
+        )
+        media = dict(
+            artifact,
+            id=media_id,
+            actor_id=actor,
+            conversation_id=actor,
+            job_id=None,
+            state="available",
+            version=1,
+            content_ref=reference,
+            scope=scope,
+            completed_at=None,
+            origin_kind="external_query",
+            operation_ref=operation_ref,
+            source=source,
+        )
+        self.store.put("image_media", media)
+        return reference
 
     def _record_original(self, job, artifact):
         reference = dict(

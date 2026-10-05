@@ -79,7 +79,7 @@ def test_image_context_exposes_truthful_configuration_and_actor_isolation(tmp_pa
                             ),
                         ),
                     )
-            context = h.core.role_actions.image_context(turn)
+            context = h.core.skills.handlers["image.generate"].context(h.core.role_actions, turn)
             facts = context["capability"]
             assert facts["can_request"] == (state == "configured")
             assert facts["state"] == ("not_configured" if state == "unconfigured" else state)
@@ -89,7 +89,16 @@ def test_image_context_exposes_truthful_configuration_and_actor_isolation(tmp_pa
             )
             other = copy.deepcopy(turn)
             other["scope"]["actor_id"] = "actor:b"
-            assert h.core.role_actions.image_context(other)["capability"]["configured"] is False
+            assert (
+                h.core.skills.handlers["image.generate"].context(h.core.role_actions, other)[
+                    "capability"
+                ]["configured"]
+                is False
+            )
+            tools = h.core.role_actions.tools(turn)
+            if state != "configured":
+                assert not any(tool["function"]["name"] == "life_image_request" for tool in tools)
+                return
             schema = next(
                 tool["function"]["parameters"]
                 for tool in h.core.role_actions.tools(turn)
@@ -123,7 +132,7 @@ def test_current_outfit_is_real_data_and_per_image_choice_does_not_change_it(tmp
                 outfit_ref=outfit["id"],
                 expected=h.core.store.get("life_actors", "actor:a")["version"],
             )
-            context = h.core.role_actions.image_context(turn)
+            context = h.core.skills.handlers["image.generate"].context(h.core.role_actions, turn)
             assert context["current_outfit"]["prompt"] == "blue daily dress"
             tool = dict(
                 id="new-photo",

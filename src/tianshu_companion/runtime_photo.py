@@ -69,6 +69,12 @@ class RuntimePhotos:
             await self.execution.validate_sources(candidate, current["origin"])
             job = self.store.get("image_jobs", job_id)
             if job is None:
+                skill = self.core.skills.result(candidate["actor_id"], "detail", "image.generate")[
+                    "skills"
+                ][0]
+                if not skill["availability"]["can_execute"]:
+                    raise Fault("dependency_unavailable")
+                skill_revision = skill["revision"]
                 value = dict(
                     id=job_id,
                     parameters=decision["parameters"],
@@ -103,6 +109,14 @@ class RuntimePhotos:
                 latest = await self.execution.current_context(fresh)
                 await self.execution.validate_sources(fresh, latest["origin"])
                 with self.store.transaction():
+                    latest_skill = self.core.skills.result(
+                        candidate["actor_id"], "detail", "image.generate"
+                    )["skills"][0]
+                    if (
+                        not latest_skill["availability"]["can_execute"]
+                        or latest_skill["revision"] != skill_revision
+                    ):
+                        raise Fault("scope_changed")
                     self.core.life.concerns.operation(
                         "actor:" + candidate["actor_id"],
                         request,

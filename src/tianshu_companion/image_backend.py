@@ -2,7 +2,6 @@
 
 import httpx
 
-from .clients import uid
 from .contracts import Fault, digest
 from .images import ComfyUI, Workflow
 from .life_work import require_version
@@ -129,31 +128,11 @@ class ImageBackend:
         return prepared
 
     async def resolve(self, value):
-        token = None
-        if value["credential_ref"]:
-            if self.credentials is None:
-                raise Fault("dependency_unavailable")
-            request = dict(
-                schema_version=1,
-                request_id=uid("image-credential"),
-                credential_ref=value["credential_ref"],
-                audience=value["base_url"],
-                purpose="companion.images",
-            )
-            response = await self.credentials.call(
-                "/internal/v1/service-credentials/resolve", request
-            )
-            if (
-                not isinstance(response, dict)
-                or set(response) != {"schema_version", "request_id", "credential_ref", "token"}
-                or response["schema_version"] != 1
-                or response["request_id"] != request["request_id"]
-                or response["credential_ref"] != value["credential_ref"]
-                or not isinstance(response["token"], str)
-                or not 1 <= len(response["token"]) <= 8192
-            ):
-                raise Fault("dependency_unavailable")
-            token = response["token"]
+        from .service_credentials import resolve
+
+        token = await resolve(
+            self.credentials, value["credential_ref"], value["base_url"], "companion.images"
+        )
         return ComfyUI(value["base_url"], token=token, credential_ref=value["credential_ref"])
 
     async def prepare(self, value, expected):

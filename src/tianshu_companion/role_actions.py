@@ -36,75 +36,9 @@ TRUSTED = {"scope", "sources", "query"}
 class RoleActions:
     def __init__(self, core):
         self.core = core
+        from .skills import SkillRegistry
 
-    def image_context(self, turn):
-        actor_id = turn["scope"]["actor_id"]
-        capability = self.core.image_backend.catalog.capability(actor_id)
-        capability["can_request"] &= self.core._turn_allows(turn, "dialogue")
-        actor = self.core.store.get("life_actors", actor_id)
-        outfit = (
-            self.core.store.get("image_outfits", actor["outfit_ref"])
-            if actor and actor["outfit_ref"]
-            else None
-        )
-        if outfit and not visible({"scope": outfit.get("source_scope")}, turn["scope"]):
-            outfit = None
-        return dict(
-            capability=capability,
-            current_outfit={key: outfit[key] for key in ("id", "version", "description", "prompt")}
-            if outfit
-            else None,
-            identity="preserved_actor_configuration_and_workflow",
-            completion_delivery="automatic_original_to_this_conversation",
-        )
-
-    def image_tool(self, schema):
-        value = self._expand(schema["$defs"]["image_request_value"], schema)
-        fields = value["properties"]
-        fields["intent"]["properties"].pop("character", None)
-        fields["intent"]["description"] = (
-            "Describe this image's clothing, action, setting and camera. Character identity and "
-            "style are inherited. Clothing chosen for this image does not change the current outfit."
-        )
-        model_value = dict(
-            type="object",
-            properties={
-                key: fields[key]
-                for key in (
-                    "scene",
-                    "intent",
-                    "parameters",
-                    "outfit_id",
-                    "activity_id",
-                    "edit_source_id",
-                    "edit_source_ref",
-                )
-            },
-            additionalProperties=False,
-        )
-        return dict(
-            type="function",
-            function=dict(
-                name="life_image_request",
-                description=(
-                    "Create an image of this actor when the user wants to see their outfit, "
-                    "a selfie, pose or scene. Check the supplied image capability facts. Use "
-                    "the current outfit record when present; otherwise choose clothing from "
-                    "the user's request or inherit the workflow outfit. No wardrobe entry is "
-                    "required. Supply only this image's intent; omitted dimensions use actor "
-                    "defaults. This creates a queued job, not an already taken photograph. "
-                    "Its completed original is automatically sent to this conversation; do not "
-                    "send it again. Describe the intention naturally without inventing a past "
-                    "outfit or claiming completion before the receipt."
-                ),
-                parameters=dict(
-                    type="object",
-                    properties=dict(value=model_value),
-                    required=["value"],
-                    additionalProperties=False,
-                ),
-            ),
-        )
+        self.registry = SkillRegistry(self)
 
     def _expand(self, shape, schema):
         if isinstance(shape, list):
@@ -151,13 +85,12 @@ class RoleActions:
                 ]
         return value
 
-    def tools(self, turn):
+    def domain_tools(self, turn):
         schema = self.core.contracts.schemas["life-runtime"]
         tools = []
         if self.core._turn_allows(turn, "dialogue"):
             for operation in OPERATIONS:
                 if operation == "image.request":
-                    tools.append(self.image_tool(schema))
                     continue
                 value = schema["$defs"][operation.replace(".", "_") + "_value"]
                 parameters = dict(
@@ -267,9 +200,16 @@ class RoleActions:
             )
         return tools
 
+    def tools(self, turn):
+        return self.registry.tools(turn)
+
     async def execute(self, turn_id, tool, *, model_slot_held=False):
         turn = self.core.store.get("turns", turn_id)
         await self.core._preflight(turn)
+        return await self.registry.execute(turn, tool, model_slot_held=model_slot_held)
+
+    async def execute_domain(self, turn_id, tool, *, model_slot_held=False):
+        turn = self.core.store.get("turns", turn_id)
         name = tool["function"]["name"]
         supplied = strict_json(tool["function"]["arguments"])
         if not isinstance(supplied, dict):
@@ -294,10 +234,6 @@ class RoleActions:
         operation = next(
             (item for item in OPERATIONS if name == "life_" + item.replace(".", "_")), None
         )
-        if operation == "image.request":
-            if set(supplied) - {"expected_version", "value"}:
-                raise Fault("invalid_input")
-            supplied = dict(supplied, expected_version=supplied.get("expected_version", 0))
         if (
             operation is None
             or not self.core._turn_allows(turn, "dialogue")
@@ -307,23 +243,7 @@ class RoleActions:
         value = copy.deepcopy(supplied["value"])
         if not isinstance(value, dict) or TRUSTED & set(value):
             raise Fault("invalid_input")
-        if operation == "image.request":
-            if "id" in value:
-                raise Fault("invalid_input")
-            defaults = dict(
-                id="image-request:" + digest([turn_id, tool["id"]]),
-                outfit_id=None,
-                activity_id=None,
-                scene=None,
-                parameters={},
-                edit_source_id=None,
-                edit_source_ref=None,
-            )
-            defaults.update(value)
-            value = defaults
         actor_id = turn["scope"]["actor_id"]
-        if operation == "image.request" and "character" in (value.get("intent") or {}):
-            raise Fault("forbidden")
         schema = self.core.contracts.schemas["life-runtime"]["$defs"][
             operation.replace(".", "_") + "_value"
         ]
@@ -380,6 +300,7 @@ class RoleActions:
             )
 
             def execute():
+                self.registry.check_selected(self.core.store.get("turns", turn_id), name)
                 result = self.core.life_runtime._execute(
                     actor_id,
                     operation,

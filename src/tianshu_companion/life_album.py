@@ -89,7 +89,9 @@ class Album:
             "AND json_extract(body,'$.media_id')=? AND status='available' LIMIT 64",
             (actor_id, media_id),
         ).fetchall()
-        if not any(visible(json.loads(row[0]), scope) for row in rows):
+        if media.get("origin_kind") != "external_query" and not any(
+            visible(json.loads(row[0]), scope) for row in rows
+        ):
             raise Fault("not_found")
         if not self.images.media_available(media):
             raise Fault("dependency_unavailable")

@@ -731,9 +731,9 @@ def create_app(core=None, tokens=None, life_readers=None):
             )
             if service is None:
                 raise Fault("unauthorized")
-            if operation.startswith(("life-runtime-", "image-backend-")) and not json_media_type(
-                request.headers
-            ):
+            if operation.startswith(
+                ("life-runtime-", "image-backend-", "skills-")
+            ) and not json_media_type(request.headers):
                 raise Fault("invalid_input")
             content = bytearray()
             async for chunk in request.stream():
@@ -788,6 +788,11 @@ def create_app(core=None, tokens=None, life_readers=None):
                 return core.retry_life_generation(service, body)
             if operation == "life-runtime-manage":
                 return await core.life_runtime.manage(service, body)
+            if operation.startswith("skills-"):
+                return JSONResponse(
+                    await core.skills.call(service, operation.removeprefix("skills-"), body),
+                    headers={"Cache-Control": "no-store"},
+                )
             if operation.startswith("image-backend-"):
                 return JSONResponse(
                     await core.image_backend.catalog.call(
@@ -904,6 +909,14 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v2/life/manage")
     async def life_runtime_manage(request: Request):
         return await dispatch(request, "life-runtime-manage")
+
+    @app.post("/internal/v1/skills/read")
+    async def skills_read(request: Request):
+        return await dispatch(request, "skills-read")
+
+    @app.post("/internal/v1/skills/manage")
+    async def skills_manage(request: Request):
+        return await dispatch(request, "skills-manage")
 
     @app.post("/internal/v1/image-backend/read")
     async def image_backend_read(request: Request):

@@ -84,6 +84,7 @@ class Contracts:
         root = Path(directory).resolve()
         packages = root.parent.parent
         self.schemas = {}
+        self.documents = {}
         self.registry = Registry()
 
         def read(path):
@@ -107,6 +108,7 @@ class Contracts:
             "memory-context/v1": "memory-context",
             "knowledge-content/v1": "knowledge-content",
             "image-backend/v1": "image-backend",
+            "skills/v1": "skills",
         }
         for package in (
             "text-dialogue/v1",
@@ -119,6 +121,7 @@ class Contracts:
             "bot-delivery/v2",
             "knowledge-content/v1",
             "image-backend/v1",
+            "skills/v1",
         ):
             package_root = (packages / package).resolve()
             manifest = read(package_root / "manifest.json")
@@ -150,6 +153,7 @@ class Contracts:
                 if path.suffix != ".json":
                     continue
                 schema = json.loads(read(path))
+                self.documents[package + "/" + path.relative_to(package_root).as_posix()] = schema
                 if not isinstance(schema, dict) or "$id" not in schema:
                     continue
                 key = path.stem if "dependencies" in path.parts else aliases.get(package, path.stem)
@@ -168,4 +172,10 @@ class Contracts:
         )
         if not validator.is_valid(value):
             raise Fault("invalid_input")
+        return value
+
+    def check_document(self, path, member, value):
+        schema = self.documents[path][member]
+        if not Draft202012Validator(schema, format_checker=FormatChecker()).is_valid(value):
+            raise Fault("dependency_unavailable")
         return value

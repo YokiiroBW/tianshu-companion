@@ -1,0 +1,69 @@
+{
+  "version": "gsuid-http-v1",
+  "source_revision": "87c06f11ae10c12b3bb8e76b3c6f420c831282a8",
+  "commands": [
+    {
+      "game": "wuthering_waves",
+      "operation": "guide",
+      "template": "ww{character}攻略",
+      "character_required": true,
+      "meaning": "Verified plugin guide query",
+      "plugin": "XutheringWavesUID",
+      "source": "gsuid_core/plugins/XutheringWavesUID/XutheringWavesUID/wutheringwaves_wiki/__init__.py:144"
+    },
+    {
+      "game": "wuthering_waves",
+      "operation": "team_statistics",
+      "template": "ww矩阵高分队{optional_character}",
+      "character_required": false,
+      "meaning": "current Matrix appearance statistics; not arbitrary personalized team solver",
+      "plugin": "XutheringWavesUID",
+      "source": "gsuid_core/plugins/XutheringWavesUID/XutheringWavesUID/wutheringwaves_query/__init__.py:126"
+    },
+    {
+      "game": "nte",
+      "operation": "guide",
+      "template": "nte{character}攻略",
+      "character_required": true,
+      "meaning": "Verified plugin guide query",
+      "plugin": "NTEUID",
+      "source": "gsuid_core/plugins/NTEUID/NTEUID/nte_guide/__init__.py:11"
+    },
+    {
+      "game": "nte",
+      "operation": "team",
+      "template": "nte{character}配队",
+      "character_required": true,
+      "meaning": "Verified plugin team query",
+      "plugin": "NTEUID",
+      "source": "gsuid_core/plugins/NTEUID/NTEUID/nte_team/__init__.py:11"
+    },
+    {
+      "game": "endfield",
+      "operation": "guide",
+      "template": "end{character}攻略",
+      "character_required": true,
+      "meaning": "Verified plugin guide query",
+      "plugin": "EndUID",
+      "source": "gsuid_core/plugins/EndUID/EndUID/end_guide/__init__.py:13"
+    },
+    {
+      "game": "starrail",
+      "operation": "guide",
+      "template": "sr角色攻略{character}",
+      "character_required": true,
+      "meaning": "Verified plugin guide query",
+      "plugin": "StarRailUID",
+      "source": "gsuid_core/plugins/StarRailUID/StarRailUID/starrailuid_wiki/__init__.py:48"
+    },
+    {
+      "game": "zzz",
+      "operation": "guide",
+      "template": "zzz{character}攻略",
+      "character_required": true,
+      "meaning": "Verified plugin guide query",
+      "plugin": "ZZZeroUID",
+      "source": "gsuid_core/plugins/ZZZeroUID/ZZZeroUID/zzzerouid_wiki/__init__.py:431"
+    }
+  ]
+}
