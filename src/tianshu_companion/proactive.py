@@ -1060,8 +1060,10 @@ class Proactive:
                         pass
             if not self._dispatcher_available():
                 return
+            if hasattr(self.dispatcher, "pending_photos"):
+                await self.dispatcher.pending_photos()
             row = self.store.db.execute(
-                "SELECT id FROM proactive_candidates WHERE status='ready' "
+                "SELECT id FROM proactive_candidates WHERE status='ready' AND COALESCE(json_extract(body,'$.photo_state'),'') NOT IN ('waiting','decided') "
                 "ORDER BY json_extract(body,'$.weight') DESC,deadline,position,id LIMIT 1"
             ).fetchone()
             if row is None:
@@ -1099,6 +1101,10 @@ class Proactive:
                     expression_receipt=receipt,
                 )
                 self._save("candidates", fresh)
+            candidate = self.store.get("proactive_candidates", row[0])
+            if candidate.get("photo") and hasattr(self.dispatcher, "prepare_photo"):
+                if not await self.dispatcher.prepare_photo(candidate):
+                    return
             await self.dispatch(row[0])
 
     async def dispatch(self, candidate_id):
@@ -1109,6 +1115,8 @@ class Proactive:
         with self.store.transaction():
             candidate = self.store.get("proactive_candidates", candidate_id)
             if candidate is None or candidate["state"] != "ready":
+                return self.candidate_view(candidate_id)
+            if candidate.get("photo") and candidate.get("photo_state") != "completed":
                 return self.candidate_view(candidate_id)
             version = candidate["version"]
             subscription = self.store.get("proactive_subscriptions", candidate["subscription_id"])

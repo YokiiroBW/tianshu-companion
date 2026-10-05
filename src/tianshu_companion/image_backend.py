@@ -19,6 +19,9 @@ class ImageBackend:
         self.error = None
         self.transports = []
         self.runtime = None
+        from .image_catalog import ImageCatalog
+
+        self.catalog = ImageCatalog(self)
 
     def current(self):
         return self.store.get("metadata", self.KEY)
@@ -83,7 +86,8 @@ class ImageBackend:
         return item
 
     async def prepare_job(self, actor, value):
-        if not self.images.transport or not self.images.workflow:
+        workflow, _ = self.catalog.selected(actor)
+        if not self.images.transport or not workflow:
             raise Fault("dependency_unavailable")
         references = []
         scope, query = value.get("scope"), value.get("query")

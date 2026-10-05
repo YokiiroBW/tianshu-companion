@@ -2,10 +2,11 @@
 
 RELEASES = {
     "bot-connection/v1": "ba4c23494452e911526b10aa85fb8c2d994e7feaa1bc1e24e1f8f7cd69a4223d",
-    "bot-delivery/v2": "fee57c68771631eba45bb4d7a9e4666c00209adf61786616968f7ac680c9f295",
+    "bot-delivery/v2": "edec27d83b8b9427656096d45818d9db3665d8d7bd82cc796805e21ba35b757b",
     "diagnostics/v1": "d273402ab395ad6e16e7b24c43390d8b53c842af0007375de9523a076720a96f",
     "life-read/v1": "7be7507d58f897a739b269de3c096ba948c92b25266888a91fa50130d342c551",
-    "life-runtime/v2": "ff7cbaf5bb9cf1330a11821c0e5f0eefb728a934e9fb8698c9b644e09f43042c",
+    "life-runtime/v2": "85aff438f91cb96876e259204b5a198e2fedaead56db64a2265aa520a59ea7e3",
+    "image-backend/v1": "62e71dd2f42fb5b1376c439c362a555619da41cb7f7ae26d07acc1182b80ffbd",
     "memory-context/v1": "d44a23ac674d5fd3f8e9325c80884dc1426305055b873be1da239f126056e570",
     "model-origin-renewal/v1": "7aa782c9571f496755c6fe0bc4d65d6489940358b198c98116b4cc08b4db51e6",
     "model-protocol/v1": "832abdbfbbb49d71bffc0aabdd816f4de92d892680f26cc5f05402e397d34262",
@@ -18,5 +19,5 @@ RELEASES = {
     "source-sync-batch/v1": "ac6f39d1f0afe55677fbbb0ce2da1b212d22c49f18917d8fe2ed613d424c4327",
     "text-dialogue/v1": "90697e6ecbb587d3db8c8e4682f7f8f43a8b1a98f70d8835c8282b03828d2d3a",
     "web-conversation/v1": "3ccb44c13f5969ce4cd279c51d14f58d95c9cd4e75ca85cd8d6af286b3db0417",
-    "knowledge-content/v1": "beecd2f75b09df089f7d20c10c1ba39cdaa79c5ba78b8db702ef5005129e9199",
+    "knowledge-content/v1": "75d210454102af5af505ec1f72d69cc7dfd344550f7cf90e70125c082fdf4cd7",
 }

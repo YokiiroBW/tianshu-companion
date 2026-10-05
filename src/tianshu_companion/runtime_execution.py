@@ -15,6 +15,10 @@ class RuntimeExecution:
 
     def __init__(self, core):
         self.core, self.store = core, core.store
+        from .runtime_photo import RuntimePhotos
+
+        self.photos = RuntimePhotos(self)
+        self.core.images.submission_guard = self.photos.before_submission
 
     def offer_event(self, event):
         if event.get("kind") not in {
@@ -38,6 +42,7 @@ class RuntimeExecution:
                         conversation_id="proactive:event",
                         state="pending",
                         event_id=event["id"],
+                        exclude_subscription_id=self.photos.completion_subscription(event),
                         actor_id=actor,
                         cursor=None,
                         sequence=int(self.core.clock()),
@@ -65,6 +70,8 @@ class RuntimeExecution:
         with self.store.transaction():
             for row in rows[:16]:
                 subscription = json.loads(row[0])
+                if subscription["id"] == task.get("exclude_subscription_id"):
+                    continue
                 scope = {
                     key: subscription[key]
                     for key in ("actor_id", "person_id", "audience", "conversation_id")
@@ -373,7 +380,11 @@ class RuntimeExecution:
                         else:
                             self.core.contracts.check("life-runtime#manage_request", request)
                             prepared = await self.core.life_runtime.prepare_action(
-                                actor, name, supplied, value["expected_version"]
+                                actor,
+                                name,
+                                supplied,
+                                value["expected_version"],
+                                model_slot_held=True,
                             )
                             result = self.core.life.concerns.operation(
                                 "actor:" + actor,
@@ -482,6 +493,11 @@ class RuntimeExecution:
             actor=self.core.life.persona_reader(candidate["actor_id"]),
             life=self.core.life.summary(candidate["actor_id"], current["scope"]),
             short_affect=self.core.life.affect.snapshot(candidate["actor_id"], current["scope"]),
+            photo_available=not self.photos.from_image_event(candidate)
+            and bool(
+                self.core.image_backend.catalog.actor(candidate["actor_id"])["workflow_id"]
+                or self.core.images.workflow
+            ),
         )
         recall = await self.core.memory.select(
             current["origin"], current["scope"], candidate["summary"], dict(tokens=2048, bytes=8192)
@@ -523,7 +539,7 @@ class RuntimeExecution:
                 [
                     dict(
                         role="system",
-                        content="Decide whether this sourced actor motive warrants contacting the person now. Use the actor's ordinary voice. Return JSON {send:boolean,text:string}. If declining, send=false and text empty. Do not invent recipient circumstances. Actual originals include exact observed coverage and gaps: do not claim anything outside them was read. No model grants or template prose.",
+                        content="Decide whether this sourced actor motive warrants contacting the person now. Use the actor's ordinary voice. Return JSON {send:boolean,text:string,photo?:null|{intent:object,parameters:object}}. A photo is optional only when photo_available=true and the actor wants to share a fictional outfit or scene illustration. intent keys: outfit,pose,background,camera,positive,negative with string values; parameters keys width,height,seed,steps. Preserve identity/style; no URL/workflow/credential fields. A photo request is an intention: never claim it has already been generated. If declining, send=false and text empty. Do not invent recipient circumstances. Actual originals include exact observed coverage and gaps: do not claim anything outside them was read. No model grants or template prose.",
                     ),
                     dict(role="user", content=canonical(material)),
                 ]
@@ -532,15 +548,50 @@ class RuntimeExecution:
         self.core.life.verify_generation_lease(lease)
         result = strict_json("\n".join(output))
         if (
-            set(result) != {"send", "text"}
+            set(result) - {"send", "text", "photo"}
+            or not {"send", "text"} <= result.keys()
             or type(result["send"]) is not bool
             or not isinstance(result["text"], str)
         ):
             raise Fault("invalid_input")
+        photo = result.get("photo")
+        if photo:
+            if (
+                not result["send"]
+                or not material["photo_available"]
+                or not isinstance(photo, dict)
+                or set(photo) != {"intent", "parameters"}
+                or "character" in photo["intent"]
+            ):
+                raise Fault("invalid_input")
+            self.core.contracts.check(
+                "image-backend#compile_request",
+                dict(
+                    schema_version=1,
+                    request_id="photo-decision:" + digest(candidate["id"]),
+                    actor_id=candidate["actor_id"],
+                    intent=photo["intent"],
+                    parameters=photo["parameters"],
+                    assist_model=False,
+                ),
+            )
+            fresh = self.store.get("proactive_candidates", candidate["id"])
+            if not fresh or fresh["state"] != "ready":
+                raise Fault("scope_changed")
+            fresh.update(photo=photo, photo_state="decided")
+            self.core.proactive._save("candidates", fresh)
         return result["text"] if result["send"] else None, receipt
+
+    async def prepare_photo(self, candidate):
+        return await self.photos.prepare(candidate)
+
+    async def pending_photos(self):
+        await self.photos.work()
 
     async def dispatch(self, request):
         candidate = self.store.get("proactive_candidates", request["candidate_id"])
+        if candidate.get("photo") and candidate.get("photo_state") != "completed":
+            raise Fault("dependency_unavailable")
         sources = candidate.get("sources", [])
         current = await self.current_context(candidate)
         await self.validate_sources(candidate, current["origin"])
@@ -568,7 +619,8 @@ class RuntimeExecution:
                     reply_id="segment:" + digest(request["candidate_id"]),
                     segment_sequence=1,
                     text=request["text"],
-                    content_refs=candidate.get("content_refs", []),
+                    content_refs=candidate.get("content_refs", [])
+                    + candidate.get("photo_content_refs", []),
                 )
             ],
         )
@@ -576,7 +628,7 @@ class RuntimeExecution:
         media = await self.core.reading.materialize(
             request["actor_id"],
             scope,
-            candidate.get("content_refs", []),
+            candidate.get("content_refs", []) + candidate.get("photo_content_refs", []),
             current["origin"],
             actor_owned=True,
         )

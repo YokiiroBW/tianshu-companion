@@ -1556,7 +1556,9 @@ class Core(Delivery):
                 return ([] if streaming else ["".join(output)]), receipt
             for call in calls:
                 try:
-                    result, attachments = await self.role_actions.execute(turn["id"], call)
+                    result, attachments = await self.role_actions.execute(
+                        turn["id"], call, model_slot_held=True
+                    )
                     state = result.get("state")
                     result = dict(
                         state="unknown"

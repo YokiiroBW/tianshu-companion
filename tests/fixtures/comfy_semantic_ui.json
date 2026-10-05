@@ -1,0 +1,694 @@
+{
+  "nodes": [
+    {
+      "id": 13,
+      "type": "VAEDecode",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 14
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 15
+        }
+      ],
+      "widgets_values": [],
+      "title": "synthetic VAEDecode"
+    },
+    {
+      "id": 21,
+      "type": "VAELoader",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "vae_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "vae_name"
+          }
+        }
+      ],
+      "widgets_values": [
+        "synthetic.safetensors"
+      ],
+      "title": "synthetic VAELoader"
+    },
+    {
+      "id": 11,
+      "type": "AnimaPromptPlusClipEncode",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 45
+        },
+        {
+          "name": "quality_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "quality_prompt"
+          },
+          "link": null
+        },
+        {
+          "name": "artist_tags",
+          "type": "STRING",
+          "widget": {
+            "name": "artist_tags"
+          },
+          "link": 52
+        },
+        {
+          "name": "character_tags",
+          "type": "STRING",
+          "widget": {
+            "name": "character_tags"
+          },
+          "link": 53
+        },
+        {
+          "name": "clothing_tags",
+          "type": "STRING",
+          "widget": {
+            "name": "clothing_tags"
+          },
+          "link": 58
+        },
+        {
+          "name": "pose_tags",
+          "type": "STRING",
+          "widget": {
+            "name": "pose_tags"
+          },
+          "link": 59
+        },
+        {
+          "name": "background_tags",
+          "type": "STRING",
+          "widget": {
+            "name": "background_tags"
+          },
+          "link": 60
+        },
+        {
+          "name": "extra_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "extra_prompt"
+          },
+          "link": 61
+        },
+        {
+          "name": "separator",
+          "type": "STRING",
+          "widget": {
+            "name": "separator"
+          },
+          "link": null
+        }
+      ],
+      "widgets_values": [
+        "fixed style",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        ", "
+      ],
+      "title": "synthetic AnimaPromptPlusClipEncode"
+    },
+    {
+      "id": 28,
+      "type": "LoraLoaderModelOnly",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 44
+        },
+        {
+          "name": "lora_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "lora_name"
+          }
+        },
+        {
+          "name": "strength_model",
+          "type": "FLOAT",
+          "widget": {
+            "name": "strength_model"
+          }
+        }
+      ],
+      "widgets_values": [
+        "synthetic.safetensors",
+        0.8000000000000002
+      ],
+      "title": "synthetic LoraLoaderModelOnly"
+    },
+    {
+      "id": 24,
+      "type": "KSampler",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 51
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 29
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 30
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 31
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          }
+        },
+        {
+          "name": "steps",
+          "type": "INT",
+          "widget": {
+            "name": "steps"
+          }
+        },
+        {
+          "name": "cfg",
+          "type": "FLOAT",
+          "widget": {
+            "name": "cfg"
+          }
+        },
+        {
+          "name": "sampler_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "sampler_name"
+          }
+        },
+        {
+          "name": "scheduler",
+          "type": "COMBO",
+          "widget": {
+            "name": "scheduler"
+          }
+        },
+        {
+          "name": "denoise",
+          "type": "FLOAT",
+          "widget": {
+            "name": "denoise"
+          }
+        }
+      ],
+      "widgets_values": [
+        1,
+        "fixed",
+        15,
+        1,
+        "euler_ancestral",
+        "simple",
+        1
+      ],
+      "title": "synthetic KSampler"
+    },
+    {
+      "id": 27,
+      "type": "LoraLoaderModelOnly",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 49
+        },
+        {
+          "name": "lora_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "lora_name"
+          }
+        },
+        {
+          "name": "strength_model",
+          "type": "FLOAT",
+          "widget": {
+            "name": "strength_model"
+          }
+        }
+      ],
+      "widgets_values": [
+        "synthetic.safetensors",
+        0.76
+      ],
+      "title": "synthetic LoraLoaderModelOnly"
+    },
+    {
+      "id": 17,
+      "type": "CLIPTextEncode",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 47
+        },
+        {
+          "name": "text",
+          "type": "STRING",
+          "widget": {
+            "name": "text"
+          }
+        }
+      ],
+      "widgets_values": [
+        "low quality"
+      ],
+      "title": "synthetic CLIPTextEncode"
+    },
+    {
+      "id": 20,
+      "type": "SaveImage",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 27
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          }
+        }
+      ],
+      "widgets_values": [
+        "synthetic"
+      ],
+      "title": "synthetic SaveImage"
+    },
+    {
+      "id": 12,
+      "type": "ResolutionMaster",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "input_image",
+          "type": "IMAGE"
+        }
+      ],
+      "widgets_values": [
+        "Manual",
+        "latent_4x8",
+        1024,
+        1536,
+        false,
+        "resolution",
+        1.1481983169296148,
+        1,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        "SDXL",
+        64,
+        0.8,
+        1080,
+        2,
+        "{\"__resolutionMasterConfigVersion\":1,\"__resolutionMasterProfile\":{\"strategy\":\"closest_preset\",\"options\":{}},\"__resolutionMasterPresets\":{\"1:1 Square\":{\"width\":1024,\"height\":1024,\"isCustom\":false,\"isHidden\":false},\"3:4 Portrait\":{\"width\":768,\"height\":1024,\"isCustom\":false,\"isHidden\":false},\"4:5 Portrait\":{\"width\":915,\"height\":1144,\"isCustom\":false,\"isHidden\":false},\"5:12 Portrait\":{\"width\":640,\"height\":1536,\"isCustom\":false,\"isHidden\":false},\"7:9 Portrait\":{\"width\":896,\"height\":1152,\"isCustom\":false,\"isHidden\":false},\"9:16 Portrait\":{\"width\":768,\"height\":1344,\"isCustom\":false,\"isHidden\":false},\"13:19 Portrait\":{\"width\":832,\"height\":1216,\"isCustom\":false,\"isHidden\":false},\"3:2 Landscape\":{\"width\":1254,\"height\":836,\"isCustom\":false,\"isHidden\":false}}}",
+        "resolution",
+        1.1481983169296148,
+        1
+      ],
+      "title": "synthetic ResolutionMaster",
+      "properties": {
+        "mode": "Manual",
+        "valueX": 1024,
+        "valueY": 1536,
+        "batch_size": 1,
+        "snapValue": 64,
+        "upscaleValue": 0.8,
+        "targetResolution": 1080,
+        "targetMegapixels": 2,
+        "rescaleMode": "resolution",
+        "rescaleValue": 1.1481983169296148,
+        "preserveScalingRatio": false,
+        "autoDetect": false,
+        "autoDetectSource": "backend",
+        "autoDetectWidth": 0,
+        "autoDetectHeight": 0,
+        "autoDetectPresetsJSON": "{\"__resolutionMasterConfigVersion\":1,\"__resolutionMasterProfile\":{\"strategy\":\"closest_preset\",\"options\":{}},\"__resolutionMasterPresets\":{\"1:1 Square\":{\"width\":1024,\"height\":1024,\"isCustom\":false,\"isHidden\":false},\"3:4 Portrait\":{\"width\":768,\"height\":1024,\"isCustom\":false,\"isHidden\":false},\"4:5 Portrait\":{\"width\":915,\"height\":1144,\"isCustom\":false,\"isHidden\":false},\"5:12 Portrait\":{\"width\":640,\"height\":1536,\"isCustom\":false,\"isHidden\":false},\"7:9 Portrait\":{\"width\":896,\"height\":1152,\"isCustom\":false,\"isHidden\":false},\"9:16 Portrait\":{\"width\":768,\"height\":1344,\"isCustom\":false,\"isHidden\":false},\"13:19 Portrait\":{\"width\":832,\"height\":1216,\"isCustom\":false,\"isHidden\":false},\"3:2 Landscape\":{\"width\":1254,\"height\":836,\"isCustom\":false,\"isHidden\":false}}}",
+        "autoFitOnChange": false,
+        "autoResizeOnChange": false,
+        "autoSnapOnChange": false,
+        "smartFit": true,
+        "selectedCategory": "SDXL",
+        "useCustomCalc": false
+      }
+    },
+    {
+      "id": 22,
+      "type": "CLIPLoader",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "clip_name"
+          }
+        },
+        {
+          "name": "type",
+          "type": "COMBO",
+          "widget": {
+            "name": "type"
+          }
+        },
+        {
+          "name": "device",
+          "type": "COMBO",
+          "widget": {
+            "name": "device"
+          }
+        }
+      ],
+      "widgets_values": [
+        "synthetic.safetensors",
+        "lumina2",
+        "default"
+      ],
+      "title": "synthetic CLIPLoader"
+    },
+    {
+      "id": 23,
+      "type": "UNETLoader",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "unet_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "unet_name"
+          }
+        },
+        {
+          "name": "weight_dtype",
+          "type": "COMBO",
+          "widget": {
+            "name": "weight_dtype"
+          }
+        }
+      ],
+      "widgets_values": [
+        "synthetic.safetensors",
+        "default"
+      ],
+      "title": "synthetic UNETLoader"
+    },
+    {
+      "id": 31,
+      "type": "AnimaArtistTagSelectorPlus",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "artist_tags",
+          "type": "STRING",
+          "widget": {
+            "name": "artist_tags"
+          },
+          "link": null
+        },
+        {
+          "name": "extra_text",
+          "type": "STRING",
+          "widget": {
+            "name": "extra_text"
+          },
+          "link": null
+        },
+        {
+          "name": "separator",
+          "type": "STRING",
+          "widget": {
+            "name": "separator"
+          },
+          "link": null
+        }
+      ],
+      "widgets_values": [
+        "fixed style",
+        "fixed style",
+        ", "
+      ],
+      "title": "synthetic AnimaArtistTagSelectorPlus"
+    },
+    {
+      "id": 32,
+      "type": "AnimaCharacterTagSelectorPlus",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "character_tags",
+          "type": "STRING",
+          "widget": {
+            "name": "character_tags"
+          },
+          "link": null
+        },
+        {
+          "name": "extra_text",
+          "type": "STRING",
+          "widget": {
+            "name": "extra_text"
+          },
+          "link": null
+        },
+        {
+          "name": "separator",
+          "type": "STRING",
+          "widget": {
+            "name": "separator"
+          },
+          "link": null
+        }
+      ],
+      "widgets_values": [
+        "fixed character",
+        "fixed character",
+        ", "
+      ],
+      "title": "synthetic AnimaCharacterTagSelectorPlus"
+    },
+    {
+      "id": 35,
+      "type": "Simple String",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "widget": {
+            "name": "text"
+          },
+          "link": null
+        }
+      ],
+      "widgets_values": [
+        "fixture scene"
+      ],
+      "title": "synthetic Simple String"
+    },
+    {
+      "id": 36,
+      "type": "AstrBot Prompt Router",
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": 57
+        }
+      ],
+      "widgets_values": [
+        ""
+      ],
+      "title": "synthetic AstrBot Prompt Router"
+    }
+  ],
+  "links": [
+    [
+      14,
+      24,
+      0,
+      13,
+      0,
+      "LATENT"
+    ],
+    [
+      15,
+      21,
+      0,
+      13,
+      1,
+      "VAE"
+    ],
+    [
+      27,
+      13,
+      0,
+      20,
+      0,
+      "IMAGE"
+    ],
+    [
+      29,
+      11,
+      0,
+      24,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      30,
+      17,
+      0,
+      24,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      31,
+      12,
+      4,
+      24,
+      3,
+      "LATENT"
+    ],
+    [
+      44,
+      23,
+      0,
+      28,
+      0,
+      "MODEL"
+    ],
+    [
+      45,
+      22,
+      0,
+      11,
+      0,
+      "CLIP"
+    ],
+    [
+      47,
+      22,
+      0,
+      17,
+      0,
+      "CLIP"
+    ],
+    [
+      49,
+      28,
+      0,
+      27,
+      0,
+      "MODEL"
+    ],
+    [
+      51,
+      27,
+      0,
+      24,
+      0,
+      "MODEL"
+    ],
+    [
+      52,
+      31,
+      0,
+      11,
+      2,
+      "STRING"
+    ],
+    [
+      53,
+      32,
+      0,
+      11,
+      3,
+      "STRING"
+    ],
+    [
+      57,
+      35,
+      0,
+      36,
+      0,
+      "STRING"
+    ],
+    [
+      58,
+      36,
+      0,
+      11,
+      4,
+      "STRING"
+    ],
+    [
+      59,
+      36,
+      1,
+      11,
+      5,
+      "STRING"
+    ],
+    [
+      60,
+      36,
+      2,
+      11,
+      6,
+      "STRING"
+    ],
+    [
+      61,
+      36,
+      3,
+      11,
+      7,
+      "STRING"
+    ]
+  ]
+}

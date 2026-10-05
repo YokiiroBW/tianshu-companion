@@ -106,6 +106,7 @@ class Contracts:
             "web-conversation/v1": "web-conversation",
             "memory-context/v1": "memory-context",
             "knowledge-content/v1": "knowledge-content",
+            "image-backend/v1": "image-backend",
         }
         for package in (
             "text-dialogue/v1",
@@ -117,6 +118,7 @@ class Contracts:
             "life-runtime/v2",
             "bot-delivery/v2",
             "knowledge-content/v1",
+            "image-backend/v1",
         ):
             package_root = (packages / package).resolve()
             manifest = read(package_root / "manifest.json")

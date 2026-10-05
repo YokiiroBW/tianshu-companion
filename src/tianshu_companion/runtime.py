@@ -20,14 +20,19 @@ class LifeRuntime:
         resolver = "platform" if issuers is not None and service not in issuers else service
         return await self.core.origins.resolve(resolver, query, self.core.clock())
 
-    async def prepare_action(self, actor, operation, value, expected):
+    async def prepare_action(self, actor, operation, value, expected, *, model_slot_held=False):
         if operation == "image.request":
+            if model_slot_held and "character" in (value.get("intent") or {}):
+                raise Fault("forbidden")
+            compiled = await self.core.image_backend.catalog.prepare_request(
+                actor, value, model_slot_held=model_slot_held
+            )
             references = await self.core.image_backend.prepare_job(actor, value)
             for reference in references:
                 self.core.image_backend.remember_reference(
                     actor, reference["content_ref"], reference["scope"], reference["query"]
                 )
-            return dict(reference_inputs=references)
+            return dict(reference_inputs=references, **compiled)
         if operation == "actor.image-reference.configure":
             await self.core.image_backend.authorize_reference(
                 actor, value["content_ref"], value["scope"], value["query"]
@@ -65,7 +70,6 @@ class LifeRuntime:
             request["value"],
             request["expected_version"],
         )
-        action_inputs = await self.prepare_action(actor_id, operation, value, expected)
         replay = (
             self.life.concerns.replay(service, request)
             if not (operation.startswith("reading.") or operation == "content.acquire")
@@ -79,6 +83,7 @@ class LifeRuntime:
                 operation=operation,
                 result=replay,
             )
+        action_inputs = await self.prepare_action(actor_id, operation, value, expected)
         if operation.startswith("reading.") or operation == "content.acquire":
             result = await self.core.reading.action(service, request)
             return dict(
@@ -188,6 +193,7 @@ class LifeRuntime:
                 scene=value["scene"],
                 edit_source_id=value.get("edit_source_id"),
                 scope=value.get("scope"),
+                intent=value.get("intent"),
                 **(prepared or {}),
             )
         elif operation == "actor.image-reference.configure":

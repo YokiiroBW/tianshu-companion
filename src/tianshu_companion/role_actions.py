@@ -195,7 +195,7 @@ class RoleActions:
             )
         return tools
 
-    async def execute(self, turn_id, tool):
+    async def execute(self, turn_id, tool, *, model_slot_held=False):
         turn = self.core.store.get("turns", turn_id)
         await self.core._preflight(turn)
         name = tool["function"]["name"]
@@ -232,6 +232,8 @@ class RoleActions:
         if not isinstance(value, dict) or TRUSTED & set(value):
             raise Fault("invalid_input")
         actor_id = turn["scope"]["actor_id"]
+        if operation == "image.request" and "character" in (value.get("intent") or {}):
+            raise Fault("forbidden")
         schema = self.core.contracts.schemas["life-runtime"]["$defs"][
             operation.replace(".", "_") + "_value"
         ]
@@ -280,7 +282,11 @@ class RoleActions:
             )
         else:
             prepared = await self.core.life_runtime.prepare_action(
-                actor_id, operation, value, supplied["expected_version"]
+                actor_id,
+                operation,
+                value,
+                supplied["expected_version"],
+                model_slot_held=model_slot_held,
             )
 
             def execute():

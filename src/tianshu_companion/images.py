@@ -1,310 +1,23 @@
 """Trusted, opt-in ComfyUI image ports. No public wire or automatic GPU submission."""
 
 import asyncio
-import copy
 import hashlib
-import ipaddress
 import json
 import os
 import re
-import struct
 import uuid
-import zlib
 from pathlib import Path
-from urllib.parse import urlsplit
 
-import httpx
 
-from .contracts import canonical, digest
+from .contracts import digest
 from .life import expected_version, text
 
-EDITABLE = {
-    "positive": {("CLIPTextEncode", "text"), ("AnimaArtistPack", "base_prompt")},
-    "negative": {("CLIPTextEncode", "text")},
-    "reference": {("LoadImage", "image")},
-    "reference2": {("LoadImage", "image")},
-    "reference3": {("LoadImage", "image")},
-    "seed": {("KSampler", "seed"), ("FLS_SamplerV4", "seed")},
-    "steps": {("KSampler", "steps"), ("FLS_SamplerV4", "steps")},
-    "width": {("EmptyLatentImage", "width"), ("ImageScale", "width")},
-    "height": {("EmptyLatentImage", "height"), ("ImageScale", "height")},
-}
+from .image_workflow import Workflow
+from .image_comfy import ComfyUI as ComfyUI
+from .image_provider import ImageRejected
+from .image_prompt import intent_from_life, bound_prompt_values
+
 TERMINAL = {"completed", "failed", "cancelled"}
-
-
-class Workflow:
-    """Reviewed API export plus explicit typed editable inputs, never UI conversion."""
-
-    @classmethod
-    def standard(cls, checkpoint, *, edit=False, references=1):
-        text(checkpoint, 128)
-        graph = {
-            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": checkpoint}},
-            "2": {
-                "class_type": "CLIPTextEncode",
-                "inputs": {"text": "Fictional character illustration", "clip": ["1", 1]},
-            },
-            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
-            "4": {
-                "class_type": "EmptyLatentImage",
-                "inputs": {"width": 768, "height": 768, "batch_size": 1},
-            },
-            "5": {
-                "class_type": "KSampler",
-                "inputs": {
-                    "seed": 0,
-                    "steps": 24,
-                    "cfg": 7.0,
-                    "sampler_name": "euler",
-                    "scheduler": "normal",
-                    "denoise": 0.65 if edit else 1.0,
-                    "model": ["1", 0],
-                    "positive": ["2", 0],
-                    "negative": ["3", 0],
-                    "latent_image": ["8", 0] if edit else ["4", 0],
-                },
-            },
-            "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
-            "7": {
-                "class_type": "SaveImage",
-                "inputs": {"filename_prefix": "tianshu", "images": ["6", 0]},
-            },
-        }
-        bindings = {
-            "positive": dict(node="2", class_type="CLIPTextEncode", input="text"),
-            "negative": dict(node="3", class_type="CLIPTextEncode", input="text"),
-            "seed": dict(node="5", class_type="KSampler", input="seed", min=0, max=2**63 - 1),
-            "steps": dict(node="5", class_type="KSampler", input="steps", min=1, max=150),
-            "width": dict(node="4", class_type="EmptyLatentImage", input="width", min=64, max=4096),
-            "height": dict(
-                node="4", class_type="EmptyLatentImage", input="height", min=64, max=4096
-            ),
-        }
-        if edit:
-            graph.update(
-                {
-                    "8": {
-                        "class_type": "VAEEncode",
-                        "inputs": {"pixels": ["10", 0], "vae": ["1", 2]},
-                    },
-                    "9": {"class_type": "LoadImage", "inputs": {"image": "input.png"}},
-                    "10": {
-                        "class_type": "ImageScale",
-                        "inputs": {
-                            "image": ["9", 0],
-                            "upscale_method": "lanczos",
-                            "width": 768,
-                            "height": 768,
-                            "crop": "disabled",
-                        },
-                    },
-                }
-            )
-            bindings["reference"] = dict(node="9", class_type="LoadImage", input="image")
-            previous = "9"
-            for number in range(2, references + 1):
-                loader, blend = str(7 + number * 2), str(8 + number * 2)
-                graph[loader] = {"class_type": "LoadImage", "inputs": {"image": "input.png"}}
-                graph[blend] = {
-                    "class_type": "ImageBlend",
-                    "inputs": {
-                        "image1": [previous, 0],
-                        "image2": [loader, 0],
-                        "blend_factor": 0.3,
-                        "blend_mode": "normal",
-                    },
-                }
-                bindings["reference" + str(number)] = dict(
-                    node=loader, class_type="LoadImage", input="image"
-                )
-                previous = blend
-            graph["10"]["inputs"]["image"] = [previous, 0]
-            for field in ("width", "height"):
-                bindings[field] = dict(
-                    node="10", class_type="ImageScale", input=field, min=64, max=4096
-                )
-        return cls(graph, bindings, ["7"])
-
-    def __init__(self, graph, bindings, outputs):
-        if not isinstance(graph, dict) or not graph or "nodes" in graph:
-            raise ValueError("Reviewed API-format export required")
-        if len(canonical(graph).encode()) > 1_000_000:
-            raise ValueError("Workflow too large")
-        for key, node in graph.items():
-            if not isinstance(key, str) or not isinstance(node, dict):
-                raise ValueError("Invalid API node")
-            text(node.get("class_type"), 128)
-            if not isinstance(node.get("inputs"), dict):
-                raise ValueError("Invalid API inputs")
-            for value in node["inputs"].values():
-                if isinstance(value, list) and (
-                    len(value) != 2
-                    or value[0] not in graph
-                    or type(value[1]) is not int
-                    or value[1] < 0
-                ):
-                    raise ValueError("Invalid node link")
-        if not outputs or any(graph.get(k, {}).get("class_type") != "SaveImage" for k in outputs):
-            raise ValueError("Explicit SaveImage outputs required")
-        seen = set()
-        for name, spec in bindings.items():
-            if name not in {
-                "positive",
-                "negative",
-                "reference",
-                "reference2",
-                "reference3",
-                "seed",
-                "width",
-                "height",
-                "steps",
-            }:
-                raise ValueError("Unsupported binding")
-            if (spec["class_type"], spec["input"]) not in EDITABLE[name]:
-                raise ValueError("Input is not an approved editable field")
-            node = graph.get(spec["node"], {})
-            value = node.get("inputs", {}).get(spec["input"])
-            pair = (spec["node"], spec["input"])
-            if node.get("class_type") != spec["class_type"] or pair in seen:
-                raise ValueError("Missing/type-mismatched/duplicate binding")
-            seen.add(pair)
-            kind = str if name in {"positive", "negative"} or name.startswith("reference") else int
-            if type(value) is not kind:
-                raise ValueError("Editable literal of correct type required")
-            if kind is int and not (
-                type(spec.get("min")) is int
-                and type(spec.get("max")) is int
-                and 0 <= spec["min"] <= value <= spec["max"] <= 2**63 - 1
-            ):
-                raise ValueError("Explicit bounded numeric constraint required")
-        if "positive" not in bindings:
-            raise ValueError("Positive binding required")
-        self.graph, self.bindings, self.outputs = copy.deepcopy((graph, bindings, outputs))
-        self.version = digest([graph, bindings, outputs])
-
-    def render(self, values):
-        graph = copy.deepcopy(self.graph)
-        for name, value in values.items():
-            spec = self.bindings.get(name)
-            if spec is None:
-                raise ValueError("Unbound input")
-            if name in {"positive", "negative"} or name.startswith("reference"):
-                text(value, 8000)
-            elif type(value) is not int or not spec["min"] <= value <= spec["max"]:
-                raise ValueError("Out of range")
-            # Fixed style/artist prefix is retained even in the editable positive node.
-            if name == "positive":
-                value = graph[spec["node"]]["inputs"][spec["input"]] + "\n" + value
-            graph[spec["node"]]["inputs"][spec["input"]] = value
-        return graph
-
-
-class ComfyUI:
-    def __init__(self, base_url, *, token_env=None, token=None, credential_ref=None, timeout=10):
-        url = urlsplit(base_url)
-        if (
-            url.scheme not in {"http", "https"}
-            or not url.hostname
-            or url.username
-            or url.password
-            or url.query
-            or url.fragment
-            or url.path not in {"", "/"}
-        ):
-            raise ValueError("Fixed ComfyUI origin required")
-        if url.scheme == "http" and url.hostname != "localhost":
-            try:
-                private = ipaddress.ip_address(url.hostname).is_private
-            except ValueError:
-                private = False
-            if not private:
-                raise ValueError("Public ComfyUI requires TLS")
-        if not 0 < timeout <= 30:
-            raise ValueError("Invalid network budget")
-        token = os.environ.get(token_env) if token_env else token
-        if token_env and not token:
-            raise ValueError("Missing authentication reference")
-        self.identity = digest([base_url.rstrip("/"), credential_ref or token_env])
-        self.client = httpx.AsyncClient(
-            base_url=base_url,
-            timeout=timeout,
-            follow_redirects=False,
-            trust_env=False,
-            headers={"Authorization": "Bearer " + token} if token else {},
-        )
-
-    async def json(self, method, path, body=None):
-        async with self.client.stream(method, path, json=body) as response:
-            response.raise_for_status()
-            data = bytearray()
-            async for chunk in response.aiter_bytes():
-                data.extend(chunk)
-                if len(data) > 2_000_000:
-                    raise ValueError("Response budget exceeded")
-            return json.loads(data) if data else {}
-
-    async def image(self, descriptor, maximum):
-        if descriptor.get("type") != "output":
-            raise ValueError("Only output artifacts allowed")
-        for key in ("filename", "subfolder"):
-            value = descriptor.get(key)
-            if not isinstance(value, str) or len(value) > 240 or "\\" in value or ":" in value:
-                raise ValueError("Unsafe artifact descriptor")
-            if value.startswith("/") or any(p in {".", ".."} for p in value.split("/")):
-                raise ValueError("Unsafe artifact path")
-        if not descriptor["filename"] or "/" in descriptor["filename"]:
-            raise ValueError("Invalid filename")
-        # ComfyUI resolves these suffixes before query type, even without a space.
-        if descriptor["filename"].endswith(("[input]", "[temp]", "[output]")):
-            raise ValueError("Artifact directory annotations are not allowed")
-        params = {key: descriptor[key] for key in ("filename", "subfolder", "type")}
-        async with self.client.stream("GET", "/view", params=params) as response:
-            response.raise_for_status()
-            data = bytearray()
-            async for chunk in response.aiter_bytes():
-                data.extend(chunk)
-                if len(data) > maximum:
-                    raise ValueError("Artifact byte budget exceeded")
-        # First adapter deliberately accepts PNG only, with header and dimension checks.
-        if len(data) < 33 or data[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR":
-            raise ValueError("Expected PNG")
-        width, height = struct.unpack(">II", data[16:24])
-        if not 0 < width <= 8192 or not 0 < height <= 8192 or width * height > 32_000_000:
-            raise ValueError("Image pixel budget exceeded")
-        offset, has_data, ended = 8, False, False
-        while offset + 12 <= len(data):
-            size = int.from_bytes(data[offset : offset + 4], "big")
-            end = offset + 12 + size
-            if end > len(data):
-                raise ValueError("Truncated PNG")
-            chunk = data[offset + 4 : end - 4]
-            if zlib.crc32(chunk) != int.from_bytes(data[end - 4 : end], "big"):
-                raise ValueError("PNG CRC mismatch")
-            has_data |= chunk[:4] == b"IDAT"
-            offset = end
-            if chunk[:4] == b"IEND":
-                ended = size == 0 and end == len(data)
-                break
-        if not has_data or not ended:
-            raise ValueError("Incomplete PNG")
-        return bytes(data), width, height
-
-    async def close(self):
-        await self.client.aclose()
-
-    async def upload(self, data, name):
-        response = await self.client.post(
-            "/upload/image",
-            files={"image": (name, data, "image/png")},
-            data={"type": "input", "overwrite": "true"},
-        )
-        response.raise_for_status()
-        if len(response.content) > 16384:
-            raise ValueError("Upload response budget")
-        result = json.loads(response.content)
-        if result.get("name") != name or result.get("type") != "input":
-            raise ValueError("Unexpected uploaded image identity")
-        return name
 
 
 class Images:
@@ -335,6 +48,7 @@ class Images:
         self.standard_checkpoint = None
         self.completion_port = None
         self.original_reader = None
+        self.submission_guard = None
 
     def get(self, job_id):
         item = self.store.get("image_jobs", job_id)
@@ -403,30 +117,40 @@ class Images:
         edit_source_id=None,
         scope=None,
         reference_inputs=None,
+        workflow=None,
+        prompt_values=None,
+        compile_evidence=None,
+        intent=None,
+        prepared_plan=None,
     ):
         text(request_id, 128)
         parameters = parameters or {}
-        fingerprint = digest(
+        identity = [
+            actor_id,
+            parameters,
+            outfit_id,
+            scene,
+            activity_id,
+            edit_source_id,
+            scope,
             [
-                actor_id,
-                parameters,
-                outfit_id,
-                scene,
-                activity_id,
-                edit_source_id,
-                scope,
-                [
-                    {key: value for key, value in item.items() if key != "query"}
-                    for item in (reference_inputs or [])
-                ],
-            ]
-        )
+                {key: value for key, value in item.items() if key != "query"}
+                for item in (reference_inputs or [])
+            ],
+        ]
+        if intent is not None:
+            identity.append(intent)
+        fingerprint = digest(identity)
         old = self.store.get("image_jobs", request_id)
         if old:
             if old["request_hash"] != fingerprint:
                 raise ValueError("Idempotency conflict")
             return old
-        if not self.transport or not self.workflow or self.staging is None:
+        if (
+            not self.transport
+            or not (prepared_plan or workflow or self.workflow)
+            or self.staging is None
+        ):
             raise ValueError("Image service explicitly unconfigured")
         if set(parameters) - {"seed", "width", "height", "steps", "negative"}:
             raise ValueError("Caller cannot override life or reference binding")
@@ -437,37 +161,46 @@ class Images:
             raise ValueError("Pending budget exhausted")
         snapshot = self.life.snapshot(actor_id)
         outfit = self.store.get("image_outfits", outfit_id or snapshot["actor"]["outfit_ref"])
-        if outfit is None:
-            raise ValueError("Current outfit has no explicit generation binding")
-        values = dict(
-            parameters,
-            positive=canonical(
-                dict(
-                    fictional=True,
-                    outfit=outfit["prompt"],
-                    activity=scene or snapshot["actor"]["activity"],
-                    room=snapshot["room"],
-                    world=snapshot["world"],
-                )
-            ),
+        if activity_id is not None:
+            process = self.life.activities.get(actor_id, activity_id)
+            if process["state"] == "planned" or process.get("scope") != scope:
+                raise ValueError("An actual authorized activity is required")
+        if prepared_plan is not None:
+            return self._admit(
+                request_id,
+                actor_id,
+                fingerprint,
+                snapshot,
+                outfit,
+                prepared_plan,
+                activity_id,
+                scene,
+                scope,
+                edit_source_id,
+                reference_inputs,
+                compile_evidence,
+            )
+        selected = workflow or self.workflow
+        values = (
+            dict(prompt_values)
+            if prompt_values is not None
+            else bound_prompt_values(
+                selected, intent_from_life(snapshot, outfit, scene, intent=intent), parameters
+            )
         )
-        if isinstance(outfit["reference"], str):
+        if outfit and isinstance(outfit["reference"], str):
             values["reference"] = outfit["reference"]
         for index, reference in enumerate(reference_inputs or []):
             values["reference" + (str(index + 1) if index else "")] = reference["filename"]
-        workflow = (
+        workflow = workflow or (
             Workflow.standard(
                 self.standard_checkpoint,
-                edit=bool(edit_source_id or outfit["reference"] or reference_inputs),
+                edit=bool(edit_source_id or (outfit or {}).get("reference") or reference_inputs),
                 references=max(1, len(reference_inputs or [])),
             )
             if self.standard_checkpoint
             else self.workflow
         )
-        if activity_id is not None:
-            process = self.life.activities.get(actor_id, activity_id)
-            if process["state"] == "planned" or process.get("scope") != scope:
-                raise ValueError("An actual authorized activity is required")
         if edit_source_id is not None:
             _, source = self.life.album.read(actor_id, edit_source_id, scope)
             if "reference" not in workflow.bindings:
@@ -477,6 +210,43 @@ class Images:
             spec = workflow.bindings["seed"]
             values["seed"] = spec["min"] + uuid.uuid4().int % (spec["max"] - spec["min"] + 1)
         graph = workflow.render(values)
+        plan = dict(
+            provider=getattr(self.transport, "provider", "comfyui"),
+            submission=dict(graph=graph, outputs=workflow.outputs),
+            graph=graph,
+            outputs=workflow.outputs,
+            workflow_version=workflow.version,
+        )
+        return self._admit(
+            request_id,
+            actor_id,
+            fingerprint,
+            snapshot,
+            outfit,
+            plan,
+            activity_id,
+            scene,
+            scope,
+            edit_source_id,
+            reference_inputs,
+            compile_evidence,
+        )
+
+    def _admit(
+        self,
+        request_id,
+        actor_id,
+        fingerprint,
+        snapshot,
+        outfit,
+        plan,
+        activity_id,
+        scene,
+        scope,
+        edit_source_id,
+        reference_inputs,
+        compile_evidence,
+    ):
         item = dict(
             id=request_id,
             conversation_id=actor_id,
@@ -486,9 +256,13 @@ class Images:
             prompt_id=str(uuid.uuid4()),
             snapshot=snapshot,
             outfit=outfit,
-            graph=graph,
-            workflow_version=workflow.version,
-            outputs=workflow.outputs,
+            graph=plan.get("graph"),
+            workflow_version=plan.get("workflow_version"),
+            provider=plan["provider"],
+            submission=plan["submission"],
+            provider_handle=None,
+            compile_evidence=compile_evidence,
+            outputs=plan.get("outputs", []),
             endpoint=self.transport.identity,
             fictional=True,
             artifacts=[],
@@ -546,16 +320,8 @@ class Images:
             except asyncio.CancelledError:
                 item["state"] = "unknown" if item["submitted"] else "queued"
                 raise
-            except httpx.HTTPStatusError as exc:
-                rejected = (
-                    exc.request.method == "POST"
-                    and exc.request.url.path == "/prompt"
-                    and exc.response.status_code == 400
-                )
-                item.update(
-                    state="failed" if rejected else "unknown",
-                    failure="prompt_rejected" if rejected else "http_error",
-                )
+            except ImageRejected:
+                item.update(state="failed", failure="prompt_rejected")
             except Exception as exc:
                 item.update(
                     state="unknown" if item["submitted"] else "failed", failure=type(exc).__name__
@@ -569,6 +335,9 @@ class Images:
     async def _work(self, item):
         prompt_id = item["prompt_id"]
         if not item["submitted"]:
+            if self.submission_guard and not await self.submission_guard(item):
+                item["state"] = "cancelled"
+                return
             actor = self.store.get("life_actors", item["conversation_id"])
             if (
                 not actor
@@ -603,58 +372,47 @@ class Images:
             # Persist intent before I/O: even crash/timeout cannot cause automatic resubmission.
             item.update(submitted=True, state="unknown")
             self._save_job(item)
-            result = await self.transport.json(
-                "POST",
-                "/prompt",
-                {
-                    "prompt_id": prompt_id,
-                    "prompt": item["graph"],
-                    "client_id": "tianshu-core",
-                },
+            result = await self.transport.submit(
+                prompt_id,
+                item.get("submission") or dict(graph=item["graph"], outputs=item["outputs"]),
             )
-            if result.get("prompt_id") != prompt_id:
-                raise ValueError("Server must support submitted prompt_id")
-            item["state"] = "queued"
-            return
-        history = await self.transport.json("GET", "/history/" + prompt_id)
-        record = history.get(prompt_id)
-        if record:
-            if record.get("status", {}).get("status_str") == "error":
-                item["state"] = "failed"
-                return
-            if record.get("status", {}).get("completed") is not True:
-                item["state"] = "unknown"
-                return
-            await self._artifacts(item, record)
-            item["state"] = "completed"
-            item["completed_at"] = self.life.clock()
-            for artifact in item["artifacts"]:
-                self._record_original(item, artifact)
+            item["provider_handle"] = result.handle
+            item["state"] = "unknown" if result.state == "completed" else result.state
+            if result.error_code:
+                item["failure"] = result.error_code
+            # A synchronous artifact may still need I/O to download. Persist the
+            # provider's recovery handle before that I/O can be interrupted.
             self._save_job(item)
-            if hasattr(self.life, "album"):
-                self.life.album.reconcile_job(item)
+            if result.state == "completed":
+                await self._complete(item, result.artifacts)
             return
-        queue = await self.transport.json("GET", "/queue")
-        running = any(x[1] == prompt_id for x in queue["queue_running"])
-        pending = any(x[1] == prompt_id for x in queue["queue_pending"])
-        item["state"] = "running" if running else "queued" if pending else "unknown"
+        plan = item.get("submission") or dict(graph=item["graph"], outputs=item["outputs"])
+        handle = item.get("provider_handle")
+        if handle is None and item.get("provider", "comfyui") == "comfyui":
+            handle = prompt_id
+        result = await self.transport.poll(handle, plan)
         item["cancel_requested"] |= self.get(item["id"])["cancel_requested"]
-        if item["cancel_requested"] and pending:
-            await self.transport.json("POST", "/queue", {"delete": [prompt_id]})
-            # Deletion can race execution. Do not claim cancellation without reconciliation.
-            queue = await self.transport.json("GET", "/queue")
-            history = await self.transport.json("GET", "/history/" + prompt_id)
-            if (
-                not any(x[1] == prompt_id for x in queue["queue_running"] + queue["queue_pending"])
-                and prompt_id not in history
-            ):
-                item["state"] = "cancelled"
+        if item["cancel_requested"] and result.state == "queued":
+            result = await self.transport.cancel_pending(handle, plan)
+        item["state"] = result.state
+        if result.error_code:
+            item["failure"] = result.error_code
+        if result.state == "completed":
+            await self._complete(item, result.artifacts)
+
+    async def _complete(self, item, descriptors):
+        await self._artifacts(item, descriptors)
+        item["state"] = "completed"
+        item["failure"] = None
+        item["completed_at"] = self.life.clock()
+        for artifact in item["artifacts"]:
+            self._record_original(item, artifact)
+        self._save_job(item)
+        if hasattr(self.life, "album"):
+            self.life.album.reconcile_job(item)
         # Running GPU work is not interrupted. Intent remains visible until completion.
 
-    async def _artifacts(self, item, record):
-        descriptors = []
-        for node in item["outputs"]:
-            descriptors.extend(record.get("outputs", {}).get(node, {}).get("images", []))
+    async def _artifacts(self, item, descriptors):
         if not 0 < len(descriptors) <= self.max_files:
             raise ValueError("Artifact count budget")
         self.staging.mkdir(parents=True, exist_ok=True)
@@ -732,6 +490,9 @@ class Images:
     def _save_job(self, item):
         previous = self.store.get("image_jobs", item["id"])
         if previous:
+            item["cancel_requested"] = item.get("cancel_requested", False) or previous.get(
+                "cancel_requested", False
+            )
             fields = ("state", "cancel_requested", "artifacts", "failure")
             item["version"] = previous.get("version", 1) + int(
                 any(previous.get(field) != item.get(field) for field in fields)
