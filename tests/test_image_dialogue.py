@@ -245,3 +245,125 @@ def test_ordinary_dialogue_compact_image_tool_delivers_original_once(tmp_path):
             await h.core.close()
 
     asyncio.run(run())
+
+
+def test_natural_acceptance_script_uses_auto_tools_and_does_not_submit_or_repeat(
+    tmp_path, monkeypatch
+):
+    async def run():
+        import argparse
+        import importlib.util
+        from pathlib import Path
+        import os
+        from tianshu_companion.image_backend import ImageBackend
+        from test_comfy_deep import ComfyFixture
+
+        script = Path(__file__).parents[1] / "scripts" / "comfy_dialogue_acceptance.py"
+        spec = importlib.util.spec_from_file_location("dialogue_acceptance", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fixture = ComfyFixture()
+
+        async def resolve(self, value):
+            return await fixture.resolve(value)
+
+        class Model(SemanticModel):
+            native_calls = 0
+
+            def __init__(self, *args):
+                super().__init__()
+
+            async def complete(self, turn, messages, *, tools=None, on_delta=None):
+                type(self).native_calls += 1
+                if type(self).native_calls == 1:
+                    assert "original persona exact text" in messages[0]["content"]
+                    assert '"stage":"acquaintance"' in messages[1]["content"]
+                    assert '"relationship_type":"unspecified"' in messages[1]["content"]
+                    return dict(
+                        role="assistant",
+                        content=None,
+                        tool_calls=[
+                            dict(
+                                id="actual-model-choice",
+                                type="function",
+                                function=dict(
+                                    name="life_image_request",
+                                    arguments=json.dumps(
+                                        dict(
+                                            value=dict(
+                                                intent=dict(
+                                                    outfit="opaque pajamas",
+                                                    pose="standing naturally",
+                                                )
+                                            )
+                                        )
+                                    ),
+                                ),
+                            )
+                        ],
+                    ), dict(fixture_only=True)
+                if on_delta:
+                    await on_delta("这次选这件睡衣。")
+                return dict(role="assistant", content="这次选这件睡衣。"), dict(fixture_only=True)
+
+        private = tmp_path / "private-input.json"
+        private.write_text(
+            json.dumps(
+                dict(
+                    actor_id="actor:a",
+                    role=dict(persona="original persona exact text", version=1),
+                    relationship_background=dict(
+                        view="private",
+                        relationship_type="unspecified",
+                        display_label="",
+                        stage="acquaintance",
+                        version=2,
+                    ),
+                    config_version=22,
+                    request_text="看看小汐今天的睡衣",
+                )
+            ),
+            encoding="utf-8",
+        )
+        settings = tmp_path / "settings.json"
+        settings.write_text(
+            json.dumps(
+                dict(
+                    services=dict(
+                        gateway=dict(
+                            url="https://registered-fixture", token_env="DIALOGUE_FIXTURE_TOKEN"
+                        )
+                    )
+                )
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("DIALOGUE_FIXTURE_TOKEN", "synthetic-not-a-real-secret")
+        monkeypatch.setattr(ImageBackend, "resolve", resolve)
+        monkeypatch.setattr(module, "Gateway", Model)
+        h = Harness()
+        args = argparse.Namespace(
+            contracts=os.environ["TIANSHU_CONTRACTS"],
+            settings=str(settings),
+            private_input=str(private),
+            output=str(tmp_path / "output"),
+            base_url="http://127.0.0.1:8188",
+            workflow="synthetic.json",
+            run_dialogue=True,
+            generate=False,
+            dialogue_timeout=5,
+            generation_timeout=5,
+        )
+        await h.core.close()
+        assert await module.run(args) == 0
+        report = json.loads((tmp_path / "output" / "receipt.json").read_text(encoding="utf-8"))
+        assert report["scenario_state"] == "image_requested"
+        assert report["tool_calls"] == ["life_image_request"]
+        assert report["relationship_snapshot_version"] == 2
+        assert report["image_jobs"][0]["submitted"] is False
+        assert not any(method == "POST" for method, _ in fixture.calls)
+        assert await module.run(args) == 0
+        assert Model.native_calls == 2
+        assert not any(method == "POST" for method, _ in fixture.calls)
+
+    asyncio.run(run())
