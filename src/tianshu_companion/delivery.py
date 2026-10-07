@@ -25,6 +25,21 @@ class Delivery:
             sources=self.life.concerns.captured_sources(turn),
         )
 
+    async def continue_delivery_origin(self, turn):
+        sender = self.expression_sender(turn)
+        context = getattr(sender, "expression_context", None)
+        if context is None:
+            return  # Legacy transports keep their existing authorization contract.
+        current = await context(
+            self.response_origin(turn), turn["scope"], turn["bundle"]["collection_key"]["channel"]
+        )
+        if (
+            current["origin"] != turn["origin"]
+            or current["scope"] != turn["scope"]
+            or current["channel"] != turn["bundle"]["collection_key"]["channel"]
+        ):
+            raise Fault("scope_changed")
+
     async def stream_segment(self, turn_id, text="", content_refs=None):
         turn = self.store.get("turns", turn_id)
         sender = self.expression_sender(turn)
@@ -234,6 +249,7 @@ class Delivery:
             if turn["phase"] not in TERMINAL:
                 turn["phase"] = "reconciling"
             self._save_turn(turn)
+        await self.continue_delivery_origin(turn)
         receipt = await self.expression_sender(turn).finalize_expression(
             turn["expression_id"], self.response_origin(turn)
         )

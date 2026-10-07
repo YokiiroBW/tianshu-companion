@@ -1795,6 +1795,7 @@ class Core(Delivery):
         ):
             raise Fault("scope_changed")
         self._check_input_versions(turn)
+        await self.continue_delivery_origin(turn)
         await self._check_qq_admin(turn)
         envelope = command(turn["origin"], uid("check"), self.clock())
         _, _, binding = await self._authorize(

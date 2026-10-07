@@ -779,7 +779,8 @@ class RuntimeExecution:
     async def image_notices(self):
         """Finish an explicit user image request, including after a worker restart."""
         rows = self.store.db.execute(
-            "SELECT body FROM metadata WHERE id LIKE 'image-notice:%' AND status IN ('waiting','queued','sending','unknown') ORDER BY id LIMIT 4"
+            "SELECT body FROM metadata WHERE id LIKE 'image-notice:%' AND status IN ('waiting','queued','sending','unknown') AND COALESCE(json_extract(body,'$.retry_at'),0)<=? ORDER BY id LIMIT 4",
+            (self.core.clock(),),
         ).fetchall()
         for row in rows:
             notice = json.loads(row[0])
@@ -838,7 +839,13 @@ class RuntimeExecution:
                     self.store.put("metadata", notice)
                     receipt = await sender.send_expression(envelope)
                 self.core.record_contact(receipt["expression_id"], notice["scope"], receipt)
-                notice.update(state=receipt["state"], receipt=receipt)
+                notice.update(state=receipt["state"], receipt=receipt, last_error=None)
                 self.store.put("metadata", notice)
-            except (Fault, OSError):
-                pass
+            except (Fault, OSError) as error:
+                notice.update(
+                    last_error=error.code if isinstance(error, Fault) else "dependency_unavailable",
+                    last_attempt_at=self.core.clock(),
+                    attempts=notice.get("attempts", 0) + 1,
+                    retry_at=self.core.clock() + 30,
+                )
+                self.store.put("metadata", notice)

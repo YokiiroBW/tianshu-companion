@@ -692,6 +692,12 @@ class PlatformBotSender(Sender):
 
     async def send_expression(self, request):
         self.contracts.check("bot-delivery#send_request", request)
+        if request["origin"]["kind"] in {"response", "direct"}:
+            current = await self.expression_context(
+                request["origin"], request["scope"], request["channel"]
+            )
+            if current["origin"] != request["origin"]["origin"]:
+                raise Fault("scope_changed")
         value = await self.client.call(
             "/internal/v2/bot-delivery/send", request, uncertain_write=True
         )

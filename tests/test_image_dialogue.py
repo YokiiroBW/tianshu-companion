@@ -22,7 +22,15 @@ class RecordingQueue:
     def expression_available(self, channel):
         return True
 
+    async def expression_context(self, origin, scope, channel):
+        if getattr(self, "unavailable", False):
+            raise Fault("dependency_unavailable")
+        self.valid_until = self.clock() + 30
+        return dict(origin=origin["origin"], scope=scope, channel=channel)
+
     async def send_expression(self, request):
+        assert self.valid_until > self.clock()
+
         self.requests.append(copy.deepcopy(request))
         receipt = dict(
             schema_version=2,
@@ -227,8 +235,17 @@ def test_ordinary_dialogue_compact_image_tool_delivers_original_once(tmp_path):
                 for segment in request["segments"]
             )
             await h.core.images.work()
+            h.clock.advance(65)
             fixture.complete = True
             await h.core.images.work()
+            queue.unavailable = True
+            await h.core.images.work()
+            blocked = next(
+                row for row in h.core.store.list("metadata") if row.get("job_id") == jobs[0]["id"]
+            )
+            assert blocked["last_error"] == "dependency_unavailable" and not blocked.get("envelope")
+            queue.unavailable = False
+            h.clock.advance(31)
             await h.core.images.work()
             await h.core.images.work()
             media_requests = [

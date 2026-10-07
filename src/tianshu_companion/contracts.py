@@ -103,7 +103,7 @@ class Contracts:
             "profile-memory/v1": "profiles",
             "life-read/v1": "life-read",
             "life-runtime/v2": "life-runtime",
-            "bot-delivery/v2": "bot-delivery",
+            "bot-delivery/v2.1": "bot-delivery",
             "web-conversation/v1": "web-conversation",
             "memory-context/v1": "memory-context",
             "knowledge-content/v1": "knowledge-content",
@@ -118,7 +118,7 @@ class Contracts:
             "life-read/v1",
             "memory-context/v1",
             "life-runtime/v2",
-            "bot-delivery/v2",
+            "bot-delivery/v2.1",
             "knowledge-content/v1",
             "image-backend/v1",
             "skills/v1",
@@ -128,7 +128,13 @@ class Contracts:
             if hashlib.sha256(manifest).hexdigest() != RELEASES[package]:
                 raise ValueError("Unrecognized contract release: " + package)
             release = json.loads(manifest)
-            expected_version = "2.0.0" if package.endswith("/v2") else "1.0.0"
+            expected_version = (
+                "2.1.0"
+                if package.endswith("/v2.1")
+                else "2.0.0"
+                if package.endswith("/v2")
+                else "1.0.0"
+            )
             if release.get("version") != expected_version:
                 raise ValueError("Unsupported contract version")
             dependencies = release.get("dependencies", [])
