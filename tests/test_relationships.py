@@ -12,6 +12,7 @@ import pytest
 from support import Harness
 
 from tianshu_companion.clients import JsonService, utc
+from tianshu_companion.contracts import Fault
 from tianshu_companion.relationships import assemble
 from tianshu_companion.relationships.contract import DOMAIN, CandidateContract
 
@@ -154,6 +155,24 @@ class RelationshipTests(unittest.IsolatedAsyncioTestCase):
         await self.finish()
         self.assertIn("relationship_expression", self.prompt())
         self.assertEqual(1, len(self.settlements))
+
+    async def test_delayed_delivery_rechecks_owner_after_projection_cache_expires(self):
+        await self.finish()
+        check = next(
+            c for c in self.h.turns()[0]["context_checks"] if c["version_domain"] == DOMAIN
+        )
+        self.h.clock.advance(600)
+        self.calls.clear()
+        await self.runtime.verify(check, self.h.clock())
+        self.assertEqual(["check"], [operation for operation, _ in self.calls])
+        self.versions[tuple(self.calls[-1][1]["pair"].values())] = 2
+        with self.assertRaises(Fault) as changed:
+            await self.runtime.verify(check, self.h.clock())
+        self.assertEqual("version_conflict", changed.exception.code)
+        self.check_error = True
+        with self.assertRaises(Fault) as revoked:
+            await self.runtime.verify(check, self.h.clock())
+        self.assertEqual("forbidden", revoked.exception.code)
 
     async def test_same_person_different_actors_keep_distinct_relationships(self):
         await self.finish(actor="actor:a")

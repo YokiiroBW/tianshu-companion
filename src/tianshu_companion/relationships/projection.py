@@ -54,8 +54,10 @@ async def verify(runtime, check, now):
         check.get("relationship_view") != view
         or type(check.get("relationship_version")) is not int
         or check["relationship_version"] < 1
-        or not -1 <= now - epoch(check["checked_at"]) <= 120
+        or now - epoch(check["checked_at"]) < -1
         or runtime is None
     ):
         raise Fault("scope_changed")
+    # The owner checks current authority and the exact version on every delivery.
+    # Cache age alone must not prevent that live check for delayed work.
     await runtime.client.check(check["origin"], scope, check["relationship_version"])
