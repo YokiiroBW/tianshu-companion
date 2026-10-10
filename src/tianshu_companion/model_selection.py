@@ -25,6 +25,7 @@ class SelectionRequest:
     conversation_id: str
     caller_service: str = "companion"
     workload: str = "companion.text"
+    function_id: str = "chat"
 
     @classmethod
     def from_turn(cls, turn):
@@ -53,7 +54,10 @@ class HttpDefaultModelSelector:
         self.client = client
 
     async def select(self, request: SelectionRequest) -> ModelSelection:
-        value = await self.client.call("/internal/v1/provider-self-service/select", asdict(request))
+        payload = asdict(request)
+        if request.function_id == "chat":
+            payload.pop("function_id")  # Preserve the existing chat request and grant digest.
+        value = await self.client.call("/internal/v1/provider-self-service/select", payload)
         if not isinstance(value, dict) or set(value) != {
             "config_version",
             "expires_at",

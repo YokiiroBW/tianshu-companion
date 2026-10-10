@@ -146,6 +146,7 @@ class Life:
                         person_id="person:life:" + digest(actor),
                         audience="self_private",
                         conversation_id="life:" + digest(actor),
+                        function_id="writing",
                     ),
                     self.clock,
                 )
@@ -664,11 +665,15 @@ class Life:
         return self.diary_metadata(key)
 
     def _available(self):
-        return self.writing and self.config_version is not None and self.gateway.available
+        return (
+            self.writing
+            and (self.model_selector is not None or self.config_version is not None)
+            and self.gateway.available
+        )
 
     def writing_available(self):
-        """Independent writing switch shared by diary and long-form; never the chat fallback."""
-        return self._available()
+        """Long-form writing retains its explicit static configuration."""
+        return self.writing and self.config_version is not None and self.gateway.available
 
     def recover(self):
         self.activities.recover()
@@ -722,6 +727,14 @@ class Life:
             item["state"] = "generating"
             self._save("diaries", item)
             try:
+                generation = {
+                    "actor_id": item["conversation_id"],
+                    "generation_turn_id": "diary:" + digest([item["id"], item["version"]]),
+                    "config_version": item["config_version"],
+                }
+                await self.select_generation(generation)
+                item["config_version"] = generation["config_version"]
+                self._save("diaries", item)
                 messages = [
                     dict(
                         role="system",
@@ -745,10 +758,11 @@ class Life:
                     ),
                 ]
                 async with self.model_slots:
+                    self.verify_generation_lease(generation)
                     output, receipt = await asyncio.wait_for(
                         self.gateway.generate(
                             dict(
-                                id="diary:" + item["id"],
+                                id=generation["generation_turn_id"],
                                 config_version=item["config_version"],
                                 actor_id=item["conversation_id"],
                                 conversation_id="diary:" + digest(item["conversation_id"]),

@@ -219,6 +219,7 @@ def test_autonomous_generation_uses_each_actor_selected_model_and_explicit_false
                 await h.core.life.work()
             assert {request.actor_id for request in requests} == {"actor:a", "actor:b"}
             for request in requests:
+                assert request.function_id == "writing"
                 assert request.audience == "self_private" and request.workload == "companion.text"
                 assert request.conversation_id.startswith("life:")
                 assert request.person_id.startswith("person:life:")
