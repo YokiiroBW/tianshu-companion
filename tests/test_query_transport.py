@@ -217,7 +217,7 @@ class QueryTLS(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(service.close)
         return service
 
-    async def test_memory_received_commit_with_lost_tls_response_stays_unknown_after_restart(self):
+    async def test_memory_lost_receipt_replays_same_candidate_after_restart(self):
         seen = []
 
         async def drop(reader, writer):
@@ -254,7 +254,8 @@ class QueryTLS(unittest.IsolatedAsyncioTestCase):
                 h.core.recover()
                 h.clock.advance(600)
                 await h.core.flush_outbox()
-                self.assertEqual(1, len(seen))
+                self.assertEqual(2, len(seen))
+                self.assertEqual(seen[0], seen[1])
                 self.assertEqual("unknown", h.core.store.list("outbox")[0]["state"])
             finally:
                 await h.core.close()

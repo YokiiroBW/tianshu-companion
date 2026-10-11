@@ -75,7 +75,7 @@ class CandidatePolicyTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_disabled_preserves_all_old_states_and_explicit_enable_never_replays_unknown(
+    async def test_disabled_preserves_all_old_states_and_enable_reconciles_same_events(
         self,
     ):
         h = self.h
@@ -100,15 +100,15 @@ class CandidatePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], h.memory.commits)
         await self.restart(True)
         await h.core.flush_outbox()
-        self.assertEqual(2, len(h.memory.commits))
+        self.assertEqual(4, len(h.memory.commits))
         states = [r[3] for r in self.rows()]
-        self.assertEqual(2, states.count("unknown"))
-        self.assertEqual(2, states.count("delivered"))
+        self.assertEqual(0, states.count("unknown"))
+        self.assertEqual(4, states.count("delivered"))
         await self.restart(True)
         await h.core.flush_outbox()
-        self.assertEqual(2, len(h.memory.commits))
+        self.assertEqual(4, len(h.memory.commits))
 
-    async def test_unknown_memory_submission_is_durable_and_never_retried(self):
+    async def test_unknown_memory_submission_reconciles_with_identical_event_after_backoff(self):
         await self.turn()
         h = self.h
         calls = []
@@ -125,7 +125,8 @@ class CandidatePolicyTests(unittest.IsolatedAsyncioTestCase):
         await self.restart(True)
         h.clock.advance(600)
         await h.core.flush_outbox()
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
+        self.assertEqual(calls[0], calls[1])
 
     async def test_cancelled_commit_and_concurrent_flush_cannot_duplicate_submission(self):
         await self.turn()

@@ -19,6 +19,8 @@ Memory 查询与 check 的来源屏障可能提交水位/失效记录。因此�
 
 请求只序列化一次，保留方法、URL、正文、关联头、凭据及固定 CA/TLS 配置。查询从发送到响应体读取共用 15 秒 wall-clock 上限，两次不重置预算；HTTPX 原有每阶段 15 秒限制不变。外部取消原样传播。没有新依赖、配置开关、全局禁用 keepalive 或延长超时；HTTPX/httpcore 自行释放失败连接，不关闭或替换共享 client。非白名单命令仍单次发送，原消费者继续处理不确定结果，例如 Core 发送响应丢失进入 reconciling，再到 closed_unknown，不能再发一次。
 
-验证命令（项目根）：先显式设置 `TIANSHU_TLS_PYTHON` 为具有 cryptography 的解释器，运行 `.venv/Scripts/python.exe -m pytest tests/test_query_transport.py -q -s`。真实 TLS 用临时单日回环证书；Uvicorn 原默认 5 秒空闲关闭，HTTPX 正式 trace hook 在已复用连接的 send_request_headers.started 暂停 5.2 秒。断言第一次 RemoteProtocolError 且无响应头、随后新 TLS 握手、目标查询只入站一次、并发 T2 保持运行直至释放并正常完成。另用 TLS 服务收到完整写正文后断连，证明无重发与 Core unknown 封账；不信任临时 CA 的 client 必须失败。
+验证命令（项目根）：先显式设置 `TIANSHU_TLS_PYTHON` 为具有 cryptography 的解释器，运行 `.venv/Scripts/python.exe -m pytest tests/test_query_transport.py -q -s`。真实 TLS 用临时单日回环证书；Uvicorn 原默认 5 秒空闲关闭，HTTPX 正式 trace hook 在已复用连接的 send_request_headers.started 暂停 5.2 秒。断言第一次 RemoteProtocolError 且无响应头、随后新 TLS 握手、目标查询只入站一次、并发 T2 保持运行直至释放并正常完成。另用 TLS 服务收到完整写正文后断连，证明传输层不重发、聊天发送仍 unknown 封账；不信任临时 CA 的 client 必须失败。
+
+TS-118：候选记忆事件由 outbox 业务层按退避重放同一不可变事件，以 Memory 消费账本取回遗失回执；不改变 JsonService 的写入单次发送规则，也不重发渠道消息。候选提议先持久化，结果不明时先读取处理回执，详见 `memory-learning.md`。TLS 用例断言重启后候选重放正文完全相同。
 
 这都是合成数据、真实传输的组件测试，不是 Platform/Memory/Gateway 三方 L0。原协调 W5 未记录底层异常，根因仍仅高置信推断；TS-050 独立受控复现已确认竞态，历史成功/失败证据均不在本任务修改。集成后须由协调者安排 TS-050 固定提交的真实三方 W5 重验。

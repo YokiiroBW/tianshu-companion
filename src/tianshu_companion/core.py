@@ -70,6 +70,7 @@ def _elapsed_ms(started):
 WORK_COUNTERS = (
     "core.tick",
     "core.outbox",
+    "memory.work",
     "life.work",
     "images.work",
     "writing.work",
@@ -138,6 +139,9 @@ class Core(Delivery):
         self._outbox_lock = asyncio.Lock()
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
+        from .memory_learning import MemoryLearning
+
+        self.memory_learning = MemoryLearning(self)
         self.knowledge_client = knowledge_client or getattr(memory, "client", None)
         # The injected runtime-event port. It records what already happened and decides
         # nothing: no rule is moved here, no table is created, and a port that fails or is
@@ -1855,7 +1859,7 @@ class Core(Delivery):
     async def _flush_outbox(self):
         # Only due work is materialized; completed history is never read to infer outcomes.
         attempted = False
-        for item in self.store.due("outbox", ["blocked_scope", "pending"], self.clock()):
+        for item in self.store.due("outbox", ["blocked_scope", "pending", "unknown"], self.clock()):
             turn = self.store.get("turns", item["event"]["aggregate_id"])
             if not self._turn_allows(turn, "memory.write"):
                 continue
@@ -1863,6 +1867,10 @@ class Core(Delivery):
                 outcome, error_code = "succeeded", None
                 attempts = item["attempts"] + 1
                 try:
+                    if item["state"] == "unknown":
+                        # Candidate acceptance is keyed by this immutable event ID and digest.
+                        # Replay reconciles a lost receipt without another candidate or message.
+                        item["state"] = "pending"
                     if item["state"] == "blocked_scope":
                         await self.repair_blocked_scope(turn["id"], self.memory.check_sources)
                         item = self.store.get("outbox", item["id"])
@@ -1886,10 +1894,15 @@ class Core(Delivery):
                             except BaseException:
                                 # Cancellation or an unclassified adapter failure is also
                                 # uncertain. Persist it before propagating to the worker.
-                                item.update(state="unknown", last_error="result_unknown")
+                                item.update(
+                                    state="unknown",
+                                    last_error="result_unknown",
+                                    deadline=self.clock() + min(60, 2 ** min(attempts, 6)),
+                                )
                                 self.store.put("outbox", item)
                                 raise
                             item.update(state="delivered", receipt=receipt, last_error=None)
+                            self.memory_learning.queue(item)
                             if self.relationships is not None:
                                 self.relationships.queue(self, item, turn)
                 except (Fault, OSError, TimeoutError) as error:

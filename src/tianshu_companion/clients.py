@@ -573,6 +573,44 @@ class Memory:
             raise Fault("invalid_input", unknown=True)
         return value
 
+    async def process_candidate(self, job_id, output):
+        value = await self.client.call(
+            "/internal/v1/memory/candidates/process",
+            dict(job_id=job_id, output=output),
+            uncertain_write=output is not None,
+        )
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"state", "result", "content"}
+            or value["state"] not in {"pending", "completed", "invalidated", "rejected"}
+            or not isinstance(value["content"], list)
+        ):
+            raise Fault("invalid_input", unknown=output is not None)
+        if value["state"] == "rejected":
+            if value["result"] == {"error_code": "invalid_input"} and not value["content"]:
+                return value
+            raise Fault("invalid_input", unknown=output is not None)
+        if value["state"] == "completed":
+            try:
+                self.contracts.check("workflow#candidate_result", value["result"])
+            except Fault:
+                raise Fault("invalid_input", unknown=output is not None) from None
+        elif value["result"] is not None:
+            raise Fault("invalid_input", unknown=output is not None)
+        if value["state"] != "pending" and value["content"]:
+            raise Fault("invalid_input", unknown=output is not None)
+        for index, source in enumerate(value["content"]):
+            if (
+                type(source) is not dict
+                or set(source) != {"index", "text", "sent_at"}
+                or type(source["index"]) is not int
+                or source["index"] != index
+                or type(source["text"]) is not str
+                or type(source["sent_at"]) is not str
+            ):
+                raise Fault("invalid_input", unknown=output is not None)
+        return value
+
 
 class Gateway:
     def __init__(self, contracts, client):

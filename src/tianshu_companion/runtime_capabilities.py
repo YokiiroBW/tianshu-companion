@@ -29,6 +29,15 @@ def read_capabilities(core):
             "submission": "enabled" if enabled else "paused",
             "backlog_policy": "preserve",
             "retained_outbox": retained,
+            "extraction": "enabled" if enabled else "paused",
+            "retained_learning": {
+                state: core.store.db.execute(
+                    "SELECT 1 FROM metadata WHERE conversation_id=? AND status=? LIMIT 1",
+                    ("memory:learning", state),
+                ).fetchone()
+                is not None
+                for state in ("pending", "completed", "invalidated")
+            },
             "memory_write_verification": "not_verified",
         },
         "chat_audit": {"enabled": False, "state": "not_integrated"},
