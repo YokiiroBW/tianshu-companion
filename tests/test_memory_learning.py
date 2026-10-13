@@ -283,9 +283,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
 
     def dialogue_memory_status(self):
         system = self.h.gateway.calls[-1][1][0]["content"]
-        return json.loads(
-            system.split("Trusted memory processing: ", 1)[1].split("\nPersona expression", 1)[0]
-        )
+        return json.loads(system.split("Trusted memory processing: ", 1)[1].split("\n", 1)[0])
 
     async def test_dialogue_reports_automatic_learning_when_explicit_skill_is_disabled(self):
         from test_skills import manage
@@ -310,3 +308,27 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.flush()
         self.assertEqual(self.generated, [])
         self.assertEqual(self.calls, [])
+
+    async def test_native_catalog_keeps_completed_empty_recall_separate_from_disabled_skill(self):
+        from test_skills import manage
+
+        await manage(self.h, "skill.disable", dict(skill_id="memory.propose"))
+        captured = []
+
+        async def complete(turn, messages, **kwargs):
+            captured.append(copy.deepcopy(messages))
+            text, receipt = await self.original_generate(turn, messages)
+            return {"role": "assistant", "content": "".join(text)}, receipt
+
+        self.h.gateway.complete = complete
+        await self.chat()
+        status = self.dialogue_memory_status()
+        self.assertEqual(status["automatic_recall_before_reply"], "completed")
+        self.assertEqual(status["recalled_units"], 0)
+        self.assertEqual(status["automatic_extraction_after_delivery"], "enabled")
+        system = captured[0][0]["content"]
+        self.assertGreater(
+            system.index("Trusted memory processing: "), system.index("memory.propose")
+        )
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")

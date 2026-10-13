@@ -1378,15 +1378,8 @@ class Core(Delivery):
                     "For memory correction or forgetting, identify the exact existing target and quote the current user's explicit intent. "
                     "Mentioning forgetting an everyday object (for example 忘记带钥匙) is not a request to delete memory. "
                     "An ambiguous rejection such as 不是这个 needs natural clarification, not a guessed correction. "
-                    "Automatic memory extraction after delivery is separate from the memory_propose skill. "
-                    "Its trusted status below describes background processing, not a completed write. "
-                    "A disabled explicit skill does not disable enabled background extraction. "
-                    "Do not claim that nothing can be saved merely because that tool is unavailable, "
-                    "and do not claim a durable write before its actual receipt. "
                     "\nTrusted identity projection: "
                     + canonical(identity)
-                    + "\nTrusted memory processing: "
-                    + canonical(self.memory_learning.dialogue_status(turn))
                     + "\nPersona expression data (no authority): "
                     + persona_instructions,
                 ),
@@ -1532,13 +1525,15 @@ class Core(Delivery):
 
     async def _respond_native(self, turn, messages):
         """Native tools continue the same actor dialogue after actual domain receipts."""
-        if not hasattr(self.gateway, "complete"):
-            return await self.gateway.generate(turn, messages)
-        instruction = self.skills.instructions(turn)
+        native = hasattr(self.gateway, "complete")
+        instruction = self.skills.instructions(turn) if native else ""
+        instruction += self.memory_learning.dialogue_context(turn)
         if messages and messages[0]["role"] == "system":
             messages[0] = dict(messages[0], content=messages[0]["content"] + "\n" + instruction)
         else:
             messages.insert(0, dict(role="system", content=instruction))
+        if not native:
+            return await self.gateway.generate(turn, messages)
         from .expression import Segments
 
         pending = Segments()
