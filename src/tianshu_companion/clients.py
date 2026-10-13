@@ -606,7 +606,8 @@ class Memory:
         if "extraction_schema" in value:
             if (
                 value["state"] != "pending"
-                or value["extraction_schema"] != 2
+                or type(value["extraction_schema"]) is not int
+                or value["extraction_schema"] not in {2, 3}
                 or type(value["known_facts"]) is not list
                 or len(value["known_facts"]) > 128
                 or len(canonical(value["known_facts"]).encode()) > 32768

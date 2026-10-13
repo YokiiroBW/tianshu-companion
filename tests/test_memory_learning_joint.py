@@ -4,13 +4,14 @@ Run explicitly with the existing TS050 integration fixture on PYTHONPATH.
 """
 
 import json
+import os
 
 import pytest
 
 SourceChain = pytest.importorskip("ts050_source_support").SourceChain
 web = pytest.importorskip("aiohttp.web")
 
-TEXT = "晚上不喝咖啡，白天偶尔可以"
+TEXT = "第一支钢笔用蓝黑墨水"
 
 
 class MemoryLearningJoint(SourceChain):
@@ -49,6 +50,9 @@ class MemoryLearningJoint(SourceChain):
 
     def make_memory_config(self):
         config = super().make_memory_config()
+        config["contract_directory"] = os.environ.get(
+            "TIANSHU_CONTRACT_DIRECTORY", config["contract_directory"]
+        )
         config["callers"]["companion"]["operations"] += [
             "context_query",
             "context_propose",
@@ -60,25 +64,36 @@ class MemoryLearningJoint(SourceChain):
         if owner == "memory":
             self.memory.store.migrate_context(self.directory / "backups/context.sqlite")
             self.memory.contracts.load_context()
+            self.memory.store.migrate_facts(self.directory / "backups/facts.sqlite")
         return await super().start_asgi(app, owner, sock)
 
     async def record_model(self, request):
         body = await request.json()
         self.model_requests.append(body)
-        extraction = body["messages"][0]["content"].startswith("Extract durable memories")
+        extraction = body["messages"][0]["content"].startswith("Extract only durable facts")
         if extraction:
             content = json.loads(body["messages"][-1]["content"])
+            self.assertEqual(content["extraction_schema"], 3)
             memories = (
                 [
                     dict(
                         statement=TEXT,
-                        conditions=["白天偶尔可以"],
-                        negations=["晚上不喝咖啡"],
+                        conditions=[],
+                        negations=[],
                         valid_time="current",
                         evidence=[dict(source_index=0, quote=TEXT)],
+                        fact=dict(
+                            key="pen.ink",
+                            value="蓝黑墨水",
+                            state="current",
+                            valid_from=None,
+                            valid_to=None,
+                            keywords=["钢笔", "墨水"],
+                            entity=dict(id=None, kind="pen", mention="第一支钢笔"),
+                        ),
                     )
                 ]
-                if TEXT in content[0]["text"]
+                if TEXT in content["messages"][0]["text"]
                 else []
             )
             text = json.dumps({"memories": memories}, ensure_ascii=False)
@@ -130,7 +145,7 @@ class MemoryLearningJoint(SourceChain):
         tasks = self.core.store.list("metadata", "memory:learning")
         self.assertEqual(tasks[0]["receipt"]["state"], "committed")
         extraction_count = sum(
-            body["messages"][0]["content"].startswith("Extract durable memories")
+            body["messages"][0]["content"].startswith("Extract only durable facts")
             for body in self.model_requests
         )
         self.assertEqual(extraction_count, 1)
@@ -139,11 +154,11 @@ class MemoryLearningJoint(SourceChain):
 
         await self.restart_core()
         self.core.short_context_policy = ShortContextPolicy(max_turns=0)
-        await self.submit(self.physical("咖啡适合晚上喝吗", "recall-two"))
+        await self.submit(self.physical("第一支钢笔用什么墨水", "recall-two"))
 
         def recalled():
             for body in self.model_requests:
-                if body["messages"][0]["content"].startswith("Extract durable memories"):
+                if body["messages"][0]["content"].startswith("Extract only durable facts"):
                     continue
                 content = json.loads(body["messages"][1]["content"])
                 if any(unit["statement"] == TEXT for unit in content.get("evidence", [])):

@@ -27,11 +27,23 @@ statement (concise string), conditions (string array), negations (string array),
 (nonempty string preserving the author's stated time; use "未说明有效时间" when unspecified,
 never an invented date; source sent_at means observation only), evidence (array of
 {source_index: integer, quote: exact substring of that numbered source}). Each fact needs evidence.
-When extraction_schema is 2, each entry additionally MUST have fact with exactly:
+When extraction_schema is 2 or 3, each entry additionally MUST have fact with:
 key (stable lowercase dotted predicate; no person's name or value in it), value (concise canonical
 value INCLUDING relevant conditions and negation), state (current or historical), valid_from and
 valid_to (RFC3339 timestamp or null when not explicitly known), keywords (2-8 topic terms/synonyms
 in the source language, not filler like user/fact/preference). Use distinct keys for distinct items.
+For extraction_schema 3, fact additionally MUST include entity. Use null for facts about the
+author as a whole (residence, occupation, preferences). For an individually identifiable owned
+object/pet, use {"id": null, "kind": "pen", "mention": "第一支钢笔"}. mention MUST be an exact
+substring of this fact's evidence quote, identifying that object, NOT its attribute value.
+kind is a stable lowercase English type. Reuse an existing entity.id from known_facts only for
+the SAME object with a matching source mention; never invent IDs. Different objects MUST remain
+distinct even when their attribute key is the same. For example, 第一支钢笔 and 第二支钢笔 both
+use key pen.ink but different entities; changing 第一支钢笔 updates only its ink. A repeated
+unchanged fact reuses both its entity ID and canonical value. Keep ordinal labels (first/second),
+names and distinguishing labels in mention. Do not resolve an ambiguous 'it/that one' to an
+arbitrary known object; omit the unresolved fact. A new label is not proof of an old object's
+identity. Legacy known facts without entity keep their existing key when directly reaffirmed.
 NEVER copy source sent_at into valid_from/valid_to merely because a fact is current. Unknown start
 and end dates MUST be null. A repeated unchanged fact has the same effective range; a new message
 is only another observation. Non-null dates require an exact evidence quote containing that date
@@ -40,7 +52,7 @@ preserve the original phrase in valid_time and conditions instead of inventing a
 Examples of general predicates: residence, hometown, occupation, employer, pet.cat.name,
 pet.dog.name, diet.<food>, beverage.<drink>, language.<language>, hobby.<activity>, event.<topic>.
 Match known_facts FIRST: for equivalent meaning reuse its exact key, value, conditions and
-negations; for a changed value reuse the same key with the new value. known_facts alone is NEVER
+negations; for a changed value of the SAME entity reuse the same key with the new value. known_facts alone is NEVER
 evidence and may not be re-extracted. A reported old/ended fact is historical and does not replace
 current facts. Do not combine past and present values in one atomic entry. If a former preference
 changes, keep the new value; a correction is not a reason to erase the source history.

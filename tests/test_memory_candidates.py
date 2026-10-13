@@ -238,6 +238,50 @@ class CandidatePolicyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MemoryWriteOutcomeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_candidate_read_accepts_supported_versions_with_matching_context(self):
+        for version in (2, 3, 4, True, 3.0):
+            with self.subTest(version=version):
+                response = dict(
+                    state="pending",
+                    result=None,
+                    content=[
+                        dict(index=0, text="第一支钢笔用蓝墨水", sent_at="2026-10-14T00:00:00Z")
+                    ],
+                    extraction_schema=version,
+                    known_facts=[
+                        dict(
+                            key="pen.ink",
+                            value="蓝色",
+                            entity=dict(id="entity:" + "a" * 64, kind="pen", mention="第一支钢笔"),
+                        )
+                    ],
+                )
+
+                async def handler(request):
+                    self.assertEqual(
+                        json.loads(request.content), dict(job_id="candidate:quality", output=None)
+                    )
+                    return httpx.Response(200, json=response)
+
+                client = JsonService(
+                    "https://synthetic.invalid",
+                    "synthetic-token",
+                    transport=httpx.MockTransport(handler),
+                )
+                self.addAsyncCleanup(client.close)
+                if type(version) is int and version in (2, 3):
+                    self.assertEqual(
+                        await Memory(contracts(), client).process_candidate(
+                            "candidate:quality", None
+                        ),
+                        response,
+                    )
+                else:
+                    with self.assertRaises(Fault):
+                        await Memory(contracts(), client).process_candidate(
+                            "candidate:quality", None
+                        )
+
     async def test_real_client_never_treats_lost_or_invalid_receipt_as_not_started(self):
         h = Harness(silence_ms=0)
         self.addAsyncCleanup(h.core.close)
