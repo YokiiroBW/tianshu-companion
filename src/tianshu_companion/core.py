@@ -1275,7 +1275,7 @@ class Core(Delivery):
                 start = self.clock()
                 text = self._input_text(turn)
                 recall = self._turn_allows(turn, "memory.read")
-                budget = dict(tokens=2048 if recall else 0, bytes=8192 if recall else 0)
+                budget = dict(tokens=8192 if recall else 0, bytes=8192 if recall else 0)
                 try:
                     selection = await self.memory.select(
                         turn["origin"], turn["scope"], text or "media", budget

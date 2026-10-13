@@ -166,6 +166,8 @@ class RoleActions:
                 )
             )
         if self.core._turn_allows(turn, "memory.write"):
+            memory_schema = self.core.contracts.schemas["memory-context"]
+            proposal = self._expand(memory_schema["$defs"]["proposal_request"], memory_schema)
             tools.append(
                 dict(
                     type="function",
@@ -176,11 +178,11 @@ class RoleActions:
                             type="object",
                             properties=dict(
                                 kind={"enum": ["upsert", "correct", "forget", "no_op"]},
-                                target={"type": "object"},
+                                target=proposal["properties"]["target"],
                                 units={
                                     "type": "array",
                                     "maxItems": 32,
-                                    "items": {"type": "object"},
+                                    "items": proposal["properties"]["units"]["items"],
                                 },
                                 intent=dict(
                                     type="object",
@@ -591,7 +593,7 @@ class RoleActions:
                 turn["origin"],
                 turn["scope"],
                 self.core._input_text(turn),
-                dict(tokens=2048, bytes=8192),
+                dict(tokens=8192, bytes=8192),
             )
             with self.core.store.transaction():
                 fresh = self.core.store.get("turns", turn["id"])

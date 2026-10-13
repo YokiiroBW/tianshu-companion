@@ -36,7 +36,7 @@ def read_capabilities(core):
                     ("memory:learning", state),
                 ).fetchone()
                 is not None
-                for state in ("pending", "completed", "invalidated")
+                for state in ("pending", "completed", "invalidated", "blocked")
             },
             "memory_write_verification": "not_verified",
         },

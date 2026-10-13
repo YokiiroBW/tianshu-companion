@@ -581,7 +581,11 @@ class Memory:
         )
         if (
             not isinstance(value, dict)
-            or set(value) != {"state", "result", "content"}
+            or set(value)
+            not in (
+                {"state", "result", "content"},
+                {"state", "result", "content", "extraction_schema", "known_facts"},
+            )
             or value["state"] not in {"pending", "completed", "invalidated", "rejected"}
             or not isinstance(value["content"], list)
         ):
@@ -599,6 +603,15 @@ class Memory:
             raise Fault("invalid_input", unknown=output is not None)
         if value["state"] != "pending" and value["content"]:
             raise Fault("invalid_input", unknown=output is not None)
+        if "extraction_schema" in value:
+            if (
+                value["state"] != "pending"
+                or value["extraction_schema"] != 2
+                or type(value["known_facts"]) is not list
+                or len(value["known_facts"]) > 128
+                or len(canonical(value["known_facts"]).encode()) > 32768
+            ):
+                raise Fault("invalid_input", unknown=output is not None)
         for index, source in enumerate(value["content"]):
             if (
                 type(source) is not dict

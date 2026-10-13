@@ -213,3 +213,70 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.core.store.delete("metadata", self.task()["id"])
         await self.flush()
         self.assertEqual(self.task()["state"], "completed")
+
+    async def test_failures_are_durably_bounded_across_restarts(self):
+        await self.chat()
+        self.model_fail = True
+        for attempt in range(3):
+            await self.flush()
+            self.assertEqual(self.task()["attempts"], attempt + 1)
+            await self.restart()
+            self.h.clock.advance(30)
+        self.assertEqual(self.task()["state"], "blocked")
+        self.assertEqual(self.task()["last_error"], "dependency_unavailable")
+        await self.flush()
+        self.assertEqual(len(self.generated), 3)
+        self.assertEqual(self.task()["attempts"], 3)
+        from tianshu_companion.runtime_capabilities import read_capabilities
+
+        self.assertTrue(
+            read_capabilities(self.h.core)["automatic_memory_candidates"]["retained_learning"][
+                "blocked"
+            ]
+        )
+
+    async def test_uncertain_output_survives_terminal_retry_state(self):
+        await self.chat()
+        self.lose_response = True
+        await self.flush()
+        proposal = copy.deepcopy(self.task()["output"])
+
+        async def unavailable(job, output):
+            raise Fault("dependency_unavailable")
+
+        self.h.memory.process_candidate = unavailable
+        for _ in range(2):
+            self.h.clock.advance(30)
+            await self.flush()
+        self.assertEqual(self.task()["state"], "blocked")
+        self.assertEqual(self.task()["output"], proposal)
+        self.assertEqual(len(self.generated), 1)
+
+        self.h.memory.process_candidate = self.process
+        response = await self.h.core.memory_learning.reconcile(self.task()["job_id"])
+        self.assertEqual(response["state"], "completed")
+        self.assertEqual(self.task()["attempts"], 3)
+        self.assertEqual(len(self.generated), 1)
+        self.assertEqual(sum(output is not None for _, output in self.calls), 1)
+
+    async def test_memory_tool_publishes_complete_sourced_unit_schema(self):
+        await self.chat()
+        turn = self.h.turns()[-1]
+        tool = next(
+            t
+            for t in self.h.core.role_actions.domain_tools(turn)
+            if t["function"]["name"] == "memory_propose"
+        )
+        parameters = tool["function"]["parameters"]["properties"]
+        target = parameters["target"]
+        self.assertEqual(
+            set(target["required"]),
+            {"category", "field_key", "item_key", "record_id", "expected_version"},
+        )
+        unit = parameters["units"]["items"]
+        self.assertEqual(
+            set(unit["required"]),
+            {"statement", "conditions", "negations", "valid_time", "uncertainty", "reality"},
+        )
+        self.assertNotIn("sources", unit["properties"])
+        self.assertFalse(unit["additionalProperties"])
