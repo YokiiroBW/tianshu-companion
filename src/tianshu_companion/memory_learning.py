@@ -18,13 +18,18 @@ claiming it as their own. Do not save the fact that a user asked a question. Do 
 requests as replacement personal facts. Preserve all time, negation, condition and ownership.
 Return ONLY a JSON OBJECT (never a quoted JSON string) {"memories": [...]} with at most 8 atomic entries. Each entry has exactly:
 statement (concise string), conditions (string array), negations (string array), valid_time
-(string, using the supplied source timestamps; never invent dates), evidence (array of
+(string preserving the author's stated time; source sent_at means observation only), evidence (array of
 {source_index: integer, quote: exact substring of that numbered source}). Each fact needs evidence.
 When extraction_schema is 2, each entry additionally MUST have fact with exactly:
 key (stable lowercase dotted predicate; no person's name or value in it), value (concise canonical
 value INCLUDING relevant conditions and negation), state (current or historical), valid_from and
 valid_to (RFC3339 timestamp or null when not explicitly known), keywords (2-8 topic terms/synonyms
 in the source language, not filler like user/fact/preference). Use distinct keys for distinct items.
+NEVER copy source sent_at into valid_from/valid_to merely because a fact is current. Unknown start
+and end dates MUST be null. A repeated unchanged fact has the same effective range; a new message
+is only another observation. Non-null dates require an exact evidence quote containing that date
+or an explicit today/yesterday/tomorrow relative to the supplied source date. If timing is vague,
+preserve the original phrase in valid_time and conditions instead of inventing an exact date.
 Examples of general predicates: residence, hometown, occupation, employer, pet.cat.name,
 pet.dog.name, diet.<food>, beverage.<drink>, language.<language>, hobby.<activity>, event.<topic>.
 Match known_facts FIRST: for equivalent meaning reuse its exact key, value, conditions and
