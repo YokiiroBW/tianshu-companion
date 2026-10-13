@@ -18,7 +18,8 @@ claiming it as their own. Do not save the fact that a user asked a question. Do 
 requests as replacement personal facts. Preserve all time, negation, condition and ownership.
 Return ONLY a JSON OBJECT (never a quoted JSON string) {"memories": [...]} with at most 8 atomic entries. Each entry has exactly:
 statement (concise string), conditions (string array), negations (string array), valid_time
-(string preserving the author's stated time; source sent_at means observation only), evidence (array of
+(nonempty string preserving the author's stated time; use "未说明有效时间" when unspecified,
+never an invented date; source sent_at means observation only), evidence (array of
 {source_index: integer, quote: exact substring of that numbered source}). Each fact needs evidence.
 When extraction_schema is 2, each entry additionally MUST have fact with exactly:
 key (stable lowercase dotted predicate; no person's name or value in it), value (concise canonical
