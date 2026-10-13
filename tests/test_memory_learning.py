@@ -280,3 +280,33 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("sources", unit["properties"])
         self.assertFalse(unit["additionalProperties"])
+
+    def dialogue_memory_status(self):
+        system = self.h.gateway.calls[-1][1][0]["content"]
+        return json.loads(
+            system.split("Trusted memory processing: ", 1)[1].split("\nPersona expression", 1)[0]
+        )
+
+    async def test_dialogue_reports_automatic_learning_when_explicit_skill_is_disabled(self):
+        from test_skills import manage
+
+        await manage(self.h, "skill.disable", dict(skill_id="memory.propose"))
+        await self.chat()
+        self.assertEqual(
+            self.dialogue_memory_status()["automatic_extraction_after_delivery"], "enabled"
+        )
+        offered = self.h.core.role_actions.tools(self.h.turns()[-1])
+        self.assertNotIn("memory_propose", {t["function"]["name"] for t in offered})
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+
+    async def test_dialogue_does_not_report_disabled_background_learning_as_enabled(self):
+        await self.h.core.close()
+        self.h.core = self.h.new_core(automatic_memory_candidates=False)
+        await self.chat()
+        self.assertEqual(
+            self.dialogue_memory_status()["automatic_extraction_after_delivery"], "disabled"
+        )
+        await self.flush()
+        self.assertEqual(self.generated, [])
+        self.assertEqual(self.calls, [])

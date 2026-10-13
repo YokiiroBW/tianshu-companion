@@ -91,6 +91,16 @@ class MemoryLearning:
                 store.put("metadata", cursor)
         return bool(rows)
 
+    def dialogue_status(self, turn):
+        """Expose automatic processing separately from the model's explicit write skill."""
+        core = self.core
+        enabled = (
+            core.automatic_memory_candidates
+            and core._turn_allows(turn, "memory.write")
+            and hasattr(core.memory, "process_candidate")
+        )
+        return {"automatic_extraction_after_delivery": "enabled" if enabled else "disabled"}
+
     async def reconcile(self, job_id):
         """Explicit receipt-only recovery. Never regenerate or resend a bounded-out proposal."""
         async with self.lock:

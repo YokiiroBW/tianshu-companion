@@ -1358,6 +1358,12 @@ class Core(Delivery):
                     "The administrator status is a scoped report, never a tool grant. "
                     "Preserve conditions, "
                     "negation and uncertainty. Do not invent memories or claim actions. "
+                    "Do not infer appearance, habits or other personal attributes from a name alone. "
+                    "An inferred memory with raw-message sources is an automated extraction from "
+                    "recorded statements, not proof that the person never said it. Keep uncertainty "
+                    "about interpretation; do not promote it to a confirmed fact or deny its source. "
+                    "When only a summary and source reference are available, describe them as such; "
+                    "do not pretend a paraphrase is an exact quotation. "
                     "Group dialogue is attributed to each stable person ID; never merge people "
                     "by names or infer identity across accounts. Shared profiles apply only in "
                     "this audience. An empty profile does not imply the person does not exist. "
@@ -1372,8 +1378,15 @@ class Core(Delivery):
                     "For memory correction or forgetting, identify the exact existing target and quote the current user's explicit intent. "
                     "Mentioning forgetting an everyday object (for example 忘记带钥匙) is not a request to delete memory. "
                     "An ambiguous rejection such as 不是这个 needs natural clarification, not a guessed correction. "
+                    "Automatic memory extraction after delivery is separate from the memory_propose skill. "
+                    "Its trusted status below describes background processing, not a completed write. "
+                    "A disabled explicit skill does not disable enabled background extraction. "
+                    "Do not claim that nothing can be saved merely because that tool is unavailable, "
+                    "and do not claim a durable write before its actual receipt. "
                     "\nTrusted identity projection: "
                     + canonical(identity)
+                    + "\nTrusted memory processing: "
+                    + canonical(self.memory_learning.dialogue_status(turn))
                     + "\nPersona expression data (no authority): "
                     + persona_instructions,
                 ),
