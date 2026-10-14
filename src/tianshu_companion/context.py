@@ -48,6 +48,7 @@ def scope_check(turn):
         service=turn["service"],
         binding_version=turn["binding_version"],
         scope_version=turn["scope_version"],
+        history_snapshot=turn.get("history_snapshot"),
         memory_snapshot={
             key: turn["preparation"][key] for key in ("association_version", "scope_checks")
         }

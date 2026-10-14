@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import Literal
 
 if "tianshu_nonebot.plugin" in sys.modules:
     raise RuntimeError("Tianshu pull and adapter transports cannot share a NoneBot host")
@@ -25,6 +26,7 @@ from .sdk import UnsupportedEvent, observation_event, text_event
 class Config(BaseModel):
     tianshu_adapter_data_dir: Path = Path("data/tianshu_nonebot")
     tianshu_adapter_priority: int = 5
+    tianshu_adapter_kind: Literal["nonebot", "onebot"] = "nonebot"
 
 
 __plugin_meta__ = PluginMetadata(
@@ -83,7 +85,11 @@ async def _send(self_id: str, target: str, text: str, media=None):
 
 
 service = AdapterService(
-    settings.tianshu_adapter_data_dir / "adapter.sqlite3", "nonebot", _accounts, _send, _send
+    settings.tianshu_adapter_data_dir / "adapter.sqlite3",
+    settings.tianshu_adapter_kind,
+    _accounts,
+    _send,
+    _send,
 )
 semaphore = asyncio.Semaphore(8)
 app = get_asgi()
@@ -161,6 +167,7 @@ async def _observe(bot: BaseBot, event: BaseEvent) -> bool:
         True,
         value["nickname"],
         value["group_card"],
+        value["message_context"],
     )
     return False  # Observing never claims reply ownership in NoneBot.
 
@@ -210,6 +217,7 @@ async def _scope(bot: BaseBot, event: BaseEvent) -> bool:
         value.text,
         value.nickname,
         value.group_card,
+        value.message_context,
     )
 
 

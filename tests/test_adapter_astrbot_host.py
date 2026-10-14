@@ -27,7 +27,7 @@ class AstrBotHostTests(unittest.TestCase):
                 Path(__file__).resolve().parents[1]
                 / ".runtime"
                 / "adapter-artifacts"
-                / "astrbot_plugin_tianshu-0.5.0.zip"
+                / "astrbot_plugin_tianshu-0.6.0.zip"
             )
             with tempfile.TemporaryDirectory() as root:
                 before = os.getcwd()

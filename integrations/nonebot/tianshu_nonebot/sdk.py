@@ -55,18 +55,22 @@ class TextEvent:
     text: str
     nickname: str | None = None
     group_card: str | None = None
+    message_context: dict | None = None
 
     def platform_body(self, connection_id: str, platform_id: str, self_id: str) -> dict:
         names = {"nickname": self.nickname, "group_card": self.group_card}
-        return {
+        value = {
             "schema_version": 2 if any(names.values()) else 1,
             "connection_id": connection_id,
             "platform_id": platform_id,
             "self_id": self_id,
             "revision": 1,
-            **{k: v for k, v in self.__dict__.items() if k not in names},
+            **{k: v for k, v in self.__dict__.items() if k not in names and k != "message_context"},
             **(names if any(names.values()) else {}),
         }
+        if self.message_context is not None:
+            value.update(schema_version=3, **names, message_context=self.message_context)
+        return value
 
 
 def conversation_id(event) -> str:
@@ -86,20 +90,24 @@ def text_event(bot, event) -> TextEvent:
     sender, _ = verified_sender(bot, event)
     if getattr(event, "sub_type", None) == "anonymous":
         raise UnsupportedEvent("Anonymous messages have no stable account owner")
-    segments = list(event.get_message())
+    # OneBot's event preprocessor removes reply and @bot segments from message.
+    # original_message is the SDK's preserved copy of the actual received chain.
+    segments = list(event.original_message)
     if not segments:
         raise UnsupportedEvent("Empty message")
-    parts = []
-    for segment in segments:
-        if segment.type == "text":
-            parts.append(str(segment.data["text"]))
-        elif segment.type == "at" and qq_id(segment.data.get("qq")) == qq_id(bot.self_id):
-            continue  # Addressing this bot is transport metadata, not user text.
-        else:
-            raise UnsupportedEvent("Media, third-party mentions and reply segments are not enabled")
-    text = "".join(parts)
-    if not text.strip() or len(text) > 8000:
-        raise UnsupportedEvent("Text must contain 1–8000 characters")
+    from .rpc import RpcError, onebot_input
+
+    try:
+        normalized = onebot_input(
+            [dict(type=s.type, data=s.data) for s in segments],
+            qq_id(bot.self_id),
+            group=event.message_type == "group",
+        )
+    except RpcError as error:
+        raise UnsupportedEvent("Invalid message metadata") from error
+    if normalized["content_state"] != "text":
+        raise UnsupportedEvent("Media or empty text is not enabled")
+    text = normalized["text"]
     return TextEvent(
         event_id=str(event.message_id),
         namespace="qq",
@@ -110,6 +118,7 @@ def text_event(bot, event) -> TextEvent:
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z"),
         text=text,
+        message_context=normalized["message_context"],
         nickname=display_name(getattr(getattr(event, "sender", None), "nickname", None)),
         group_card=display_name(getattr(getattr(event, "sender", None), "card", None))
         if event.message_type == "group"
@@ -126,18 +135,16 @@ def observation_event(bot, event) -> dict:
     sender, self_id = verified_sender(bot, event)
     if getattr(event, "sub_type", None) == "anonymous":
         raise UnsupportedEvent("no stable sender")
-    parts = []
-    mentioned = False
-    unsupported = False
-    for segment in event.get_message():
-        if segment.type == "text":
-            parts.append(str(segment.data.get("text", "")))
-        elif segment.type == "at" and qq_id(segment.data.get("qq")) == self_id:
-            mentioned = True
-        else:
-            unsupported = True
-    text = "".join(parts)[:8000]
-    content_state = "unsupported" if unsupported or not text.strip() else "text"
+    from .rpc import RpcError, onebot_input
+
+    try:
+        normalized = onebot_input(
+            [dict(type=s.type, data=s.data) for s in event.original_message],
+            self_id,
+            group=event.message_type == "group",
+        )
+    except RpcError as error:
+        raise UnsupportedEvent("Invalid message metadata") from error
     return {
         "account_id": self_id,
         "conversation": conversation_id(event),
@@ -146,9 +153,7 @@ def observation_event(bot, event) -> dict:
         "sent_at": datetime.fromtimestamp(int(event.time), timezone.utc)
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z"),
-        "text": text if content_state == "text" else "",
-        "mentioned": mentioned,
-        "content_state": content_state,
+        **normalized,
         "nickname": display_name(getattr(getattr(event, "sender", None), "nickname", None)),
         "group_card": display_name(getattr(getattr(event, "sender", None), "card", None))
         if isinstance(event, GroupMessageEvent)

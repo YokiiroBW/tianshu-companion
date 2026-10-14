@@ -1,10 +1,10 @@
-# 天枢 NoneBot 适配器候选 0.4.0
+# 天枢 NoneBot 适配器候选 0.6.0
 
 适用于 NoneBot **2.5.0**、FastAPI driver、OneBot v11 适配器 **2.4.0**。默认没有机器人、会话或作者白名单，安装后不接管消息。网页配置只需插件地址和一次本机显示的连接密钥；平台内置固定 `tianshu.bot-adapter/v1` 协议。
 
 ## 安装与获取密钥
 
-1. 从项目根运行 `python integrations/build_adapter_releases.py`，取得 `.runtime/adapter-artifacts/tianshu_nonebot_adapter-0.4.0-py3-none-any.whl`。在 NoneBot 宿主的隔离环境安装 wheel，不覆盖宿主框架依赖。通过宿主正常插件加载机制加载 `tianshu_nonebot.adapter_plugin`，须在 `nonebot.init()` 和 OneBot v11 Adapter 注册之后、`nonebot.run()` 之前。此为一次插件安装，不需为每个机器人编辑环境变量或配置文件。
+1. 从项目根运行 `python integrations/build_adapter_releases.py`，取得 `.runtime/adapter-artifacts/tianshu_nonebot_adapter-0.6.0-py3-none-any.whl`。在 NoneBot 宿主的隔离环境安装 wheel，不覆盖宿主框架依赖。通过宿主正常插件加载机制加载 `tianshu_nonebot.adapter_plugin`，须在 `nonebot.init()` 和 OneBot v11 Adapter 注册之后、`nonebot.run()` 之前。此为一次插件安装，不需为每个机器人编辑环境变量或配置文件。
 2. 首次加载会在宿主工作目录 `data/tianshu_nonebot/adapter.sqlite3` 生成稳定随机密钥。在宿主本机同一工作目录运行：
 
    ```text
@@ -17,7 +17,7 @@
 
 入口 `tianshu_nonebot.adapter_plugin` 与历史 `tianshu_nonebot.plugin` 互斥，同一进程同时加载会拒绝第二个。旧 pull 模式及配置/API 保留，见 [README.md](README.md)；切换时先停用旧连接。NoneBot 2.5.0 没有通用插件热卸载 API，本插件路由在 driver shutdown 时移除，宿主重启用于切换插件集合。NoneBot 没有 AstrBot 式统一插件详情 Page：安装仍需宿主现有插件加载机制；密钥仍由宿主本机命令显示，这是当前候选的两个操作限制。
 
-入站只接受 OneBot v11 真实私聊/群聊纯文本与 bot 自身 @；媒体、第三方 @、引用及匿名消息放行其他插件。消息先持久入队后才由 matcher 阻断下游。发送先持久意图、再调用 SDK 一次；`unknown` 不重试，`sent` 需要真实 `message_id`。停用后不新收发。SQLite 队列与发送历史有硬上限，满后拒绝新工作；不要多进程共用数据目录。
+入站接受 OneBot v11 真实私聊/群聊文本、引用消息和精确 @ 账号；引用与 @ 作为结构化元数据交给天枢，不能改变作者或权限。媒体、@全体和匿名消息继续放行其他插件。消息先持久入队后才由 matcher 阻断下游。发送先持久意图、再调用 SDK 一次；`unknown` 不重试，`sent` 需要真实 `message_id`。停用后不新收发。SQLite 队列与发送历史有硬上限，满后拒绝新工作；不要多进程共用数据目录。
 
 本插件 matcher 默认优先级 5；宿主上优先级更高或相同的其他插件仍可能处理同一消息，安装时需检查既有回复插件的会话范围。
 
@@ -28,3 +28,7 @@
 ## 持续运行与历史保留
 
 入站容量只计算尚未 ACK 的事件，上限 10000。ACK 后立即清除传输正文，保留紧凑事件身份，旧 SDK 重放不会重新入队；升级启动也清除旧 ACK 行的正文。发送与绑定操作的幂等回执保留用于重试和状态核对，不计入终身发送次数配额；unknown 回执不会自动重发。紧凑身份和回执随处理量增长，需随适配器数据库备份，不通过清空账本释放容量。观察模式仍沿用已有 30 天及 20000 条传输历史保留策略，未 ACK 事件不清理；正文权威归档位于归档服务。
+
+## 直接接入 OneBot
+
+同一安装包提供 `python -m tianshu_nonebot.onebot` 独立入口，只加载天枢适配器。模型、人格和上下文由天枢负责，启动和令牌配置见 [直接接入说明](../../docs/onebot-direct.md)。平台类型选 OneBot / NapCat，地址填写该接入服务的 HTTP 地址。

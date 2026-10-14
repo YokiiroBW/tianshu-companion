@@ -88,6 +88,7 @@ class FakeMemory:
         self.clock, self.accounts = clock, {}
         self.selections, self.commits = [], []
         self.scope_version = 1
+        self.history_version = None
         self.unavailable = False
         self.fail_commit = False
         self.profile_selections = []
@@ -142,6 +143,26 @@ class FakeMemory:
             budget_used=dict(tokens=0, bytes=0),
             omissions=["no_match"],
         )
+
+    async def history(self, origin, scope, *, expected=None, known=None):
+        if self.unavailable:
+            raise Fault("dependency_unavailable")
+        if expected is not None and expected["scope_version"] != self.scope_version:
+            raise Fault("scope_changed")
+        snapshot = dict(
+            association_version=1,
+            history_checks=[
+                dict(
+                    scope=scope,
+                    history_version=self.history_version or self.scope_version,
+                    association_id=None,
+                    association_version=1,
+                )
+            ],
+        )
+        if known is not None and known != snapshot:
+            raise Fault("scope_changed")
+        return snapshot
 
     async def profiles(self, origin, scope, target, text, selection, budget, known_version=None):
         if self.unavailable:

@@ -9,6 +9,7 @@ RELEASES = {
     "life-runtime/v2": "85aff438f91cb96876e259204b5a198e2fedaead56db64a2265aa520a59ea7e3",
     "image-backend/v1": "62e71dd2f42fb5b1376c439c362a555619da41cb7f7ae26d07acc1182b80ffbd",
     "memory-context/v1": "d44a23ac674d5fd3f8e9325c80884dc1426305055b873be1da239f126056e570",
+    "context-history/v1": "3b535e58c34eedba5589e45cc11ce44468f312251eb719cedd66368fdda02a2d",
     "model-origin-renewal/v1": "7aa782c9571f496755c6fe0bc4d65d6489940358b198c98116b4cc08b4db51e6",
     "model-protocol/v1": "832abdbfbbb49d71bffc0aabdd816f4de92d892680f26cc5f05402e397d34262",
     "observation-source/v1": "c44f0983629c3e145cf37cccc64563cf2ba8d2a569b34308267fd88fab3713d3",

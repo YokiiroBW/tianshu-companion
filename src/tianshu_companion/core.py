@@ -1402,14 +1402,21 @@ class Core(Delivery):
                 turn = self.store.get("turns", turn_id)
                 if turn["cancelled"] or turn["phase"] in TERMINAL:
                     return
-                context, context_metadata, checks, profiles = await self._prepare_context(
-                    turn, dependencies
-                )
+                (
+                    context,
+                    context_metadata,
+                    checks,
+                    profiles,
+                    history_snapshot,
+                ) = await self._prepare_context(turn, dependencies)
                 turn = self.store.get("turns", turn_id)
                 if turn["cancelled"] or turn["phase"] in TERMINAL:
                     return
                 turn.update(
-                    short_context=context_metadata, context_checks=checks, profile_checks=profiles
+                    short_context=context_metadata,
+                    context_checks=checks,
+                    profile_checks=profiles,
+                    history_snapshot=history_snapshot,
                 )
                 await self._preflight(turn)
                 prompt = json.loads(messages[1]["content"])
@@ -1428,6 +1435,7 @@ class Core(Delivery):
                         short_context=context_metadata,
                         context_checks=checks,
                         profile_checks=profiles,
+                        history_snapshot=history_snapshot,
                     )
                     turn = fresh
                     turn["context_revision"] = context_metadata["context_revision"]
@@ -1705,20 +1713,34 @@ class Core(Delivery):
                     check["scope_version"],
                 )
             elif check["version_domain"] == TEXT_DOMAIN:
-                await self.memory.select(
-                    check["origin"],
-                    scope,
-                    "context validity",
-                    dict(tokens=0, bytes=0),
-                    check["scope_version"],
-                    known=check.get("memory_snapshot"),
-                )
+                if check.get("history_snapshot") is not None:
+                    await self.memory.history(
+                        check["origin"], scope, known=check["history_snapshot"]
+                    )
+                else:
+                    await self.memory.select(
+                        check["origin"],
+                        scope,
+                        "context validity",
+                        dict(tokens=0, bytes=0),
+                        check["scope_version"],
+                        known=check.get("memory_snapshot"),
+                    )
             elif check["version_domain"] == RELATIONSHIP_DOMAIN:
                 await verify_relationship(self.relationships, check, self.clock())
             else:
                 raise Fault("invalid_input")
 
     async def _prepare_context(self, turn, dependencies):
+        if self._turn_allows(turn, "memory.read") and hasattr(self.memory, "history"):
+            turn["history_snapshot"] = await self.memory.history(
+                turn["origin"],
+                turn["scope"],
+                expected={
+                    key: turn["preparation"][key]
+                    for key in ("scope_version", "association_version", "scope_checks")
+                },
+            )
         context = TurnContext(turn["preparation"], self._continuation_messages(turn), dependencies)
         checks, profiles = [], []
         if self.relationships is not None:
@@ -1794,7 +1816,7 @@ class Core(Delivery):
             context.append("current_activity", process)
         context.data["short_affect"] = []
         context.append("short_affect", self.life.affect.snapshot(actor_id, turn["scope"]))
-        return context, metadata, checks, profiles
+        return context, metadata, checks, profiles, turn.get("history_snapshot")
 
     async def _preflight(self, turn):
         if (

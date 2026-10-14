@@ -217,21 +217,15 @@ class AstrAdapter:
         segments = raw.get("message")
         if not isinstance(segments, list) or not segments:
             return False
-        parts = []
-        mentioned = False
-        unsupported = False
-        for segment in segments:
-            if not isinstance(segment, Mapping) or not isinstance(segment.get("data"), Mapping):
-                return False
-            if segment.get("type") == "text" and isinstance(segment["data"].get("text"), str):
-                parts.append(segment["data"]["text"])
-            elif (
-                segment.get("type") == "at" and group and str(segment["data"].get("qq")) == self_id
-            ):
-                mentioned = True
-            else:
-                unsupported = True
-        text = "".join(parts).strip()
+        from .rpc import RpcError, onebot_input
+
+        try:
+            normalized = onebot_input(segments, self_id, group=bool(group))
+        except RpcError:
+            return False
+        text = normalized["text"]
+        mentioned = normalized["mentioned"]
+        unsupported = normalized["content_state"] != "text"
         try:
             when = datetime.fromtimestamp(int(raw["time"]), timezone.utc)
         except (KeyError, TypeError, ValueError, OverflowError, OSError):
@@ -253,6 +247,7 @@ class AstrAdapter:
             _display(raw.get("sender", {}).get("card"))
             if group and isinstance(raw.get("sender"), Mapping)
             else None,
+            normalized["message_context"],
         )
         if await self.service.observation_claimed(
             self_id, f"{kind}:{group or author}", author, native_id
@@ -274,6 +269,7 @@ class AstrAdapter:
             _display(raw.get("sender", {}).get("card"))
             if group and isinstance(raw.get("sender"), Mapping)
             else None,
+            normalized["message_context"],
         )
         if captured:
             event.stop_event()

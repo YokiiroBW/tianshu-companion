@@ -1,10 +1,10 @@
-# 天枢 AstrBot 适配器候选 0.4.0
+# 天枢 AstrBot 适配器候选 0.6.0
 
 适用于 AstrBot **4.27.3** 的 aiocqhttp/OneBot v11 QQ 纯文本。插件默认运行 `tianshu.bot-adapter/v1`：平台主动读取事件、提交已授权回复。安装后没有绑定，不接管聊天或发送消息。
 
 ## 安装、监听与获取密钥
 
-1. 从项目根运行 `python integrations/build_adapter_releases.py`。将 `.runtime/adapter-artifacts/astrbot_plugin_tianshu-0.4.0.zip` 通过 AstrBot 插件上传页安装，或解压成 `data/plugins/astrbot_plugin_tianshu/`。在插件配置页保持旧 `enabled=false`。
+1. 从项目根运行 `python integrations/build_adapter_releases.py`。将 `.runtime/adapter-artifacts/astrbot_plugin_tianshu-0.6.0.zip` 通过 AstrBot 插件上传页安装，或解压成 `data/plugins/astrbot_plugin_tianshu/`。在插件配置页保持旧 `enabled=false`。
 2. 在 AstrBot 插件配置页设置 `adapter_port` 和 `adapter_listen_mode`，保存并重载插件：
 
    | 模式 | 监听地址 | 使用场景 |
@@ -35,3 +35,5 @@ AstrBot 4.27.3 的 `Context.register_web_api()` 固定映射到 Dashboard `/api/
 ## 持续运行与历史保留
 
 入站容量只计算尚未 ACK 的事件，上限 10000。ACK 后立即清除传输正文，保留紧凑事件身份，旧 SDK 重放不会重新入队；升级启动也清除旧 ACK 行的正文。发送与绑定操作的幂等回执保留用于重试和状态核对，不计入终身发送次数配额；unknown 回执不会自动重发。紧凑身份和回执随处理量增长，需随适配器数据库备份，不通过清空账本释放容量。观察模式仍沿用已有 30 天及 20000 条传输历史保留策略，未 ACK 事件不清理；正文权威归档位于归档服务。
+
+0.6.0 保留原生 OneBot 消息链中的引用 ID 和精确 @ 账号，交由天枢统一管理上下文；不导入 AstrBot 自身的模型上下文。媒体与 @全体仍按 unsupported 处理。

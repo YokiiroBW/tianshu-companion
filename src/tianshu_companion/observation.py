@@ -42,12 +42,12 @@ def validate(request):
         "scope_revision",
     }
     if not isinstance(event, dict) or set(event) != fields | (
-        {"nickname", "group_card"} if event.get("schema_version") == 3 else set()
-    ):
+        {"nickname", "group_card"} if event.get("schema_version") in (3, 4) else set()
+    ) | ({"message_context"} if event.get("schema_version") == 4 else set()):
         raise Fault("invalid_input")
     if (
         type(event["schema_version"]) is not int
-        or event["schema_version"] not in (2, 3)
+        or event["schema_version"] not in (2, 3, 4)
         or event["revision"] != 1
         or event["namespace"] != "qq"
         or not IDENT.fullmatch(str(event["platform_id"]))
@@ -76,7 +76,7 @@ def validate(request):
         or digest(event) != request["source_digest"]
     ):
         raise Fault("invalid_input")
-    if event["schema_version"] == 3:
+    if event["schema_version"] >= 3:
         if event["conversation_id"].startswith("private:") and event["group_card"] is not None:
             raise Fault("invalid_input")
         for name in (event["nickname"], event["group_card"]):
@@ -90,6 +90,19 @@ def validate(request):
                     or 0x2066 <= ord(char) <= 0x2069
                     for char in name
                 )
+            ):
+                raise Fault("invalid_input")
+    if event["schema_version"] == 4:
+        value = event["message_context"]
+        if not isinstance(value, dict) or set(value) != {"reply_ids", "mentioned_accounts"}:
+            raise Fault("invalid_input")
+        for key, limit, pattern in (("reply_ids", 16, IDENT), ("mentioned_accounts", 64, QQ)):
+            items = value[key]
+            if (
+                not isinstance(items, list)
+                or len(items) > limit
+                or any(type(item) is not str or not pattern.fullmatch(item) for item in items)
+                or len(set(items)) != len(items)
             ):
                 raise Fault("invalid_input")
     if event["content_state"] == "unsupported" and event["text"]:

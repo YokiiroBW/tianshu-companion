@@ -40,6 +40,10 @@ class MemoryLearningJoint(SourceChain):
         web_namespace(config)
         web_namespace(self.account)
         web_namespace(self.channels)
+        for entry in config["entries"].values():
+            route = dict(caller="companion", receiver="platform", purpose="dialogue")
+            if entry.get("actor_id") and route not in entry["routes"]:
+                entry["routes"].append(route)
         return config
 
     def make_core_config(self):
@@ -66,6 +70,26 @@ class MemoryLearningJoint(SourceChain):
             self.memory.contracts.load_context()
             self.memory.store.migrate_facts(self.directory / "backups/facts.sqlite")
         return await super().start_asgi(app, owner, sock)
+
+    async def start_core(self):
+        await super().start_core()
+        # The synthetic web channel uses this fixture's delivery recorder.
+        self.core.web_sender = self.core.sender
+        for skill in ("life.manage", "memory.propose"):
+            if self.core.skills.actor("actor:a")["skills"].get(skill, {}).get("enabled") is False:
+                continue
+            await self.core.skills.call(
+                "platform",
+                "manage",
+                dict(
+                    schema_version=1,
+                    request_id="learning:disable:" + skill,
+                    actor_id="actor:a",
+                    operation="skill.disable",
+                    expected_version=self.core.skills.actor("actor:a")["version"],
+                    value=dict(skill_id=skill),
+                ),
+            )
 
     async def record_model(self, request):
         body = await request.json()
@@ -167,3 +191,36 @@ class MemoryLearningJoint(SourceChain):
 
         await self.eventually(recalled, timeout=30)
         self.assertTrue(recalled())
+
+    async def test_automatic_learning_preserves_recent_dialogue_after_restart(self):
+        await self.submit(self.physical(TEXT, "context-first"))
+        await self.eventually(
+            lambda: any(
+                item["state"] == "completed"
+                for item in self.core.store.list("metadata", "memory:learning")
+            ),
+            timeout=30,
+        )
+        await self.eventually(
+            lambda: any(turn["phase"] == "sent" for turn in self.core.store.list("turns")),
+            timeout=30,
+        )
+        first = self.core.store.list("turns")[0]
+        self.assertIsNotNone(first.get("history_snapshot"))
+        await self.restart_core()
+        count = len(self.model_requests)
+        await self.submit(self.physical("刚才那支呢？", "context-next"))
+
+        def followup():
+            return [
+                body
+                for body in self.model_requests[count:]
+                if not body["messages"][0]["content"].startswith("Extract only durable facts")
+            ]
+
+        await self.eventually(followup, timeout=30)
+        prompt = json.loads(followup()[0]["messages"][1]["content"])
+        self.assertIn(TEXT, json.dumps(prompt["recent_dialogue"], ensure_ascii=False))
+        self.assertGreater(
+            self.core.store.list("turns")[-1]["scope_version"], first["scope_version"]
+        )

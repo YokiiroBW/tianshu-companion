@@ -77,7 +77,7 @@ def test_real_sdk_event_and_text_sender():
     bot = FakeBot()
     value = text_event(bot, group_event())
     assert value.platform_body("conn", "host", bot.self_id) == {
-        "schema_version": 1,
+        "schema_version": 3,
         "connection_id": "conn",
         "platform_id": "host",
         "self_id": "42",
@@ -89,6 +89,9 @@ def test_real_sdk_event_and_text_sender():
         "account_id": "7",
         "sent_at": "2023-11-14T22:13:20.000Z",
         "text": "hello",
+        "nickname": None,
+        "group_card": None,
+        "message_context": {"reply_ids": [], "mentioned_accounts": []},
     }
     assert asyncio.run(send_text(bot, delivery())) == ["888"]
     assert bot.calls[0]["group_id"] == 99
@@ -109,16 +112,18 @@ def test_real_sdk_event_and_text_sender():
         ).text
         == "hello"
     )
-    with pytest.raises(UnsupportedEvent):
-        text_event(
-            bot,
-            group_event(
-                segments=[
-                    {"type": "at", "data": {"qq": "100"}},
-                    {"type": "text", "data": {"text": "hello"}},
-                ]
-            ),
-        )
+    addressed = text_event(
+        bot,
+        group_event(
+            segments=[
+                {"type": "reply", "data": {"id": "11"}},
+                {"type": "at", "data": {"qq": "100"}},
+                {"type": "text", "data": {"text": "hello"}},
+            ]
+        ),
+    )
+    assert addressed.account_id == "7"
+    assert addressed.message_context == {"reply_ids": ["11"], "mentioned_accounts": ["100"]}
     with pytest.raises(UnsupportedEvent):
         text_event(bot, group_event(user_id=42))
     with pytest.raises(ValueError):

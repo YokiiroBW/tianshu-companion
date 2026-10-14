@@ -76,6 +76,7 @@ class JsonService:
             "/internal/v1/memory/source-sync/check",
             "/internal/v1/conversation/reply-status",
             "/internal/v1/memory/context/query",
+            "/internal/v1/memory/context/history",
             "/internal/v1/memory/context/receipt",
             "/internal/v2/bot-delivery/query",
         }
@@ -454,6 +455,45 @@ class Memory:
             ):
                 raise Fault("forbidden")
         return response
+
+    async def history(self, origin, scope, *, expected=None, known=None):
+        request = dict(
+            query=query(origin),
+            requested_scope=scope,
+            include_associated=scope["audience"] == "self_private",
+            expected_snapshot=expected,
+            known_snapshot=known,
+        )
+        self.contracts.check("context-history#request", request)
+        response = await self.client.call("/internal/v1/memory/context/history", request)
+        self.contracts.check("context-history#response", response)
+        if (
+            response["request_id"] != request["query"]["request_id"]
+            or response["effective_scope"] != scope
+        ):
+            raise Fault("forbidden")
+        snapshot = response["snapshot"]
+        history_scopes = snapshot["history_checks"]
+        if not history_scopes or history_scopes[0]["scope"] != scope:
+            raise Fault("forbidden")
+        if expected is not None and (
+            response["scope_version"] != expected["scope_version"]
+            or snapshot["association_version"] != expected["association_version"]
+            or [
+                {k: row[k] for k in ("scope", "association_id", "association_version")}
+                for row in history_scopes
+            ]
+            != [
+                {k: row[k] for k in ("scope", "association_id", "association_version")}
+                for row in expected["scope_checks"]
+            ]
+        ):
+            raise Fault("scope_changed")
+        if epoch(response["valid_until"]) <= time.time() or (
+            known is not None and response["snapshot"] != known
+        ):
+            raise Fault("scope_changed")
+        return response["snapshot"]
 
     async def propose(self, request):
         self.contracts.check("memory-context#proposal_request", request)

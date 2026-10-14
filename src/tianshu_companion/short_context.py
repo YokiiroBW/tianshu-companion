@@ -85,7 +85,11 @@ def select_recent(store, turn, policy, now):
             not same_boundary
             or (turn["scope"]["audience"] != "group" and not same_person)
             or previous["scope_version"] is None
-            or (same_person and previous["scope_version"] != turn["scope_version"])
+            or (
+                same_person
+                and previous["scope_version"] != turn["scope_version"]
+                and not previous.get("history_snapshot")
+            )
             or previous.get("context_revision") != revision
             or (same_person and previous["binding_version"] != turn["binding_version"])
             or (

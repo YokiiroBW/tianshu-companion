@@ -24,6 +24,7 @@ QUERIES = [
     ("/internal/v1/origins/resolve", {}),
     ("/internal/v1/identity/resolve", {}),
     (SELECT, {}),
+    ("/internal/v1/memory/context/history", {}),
     ("/internal/v1/memory/profiles/select", {}),
     ("/internal/v1/memory/source-sync/check", {}),
     ("/internal/v1/model-requests/model:" + "a" * 32, None),

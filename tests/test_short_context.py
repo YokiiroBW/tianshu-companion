@@ -62,6 +62,24 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
             await h.core.close()
             self.h = Harness(silence_ms=0)
 
+    async def test_additive_memory_version_preserves_history_but_invalidation_removes_it(self):
+        self.h.memory.history_version = 1
+        await self.say("阳台那盆是薄荷", group=True, channel="group:shared", account="a")
+        self.h.memory.scope_version = 2
+        await self.say("刚才那盆闻起来怎么样", group=True, channel="group:shared", account="b")
+        self.assertIn("阳台那盆是薄荷", canonical(self.prompt()["recent_dialogue"]))
+        self.h.memory.scope_version = 3
+        self.h.memory.history_version = 3
+        await self.say("继续刚才的话", group=True, channel="group:shared", account="b")
+        self.assertEqual([], self.prompt()["recent_dialogue"])
+
+    async def test_same_author_history_survives_additive_memory_version(self):
+        self.h.memory.history_version = 1
+        await self.say("第一本叫晨光手册")
+        self.h.memory.scope_version = 2
+        await self.say("那本封面也是绿色的")
+        self.assertIn("第一本叫晨光手册", canonical(self.prompt()["recent_dialogue"]))
+
     async def test_scope_isolation_covers_other_private_group_thread_person_and_role(self):
         h = self.h
         h.gateway.segments = ["私聊回复"]

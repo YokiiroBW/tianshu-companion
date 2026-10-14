@@ -54,6 +54,57 @@ def _ident(value: Any) -> str:
     return value
 
 
+def message_context(value: Any) -> dict:
+    """Bounded transport metadata; account mentions never grant authority."""
+    if not isinstance(value, dict) or set(value) != {"reply_ids", "mentioned_accounts"}:
+        _bad()
+    for key, limit, validator in (
+        ("reply_ids", 16, _ident),
+        ("mentioned_accounts", 64, _qq_account),
+    ):
+        items = value[key]
+        if not isinstance(items, list) or len(items) > limit:
+            _bad()
+        for item in items:
+            validator(item)
+        if len(set(items)) != len(items):
+            _bad()
+    return {key: list(items) for key, items in value.items()}
+
+
+def onebot_input(segments: list, self_id: str, *, group: bool) -> dict:
+    """Preserve text, exact account mentions and native reply IDs from OneBot segments."""
+    if not isinstance(segments, list) or not segments or len(segments) > 256:
+        _bad()
+    parts, replies, accounts = [], [], []
+    unsupported = False
+    for segment in segments:
+        if not isinstance(segment, dict) or not isinstance(segment.get("data"), dict):
+            _bad()
+        data = segment["data"]
+        if segment.get("type") == "text" and isinstance(data.get("text"), str):
+            parts.append(data["text"])
+        elif segment.get("type") == "reply":
+            replies.append(_ident(str(data.get("id", ""))))
+        elif segment.get("type") == "at" and str(data.get("qq")) != "all":
+            accounts.append(_qq_account(str(data.get("qq", ""))))
+        else:
+            unsupported = True
+    text = "".join(parts)
+    context = message_context(
+        dict(
+            reply_ids=list(dict.fromkeys(replies)), mentioned_accounts=list(dict.fromkeys(accounts))
+        )
+    )
+    supported = bool(text.strip()) and len(text) <= 8000 and not unsupported
+    return dict(
+        text=text if supported else "",
+        content_state="text" if supported else "unsupported",
+        mentioned=group and self_id in accounts,
+        message_context=context,
+    )
+
+
 def request_limit(path: str) -> int:
     return (
         MAX_MEDIA_REQUEST
@@ -162,7 +213,7 @@ class AdapterService:
         send: Callable[[str, str, str], Awaitable[str | int]],
         send_media: Callable[[str, str, str, list[dict]], Awaitable[str | int]] | None = None,
     ):
-        if adapter not in {"astrbot", "nonebot"}:
+        if adapter not in {"astrbot", "nonebot", "onebot"}:
             raise ValueError("adapter")
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,11 +322,13 @@ class AdapterService:
         text: str,
         nickname: str | None = None,
         group_card: str | None = None,
+        context: dict | None = None,
     ) -> bool:
         """Return true only after an enabled, exact-author event is durable."""
         if not isinstance(text, str) or not 1 <= len(text) <= 8000:
             return False
         try:
+            context = message_context(context) if context is not None else None
             account_id, conversation, author, native_id = (
                 _qq_account(account_id),
                 _qq(conversation),
@@ -321,6 +374,13 @@ class AdapterService:
             }
             if nickname or group_card:
                 payload.update(nickname=nickname, group_card=group_card)
+            if context is not None:
+                payload.update(
+                    schema_version=3,
+                    nickname=nickname,
+                    group_card=group_card,
+                    message_context=context,
+                )
             self.db.execute(
                 "INSERT OR IGNORE INTO events(id,connection_id,native_id,author,payload,created) "
                 "VALUES(?,?,?,?,?,?)",
@@ -341,9 +401,11 @@ class AdapterService:
         identity_v3: bool = False,
         nickname: str | None = None,
         group_card: str | None = None,
+        context: dict | None = None,
     ) -> bool:
         """Durably observe an enrolled SDK account without claiming a reply."""
         try:
+            context = message_context(context) if context is not None else None
             account_id, conversation, author, native_id = (
                 _qq_account(account_id),
                 _qq(conversation),
@@ -425,6 +487,13 @@ class AdapterService:
             }
             if identity_v3:
                 payload.update(nickname=nickname, group_card=group_card)
+            if context is not None:
+                payload.update(
+                    schema_version=4,
+                    nickname=nickname,
+                    group_card=group_card,
+                    message_context=context,
+                )
             matched = target in policy["list"]
             permitted = (policy["mode"] == "whitelist" and matched) or (
                 policy["mode"] == "blacklist" and not matched
