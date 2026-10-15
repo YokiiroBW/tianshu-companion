@@ -104,6 +104,9 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
         h = self.h
         request = h.request()
         request["command"]["deadline_at"] = utc(h.clock() + 0.2)
+        h.origins.values[request["command"]["origin"]["assertion_ref"]]["expires_at"] = utc(
+            h.clock() + 0.2
+        )
         await h.core.ingest("nonebot", request)
         calls = []
 
@@ -129,6 +132,16 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
         await h.cycles()
         self.assertEqual("failed", h.turns()[1]["phase"])
         self.assertEqual([1, 2], calls)
+
+    async def test_accepted_turn_can_leave_queue_after_ingest_deadline_with_live_grant(self):
+        h = self.h
+        request = h.request()
+        request["command"]["deadline_at"] = utc(h.clock() + 0.2)
+        await h.core.ingest("nonebot", request)
+        h.clock.advance(10)
+        await h.cycles()
+        self.assertEqual("sent", h.turns()[0]["phase"])
+        self.assertEqual(1, len(h.gateway.calls))
 
     async def test_non_null_conflicting_source_mapping_is_rejected(self):
         h = self.h

@@ -1281,6 +1281,10 @@ class Core(Delivery):
                         turn["origin"], turn["scope"], text or "media", budget
                     )
                 except Fault as error:
+                    if error.retryable_read:
+                        # Durable preparation recovery handles explicit peer congestion;
+                        # it must not be consumed by the short initial mapping retry.
+                        raise
                     if (
                         error.code == "dependency_unavailable"
                         and turn["bootstrap_mapping"]
@@ -1515,6 +1519,11 @@ class Core(Delivery):
                 if turn["cancelled"] or turn["phase"] in TERMINAL:
                     return
                 turn["failure"] = error.code if isinstance(error, Fault) else type(error).__name__
+                from .preparation_retry import retry_preparation
+
+                if retry_preparation(turn, error, self.clock()):
+                    self._save_turn(turn)
+                    return
                 if turn.get("expression_id"):
                     turn.update(
                         stream_open=False,

@@ -281,7 +281,7 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
         select_recent(h.core.store, latest_turn, h.core.short_context_policy, h.clock())
         h.core.store.db.set_trace_callback(None)
         recent_query = next(q for q in queries if "FROM turns WHERE" in q)
-        self.assertIn("ORDER BY position DESC LIMIT 4", recent_query)
+        self.assertIn("ORDER BY position DESC LIMIT 128", recent_query)
         h.clock.advance(1800)
         await self.say("久以后")
         self.assertEqual([], self.prompt()["recent_dialogue"])

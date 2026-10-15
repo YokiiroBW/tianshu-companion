@@ -456,7 +456,9 @@ def accept_actor(
     )
     collection["messages"].append(message)
     collection["revision"] += 1
-    collection.update(origin=origin, source_deadline=epoch(request["command"]["deadline_at"]))
+    # The ingest command's deadline governs admission, which has completed here.
+    # A queued turn remains bounded by its actual source grant, rechecked before use.
+    collection.update(origin=origin, source_deadline=epoch(ctx["expires_at"]))
     collection["deadline"] = core._deadline(collection, now)
     store.put("collections", collection)
     receipt = dict(

@@ -14,6 +14,12 @@ def _digest(value):
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _event_state(response):
+    if response["state"] == "not_started" and response.get("retryable") is True:
+        return "pending"
+    return response["state"]
+
+
 class Conflict(ValueError):
     pass
 
@@ -118,13 +124,13 @@ class Journal:
     def resolve_event(self, key, response):
         self.db.execute(
             "UPDATE inbound SET state=?,response=? WHERE key=? AND state='unknown'",
-            (response["state"], _json(response), key),
+            (_event_state(response), _json(response), key),
         )
 
     def accepted(self, key, response):
         self.db.execute(
             "UPDATE inbound SET state=?,response=? WHERE key=? AND state='inflight'",
-            (response["state"], _json(response), key),
+            (_event_state(response), _json(response), key),
         )
 
     def claim(self, delivery):

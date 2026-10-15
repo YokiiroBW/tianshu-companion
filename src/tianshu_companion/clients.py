@@ -95,6 +95,7 @@ class JsonService:
         ):
             raise ValueError("Internal service URL must be an explicitly configured HTTPS URL")
         self.url, self.token = url, token
+        self.query_slots = asyncio.Semaphore(4)
         # A registered interface label for the runtime event stream. It is never the
         # configured URL, host or any other deployment value.
         self.label = _label(label, obs.PEER_LABELS)
@@ -156,16 +157,48 @@ class JsonService:
             raise Fault("dependency_unavailable", unknown=True) from None
 
     async def call(self, path, body=None, headers=None, *, uncertain_write=False):
-        if not self.url or not self.token:
-            raise Fault("dependency_unavailable")
-        retry_query = (body is not None and path in self.QUERY_PATHS) or (
+        retry_query = self._is_query(path, body)
+        if not retry_query:
+            return await self._call_once(path, body, headers, uncertain_write=uncertain_write)
+        headers = dict(headers or {})
+        headers.setdefault(
+            obs.CORRELATION_HEADER, obs.current_correlation_id() or obs.new_correlation_id()
+        )
+        try:
+            # Share the peer's capacity fairly; commands never enter this replay path.
+            async with asyncio.timeout(self.QUERY_BUDGET_SECONDS):
+                async with self.query_slots:
+                    for attempt in range(4):
+                        try:
+                            return await self._call_once(
+                                path, body, headers, uncertain_write=uncertain_write
+                            )
+                        except Fault as error:
+                            if not error.retryable_read or attempt == 3:
+                                raise
+                            await asyncio.sleep(0.1 * 2**attempt)
+        except TimeoutError:
+            raise Fault("dependency_unavailable", retryable_read=True) from None
+
+    @classmethod
+    def _is_query(cls, path, body):
+        return (body is not None and path in cls.QUERY_PATHS) or (
             body is None
             and re.fullmatch(r"/internal/v1/model-requests/model:[0-9a-f]{32}", path) is not None
         )
+
+    async def _call_once(self, path, body=None, headers=None, *, uncertain_write=False):
+        if not self.url or not self.token:
+            raise Fault("dependency_unavailable")
+        retry_query = self._is_query(path, body)
         # One correlation ID for the whole logical call, taken unchanged from the operation
         # in flight so the caller's other events share it. It is not propagated to a peer
         # body or credential: only the dedicated header carries it.
-        correlation = obs.current_correlation_id() or obs.new_correlation_id()
+        correlation = (
+            (headers or {}).get(obs.CORRELATION_HEADER)
+            or obs.current_correlation_id()
+            or obs.new_correlation_id()
+        )
         request_headers = {
             "Authorization": "Bearer " + self.token,
             obs.CORRELATION_HEADER: correlation,
@@ -221,6 +254,14 @@ class JsonService:
                     isinstance(value, dict) and value.get("execution_state") == "not_started"
                 )
                 code = value.get("code") if isinstance(value, dict) else None
+                if (
+                    retry_query
+                    and response.status_code in {429, 503}
+                    and code in {"queue_full", "dependency_unavailable"}
+                    and not_started
+                    and value.get("retryable") is True
+                ):
+                    raise Fault(code, retryable_read=True)
                 if code in {
                     "scope_changed",
                     "forbidden",

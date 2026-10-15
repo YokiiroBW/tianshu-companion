@@ -82,6 +82,10 @@ class BotRuntime:
                     break
                 else:
                     self.journal.accepted(key, response)
+                    if response["state"] == "not_started" and response.get("retryable") is True:
+                        # Leave the identical event pending and use the normal poll interval.
+                        # Unknown outcomes still require status, never a speculative resend.
+                        break
 
     async def check_unknown_events(self):
         for key, body in self.journal.unknown_events():

@@ -48,7 +48,7 @@ def message_current(store, scope, message):
 
 
 def select_recent(store, turn, policy, now):
-    """Recent adjacency is the first-slice relevance rule; never load account history.
+    """Keep adjacency and retrieve older relevant inputs within the same boundary.
 
     A candidate is one entire input group plus its currently confirmed sent replies.
     Draft/sending/unknown text is not read. Oversized groups are omitted whole.
@@ -64,11 +64,8 @@ def select_recent(store, turn, policy, now):
     )
     if not policy.max_turns or not policy.max_bytes or not policy.max_age_seconds:
         return [], metadata
-    chosen = []
-    oldest_expiry = None
-    for previous in store.recent_turns(
-        turn["conversation_id"], turn["sequence"], policy.max_turns * 2
-    ):
+    candidates = []
+    for previous in store.recent_turns(turn["conversation_id"], turn["sequence"], 128):
         expiry = epoch(previous["bundle"]["sealed_at"]) + policy.max_age_seconds
         if expiry <= now:
             break
@@ -134,9 +131,37 @@ def select_recent(store, turn, policy, now):
                 for r in replies
             ],
         )
-        candidate = [group] + chosen
+        candidates.append((group, expiry))
+
+    from .context_relevance import relevance
+
+    scores = {group["turn_id"]: relevance(turn, group) for group, _ in candidates}
+    older = candidates[policy.max_turns :]
+    topic_return = any(scores[group["turn_id"]][0] > 0 for group, _ in older)
+    if topic_return:
+        adjacent = policy.max_turns // 2
+        ranked = sorted(
+            candidates,
+            key=lambda item: (*scores[item[0]["turn_id"]], item[0]["turn_sequence"]),
+            reverse=True,
+        )
+        # Reserve space for the best actual source before adjacent verbose
+        # replies consume the byte budget. Then keep the local conversation.
+        preferred = [ranked[0]] + candidates[:adjacent] + ranked[1:]
+        seen = set()
+        candidates = []
+        for item in preferred:
+            if item[0]["turn_id"] not in seen:
+                seen.add(item[0]["turn_id"])
+                candidates.append(item)
+    chosen = []
+    oldest_expiry = None
+    for group, expiry in candidates:
+        candidate = sorted([group] + chosen, key=lambda item: item["turn_sequence"])
         size = len(canonical(candidate).encode("utf-8"))
         if size > policy.max_bytes:
+            if topic_return:
+                continue
             break
         chosen = candidate
         metadata["bytes_used"] = size

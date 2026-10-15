@@ -15,7 +15,9 @@ Memory 查询与 check 的来源屏障可能提交水位/失效记录。因此�
 
 所有 JsonService.call 调用点已核对：Origins.input_access/resolve、Memory.identity/check_sources/select/profiles/commit、Gateway.generate（生成及回执）、Sender.send，以及 NoneBot Bridge.flush 的 ingest-actors。source-access/read 的 operation=input 可能冻结路由集合或签发 actor context，明确排除；即使名字含 read，也不属于本次恢复范围。register、turn-commits/consume、revise、ingest、ingest-actors、渠道 send 和 chat/completions 均不重放；未来新路径默认不重试。
 
-只有获取响应头之前的 HTTPX RemoteProtocolError、ReadError、WriteError 可以触发恢复；第二次仍失败则沿用 dependency_unavailable。明确 HTTP 错误/拒绝/重定向、JSON/schema/业务校验失败、响应体中途断开、连接建立/证书错误、连接/读取/连接池超时均不重试。这个有意保守的范围解决已确认的复用连接关闭竞态，不是通用可用性重试策略。
+获取响应头之前的 HTTPX RemoteProtocolError、ReadError、WriteError 可以触发一次连接恢复；第二次仍失败则沿用 dependency_unavailable。TS-153 另外允许既有查询白名单在 HTTP 429/503 且响应明确为 `execution_state=not_started`、`retryable=true`、错误为 `queue_full` 或 `dependency_unavailable` 时退避重试，总计最多四次尝试。其余 HTTP 错误/拒绝/重定向、JSON/schema/业务校验失败、响应体中途断开、连接建立/证书错误、连接/读取/连接池超时均不重试。
+
+同一 JsonService 查询并发最多四个，等待槽位与所有尝试共享原来的 15 秒总预算。业务准备仅在尚未调用模型、没有开始表达且收到上述可重试只读错误时重新入队，最多五次、总计不超过首次准备后的 30 秒及来源授权实际有效期；已接收的命令截止时间不再错误地截断排队后的处理。入站 SDK 的持久回执只有明确未执行且可重试才回到 pending，沿用同一事件与消息 ID，并由 Platform 重新核对当前连接权限；unknown、永久拒绝和已接收均不盲目重发。
 
 请求只序列化一次，保留方法、URL、正文、关联头、凭据及固定 CA/TLS 配置。查询从发送到响应体读取共用 15 秒 wall-clock 上限，两次不重置预算；HTTPX 原有每阶段 15 秒限制不变。外部取消原样传播。没有新依赖、配置开关、全局禁用 keepalive 或延长超时；HTTPX/httpcore 自行释放失败连接，不关闭或替换共享 client。非白名单命令仍单次发送，原消费者继续处理不确定结果，例如 Core 发送响应丢失进入 reconciling，再到 closed_unknown，不能再发一次。
 
