@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 import httpx
@@ -7,6 +8,22 @@ from tianshu_companion.contracts import Fault
 
 
 class CongestionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preparation_is_globally_bounded_and_queued_conversations_drain(self):
+        h = Harness(silence_ms=0)
+        self.addAsyncCleanup(h.core.close)
+        gate = asyncio.Event()
+        h.gateway.gates[1] = gate
+        for i in range(12):
+            account = str(1000 + i)
+            await h.ingest(account=account, channel="private:" + account, text="刚泡了一杯茶")
+        await h.cycles()
+        self.assertEqual(len(h.gateway.calls), h.core.preparation_slots)
+        self.assertEqual(sum(t["phase"] == "queued" for t in h.turns()), 8)
+        gate.set()
+        await h.cycles(180)
+        self.assertEqual(len(h.gateway.calls), 12)
+        self.assertTrue(all(t["phase"] == "sent" for t in h.turns()))
+
     async def test_explicit_query_congestion_reuses_request_but_never_replays_a_command(self):
         seen = []
 

@@ -373,6 +373,7 @@ class SecretTests(unittest.TestCase):
 
                 await client_request_failure(client, h, explode)
             await h.core.close()
+            await logs.adapter.aclose()
             return logs
 
         logs = asyncio.run(scenario())
@@ -471,6 +472,7 @@ class SecretTests(unittest.TestCase):
                 await h.cycles()
             await service.close()
             await h.core.close()
+            await logs.adapter.aclose()
             return logs, seen, offered
 
         logs, seen, offered = asyncio.run(scenario())

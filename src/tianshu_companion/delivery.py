@@ -2,7 +2,7 @@
 
 import asyncio
 
-from .clients import command, uid, utc
+from .clients import command, epoch, uid, utc
 from .contracts import Fault, digest
 from . import observability as obs
 
@@ -39,6 +39,20 @@ class Delivery:
             or current["channel"] != turn["bundle"]["collection_key"]["channel"]
         ):
             raise Fault("scope_changed")
+        # This is a freshly verified lease from the existing delivery authority, not
+        # a local extension of the admission deadline. Persist it for retry/restart.
+        deadline = epoch(current["expires_at"])
+        if deadline <= self.clock():
+            raise Fault("forbidden")
+        with self.store.transaction():
+            fresh = self.store.get("turns", turn["id"])
+            if fresh and deadline > fresh["source_deadline"]:
+                fresh["source_deadline"] = deadline
+                if fresh.get("bootstrap_mapping") and fresh["bootstrap_until"] <= self.clock():
+                    fresh["bootstrap_until"] = min(deadline, self.clock() + 5)
+                # Lease bookkeeping does not revise the turn's source/event version.
+                self.store.put("turns", fresh)
+        turn["source_deadline"] = max(turn["source_deadline"], deadline)
 
     async def stream_segment(self, turn_id, text="", content_refs=None):
         turn = self.store.get("turns", turn_id)
@@ -165,6 +179,23 @@ class Delivery:
             turn = self.store.get("turns", turn_id)
             if receipt["expression_id"] != turn.get("expression_id"):
                 raise Fault("invalid_input")
+            previous = turn.get("expression_receipt")
+
+            def semantic(value):
+                return {k: v for k, v in value.items() if k not in {"request_id", "observed_at"}}
+
+            terminal_transition = (
+                turn["phase"] not in TERMINAL
+                and not turn.get("stream_open")
+                and receipt["final"]
+                and all(
+                    s["state"] not in {"queued", "sending", "unknown"} for s in receipt["segments"]
+                )
+            )
+            if previous and semantic(previous) == semantic(receipt) and not terminal_transition:
+                # Poll time/request correlation is not a new source fact. Repeated
+                # pending receipts must not invalidate every reader's Core barrier.
+                return
             for segment in receipt["segments"]:
                 reply = self.store.get("replies", segment["reply_id"])
                 if (

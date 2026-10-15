@@ -779,6 +779,10 @@ def create_app(core=None, tokens=None, life_readers=None):
                 return await core.web_snapshot(service, body)
             if operation == "facts":
                 return core.source_facts(service, body)
+            if operation == "ingest-receipt":
+                from .ingress_receipts import read
+
+                return read(core, service, body)
             if operation == "direct-command":
                 return await core.direct_command(service, body)
             if operation == "commands":
@@ -857,6 +861,10 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v1/conversation/ingest-actors")
     async def ingest_actors(request: Request):
         return await dispatch(request, "ingest-actors")
+
+    @app.post("/internal/v1/conversation/ingest-receipt")
+    async def ingest_receipt(request: Request):
+        return await dispatch(request, "ingest-receipt")
 
     @app.post("/internal/v1/bot-bindings/apply")
     async def bot_binding_apply(request: Request):

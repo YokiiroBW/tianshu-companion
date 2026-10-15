@@ -42,6 +42,7 @@ class TurnContext:
 def scope_check(turn):
     return dict(
         version_domain=TEXT_DOMAIN,
+        source_turn_id=turn["id"],
         origin=turn["origin"],
         scope=turn["scope"],
         channel=turn["bundle"]["collection_key"]["channel"],

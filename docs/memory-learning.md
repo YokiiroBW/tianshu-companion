@@ -4,11 +4,13 @@
 
 处理顺序：读取 Memory 回执/当前来源 → 选择 `function_id=memory` 模型 → 提炼带精确引文的事实 → 持久保存原提议 → Memory 再核验与提交 → 保存回执。模型选择复用原功能配置与默认回退，未启用动态选择的部署沿用固定配置版本。抽取与聊天使用独立 provider 会话，避免提炼提示或 JSON 污染聊天历史。模型输出仅为 inferred，不生成权限、身份绑定或关系分数。
 
-现有 `automatic_memory_candidates=false` 同时暂停候选投递和整理，不删除积压。来源和授权由 Memory 在读取及提交时核验。失败指数退避，上限 300 秒；后台处理每轮最多 90 秒，单独回执恢复最多 45 秒，总尝试上限 3 次。停止/重启不丢待处理任务。写入无响应时保留原提议，先查询回执；只有 Memory 明确 rejected 才重新生成。候选受理 outbox 的 unknown 也按相同不可变事件重放，复用服务端幂等，不重发聊天消息。
+现有 `automatic_memory_candidates=false` 同时暂停候选投递和整理，不删除积压。来源和授权由 Memory 在读取及提交时核验。后台每轮最多 90 秒，模型最多 60 秒，单独回执恢复最多 45 秒。临时失败前两次分别等待 2、4 秒；第三次起冷却 60、120、240 秒，总尝试最多 6 次。累计三次明确无效提议或权限/来源拒绝提前停止。尝试次数、处理阶段、恢复原因及原提议持久保存，重启不重置额度；旧版本三次后 blocked 的临时失败通过有界游标补入冷却队列。
+
+写入无响应时保留原提议，先查询回执；只有 Memory 明确 rejected 才丢弃提议重新生成。恢复时重新核验来源和角色，重新生成使用当前获准的 memory 功能模型；不重放聊天。全部尝试耗尽后仍保留 blocked 和提议，内部 reconcile 只查回执，不无限追加模型调用。候选受理 outbox 的 unknown 也按相同不可变事件重放，复用服务端幂等，不重发聊天消息。
 
 完成的事实由现有 memory-context 自动召回，普通问题无需“你记得吗”等触发词。纠正、遗忘及抑制旧来源重新出现继续由 Memory 现有修订与 proof 机制负责。本次没有另建第二套用户画像或长期存储。
 
-内部运行能力端口增加 `extraction` 与 `retained_learning`（pending/completed/invalidated 的有无），不包含原文、人物标识或模型输出。completed 包括 committed/skipped，不能单凭任务完成就声称产生了事实；`memory_write_verification` 不自动升级为真实环境已验收。
+内部运行能力端口增加 `extraction` 与 `retained_learning`（pending/completed/invalidated/blocked 的有无），不包含原文、人物标识或模型输出。completed 包括 committed/skipped，不能单凭任务完成就声称产生了事实；`memory_write_verification` 不自动升级为真实环境已验收。
 
 跨产品联合用例：`tests/run_memory_learning_joint.ps1`，所有依赖路径均为必传，创建独立 `.runtime/memory-learning-joint` 数据、临时证书及回环端口；只有外部模型与渠道是合成替身，Platform、Companion、Memory、Gateway 均使用实际代码。当前用例使用协议 3 保存带对象身份的钢笔墨水事实、重启 Companion、关闭短期邻接，再验证普通问题的实际模型请求中包含长期记忆。Memory 使用独立发布合同目录时设置现有测试变量 `TIANSHU_CONTRACT_DIRECTORY`。它不证明真实模型提炼质量或 QQ 收发效果。
 

@@ -26,7 +26,9 @@ class RecordingQueue:
         if getattr(self, "unavailable", False):
             raise Fault("dependency_unavailable")
         self.valid_until = self.clock() + 30
-        return dict(origin=origin["origin"], scope=scope, channel=channel)
+        return dict(
+            origin=origin["origin"], scope=scope, channel=channel, expires_at=utc(self.valid_until)
+        )
 
     async def send_expression(self, request):
         assert self.valid_until > self.clock()

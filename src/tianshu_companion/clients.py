@@ -168,13 +168,13 @@ class JsonService:
             # Share the peer's capacity fairly; commands never enter this replay path.
             async with asyncio.timeout(self.QUERY_BUDGET_SECONDS):
                 async with self.query_slots:
-                    for attempt in range(4):
+                    for attempt in range(2):
                         try:
                             return await self._call_once(
                                 path, body, headers, uncertain_write=uncertain_write
                             )
                         except Fault as error:
-                            if not error.retryable_read or attempt == 3:
+                            if not error.retryable_read or attempt == 1:
                                 raise
                             await asyncio.sleep(0.1 * 2**attempt)
         except TimeoutError:

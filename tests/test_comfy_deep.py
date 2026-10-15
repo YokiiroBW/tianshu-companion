@@ -580,7 +580,14 @@ async def photo_candidate(h, tmp_path):
 
     class Queue(NativeQueue):
         async def expression_context(self, requested_origin, requested_scope, channel):
-            return dict(scope=requested_scope, origin=origin, channel=channel)
+            from tianshu_companion.clients import utc
+
+            return dict(
+                scope=requested_scope,
+                origin=origin,
+                channel=channel,
+                expires_at=utc(h.clock() + 60),
+            )
 
     queue = Queue(h.clock)
     queue.states, queue.final = ["sent"], True

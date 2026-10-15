@@ -94,11 +94,23 @@ def projection(turn, admin):
         )
     return {
         "actor_id": turn["scope"]["actor_id"],
+        "actor_kind": "bot_character",
         "audience": turn["scope"]["audience"],
         "conversation_id": turn["scope"]["conversation_id"],
         "current_request": attribution[-1],
         "authors": attribution,
-        "administrator": admin,
+        "administrator": None
+        if admin is None
+        else {
+            **admin,
+            "subject": {
+                "kind": "human_speaker",
+                "speaker_ref": attribution[-1]["speaker_ref"],
+                "person_ref": attribution[-1]["person_ref"],
+                "account": messages[-1]["author"],
+            },
+            "authority": "platform_current_qq_admin_registry",
+        },
     }
 
 

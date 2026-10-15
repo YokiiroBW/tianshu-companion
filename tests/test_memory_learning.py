@@ -222,16 +222,16 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
     async def test_failures_are_durably_bounded_across_restarts(self):
         await self.chat()
         self.model_fail = True
-        for attempt in range(3):
+        for attempt in range(6):
             await self.flush()
             self.assertEqual(self.task()["attempts"], attempt + 1)
             await self.restart()
-            self.h.clock.advance(30)
+            self.h.clock.advance(301)
         self.assertEqual(self.task()["state"], "blocked")
         self.assertEqual(self.task()["last_error"], "dependency_unavailable")
         await self.flush()
-        self.assertEqual(len(self.generated), 3)
-        self.assertEqual(self.task()["attempts"], 3)
+        self.assertEqual(len(self.generated), 6)
+        self.assertEqual(self.task()["attempts"], 6)
         from tianshu_companion.runtime_capabilities import read_capabilities
 
         self.assertTrue(
@@ -253,7 +253,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(2):
             self.h.clock.advance(30)
             await self.flush()
-        self.assertEqual(self.task()["state"], "blocked")
+        self.assertEqual(self.task()["state"], "pending")
         self.assertEqual(self.task()["output"], proposal)
         self.assertEqual(len(self.generated), 1)
 
@@ -261,6 +261,64 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         response = await self.h.core.memory_learning.reconcile(self.task()["job_id"])
         self.assertEqual(response["state"], "completed")
         self.assertEqual(self.task()["attempts"], 3)
+        self.assertEqual(len(self.generated), 1)
+        self.assertEqual(sum(output is not None for _, output in self.calls), 1)
+
+    async def test_three_timeouts_cool_down_then_recover_after_restart_without_chat_replay(self):
+        await self.chat()
+        chat_calls = len(self.h.gateway.calls)
+        self.model_fail = True
+        for _ in range(3):
+            await self.flush()
+            self.h.clock.advance(10)
+        self.assertEqual(self.task()["state"], "pending")
+        self.assertGreater(self.task()["deadline"], self.h.clock())
+        self.assertEqual(self.task()["attempts"], 3)
+        await self.restart()
+        self.model_fail = False
+        await self.flush()
+        self.assertEqual(len(self.generated), 3)
+        self.h.clock.advance(60)
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["attempts"], 4)
+        self.assertEqual(len(self.h.gateway.calls), chat_calls)
+        self.assertEqual(sum(output is not None for _, output in self.calls), 1)
+
+    async def test_revoked_source_during_cooldown_never_regenerates(self):
+        await self.chat()
+        self.model_fail = True
+        for _ in range(3):
+            await self.flush()
+            self.h.clock.advance(10)
+
+        async def revoked(job, output):
+            self.assertIsNone(output)
+            return dict(state="invalidated", result={"state": "invalidated"}, content=[])
+
+        self.h.memory.process_candidate = revoked
+        self.h.clock.advance(60)
+        await self.flush()
+        self.assertEqual(self.task()["state"], "invalidated")
+        self.assertEqual(len(self.generated), 3)
+
+    async def test_legacy_blocked_transient_job_keeps_attempts_and_original_proposal(self):
+        await self.chat()
+        self.lose_response = True
+        await self.flush()
+        item = self.task()
+        proposal = item["output"]
+        item.update(state="blocked", attempts=3, last_error="dependency_unavailable")
+        self.h.core.store.put("metadata", item)
+        # The older three-attempt worker had no upgrade scan cursor.
+        self.h.core.store.delete("metadata", "memory-learning-recovery")
+        await self.restart()
+        await self.flush()
+        self.assertEqual(self.task()["attempts"], 3)
+        self.assertEqual(self.task()["output"], proposal)
+        self.h.clock.advance(61)
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
         self.assertEqual(len(self.generated), 1)
         self.assertEqual(sum(output is not None for _, output in self.calls), 1)
 

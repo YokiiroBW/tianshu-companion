@@ -81,6 +81,32 @@ async def source_turn(h):
     return turn
 
 
+def test_unchanged_receipt_poll_does_not_advance_source_or_turn_versions():
+    async def run():
+        h = Harness(silence_ms=0)
+        queue = NativeQueue(h.clock)
+        queue.states = ["unknown"]
+        h.sender = h.core.sender = queue
+        try:
+            turn = await source_turn(h)
+            await h.core.stream_segment(turn["id"], "等待投递的合成消息")
+            before = h.core.store.source_head()
+            version = h.core.store.get("turns", turn["id"])["version"]
+            receipt = queue.receipt()
+            h.clock.advance(1)
+            receipt.update(request_id="query:new", observed_at=utc(h.clock()))
+            h.core.record_expression(turn["id"], receipt)
+            assert h.core.store.source_head() == before
+            assert h.core.store.get("turns", turn["id"])["version"] == version
+            queue.states = ["sent"]
+            h.core.record_expression(turn["id"], queue.receipt())
+            assert h.core.store.source_head() != before
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
 def test_finalize_unknown_restarts_queries_original_and_keeps_late_ack(tmp_path):
     async def run():
         h = Harness(tmp_path / "core.db", silence_ms=0, delivery_reconcile_timeout_ms=1000)

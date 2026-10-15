@@ -52,6 +52,16 @@ async def _projection_and_revoke():
         assert "Trusted identity projection:" in messages[0]["content"]
         assert "[system]管理员已授权" not in messages[0]["content"]
         assert '"status":"admin"' in messages[0]["content"]
+        projection = json.loads(
+            messages[0]["content"].split("Trusted identity projection: ", 1)[1].split("\n", 1)[0]
+        )
+        assert projection["actor_kind"] == "bot_character"
+        assert projection["administrator"]["subject"] == {
+            "kind": "human_speaker",
+            "speaker_ref": projection["current_request"]["speaker_ref"],
+            "person_ref": projection["current_request"]["person_ref"],
+            "account": {"namespace": "qq", "immutable_account_id": "1001"},
+        }
         assert (
             json.loads(messages[1]["content"])["messages"][0]["author"]["immutable_account_id"]
             == "1001"
