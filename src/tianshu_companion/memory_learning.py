@@ -76,6 +76,19 @@ class MemoryLearning:
     def __init__(self, core):
         self.core = core
         self.lock = asyncio.Lock()
+        self.commit_job = self.commit_actor = None
+
+    def admission_blocked(self, actor_id):
+        # A ready proposal gets a short write window between dialogue batches.
+        # Actor-wide coordination also covers explicitly associated memory scopes.
+        return self.core.automatic_memory_candidates and self.commit_actor == actor_id
+
+    def _commit_ready(self, item, turn):
+        self.commit_job, self.commit_actor = item["id"], turn["scope"]["actor_id"]
+        return not self.core.has_active_dialogue(self.commit_actor)
+
+    def _release_commit(self):
+        self.commit_job = self.commit_actor = None
 
     def queue(self, item):
         receipt = item.get("receipt") or {}
@@ -186,8 +199,18 @@ class MemoryLearning:
     async def work(self):
         async with self.lock:
             # The model itself has a 60-second bound; include source checks and commit I/O.
-            async with asyncio.timeout(90):
-                await self._work()
+            try:
+                async with asyncio.timeout(90):
+                    await self._work()
+            finally:
+                item = self.core.store.get("metadata", self.commit_job) if self.commit_job else None
+                if (
+                    not self.core.automatic_memory_candidates
+                    or not item
+                    or item["state"] != "pending"
+                    or item.get("stage") != "commit_wait"
+                ):
+                    self._release_commit()
 
     async def _work(self):
         core = self.core
@@ -195,28 +218,37 @@ class MemoryLearning:
             return
         changed = self.backfill()
         changed = self._recover_legacy() or changed
-        row = core.store.db.execute(
-            "SELECT body FROM metadata WHERE conversation_id=? AND status='pending' AND deadline<=? "
-            "ORDER BY deadline,id LIMIT 1",
-            (QUEUE, core.clock()),
-        ).fetchone()
-        if row is None:
+        item = core.store.get("metadata", self.commit_job) if self.commit_job else None
+        if item is None or item["state"] != "pending":
+            self._release_commit()
+            row = core.store.db.execute(
+                "SELECT body FROM metadata WHERE conversation_id=? AND status='pending' AND deadline<=? "
+                "ORDER BY deadline,id LIMIT 1",
+                (QUEUE, core.clock()),
+            ).fetchone()
+            item = json.loads(row[0]) if row else None
+        if item is None:
             if changed:
                 core.counted("memory.work")
             return
-        item = json.loads(row[0])
-        if item["attempts"] >= MAX_RECOVERY_ATTEMPTS:
+        resuming_commit = item.get("stage") == "commit_wait" and item["output"] is not None
+        if item["attempts"] >= MAX_RECOVERY_ATTEMPTS and not resuming_commit:
             item.update(state="blocked", deadline=0)
             core.store.put("metadata", item)
             return
-        item["attempts"] += 1
-        # Reserve an attempt durably before I/O; crashes must not reset the retry budget.
-        core.store.put("metadata", item)
+        if not resuming_commit:
+            item["attempts"] += 1
+            # Reserve an attempt durably before I/O; crashes must not reset the retry budget.
+            core.store.put("metadata", item)
         try:
             turn = core.store.get("turns", item["turn_id"])
             if turn is None or not core._turn_allows(turn, "memory.write"):
                 raise Fault("forbidden")
             core._check_role(turn)
+            if resuming_commit and not self._commit_ready(item, turn):
+                if changed:
+                    core.counted("memory.work")
+                return  # Waiting is not another attempt or an idle persistent write.
             item["stage"] = "receipt"
             response = await core.memory.process_candidate(item["job_id"], None)
             if response["state"] == "pending":
@@ -234,7 +266,7 @@ class MemoryLearning:
                         generation["conversation_id"] = generation["id"]
                         item["stage"] = "model"
                         core.store.put("metadata", item)
-                        async with core.models:
+                        async with core.models.background:
                             if core.default_model_selector is not None:
                                 selected = await resolve_selection(
                                     core.default_model_selector,
@@ -285,6 +317,13 @@ class MemoryLearning:
                     # read its receipt first, then resend these same bytes if still pending.
                     core.store.put("metadata", item)
                 core._check_role(turn)
+                if not self._commit_ready(item, turn):
+                    # Keep the exact proposal, let existing replies finish, and stop
+                    # new snapshots for this actor until the commit has settled.
+                    item["stage"] = "commit_wait"
+                    core.store.put("metadata", item)
+                    core.counted("memory.work")
+                    return
                 item["stage"] = "commit"
                 core.store.put("metadata", item)
                 response = await core.memory.process_candidate(item["job_id"], item["output"])

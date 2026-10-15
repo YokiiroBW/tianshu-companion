@@ -62,6 +62,15 @@ class BotBindings:
                 "namespace": "qq",
                 "audience": "group" if item["conversation"]["kind"] == "group" else "self_private",
                 "actor_ids": [item["actor_id"]],
+                # This management path registers actual QQ chat, rather than a
+                # fictional scene. It classifies future input facts, not their truth,
+                # and never relabels previously stored unclassified physicals.
+                "classification": {
+                    "value": "real",
+                    "basis": "registered_input_mode",
+                    "policy_ref": "input-mode:platform-qq",
+                    "policy_version": 1,
+                },
             }
         else:
             self.core.bindings.pop(binding_id, None)

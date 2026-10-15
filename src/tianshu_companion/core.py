@@ -41,6 +41,7 @@ from .relationships.projection import verify as verify_relationship
 from .writing import Writing
 from .runtime_capabilities import candidates_enabled
 from .model_selection import verify_lease
+from .model_slots import ModelSlots
 from .qq_identity import (
     material_sources,
     projection as qq_projection,
@@ -173,7 +174,7 @@ class Core(Delivery):
         self.persona_problems = []
         self.policy, self.clock = policy or Policy(), clock
         contracts.check("conversation#policy", asdict(self.policy))
-        self.models = asyncio.Semaphore(model_slots)
+        self.models = ModelSlots(model_slots)
         self.preparation_slots = model_slots
         self.jobs, self.send_jobs = {}, {}
         # Monotonic counters advanced only when a background pass really did something.
@@ -187,7 +188,7 @@ class Core(Delivery):
                 clock,
                 gateway,
                 life_config_version,
-                self.models,
+                self.models.background,
                 writing=False if life_writing is None else life_writing,
                 timezone_name=life_timezone,
             )
@@ -1079,6 +1080,8 @@ class Core(Delivery):
                 for turn in queued[: 2 - len(active)]:
                     if len(self.jobs) >= self.preparation_slots:
                         break
+                    if self.memory_learning.admission_blocked(turn["scope"]["actor_id"]):
+                        break
                     if not self._responses_released(turn):
                         break
                     config_version = turn["config_version"]
@@ -1149,6 +1152,12 @@ class Core(Delivery):
         await asyncio.sleep(0)
         if self.store.db.total_changes > before:
             self.counted("core.tick")
+
+    def has_active_dialogue(self, actor_id):
+        return any(
+            turn["scope"]["actor_id"] == actor_id
+            for turn in self.store.list("turns", states=ACTIVE)
+        )
 
     def _pin_role(self, actor):
         """Snapshot the persona at the turn preparation boundary.
@@ -1421,36 +1430,39 @@ class Core(Delivery):
             ]
             if len(canonical(messages).encode()) > 524288:
                 raise Fault("budget_exceeded")
+            turn = self.store.get("turns", turn_id)
+            if turn["cancelled"] or turn["phase"] in TERMINAL:
+                return
+            self._check_role(turn)
+            self._check_input_versions(turn)
+            await self.continue_delivery_origin(turn)
+            # Preparation already has its own bounded worker admission. Do not
+            # occupy provider capacity while loading and checking local context.
+            turn = self.store.get("turns", turn_id)
+            if turn["cancelled"] or turn["phase"] in TERMINAL:
+                return
+            (
+                context,
+                context_metadata,
+                checks,
+                profiles,
+                history_snapshot,
+            ) = await self._prepare_context(turn, dependencies)
+            context_prepared_at = utc(self.clock())
+            slot_wait_started = time.perf_counter()
             async with self.models:
+                slot_wait_ms = _elapsed_ms(slot_wait_started)
                 turn = self.store.get("turns", turn_id)
                 if turn["cancelled"] or turn["phase"] in TERMINAL:
                     return
                 self._check_role(turn)
-                self._check_input_versions(turn)
-                await self.continue_delivery_origin(turn)
-                # Context reads enforce their own current authority and expected
-                # versions. The complete preflight below validates the assembled
-                # snapshot immediately before model execution; don't duplicate it
-                # before the snapshot even exists.
-                turn = self.store.get("turns", turn_id)
-                if turn["cancelled"] or turn["phase"] in TERMINAL:
-                    return
-                (
-                    context,
-                    context_metadata,
-                    checks,
-                    profiles,
-                    history_snapshot,
-                ) = await self._prepare_context(turn, dependencies)
-                turn = self.store.get("turns", turn_id)
-                if turn["cancelled"] or turn["phase"] in TERMINAL:
-                    return
                 turn.update(
                     short_context=context_metadata,
                     context_checks=checks,
                     profile_checks=profiles,
                     history_snapshot=history_snapshot,
                 )
+                # Never reuse the preparation checkpoint after waiting for a slot.
                 await self._preflight(turn)
                 prompt = json.loads(messages[1]["content"])
                 prompt.update(context.data)
@@ -1479,6 +1491,8 @@ class Core(Delivery):
                     turn["phase"] = "generating"
                     turn["model_calls"] += 1
                     turn["timings"]["model_started_at"] = utc(self.clock())
+                    turn["timings"]["context_prepared_at"] = context_prepared_at
+                    turn["timings"]["model_slot_wait_ms"] = slot_wait_ms
                     self._save_turn(turn)
                 obs.emit(self.events, "turn.generation.started", "started")
                 segments, usage = await asyncio.wait_for(
@@ -1720,73 +1734,86 @@ class Core(Delivery):
             if not sources_current(self.store, previous):
                 raise Fault("scope_changed")
 
-    async def _verify_checks(self, turn, checks):
+    async def _verify_checks(self, turn, checks, *, verified=None):
+        # This memo belongs to one preparation checkpoint, never to a turn,
+        # process cache, or subsequent preflight/delivery boundary.
+        verified = {} if verified is None else verified
         renewed = set()
-        for check in checks:
-            scope = check["scope"]
+        for check in merge_checks(checks):
+            signature = digest(check)
+            if signature in verified:
+                if verified[signature] is not None:
+                    raise verified[signature]
+                continue
+            try:
+                await self._verify_context_check(turn, check, renewed)
+            except Fault as error:
+                verified[signature] = error
+                raise
+            verified[signature] = None
+
+    async def _verify_context_check(self, turn, check, renewed):
+        scope = check["scope"]
+        if (
+            check["channel"] != turn["bundle"]["collection_key"]["channel"]
+            or any(
+                scope[k] != turn["scope"][k] for k in ("actor_id", "audience", "conversation_id")
+            )
+            or (scope["audience"] != "group" and scope != turn["scope"])
+        ):
+            raise Fault("forbidden")
+        source_turn_id = check.get("source_turn_id")
+        if source_turn_id:
+            previous = self.store.get("turns", source_turn_id)
             if (
-                check["channel"] != turn["bundle"]["collection_key"]["channel"]
-                or any(
-                    scope[k] != turn["scope"][k]
-                    for k in ("actor_id", "audience", "conversation_id")
-                )
-                or (scope["audience"] != "group" and scope != turn["scope"])
+                previous is None
+                or previous["origin"] != check["origin"]
+                or previous["scope"] != scope
+                or previous["service"] != check["service"]
+                or previous["binding_version"] != check["binding_version"]
+                or previous["bundle"]["collection_key"]["channel"] != check["channel"]
+                or not sources_current(self.store, previous)
             ):
-                raise Fault("forbidden")
-            source_turn_id = check.get("source_turn_id")
-            if source_turn_id and source_turn_id not in renewed:
-                previous = self.store.get("turns", source_turn_id)
-                if (
-                    previous is None
-                    or previous["origin"] != check["origin"]
-                    or previous["scope"] != scope
-                    or previous["service"] != check["service"]
-                    or previous["binding_version"] != check["binding_version"]
-                    or previous["bundle"]["collection_key"]["channel"] != check["channel"]
-                    or not sources_current(self.store, previous)
-                ):
-                    raise Fault("scope_changed")
-                # Historical evidence has its own human/source authorization. Renew
-                # that exact registered lease; never substitute the current speaker.
+                raise Fault("scope_changed")
+            if source_turn_id not in renewed:
+                # Renew only the original human's lease, never the current speaker's.
                 if previous["source_deadline"] <= self.clock() + 20:
                     await self.continue_delivery_origin(previous)
                 renewed.add(source_turn_id)
-            _, _, binding = await self._authorize(
-                check["service"],
-                command(check["origin"], uid("check"), self.clock()),
-                check["channel"],
-                scope=scope,
+        _, _, binding = await self._authorize(
+            check["service"],
+            command(check["origin"], uid("check"), self.clock()),
+            check["channel"],
+            scope=scope,
+        )
+        if binding != check["binding_version"]:
+            raise Fault("scope_changed")
+        if check["version_domain"] == PROFILE_DOMAIN:
+            await self.memory.profiles(
+                check["origin"],
+                scope,
+                check["target"],
+                check["text"],
+                check["selection"],
+                dict(tokens=0, bytes=0),
+                check["scope_version"],
             )
-            if binding != check["binding_version"]:
-                raise Fault("scope_changed")
-            if check["version_domain"] == PROFILE_DOMAIN:
-                await self.memory.profiles(
+        elif check["version_domain"] == TEXT_DOMAIN:
+            if check.get("history_snapshot") is not None:
+                await self.memory.history(check["origin"], scope, known=check["history_snapshot"])
+            else:
+                await self.memory.select(
                     check["origin"],
                     scope,
-                    check["target"],
-                    check["text"],
-                    check["selection"],
+                    "context validity",
                     dict(tokens=0, bytes=0),
                     check["scope_version"],
+                    known=check.get("memory_snapshot"),
                 )
-            elif check["version_domain"] == TEXT_DOMAIN:
-                if check.get("history_snapshot") is not None:
-                    await self.memory.history(
-                        check["origin"], scope, known=check["history_snapshot"]
-                    )
-                else:
-                    await self.memory.select(
-                        check["origin"],
-                        scope,
-                        "context validity",
-                        dict(tokens=0, bytes=0),
-                        check["scope_version"],
-                        known=check.get("memory_snapshot"),
-                    )
-            elif check["version_domain"] == RELATIONSHIP_DOMAIN:
-                await verify_relationship(self.relationships, check, self.clock())
-            else:
-                raise Fault("invalid_input")
+        elif check["version_domain"] == RELATIONSHIP_DOMAIN:
+            await verify_relationship(self.relationships, check, self.clock())
+        else:
+            raise Fault("invalid_input")
 
     async def _prepare_context(self, turn, dependencies):
         if self._turn_allows(turn, "memory.read") and hasattr(self.memory, "history"):
@@ -1804,7 +1831,8 @@ class Core(Delivery):
             checks = await self.relationships.prepare(self, turn, context)
         for dep in turn["bundle"]["dependencies"]:
             checks = merge_checks(checks, inherited_checks(self.store.get("turns", dep["turn_id"])))
-        await self._verify_checks(turn, checks)
+        verified = {}
+        await self._verify_checks(turn, checks, verified=verified)
         policy = replace(
             self.short_context_policy,
             max_bytes=min(self.short_context_policy.max_bytes, context.remaining),
@@ -1819,7 +1847,7 @@ class Core(Delivery):
             try:
                 inherited = inherited_checks(previous)
                 proposed = merge_checks(checks, inherited)
-                await self._verify_checks(turn, inherited)
+                await self._verify_checks(turn, inherited, verified=verified)
             except Fault:
                 # Stale or unavailable history is omitted whole; current input still requires authority.
                 continue

@@ -135,6 +135,72 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.generated), 1)
         self.assertEqual(sum(output is not None for _, output in self.calls), 1)
 
+    async def test_commit_waits_for_reply_and_then_unblocks_next_snapshot(self):
+        def phase(text):
+            return next(t["phase"] for t in self.h.turns() if self.h.core._input_text(t) == text)
+
+        await self.chat()
+        generated = asyncio.Event()
+        self.h.gateway.gates[2] = generated
+        await self.h.ingest(text="下午泡了茉莉绿茶")
+        await self.h.cycles()
+        self.assertEqual(self.h.turns()[-1]["phase"], "generating")
+
+        async def changing_commit(job, output):
+            response = await self.process(job, output)
+            if output is not None:
+                self.h.memory.scope_version += 1
+            return response
+
+        self.h.memory.process_candidate = changing_commit
+        await self.flush()
+        item = self.task()
+        self.assertEqual(item["stage"], "commit_wait")
+        self.assertEqual(item["attempts"], 1)
+        self.assertFalse(any(output is not None for _, output in self.calls))
+        await self.h.ingest(text="还准备看会儿书")
+        await self.h.ingest(text="另一个角色的对话", actor="actor:b", channel="private:b")
+        await self.h.cycles()
+        self.assertEqual(phase("还准备看会儿书"), "queued")
+        self.assertEqual(phase("另一个角色的对话"), "sent")
+
+        self.h.sender.gate = asyncio.Event()
+        generated.set()
+        await self.h.cycles()
+        self.assertEqual(phase("下午泡了茉莉绿茶"), "sending")
+        await self.h.core.memory_learning.work()  # Catch up the other actor's new outbox row.
+        before = self.h.core.store.db.total_changes
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.h.core.store.db.total_changes, before)
+        self.assertEqual(self.task()["attempts"], 1)
+
+        self.h.sender.gate.set()
+        await self.h.cycles()
+        self.assertEqual(phase("下午泡了茉莉绿茶"), "sent")
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["attempts"], 1)
+        self.assertEqual(len(self.generated), 1)
+        self.assertEqual(sum(output is not None for _, output in self.calls), 1)
+        await self.h.cycles()
+        self.assertEqual(phase("还准备看会儿书"), "sent")
+
+    async def test_commit_wait_survives_restart_without_regeneration_or_retry_charge(self):
+        await self.chat()
+        self.h.gateway.gates[2] = asyncio.Event()
+        await self.h.ingest(text="下一条消息还在生成")
+        await self.h.cycles()
+        await self.flush()
+        proposal = copy.deepcopy(self.task()["output"])
+        self.assertEqual(self.task()["stage"], "commit_wait")
+        await self.restart()
+        self.assertEqual(self.task()["output"], proposal)
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["attempts"], 1)
+        self.assertEqual(len(self.generated), 1)
+        self.assertFalse(self.h.core.memory_learning.admission_blocked("actor:a"))
+
     async def test_model_failure_keeps_pending_and_recovers(self):
         await self.chat()
         self.model_fail = True
@@ -182,6 +248,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         worker.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await worker
+        self.assertFalse(self.h.core.memory_learning.admission_blocked("actor:a"))
         self.assertIsNotNone(self.task()["output"])
         self.assertGreater(self.task()["deadline"], self.h.clock())
         self.h.memory.process_candidate = self.process

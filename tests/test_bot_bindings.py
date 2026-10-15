@@ -74,6 +74,7 @@ def test_persisted_binding_lifecycle_and_static_isolation():
                 assert error.value.code == "idempotency_conflict"
                 assert manager.apply("platform", request(2, True))["enabled"] is True
                 assert first["binding_id"] in bindings
+                assert bindings[first["binding_id"]]["classification"]["value"] == "real"
                 assert manager.apply("platform", request(3, False))["enabled"] is False
                 assert first["binding_id"] not in bindings
             else:
@@ -137,6 +138,39 @@ def test_dynamic_selection_makes_platform_only_sender_available():
     assert router.available is False
     router.select_dynamic("binding:bot:12345678")
     assert router.available is True
+
+
+def test_registered_real_input_mode_survives_restart_and_is_not_payload_authority(tmp_path):
+    for restarted in (False, True):
+        store = Store(tmp_path / "core.sqlite")
+        static_mode = dict(
+            value="fictional", basis="registered_input_mode", policy_ref="scene:a", policy_version=1
+        )
+        bindings = {
+            "binding:static": {
+                "service": "nonebot",
+                "namespace": "qq",
+                "classification": static_mode,
+            }
+        }
+        manager = BotBindings(
+            SimpleNamespace(store=store, bindings=bindings, roles={"actor:a": {}}),
+            BotSenderRouter(Sender(), Sender(), [], bindings),
+            bindings,
+        )
+        if not restarted:
+            with pytest.raises(Fault):
+                manager.apply("platform", {**request(), "classification": static_mode})
+            manager.apply("platform", request())
+            manager.apply("platform", request(2, True))
+        assert bindings["binding:bot:12345678"]["classification"] == dict(
+            value="real",
+            basis="registered_input_mode",
+            policy_ref="input-mode:platform-qq",
+            policy_version=1,
+        )
+        assert bindings["binding:static"]["classification"] == static_mode
+        store.close()
 
 
 def test_management_gate_and_authenticated_platform_endpoint():
