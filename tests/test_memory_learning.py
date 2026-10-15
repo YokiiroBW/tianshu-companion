@@ -20,6 +20,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.h = Harness(Path(self.temp.name) / "learning.sqlite", silence_ms=0)
         self.calls, self.generated, self.selections = [], [], []
+        self.extraction_messages = []
         self.completed = None
         self.lose_response = False
         self.reject = False
@@ -60,6 +61,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         if not turn["id"].startswith("memory-generation:"):
             return await self.original_generate(turn, messages)
         self.generated.append(copy.deepcopy(turn))
+        self.extraction_messages.append(copy.deepcopy(messages))
         if self.model_fail:
             raise Fault("dependency_unavailable")
         return [
@@ -193,10 +195,13 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.reject = True
         await self.flush()
         self.assertIsNone(self.task()["output"])
+        await self.restart()
         self.h.clock.advance(10)
         await self.flush()
         self.assertEqual(len(self.generated), 2)
         self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(len(self.extraction_messages[0]), 2)
+        self.assertIn("rejected without committing", self.extraction_messages[1][1]["content"])
 
     async def test_disabled_candidates_do_not_run_model_or_write(self):
         await self.chat()

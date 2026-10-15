@@ -44,6 +44,11 @@ unchanged fact reuses both its entity ID and canonical value. Keep ordinal label
 names and distinguishing labels in mention. Do not resolve an ambiguous 'it/that one' to an
 arbitrary known object; omit the unresolved fact. A new label is not proof of an old object's
 identity. Legacy known facts without entity keep their existing key when directly reaffirmed.
+For a compound sentence such as '我有两本笔记，第一本叫《晨光》，第二本叫《暮色》',
+quote the FULL sentence separately for each atomic fact; mention is 第一本 or 第二本 (exact
+source text, no inserted characters), kind is notebook. The evidence must contain the object
+noun as well as its ordinal and value. For later ordinal corrections, quote the actual short
+mention and reuse the uniquely matching existing entity ID. Never invent a longer evidence quote.
 NEVER copy source sent_at into valid_from/valid_to merely because a fact is current. Unknown start
 and end dates MUST be null. A repeated unchanged fact has the same effective range; a new message
 is only another observation. Non-null dates require an exact evidence quote containing that date
@@ -56,6 +61,12 @@ negations; for a changed value of the SAME entity reuse the same key with the ne
 evidence and may not be re-extracted. A reported old/ended fact is historical and does not replace
 current facts. Do not combine past and present values in one atomic entry. If a former preference
 changes, keep the new value; a correction is not a reason to erase the source history.
+A denial of a former value is NOT a new positive current preference. '没有跟着换回去' and
+'口味没变' alone add no replacement fact; return no entry for that reaffirmation. When the
+author explicitly stops the CURRENT preference, preserve the denial without guessing a new
+positive value. A negative-only fact must include its denied object in value and negations.
+If the author names a new positive choice and rejects an old one, extract the new positive
+choice separately. Do not copy third-party or hypothetical choices into the author's preferences.
 Return {"memories": []} if nothing durable. No tools, markdown or commentary.
 """
 
@@ -237,6 +248,20 @@ class MemoryLearning:
                                     ),
                                 ),
                             ]
+                            if item.get("proposal_rejected"):
+                                messages.insert(
+                                    1,
+                                    dict(
+                                        role="system",
+                                        content=(
+                                            "The previous extraction was rejected without committing. "
+                                            "Re-extract from the numbered messages. Check each exact quote, "
+                                            "its source_index, entity mention and matching known entity. "
+                                            "Quote enough source context to identify numbered objects; omit "
+                                            "any ambiguous candidate rather than inventing evidence."
+                                        ),
+                                    ),
+                                )
                             segments, _ = await asyncio.wait_for(
                                 core.gateway.generate(generation, messages), 60
                             )
@@ -253,6 +278,7 @@ class MemoryLearning:
                     # Only this explicit Memory-owned rejection proves the proposal did
                     # not commit. Transport/schema failures retain the original proposal.
                     item["output"] = None
+                    item["proposal_rejected"] = True
                     raise Fault("invalid_input")
             if response["state"] not in {"completed", "invalidated"}:
                 raise Fault("dependency_unavailable")
