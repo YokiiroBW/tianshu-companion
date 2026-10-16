@@ -92,3 +92,39 @@ def test_slow_context_preparation_does_not_occupy_model_capacity():
             await h.core.close()
 
     asyncio.run(run())
+
+
+def test_other_room_prepares_while_model_is_busy_without_unbounded_workers():
+    async def run():
+        h = Harness(silence_ms=0)
+        gate = asyncio.Event()
+        h.core.models = ModelSlots(1)
+        h.core.preparation_slots = 1
+        h.gateway.gates[1] = gate
+        prepared = []
+        original = h.core._prepare_context
+
+        async def prepare(turn, dependencies):
+            result = await original(turn, dependencies)
+            prepared.append(h.core._input_text(turn))
+            return result
+
+        h.core._prepare_context = prepare
+        try:
+            await h.ingest(text="第一路", channel="private:first")
+            await h.cycles()
+            for i in range(5):
+                await h.ingest(text=f"后续{i}", channel=f"private:room{i}")
+            await h.cycles()
+            assert len(prepared) == 2
+            assert len(h.core.jobs) == 2
+            assert len(h.gateway.calls) == 1
+            gate.set()
+            await h.cycles(200)
+            assert all(t["phase"] == "sent" for t in h.turns())
+            assert len(h.gateway.calls) == 6
+        finally:
+            gate.set()
+            await h.core.close()
+
+    asyncio.run(run())

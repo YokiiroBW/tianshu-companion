@@ -3,6 +3,7 @@
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 
 TEXT_DOMAIN = "text-dialogue/v1"
+TEXT_INPUT_DOMAIN = "text-input/v1"
 CONTEXT_LIMIT = 16384
 MAX_CHECKS = 64
 
@@ -32,16 +33,21 @@ class TurnContext:
         return CONTEXT_LIMIT - self.used
 
     def append(self, name, value):
-        self.data[name].append(value)
+        return self.extend(name, [value])
+
+    def extend(self, name, values):
+        before = len(self.data[name])
+        self.data[name].extend(values)
         if self.remaining < 0:
-            self.data[name].pop()
+            del self.data[name][before:]
             return False
         return True
 
 
-def scope_check(turn):
+def scope_check(turn, *, input_only=False):
+    input_only = input_only and turn.get("input_history_snapshot") is not None
     return dict(
-        version_domain=TEXT_DOMAIN,
+        version_domain=TEXT_INPUT_DOMAIN if input_only else TEXT_DOMAIN,
         source_turn_id=turn["id"],
         origin=turn["origin"],
         scope=turn["scope"],
@@ -49,7 +55,7 @@ def scope_check(turn):
         service=turn["service"],
         binding_version=turn["binding_version"],
         scope_version=turn["scope_version"],
-        history_snapshot=turn.get("history_snapshot"),
+        history_snapshot=turn.get("input_history_snapshot" if input_only else "history_snapshot"),
         memory_snapshot={
             key: turn["preparation"][key] for key in ("association_version", "scope_checks")
         }

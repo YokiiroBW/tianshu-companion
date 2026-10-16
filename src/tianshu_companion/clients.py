@@ -77,6 +77,7 @@ class JsonService:
             "/internal/v1/conversation/reply-status",
             "/internal/v1/memory/context/query",
             "/internal/v1/memory/context/history",
+            "/internal/v1/memory/context/input-history",
             "/internal/v1/memory/context/receipt",
             "/internal/v2/bot-delivery/query",
         }
@@ -498,6 +499,12 @@ class Memory:
         return response
 
     async def history(self, origin, scope, *, expected=None, known=None):
+        return await self._history(origin, scope, expected=expected, known=known)
+
+    async def input_history(self, origin, scope, *, expected=None, known=None):
+        return await self._history(origin, scope, expected=expected, known=known, input_only=True)
+
+    async def _history(self, origin, scope, *, expected=None, known=None, input_only=False):
         request = dict(
             query=query(origin),
             requested_scope=scope,
@@ -506,7 +513,8 @@ class Memory:
             known_snapshot=known,
         )
         self.contracts.check("context-history#request", request)
-        response = await self.client.call("/internal/v1/memory/context/history", request)
+        path = "input-history" if input_only else "history"
+        response = await self.client.call("/internal/v1/memory/context/" + path, request)
         self.contracts.check("context-history#response", response)
         if (
             response["request_id"] != request["query"]["request_id"]

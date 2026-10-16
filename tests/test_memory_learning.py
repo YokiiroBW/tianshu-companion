@@ -201,6 +201,30 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.generated), 1)
         self.assertFalse(self.h.core.memory_learning.admission_blocked("actor:a"))
 
+    async def test_empty_proposal_finishes_while_dialogue_is_generating(self):
+        await self.chat()
+        gate = asyncio.Event()
+        self.h.gateway.gates[2] = gate
+        await self.h.ingest(text="还在等这一条回复")
+        await self.h.cycles()
+        self.assertEqual(self.h.turns()[-1]["phase"], "generating")
+
+        async def empty(turn, messages):
+            if turn["id"].startswith("memory-generation:"):
+                return ['{"memories":[]}'], {}
+            return await self.original_generate(turn, messages)
+
+        self.h.gateway.generate = empty
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["attempts"], 1)
+        self.assertFalse(self.h.core.memory_learning.admission_blocked("actor:a"))
+        self.assertEqual(self.calls[-1][1], {"memories": []})
+        self.assertEqual(self.h.turns()[-1]["phase"], "generating")
+        gate.set()
+        await self.h.cycles()
+        self.assertEqual(self.h.turns()[-1]["phase"], "sent")
+
     async def test_model_failure_keeps_pending_and_recovers(self):
         await self.chat()
         self.model_fail = True

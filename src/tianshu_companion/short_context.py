@@ -50,8 +50,9 @@ def message_current(store, scope, message):
 def select_recent(store, turn, policy, now):
     """Keep adjacency and retrieve older relevant inputs within the same boundary.
 
-    A candidate is one entire input group plus its currently confirmed sent replies.
-    Draft/sending/unknown text is not read. Oversized groups are omitted whole.
+    Ordinary adjacency includes confirmed replies. Retrieved human inputs keep nearby
+    corrections together; bot answers need not accompany that source projection.
+    Draft/sending/unknown text is not read. Oversized batches are omitted whole.
     """
     revision = current_revision(store, turn)
     metadata = dict(
@@ -133,38 +134,30 @@ def select_recent(store, turn, policy, now):
         )
         candidates.append((group, expiry))
 
-    from .context_relevance import relevance
+    from .context_relevance import retrieval_batches
 
-    scores = {group["turn_id"]: relevance(turn, group) for group, _ in candidates}
-    older = candidates[policy.max_turns :]
-    topic_return = any(scores[group["turn_id"]][0] > 0 for group, _ in older)
-    if topic_return:
-        adjacent = policy.max_turns // 2
-        ranked = sorted(
-            candidates,
-            key=lambda item: (*scores[item[0]["turn_id"]], item[0]["turn_sequence"]),
-            reverse=True,
-        )
-        # Reserve space for the best actual source before adjacent verbose
-        # replies consume the byte budget. Then keep the local conversation.
-        preferred = [ranked[0]] + candidates[:adjacent] + ranked[1:]
-        seen = set()
-        candidates = []
-        for item in preferred:
-            if item[0]["turn_id"] not in seen:
-                seen.add(item[0]["turn_id"])
-                candidates.append(item)
+    ordinary = [group for group, _ in candidates[: policy.max_turns]]
+    batches, topic_return = retrieval_batches(
+        turn,
+        candidates,
+        policy.max_turns,
+        compact=len(canonical(ordinary).encode("utf-8")) > policy.max_bytes,
+    )
     chosen = []
+    linked = []
     oldest_expiry = None
-    for group, expiry in candidates:
-        candidate = sorted([group] + chosen, key=lambda item: item["turn_sequence"])
+    for batch in batches:
+        candidate = sorted([g for g, _ in batch] + chosen, key=lambda item: item["turn_sequence"])
         size = len(canonical(candidate).encode("utf-8"))
-        if size > policy.max_bytes:
+        if size > policy.max_bytes or len(candidate) > policy.max_turns:
             if topic_return:
                 continue
             break
         chosen = candidate
+        if len(batch) > 1:
+            linked.append([g["turn_id"] for g, _ in batch])
         metadata["bytes_used"] = size
+        expiry = min(expiry for _, expiry in batch)
         oldest_expiry = expiry if oldest_expiry is None else min(oldest_expiry, expiry)
         if len(chosen) == policy.max_turns:
             break
@@ -173,4 +166,6 @@ def select_recent(store, turn, policy, now):
         reply_ids=[r["reply_id"] for g in chosen for r in g["replies"]],
         valid_until=oldest_expiry,
     )
+    if linked:
+        metadata["linked_turn_ids"] = linked
     return chosen, metadata

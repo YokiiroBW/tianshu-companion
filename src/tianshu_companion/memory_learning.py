@@ -84,6 +84,12 @@ class MemoryLearning:
         return self.core.automatic_memory_candidates and self.commit_actor == actor_id
 
     def _commit_ready(self, item, turn):
+        if item["output"] == {"memories": []}:
+            # Memory checks the source and records a skipped receipt without a
+            # content-version change. It cannot invalidate an active dialogue.
+            if self.commit_job == item["id"]:
+                self._release_commit()
+            return True
         self.commit_job, self.commit_actor = item["id"], turn["scope"]["actor_id"]
         return not self.core.has_active_dialogue(self.commit_actor)
 

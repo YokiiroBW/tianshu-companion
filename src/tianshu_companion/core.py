@@ -20,11 +20,13 @@ from .web_snapshot import snapshot as read_web_snapshot
 from . import observability as obs
 from .context import (
     TEXT_DOMAIN,
+    TEXT_INPUT_DOMAIN,
     TurnContext,
     inherited_checks,
     merge_checks,
     profile_check,
     profile_targets,
+    scope_check,
 )
 from .short_context import (
     ShortContextPolicy,
@@ -1078,7 +1080,7 @@ class Core(Delivery):
                 active = self.store.work_turns(cid, ACTIVE)
                 queued = self.store.work_turns(cid, ["queued"])
                 for turn in queued[: 2 - len(active)]:
-                    if len(self.jobs) >= self.preparation_slots:
+                    if not self._preparation_available():
                         break
                     if self.memory_learning.admission_blocked(turn["scope"]["actor_id"]):
                         break
@@ -1130,7 +1132,7 @@ class Core(Delivery):
                     if (
                         turn["id"] not in self.jobs
                         and turn["retry_at"] <= self.clock()
-                        and len(self.jobs) < self.preparation_slots
+                        and self._preparation_available()
                     ):
                         self.jobs[turn["id"]] = asyncio.create_task(self._process(turn["id"]))
                         self._work_cursor = cid
@@ -1158,6 +1160,18 @@ class Core(Delivery):
             turn["scope"]["actor_id"] == actor_id
             for turn in self.store.list("turns", states=ACTIVE)
         )
+
+    def _preparation_available(self):
+        # Generation keeps its provider slot, but no longer also occupies a
+        # preparation worker. Both stages stay bounded, including queued models.
+        if len(self.jobs) >= 2 * self.preparation_slots:
+            return False
+        preparing = 0
+        for key in self.jobs:
+            turn = self.store.get("turns", key) if isinstance(key, str) else None
+            if turn is None or turn["phase"] != "generating":
+                preparing += 1
+        return preparing < self.preparation_slots
 
     def _pin_role(self, actor):
         """Snapshot the persona at the turn preparation boundary.
@@ -1402,6 +1416,13 @@ class Core(Delivery):
                     "when absent, do not invent a relationship. Affinity freezing does not freeze feelings. "
                     "Use native life_read/content tools to inspect originals before discussing their contents. "
                     "Plans describe intentions; only persisted activity steps and completed artifacts describe results. "
+                    "For human plans, keep the speaker and the particular activity distinct. "
+                    "Read later corrections together with their original context; a later change "
+                    "to that same plan takes precedence over its old value. Bot suggestions and "
+                    "repetitions are not human agreement. If the target of a change is ambiguous, "
+                    "describe the uncertainty rather than merging different plans or people. "
+                    "This context is selective, not a complete transcript. Do not infer that an "
+                    "earlier answer or lookup failed, or invent a past date, from a detail absent here. "
                     "Use concerns for unresolved matters, scoped affect feedback for current feelings; feelings never alter affinity. "
                     "Continue original chapters/images from exact read results; summaries and filenames are not originals. "
                     "Do not claim a tool succeeded unless its actual receipt confirms it."
@@ -1447,6 +1468,7 @@ class Core(Delivery):
                 checks,
                 profiles,
                 history_snapshot,
+                input_history_snapshot,
             ) = await self._prepare_context(turn, dependencies)
             context_prepared_at = utc(self.clock())
             slot_wait_started = time.perf_counter()
@@ -1461,6 +1483,7 @@ class Core(Delivery):
                     context_checks=checks,
                     profile_checks=profiles,
                     history_snapshot=history_snapshot,
+                    input_history_snapshot=input_history_snapshot,
                 )
                 # Never reuse the preparation checkpoint after waiting for a slot.
                 await self._preflight(turn)
@@ -1481,6 +1504,7 @@ class Core(Delivery):
                         context_checks=checks,
                         profile_checks=profiles,
                         history_snapshot=history_snapshot,
+                        input_history_snapshot=input_history_snapshot,
                     )
                     turn = fresh
                     turn["context_revision"] = context_metadata["context_revision"]
@@ -1798,6 +1822,8 @@ class Core(Delivery):
                 dict(tokens=0, bytes=0),
                 check["scope_version"],
             )
+        elif check["version_domain"] == TEXT_INPUT_DOMAIN:
+            await self.memory.input_history(check["origin"], scope, known=check["history_snapshot"])
         elif check["version_domain"] == TEXT_DOMAIN:
             if check.get("history_snapshot") is not None:
                 await self.memory.history(check["origin"], scope, known=check["history_snapshot"])
@@ -1825,6 +1851,15 @@ class Core(Delivery):
                     for key in ("scope_version", "association_version", "scope_checks")
                 },
             )
+            if hasattr(self.memory, "input_history"):
+                turn["input_history_snapshot"] = await self.memory.input_history(
+                    turn["origin"],
+                    turn["scope"],
+                    expected={
+                        key: turn["preparation"][key]
+                        for key in ("scope_version", "association_version", "scope_checks")
+                    },
+                )
         context = TurnContext(turn["preparation"], self._continuation_messages(turn), dependencies)
         checks, profiles = [], []
         if self.relationships is not None:
@@ -1842,18 +1877,35 @@ class Core(Delivery):
         if not memory_read:
             recent = []
         accepted = []
+        linked = {key: ids for ids in metadata.get("linked_turn_ids", []) for key in ids}
+        by_id = {g["turn_id"]: g for g in recent}
+        visited = set()
         for group in recent:
-            previous = self.store.get("turns", group["turn_id"])
+            if group["turn_id"] in visited:
+                continue
+            ids = linked.get(group["turn_id"], [group["turn_id"]])
+            batch = [by_id[key] for key in ids]
+            visited.update(ids)
             try:
-                inherited = inherited_checks(previous)
+                inherited = []
+                for member in batch:
+                    previous = self.store.get("turns", member["turn_id"])
+                    inherited = merge_checks(
+                        inherited,
+                        [scope_check(previous, input_only=True)]
+                        if member.get("input_only")
+                        else inherited_checks(previous),
+                    )
                 proposed = merge_checks(checks, inherited)
                 await self._verify_checks(turn, inherited, verified=verified)
             except Fault:
-                # Stale or unavailable history is omitted whole; current input still requires authority.
+                # Never expose an old anchor after omitting its unavailable correction.
                 continue
-            if context.append("recent_dialogue", group):
+            if context.extend("recent_dialogue", batch):
                 checks = proposed
-                accepted.append(group)
+                accepted.extend(batch)
+        accepted.sort(key=lambda g: g["turn_sequence"])
+        context.data["recent_dialogue"] = accepted
         metadata.update(
             turn_ids=[g["turn_id"] for g in accepted],
             reply_ids=[r["reply_id"] for g in accepted for r in g["replies"]],
@@ -1901,7 +1953,14 @@ class Core(Delivery):
             context.append("current_activity", process)
         context.data["short_affect"] = []
         context.append("short_affect", self.life.affect.snapshot(actor_id, turn["scope"]))
-        return context, metadata, checks, profiles, turn.get("history_snapshot")
+        return (
+            context,
+            metadata,
+            checks,
+            profiles,
+            turn.get("history_snapshot"),
+            turn.get("input_history_snapshot"),
+        )
 
     async def _preflight(self, turn):
         if (
