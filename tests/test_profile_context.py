@@ -113,6 +113,43 @@ class ProfileContextTests(unittest.IsolatedAsyncioTestCase):
         await self.h.cycles(70)
         return result
 
+    async def changed_profile_input(self, *, pending, revoked=False):
+        if pending:
+            self.h.gateway.gates[1] = asyncio.Event()
+        admitted = await self.h.ingest(
+            text="周六去梧桐展馆碰头。", group=True, channel="group:one", account="a"
+        )
+        target = dict(kind="group", conversation_id=admitted["conversation_id"])
+        self.units[digest(target)] = [profile_unit(target, "topic")]
+        await self.h.cycles(70)
+        previous = self.h.turns()[0]
+        self.assertTrue(previous["profile_checks"])
+        self.assertEqual(previous["phase"], "generating" if pending else "sent")
+        # The shared profile changed, but the original author's accepted input did not.
+        self.version += 1
+        if revoked:
+            self.h.origins.values[previous["origin"]["assertion_ref"]]["revoked"] = True
+        await self.say("刚才说的是哪家展馆？", account="b")
+        context = json.loads(self.h.gateway.calls[-1][1][1]["content"])
+        return previous, context["recent_dialogue"]
+
+    async def test_pending_human_input_does_not_depend_on_an_unshown_profile_based_reply(self):
+        previous, recent = await self.changed_profile_input(pending=True)
+        self.assertIn(previous["id"], {g["turn_id"] for g in recent})
+        self.assertIn("梧桐展馆", canonical(recent))
+        self.assertTrue(all(not g["replies"] for g in recent))
+
+    async def test_delivered_reply_still_requires_its_changed_profile_dependency(self):
+        previous, recent = await self.changed_profile_input(pending=False)
+        original = next(g for g in recent if g["turn_id"] == previous["id"])
+        self.assertTrue(original["input_only"])
+        self.assertEqual(original["replies"], [])
+        self.assertIn("梧桐展馆", canonical(original["messages"]))
+
+    async def test_reply_fallback_does_not_restore_a_revoked_original(self):
+        previous, recent = await self.changed_profile_input(pending=False, revoked=True)
+        self.assertNotIn(previous["id"], {g["turn_id"] for g in recent})
+
     def prompt(self):
         return json.loads(self.h.gateway.calls[-1][1][1]["content"])
 

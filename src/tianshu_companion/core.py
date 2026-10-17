@@ -28,6 +28,7 @@ from .context import (
     profile_targets,
     scope_check,
 )
+from .context_checks import verify_checks
 from .short_context import (
     ShortContextPolicy,
     current_revision,
@@ -1421,6 +1422,13 @@ class Core(Delivery):
                     "to that same plan takes precedence over its old value. Bot suggestions and "
                     "repetitions are not human agreement. If the target of a change is ambiguous, "
                     "describe the uncertainty rather than merging different plans or people. "
+                    "Keep each stated reason attached to the particular change it explains. "
+                    "A reason for an earlier change does not explain a later reversal; if no reason "
+                    "was stated for that step, say it was not stated rather than filling one in. "
+                    "For a recall question, answer the requested detail and its necessary qualifiers; "
+                    "do not add other remembered topics or offer to store what was only just recalled. "
+                    "Input-only history contains human messages, not a verified earlier assistant "
+                    "answer; do not present a reconstruction as a recalled assistant answer. "
                     "This context is selective, not a complete transcript. Do not infer that an "
                     "earlier answer or lookup failed, or invent a past date, from a detail absent here. "
                     "Use concerns for unresolved matters, scoped affect feedback for current feelings; feelings never alter affinity. "
@@ -1759,24 +1767,13 @@ class Core(Delivery):
                 raise Fault("scope_changed")
 
     async def _verify_checks(self, turn, checks, *, verified=None):
-        # This memo belongs to one preparation checkpoint, never to a turn,
-        # process cache, or subsequent preflight/delivery boundary.
-        verified = {} if verified is None else verified
-        renewed = set()
-        for check in merge_checks(checks):
-            signature = digest(check)
-            if signature in verified:
-                if verified[signature] is not None:
-                    raise verified[signature]
-                continue
-            try:
-                await self._verify_context_check(turn, check, renewed)
-            except Fault as error:
-                verified[signature] = error
-                raise
-            verified[signature] = None
+        await verify_checks(
+            checks,
+            lambda check, checkpoint: self._verify_context_check(turn, check, checkpoint),
+            verified=verified,
+        )
 
-    async def _verify_context_check(self, turn, check, renewed):
+    async def _verify_context_check(self, turn, check, checkpoint):
         scope = check["scope"]
         if (
             check["channel"] != turn["bundle"]["collection_key"]["channel"]
@@ -1799,16 +1796,19 @@ class Core(Delivery):
                 or not sources_current(self.store, previous)
             ):
                 raise Fault("scope_changed")
-            if source_turn_id not in renewed:
-                # Renew only the original human's lease, never the current speaker's.
-                if previous["source_deadline"] <= self.clock() + 20:
-                    await self.continue_delivery_origin(previous)
-                renewed.add(source_turn_id)
-        _, _, binding = await self._authorize(
-            check["service"],
-            command(check["origin"], uid("check"), self.clock()),
-            check["channel"],
-            scope=scope,
+            # Renew the original human's lease once, including parallel domain checks.
+            if previous["source_deadline"] <= self.clock() + 20:
+                await checkpoint.once(
+                    ["renew", source_turn_id], lambda: self.continue_delivery_origin(previous)
+                )
+        _, _, binding = await checkpoint.once(
+            ["authorize", {k: check[k] for k in ("service", "origin", "channel", "scope")}],
+            lambda: self._authorize(
+                check["service"],
+                command(check["origin"], uid("check"), self.clock()),
+                check["channel"],
+                scope=scope,
+            ),
         )
         if binding != check["binding_version"]:
             raise Fault("scope_changed")
@@ -1886,24 +1886,31 @@ class Core(Delivery):
             ids = linked.get(group["turn_id"], [group["turn_id"]])
             batch = [by_id[key] for key in ids]
             visited.update(ids)
-            try:
-                inherited = []
-                for member in batch:
-                    previous = self.store.get("turns", member["turn_id"])
-                    inherited = merge_checks(
-                        inherited,
-                        [scope_check(previous, input_only=True)]
-                        if member.get("input_only")
-                        else inherited_checks(previous),
-                    )
-                proposed = merge_checks(checks, inherited)
-                await self._verify_checks(turn, inherited, verified=verified)
-            except Fault:
-                # Never expose an old anchor after omitting its unavailable correction.
-                continue
-            if context.extend("recent_dialogue", batch):
-                checks = proposed
-                accepted.extend(batch)
+            variants = [batch]
+            if any(member["replies"] for member in batch):
+                variants.append([dict(member, replies=[], input_only=True) for member in batch])
+            for candidate in variants:
+                try:
+                    inherited = []
+                    for member in candidate:
+                        previous = self.store.get("turns", member["turn_id"])
+                        inherited = merge_checks(
+                            inherited,
+                            [scope_check(previous, input_only=True)]
+                            if member.get("input_only") or not member["replies"]
+                            else inherited_checks(previous),
+                        )
+                    proposed = merge_checks(checks, inherited)
+                    await self._verify_checks(turn, inherited, verified=verified)
+                except Fault:
+                    # A stale answer does not revoke the human source. Recheck the
+                    # whole raw batch independently; a withdrawn correction still
+                    # prevents its obsolete anchor from appearing on its own.
+                    continue
+                if context.extend("recent_dialogue", candidate):
+                    checks = proposed
+                    accepted.extend(candidate)
+                break
         accepted.sort(key=lambda g: g["turn_sequence"])
         context.data["recent_dialogue"] = accepted
         metadata.update(

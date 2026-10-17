@@ -19,3 +19,7 @@
 原话投影使用 Memory 的 `/internal/v1/memory/context/input-history` 快照：自动地点更正会使依赖旧结论的助手回答失效，但不会撤销尚有效的人类原话。含助手回答的上下文仍使用原 `history` 快照和完整依赖。两条路径都保留原作者授权、绑定、关联和来源复核；明确遗忘、撤权、撤回仍使原话失效。既存轮次没有新快照时按原严格历史检查处理，不追认旧内容。端口沿用已发布 context-history 结构和 context_query 权限，后续应先发布 Memory 再发布 Companion。
 
 相关验证：`tests/test_correction_context.py`、`tests/test_input_history_client.py`、`tests/test_context_retrieval.py`、`tests/test_short_context.py`、`tests/test_continuation_revision.py`、`tests/test_context_scheduling.py`。模型语义及原生链路计时单独记录，不能用本地字符串断言代替模型实测。
+
+TS-190 继续区分召回与解释：原话中每次改动的理由只解释那一次改动，不能拿前次理由推断后来的改回；没有说过原因时明确保留未知。回忆问句只回答被询问的内容及必要限定，不顺带列出其他记忆或把刚召回的内容再次当作写入承诺。这是现有回答指令的收敛，不额外调用模型，不改写原始消息，不保证模型绝不误解；采用独立的新场景验证原因归属、未知原因、不同人物与话题克制。核验并发与取消的确定性回归见 `tests/test_context_checkpoint.py`。
+
+相邻上下文尚无任何已发送助手回复时，也按人类原话核验，不继承未展示回复所依赖的画像或更早回答。否则画像变化会使仍然有效的原话一并消失。片段包含已发送回复时，先核验完整回复依赖；如果回复失效，再独立核验整组人类原话，仅在原话仍有效时保留输入并删除全部回复、标记input_only。原话撤权、遗忘或来源失效仍省略整组，不能留下缺少更正的旧安排。原作者、渠道、绑定及原话历史核验始终保留，模型前或发送前不会对已用失效材料做这种替换。`test_profile_context.py`和`test_context_checkpoint.py`验证回复失效、原话仍有效以及原话也被撤回的不同情况。
