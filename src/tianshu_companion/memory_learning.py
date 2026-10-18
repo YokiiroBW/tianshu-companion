@@ -23,6 +23,16 @@ A question is not a new factual assertion: its possessives or presuppositions (s
 where "my card" is) are not evidence of ownership, existence or location. Extract nothing from
 a pure question. If a message also contains a separate declarative fact, quote that declaration
 only; never manufacture a new fact by shortening a question into a noun phrase.
+Decide whether the assertion itself lasts beyond the immediate activity, not whether its object
+already appears in known_facts. Fetching, taking, washing, charging, eating or other one-off errands
+are not durable facts or evidence of a habit. "下楼拿一下快递" adds no lasting personal fact.
+The existence of an object or an earlier location does not turn a current intention into a routine.
+An explicitly stated usual storage location, owned object's name, or recurring practice remains
+eligible: "钥匙一直放门边抽屉" is a location; "每次出门都会带充电宝" is an explicit habit.
+In a mixed message, extract only the lasting declaration, not the accompanying immediate action.
+Concrete continuing plans may retain their stated time and conditions as plans, never as a
+permanent habit or proof the event occurred. Mere current chores stay in conversation context.
+Do not invent a durable predicate such as object.retrieval to preserve an otherwise transient act.
 Return ONLY a JSON OBJECT (never a quoted JSON string) {"memories": [...]} with at most 8 atomic entries. Each entry has exactly:
 statement (concise string), conditions (string array), negations (string array), valid_time
 (nonempty string preserving the author's stated time; use "未说明有效时间" when unspecified,

@@ -8,11 +8,42 @@ SCAFFOLD = re.compile(
     r"是不是|来着|记得|记住|知道|告诉|一下|关于|继续|好像|可以|时候|的|了|呢|呀|吗|是)"
 )
 UPDATE = re.compile(
-    r"改成|改到|改在|改为|改回|改叫|改名|换成|换到|换回|取消|不去了|"
+    r"改成|改到|改在|改为|改回|改叫|改名|换成|换到|换回|挪到|挪至|"
+    r"(?:改|换)(?:了|过)|最后(?:定|决定)|调整(?:到|为)|取消|不去了|"
     r"不是.{0,40}(?:而是|是)|不在.{0,40}(?:在|到)|别.{0,30}(?:去|进)|"
     r"\b(?:instead|actually|change\w*.{0,40}\bto|no longer)\b",
     re.I,
 )
+QUESTION = re.compile(r"[?？]|什么|哪(?:个|里|儿)|多少|怎么|是否|是不是")
+FACT_LOOKUP = re.compile(r"叫什么|叫啥|名字|姓什么|在哪里|在哪|放哪|收在哪|什么时候|哪天|同意|来着")
+
+
+def changes_plan(text):
+    """A recall question mentions a change without making another change.
+
+    Check clauses separately: a statement followed by a question still carries
+    its update. Tentative new proposals remain context, never confirmed facts.
+    """
+    for clause in re.split(r"[，,。；;！!？?\n]", text):
+        if not UPDATE.search(clause):
+            continue
+        if re.search(
+            r"要不|不如|能不能|可不可以|怎么样|好不好|好吗|吧|"
+            r"\b(?:let.s|shall we|could we|why don.t we|what about)\b",
+            clause,
+            re.I,
+        ):
+            return True
+        if re.search(
+            r"为(?:什么|啥)|怎么|如何|哪(?:天|里|儿|个|次)|何时|什么时候|"
+            r"是否|是不是|有没有|来着|记不记得|还记得|原因.{0,20}(?:说|提)|[吗么呢]\s*$|"
+            r"^\s*(?:why|when|where|what|how|did|have|has|was|were)\b",
+            clause,
+            re.I,
+        ):
+            continue
+        return True
+    return False
 
 
 def input_text(group):
@@ -39,7 +70,7 @@ def relevance(turn, group):
     score = len(query.intersection(content)) / max(1, len(query))
     # A repeated question is a weaker anchor than the source assertion at the
     # same lexical overlap. This never promotes an assistant answer as evidence.
-    question = bool(re.search(r"[?？]|什么|哪(?:个|里|儿)|多少|怎么|是否|是不是", value))
+    question = bool(QUESTION.search(value))
     return score, not question
 
 
@@ -57,12 +88,25 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
     )
     asks_assistant = bool(
         re.search(
-            r"你(?:刚才|之前|上次|当时)?.{0,12}(?:说|建议|方案|列|写|回复|回答|推荐|解释)|"
+            r"你(?:刚才|之前|上次|当时)?.{0,12}(?:说|建议|方案|列|写|回复|回答|推荐|解释|称呼|叫我)|"
             r"your (?:plan|reply|suggestion)|\byou\b.{0,40}\b(?:said|suggested|recommended|wrote|listed)\b",
             input_text(turn["bundle"]),
             re.I,
         )
     )
+    query = input_text(turn["bundle"])
+    asks_fact = (
+        not asks_assistant
+        and QUESTION.search(query)
+        and (FACT_LOOKUP.search(query) or any(score > 0 for score, _ in scores.values()))
+    )
+
+    def project(batch):
+        if asks_assistant:
+            return batch
+        # A bot's old guesses are not fresh human evidence, even when its
+        # delivery and authority are still valid. Keep the original statements.
+        return [(dict(g, replies=[], input_only=True), expiry) for g, expiry in batch]
 
     def priority(item):
         score, assertion = scores[item[0]["turn_id"]]
@@ -82,25 +126,40 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
         reverse=True,
     )
     recent_ids = {g["turn_id"] for g, _ in candidates[:limit]}
+    needs_origin = bool(
+        asks_fact
+        and ranked
+        and scores[ranked[0][0]["turn_id"]][0] > 0
+        and changes_plan(input_text(ranked[0][0]))
+    )
+    # A recent correction still needs the object from its original statement.
+    # This applies before byte compaction too: short bot replies must not make
+    # the ordinary recent window drop the thing that was changed.
+    topic_return = topic_return or needs_origin
+    recent_fact = bool(
+        asks_fact
+        and ranked
+        and ranked[0][0]["turn_id"] in recent_ids
+        and scores[ranked[0][0]["turn_id"]][1]
+        and not needs_origin
+    )
     if not topic_return or (
-        not compact and ranked[0][0]["turn_id"] in recent_ids and scores[ranked[0][0]["turn_id"]][1]
+        (not compact or recent_fact)
+        and ranked[0][0]["turn_id"] in recent_ids
+        and scores[ranked[0][0]["turn_id"]][1]
+        and not needs_origin
     ):
         # Continuing an already-recent asserted topic needs ordinary adjacency,
         # not overlapping historical spans that crowd out the preceding turn.
-        return [[item] for item in candidates], False
+        # Raw recent confirmations can fit even when verbose bot replies cannot.
+        # A correction anchor still needs its earlier description as one batch.
+        return [project([item]) if asks_fact else [item] for item in candidates], False
     chronological = list(reversed(candidates))
     positions = {g["turn_id"]: i for i, (g, _) in enumerate(chronological)}
 
-    def project(batch):
-        if asks_assistant:
-            return batch
-        # Fact recall carries raw adjacent inputs too. An unrelated recent bot
-        # answer must not reintroduce its whole dependency chain into this topic.
-        return [(dict(g, replies=[], input_only=True), expiry) for g, expiry in batch]
-
     def anchor_batch(item):
         position = positions[item[0]["turn_id"]]
-        if UPDATE.search(input_text(item[0])):
+        if changes_plan(input_text(item[0])):
             # A correction can itself be the best lexical match. Its original
             # description then precedes it, including another speaker in between.
             start = max(0, position - min(2, limit - 1))
@@ -114,7 +173,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
         for i in range(end + 1, len(chronological)):
             if i - end >= limit:
                 break
-            if UPDATE.search(input_text(chronological[i][0])):
+            if changes_plan(input_text(chronological[i][0])):
                 end = i
         # Human input does not inherit the claims or provenance of the bot's
         # response. Keep the original input intact and label the projection.

@@ -24,7 +24,7 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
         await self.h.ingest(text=text, **kwargs)
         await self.h.cycles()
 
-    async def test_name_and_pronoun_followups_use_complete_recent_inputs_and_sent_replies(self):
+    async def test_fact_recall_uses_inputs_and_bot_address_question_keeps_sent_replies(self):
         h = self.h
         h.gateway.segments = ["小明你好，收到你的名字。"]
         await self.say("我叫小明", message="source:name")
@@ -37,8 +37,8 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("我叫小明", recent[0]["messages"][0]["parts"][0]["text"])
         self.assertEqual("a", recent[0]["messages"][0]["author"]["immutable_account_id"])
         self.assertEqual("source:name", recent[0]["messages"][0]["message_key"]["message_id"])
-        self.assertEqual("小明你好，收到你的名字。", recent[0]["replies"][0]["text"])
-        self.assertEqual("sent", recent[0]["replies"][0]["state"])
+        self.assertEqual([], recent[0]["replies"])
+        self.assertTrue(recent[0]["input_only"])
         await self.say("那你怎么称呼我呢")
         self.assertEqual(2, len(self.prompt()["recent_dialogue"]))
         self.assertIn("你叫小明。", canonical(self.prompt()["recent_dialogue"]))
@@ -58,6 +58,9 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
             h.core.recover()
             await self.say("我叫什么名字")
             self.assertIn("我叫小明", canonical(self.prompt()["recent_dialogue"]))
+            self.assertNotIn("小明你好", canonical(self.prompt()["recent_dialogue"]))
+            self.assertTrue(all(g.get("input_only") for g in self.prompt()["recent_dialogue"]))
+            await self.say("你之前怎么称呼我的？")
             self.assertIn("小明你好", canonical(self.prompt()["recent_dialogue"]))
             await h.core.close()
             self.h = Harness(silence_ms=0)

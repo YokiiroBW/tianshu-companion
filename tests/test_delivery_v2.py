@@ -81,6 +81,42 @@ async def source_turn(h):
     return turn
 
 
+def test_sealed_expression_receipt_finishes_while_earlier_turn_is_generating():
+    async def run():
+        h = Harness(silence_ms=0)
+        queue = NativeQueue(h.clock)
+        queue.states = ["unknown"]
+        h.sender = h.core.sender = queue
+        try:
+            first = await source_turn(h)
+            await h.ingest(text="第二条消息先生成完了")
+            h.core._seal_due(h.clock())
+            second = h.turns()[-1]
+            assert first["id"] != second["id"]
+            second.update(
+                phase="generating",
+                scope_version=h.memory.scope_version,
+                role=h.core.roles["actor:a"],
+            )
+            h.core._save_turn(second)
+            await h.core.stream_segment(second["id"], "已经送出的回复。")
+            with pytest.raises(Fault):
+                await h.core.finalize_stream(second["id"])
+            queue.final = True
+            await h.core._deliver(second["conversation_id"])
+            assert h.core.store.get("turns", second["id"])["phase"] == "reconciling"
+            assert len(queue.requests) == 1  # Unknown is queried, never resent.
+            queue.states = ["sent"]
+            await h.core._deliver(second["conversation_id"])
+            assert h.core.store.get("turns", second["id"])["phase"] == "sent"
+            assert h.core.store.get("turns", first["id"])["phase"] == "generating"
+            assert len(queue.requests) == 1
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
 def test_unchanged_receipt_poll_does_not_advance_source_or_turn_versions():
     async def run():
         h = Harness(silence_ms=0)

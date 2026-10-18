@@ -385,8 +385,21 @@ class Delivery:
             if closed and closed["phase"] == "closed_unknown":
                 with obs.correlation_scope(self._turn_correlation(closed)):
                     await self._reconcile(closed)
+        reconciled = set()
+        for sealed in self.store.work_turns(cid, ["reconciling"]):
+            if sealed.get("expression_id") and not sealed.get("stream_open"):
+                # Platform already owns this expression's outbound order. Reading
+                # its terminal receipt must not wait for an older model to finish.
+                # Reuse recovery: unknown results never create another send.
+                with obs.correlation_scope(self._turn_correlation(sealed)):
+                    await self._reconcile(sealed)
+                reconciled.add(sealed["id"])
         turn = self.store.first_work_turn(cid)
-        if not turn or turn["phase"] not in {"ready_to_send", "sending", "reconciling"}:
+        if (
+            not turn
+            or turn["id"] in reconciled
+            or turn["phase"] not in {"ready_to_send", "sending", "reconciling"}
+        ):
             return
         with obs.correlation_scope(self._turn_correlation(turn)):
             await self._deliver_turn(turn)

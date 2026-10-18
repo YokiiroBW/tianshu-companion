@@ -2,10 +2,28 @@ import json
 import unittest
 
 from support import Harness
+from tianshu_companion.context_relevance import changes_plan
 from tianshu_companion.contracts import canonical
 
 
 class ContextRetrievalTests(unittest.IsolatedAsyncioTestCase):
+    def test_change_cues_distinguish_recall_from_new_proposals_and_statements(self):
+        for text, expected in [
+            ("之前为什么换到大厅？", False),
+            ("最后改到哪儿来着？", False),
+            ("是不是改到周四了？", False),
+            ("Why did we change to the east entrance?", False),
+            ("要不换到大厅，怎么样？", True),
+            ("现在改到周四吧，可以吗？", True),
+            ("Why don't we change to the east entrance?", True),
+            ("后来时间又改了，最后定周六。", True),
+            ("已经换到南门了，你知道了吗？", True),
+            ("那次为什么换到大厅？现在改到二楼了。", True),
+            ("我把窗台擦干净了。", False),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(changes_plan(text), expected)
+
     async def asyncSetUp(self):
         self.h = Harness(silence_ms=0)
 
@@ -54,3 +72,73 @@ class ContextRetrievalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("青苔雨伞", canonical(selected))
         self.assertLessEqual(len(canonical(selected).encode()), 8192)
         self.assertLessEqual(len(selected), 4)
+
+    async def test_question_about_a_change_does_not_extend_the_required_change_span(self):
+        await self.assert_change_reason_keeps_original("这是一段较长的已发送回复。" * 30)
+
+    async def test_recent_correction_keeps_original_even_when_bot_replies_are_short(self):
+        await self.assert_change_reason_keeps_original("收到。")
+
+    async def assert_change_reason_keeps_original(self, reply):
+        self.h.gateway.segments = [reply]
+        rows = [
+            ("a", "我的培训原来是周二，地点在南院。"),
+            ("a", "周二要看牙，我和老师商量换成周三了。"),
+            ("a", "后来日期又改了，最后定周五，地点还是南院。"),
+            ("b", "窗台的小花今天开了，颜色挺亮。"),
+            ("a", "培训最后哪天来着，改到那天的原因说过吗？"),
+        ]
+        for account, text in rows:
+            await self.say(text, group=True, channel="group:changes", account=account)
+        await self.say(
+            "之前从周二挪到周三又是为啥？", group=True, channel="group:changes", account="b"
+        )
+        recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+        self.assertIn("我的培训原来是周二", canonical(recent))
+        self.assertIn("周二要看牙", canonical(recent))
+        self.assertIn("最后定周五", canonical(recent))
+        self.assertLessEqual(len(recent), 4)
+        self.assertLessEqual(len(canonical(recent).encode()), 8192)
+
+    async def test_fact_question_uses_humans_but_question_about_bot_keeps_its_reply(self):
+        invented = "你昨天告诉我它叫团子，所有人都同意了。"
+        self.h.gateway.segments = [invented]
+        await self.say("昨天傍晚我家的狗把我叫醒了，它叫团子。")
+        await self.say("狗叫什么来着？")
+        prompt_messages = self.h.gateway.calls[-1][1]
+        payload = json.loads(prompt_messages[1]["content"])
+        recent = payload["recent_dialogue"]
+        self.assertIn("昨天傍晚我家的狗把我叫醒", canonical(recent))
+        self.assertNotIn(invented, canonical(recent))
+        self.assertTrue(all(g.get("input_only") and not g["replies"] for g in recent))
+        self.assertNotIn("昨天傍晚我家的狗把我叫醒", prompt_messages[0]["content"])
+        self.assertNotIn(invented, canonical(payload["human_source_view"]))
+        self.assertEqual(1, len(payload["human_source_view"]["participants"]))
+        self.assertEqual(
+            ["昨天傍晚我家的狗把我叫醒了，它叫团子。", "狗叫什么来着？"],
+            [m["text"] for m in payload["human_source_view"]["participants"][0]["messages"]],
+        )
+        await self.say("你刚才怎么回答的？")
+        recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+        self.assertIn(invented, canonical(recent))
+
+    async def test_recent_independent_confirmations_survive_verbose_bot_history(self):
+        self.h.gateway.segments = ["助手旧的判断不等于人的确认。" * 70]
+        for account, text in [
+            ("a", "周六槐安馆从北门进吧。"),
+            ("b", "我在吃早饭，还没看路线。"),
+            ("c", "先拉开窗帘。"),
+            ("a", "北门大家都同意了吗？"),
+            ("b", "北门没问题，我同意走这条路线。"),
+            ("a", "现在是谁明确同意北门了？"),
+            ("c", "我也同意从北门进，到时门口见。"),
+        ]:
+            await self.say(text, group=True, channel="group:consent", account=account)
+        await self.say(
+            "现在有哪些人明确同意北门？", group=True, channel="group:consent", account="a"
+        )
+        recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+        self.assertIn("北门没问题，我同意", canonical(recent))
+        self.assertIn("我也同意从北门进", canonical(recent))
+        self.assertNotIn("助手旧的判断", canonical(recent))
+        self.assertLessEqual(len(recent), 4)
