@@ -14,6 +14,9 @@ INDEXES = {
     "direct_waiting_band": "CREATE INDEX IF NOT EXISTS direct_waiting_band ON direct_requests(conversation_id,id) WHERE status IN ('completed','failed') AND json_extract(body,'$.reply_state')='ready_to_deliver' AND json_extract(body,'$.deferred_reason')='outbound_band_busy'",
     "life_generation_due": "CREATE INDEX IF NOT EXISTS life_generation_due ON metadata(conversation_id,deadline,position,id) WHERE status IN ('queued','unavailable','failed') AND json_extract(body,'$.attempt')<3",
     "metadata_history_page": "CREATE INDEX IF NOT EXISTS metadata_history_page ON metadata(conversation_id,status,position DESC,id DESC)",
+    "memory_learning_order": "CREATE INDEX IF NOT EXISTS memory_learning_order ON metadata(conversation_id,status,json_extract(body,'$.scope_key'),position,id)",
+    "memory_learning_due": "CREATE INDEX IF NOT EXISTS memory_learning_due ON metadata(conversation_id,status,deadline,position,id)",
+    "outbox_scope_pending": "CREATE INDEX IF NOT EXISTS outbox_scope_pending ON outbox(conversation_id,json_extract(body,'$.event.scope.actor_id'),json_extract(body,'$.event.scope.person_id'),json_extract(body,'$.event.scope.audience'),position) WHERE status IN ('pending','unknown','submitting','blocked_scope')",
 }
 
 

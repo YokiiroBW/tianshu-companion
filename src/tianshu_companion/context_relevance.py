@@ -16,6 +16,13 @@ UPDATE = re.compile(
 )
 QUESTION = re.compile(r"[?？]|什么|哪(?:个|里|儿)|多少|怎么|是否|是不是")
 FACT_LOOKUP = re.compile(r"叫什么|叫啥|名字|姓什么|在哪里|在哪|放哪|收在哪|什么时候|哪天|同意|来着")
+POSITION_STATEMENT = re.compile(
+    r"同意|赞成|反对|不参加|参加不了|去不了|不去了|\b(?:agree|agreed|disagree|can't come)\b", re.I
+)
+FOLLOWUP_QUESTION = re.compile(
+    r"^(?:那|我们|咱们)?(?:中间|后来|当时|之前)(?:还|又|为什么|为啥|怎么|考虑|是为|呢|[，,？?])|"
+    r"^(?:那|我们|咱们)?(?:为什么|为啥)(?:又|还|没|不)"
+)
 
 
 def changes_plan(text):
@@ -62,8 +69,7 @@ def tokens(text):
     return result
 
 
-def relevance(turn, group):
-    query = tokens(input_text(turn["bundle"]))
+def relevance(query, group):
     # Assistant answers cannot turn a hallucinated detail into a history anchor.
     value = input_text(group)
     content = tokens(value)
@@ -82,7 +88,26 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
     The batch is indivisible; an oversized or revoked follow-up must not leave an
     isolated obsolete anchor. This is conversation context, never a fact update.
     """
-    scores = {g["turn_id"]: relevance(turn, g) for g, _ in candidates}
+    query_text = input_text(turn["bundle"])
+    query_tokens = tokens(query_text)
+    scores = {g["turn_id"]: relevance(query_tokens, g) for g, _ in candidates}
+    if (
+        candidates
+        and QUESTION.search(query_text)
+        and FOLLOWUP_QUESTION.search(query_text)
+        and not any(score > 0 and assertion for score, assertion in scores.values())
+    ):
+        previous = candidates[0][0]
+        author = turn["bundle"]["messages"][-1]
+        last = previous["messages"][-1]
+        if (last["author"], last["person_id"]) == (
+            author["author"],
+            author["person_id"],
+        ) and QUESTION.search(input_text(previous)):
+            # Resolve an elliptical follow-up through the same speaker's most
+            # recent question. Its words are retrieval cues, never factual evidence.
+            query_tokens |= tokens(input_text(previous))
+            scores = {g["turn_id"]: relevance(query_tokens, g) for g, _ in candidates}
     topic_return = any(scores[g["turn_id"]][0] > 0 for g, _ in candidates[limit:]) or (
         compact and any(score > 0 for score, _ in scores.values())
     )
@@ -95,11 +120,23 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
         )
     )
     query = input_text(turn["bundle"])
-    asks_fact = (
-        not asks_assistant
-        and QUESTION.search(query)
-        and (FACT_LOOKUP.search(query) or any(score > 0 for score, _ in scores.values()))
+    asks_fact = not asks_assistant and (
+        (
+            QUESTION.search(query)
+            and (FACT_LOOKUP.search(query) or any(score > 0 for score, _ in scores.values()))
+        )
+        or POSITION_STATEMENT.search(query)
     )
+
+    def updates_plan(group):
+        text = input_text(group)
+        if asks_fact and POSITION_STATEMENT.search(query):
+            # A person's acceptance/withdrawal is their stance, not a change to
+            # everybody's plan. Keep those source statements independently so
+            # an unrelated interlude cannot make the whole consent set too big.
+            # Actual changes in the same message still require their origin.
+            text = POSITION_STATEMENT.sub("", text)
+        return changes_plan(text)
 
     def project(batch):
         if asks_assistant:
@@ -130,7 +167,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
         asks_fact
         and ranked
         and scores[ranked[0][0]["turn_id"]][0] > 0
-        and changes_plan(input_text(ranked[0][0]))
+        and updates_plan(ranked[0][0])
     )
     # A recent correction still needs the object from its original statement.
     # This applies before byte compaction too: short bot replies must not make
@@ -139,10 +176,28 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
     recent_fact = bool(
         asks_fact
         and ranked
-        and ranked[0][0]["turn_id"] in recent_ids
-        and scores[ranked[0][0]["turn_id"]][1]
+        and any(
+            key in recent_ids and score > 0 and assertion
+            for key, (score, assertion) in scores.items()
+        )
         and not needs_origin
     )
+    if recent_fact and scores[ranked[0][0]["turn_id"]][0] > 0:
+        # Repeated questions must not displace the original proposal or a
+        # different person's confirmation. Keep related assertions, not every
+        # recent topic. Preserve adjacency after the newest matching assertion
+        # for implicit follow-ups; explicit changes still use atomic spans below.
+        assertions = [item for item in ranked if all(scores[item[0]["turn_id"]])]
+        first = min(g["turn_sequence"] for g, _ in assertions)
+        has_changes = any(g["turn_sequence"] >= first and updates_plan(g) for g, _ in candidates)
+        if not has_changes:
+            newest = max(g["turn_sequence"] for g, _ in assertions)
+            following = [
+                item
+                for item in candidates
+                if item[0]["turn_sequence"] > newest and scores[item[0]["turn_id"]][1]
+            ]
+            return [project([item]) for item in following + assertions], True
     if not topic_return or (
         (not compact or recent_fact)
         and ranked[0][0]["turn_id"] in recent_ids
@@ -159,7 +214,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
 
     def anchor_batch(item):
         position = positions[item[0]["turn_id"]]
-        if changes_plan(input_text(item[0])):
+        if updates_plan(item[0]):
             # A correction can itself be the best lexical match. Its original
             # description then precedes it, including another speaker in between.
             start = max(0, position - min(2, limit - 1))
@@ -173,15 +228,21 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
         for i in range(end + 1, len(chronological)):
             if i - end >= limit:
                 break
-            if changes_plan(input_text(chronological[i][0])):
+            if updates_plan(chronological[i][0]):
                 end = i
         # Human input does not inherit the claims or provenance of the bot's
         # response. Keep the original input intact and label the projection.
         return project(chronological[start : end + 1])
 
     preferred = [anchor_batch(ranked[0])]
-    preferred.extend(project([item]) for item in candidates[: limit // 2])
-    preferred.extend(anchor_batch(item) for item in ranked[1:])
+    preferred.extend(
+        project([item])
+        for item in candidates[: limit // 2]
+        if not asks_fact or scores[item[0]["turn_id"]][1]
+    )
+    preferred.extend(
+        anchor_batch(item) for item in ranked[1:] if not asks_fact or scores[item[0]["turn_id"]][1]
+    )
     batches, seen = [], set()
     for batch in preferred:
         ids = {item[0]["turn_id"] for item in batch}

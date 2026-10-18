@@ -28,6 +28,7 @@ QUERIES = [
     ("/internal/v1/memory/context/input-history", {}),
     ("/internal/v1/memory/profiles/select", {}),
     ("/internal/v1/memory/source-sync/check", {}),
+    ("/internal/v1/memory/candidates/process", {"job_id": "candidate:fixture", "output": None}),
     ("/internal/v1/model-requests/model:" + "a" * 32, None),
 ]
 WRITES = [
@@ -77,6 +78,22 @@ class QueryTransportTests(unittest.IsolatedAsyncioTestCase):
             (SELECT + "?write=true", {}, 1),
             ("/internal/v1/model-requests/model:" + "a" * 32 + "/consume", None, 1),
             ("/internal/v1/model-requests/model:" + "a" * 32, {}, 1),
+            ("/internal/v1/memory/candidates/process", {"job_id": "candidate:fixture"}, 1),
+            (
+                "/internal/v1/memory/candidates/process",
+                {"job_id": "candidate:fixture", "output": {"memories": []}},
+                1,
+            ),
+            (
+                "/internal/v1/memory/candidates/process",
+                {"job_id": "candidate:fixture", "output": {}},
+                1,
+            ),
+            (
+                "/internal/v1/memory/candidates/process",
+                {"job_id": "candidate:fixture", "output": None, "extra": True},
+                1,
+            ),
         ]
         for path, body, expected in cases:
             with self.subTest(path=path, body=body):

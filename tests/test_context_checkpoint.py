@@ -21,6 +21,44 @@ class ContextCheckpointTests(unittest.IsolatedAsyncioTestCase):
             await self.h.cycles()
         return self.h.turns()
 
+    async def test_profile_preparation_overlaps_reads_and_cancel_drains_all(self):
+        for account in ("a", "b", "c"):
+            await self.h.ingest(
+                text="周末想看书", group=True, channel="group:checks", account=account
+            )
+            await self.h.cycles()
+        entered, release = asyncio.Event(), asyncio.Event()
+        active, peak = 0, 0
+        original = self.h.memory.profiles
+
+        async def profiles(*args, **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            if active == 4:
+                entered.set()
+            try:
+                await release.wait()
+                return await original(*args, **kwargs)
+            finally:
+                active -= 1
+
+        self.h.memory.profiles = profiles
+        previous = self.h.turns()[-1]
+        job = asyncio.create_task(self.h.core._prepare_context(previous, []))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            self.assertEqual(peak, 4)
+            job.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await job
+            self.assertEqual(active, 0)
+        finally:
+            release.set()
+            if not job.done():
+                job.cancel()
+                await asyncio.gather(job, return_exceptions=True)
+
     async def test_independent_history_reads_overlap_with_bounded_admission(self):
         turns = await self.turns(6)
         entered, release = asyncio.Event(), asyncio.Event()

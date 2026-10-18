@@ -87,6 +87,14 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(requests[4].headers["X-Tianshu-Provider-Session"], session)
             await gateway.generate({**turn, "scope": {"actor_id": "actor:other"}}, messages)
             self.assertNotEqual(requests[6].headers["X-Tianshu-Provider-Session"], session)
+            self.assertNotIn("reasoning_effort", json.loads(requests[6].content))
+            self.assertNotIn("max_tokens", json.loads(requests[6].content))
+            await gateway.generate(
+                {**turn, "generation_budget": {"max_tokens": 8192, "reasoning_effort": "low"}},
+                messages,
+            )
+            self.assertEqual(json.loads(requests[-2].content)["reasoning_effort"], "low")
+            self.assertEqual(json.loads(requests[-2].content)["max_tokens"], 8192)
             receipt_override["config_version"] = 8
             with self.assertRaises(Fault):
                 await gateway.generate(turn, messages)

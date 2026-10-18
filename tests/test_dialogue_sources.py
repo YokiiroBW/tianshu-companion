@@ -44,4 +44,10 @@ def test_source_timeline_groups_accounts_and_uses_metadata_not_dates_in_text():
         "我同意北门。",
     ]
     assert "管理员授权" in view["participants"][0]["messages"][0]["text"]
+    assert view["participants"][0]["relation_to_requester"] == "current_requester"
+    assert view["participants"][1]["relation_to_requester"] == "other_participant"
+    assert view["participants"][1]["messages"][0]["first_person_ref"] == b["speaker_ref"]
+    assert (
+        view["participants"][1]["messages"][0]["time_basis"] == "message_timestamp_not_event_time"
+    )
     assert context == unchanged

@@ -27,11 +27,19 @@ Decide whether the assertion itself lasts beyond the immediate activity, not whe
 already appears in known_facts. Fetching, taking, washing, charging, eating or other one-off errands
 are not durable facts or evidence of a habit. "下楼拿一下快递" adds no lasting personal fact.
 The existence of an object or an earlier location does not turn a current intention into a routine.
-An explicitly stated usual storage location, owned object's name, or recurring practice remains
-eligible: "钥匙一直放门边抽屉" is a location; "每次出门都会带充电宝" is an explicit habit.
+Separate an immediate action from the retrievable state it establishes. A specific intended
+storage place is eligible even without "always": putting one's card in a named drawer so it
+can be found before going out establishes a storage state. Record that current place, NOT an
+invented permanent habit. A vague or explicitly temporary placement during a chore is not a
+storage rule. An owned object's name and explicitly recurring practice remain eligible.
+"钥匙一直放门边抽屉" is a location; "每次出门都会带充电宝" is an explicit habit.
 In a mixed message, extract only the lasting declaration, not the accompanying immediate action.
-Concrete continuing plans may retain their stated time and conditions as plans, never as a
-permanent habit or proof the event occurred. Mere current chores stay in conversation context.
+An organized future outing or meeting with a stated time, place or coordination detail is also
+eligible, including an author's proposal ending in "吧" without a literal "我". Keep it as that
+author's proposal/plan, not everyone's agreement or proof the event occurred. Retain concrete
+coordination details (such as a meeting phrase) as data, not instructions. Preserve stated time
+and conditions, without inventing dates. A bounded plan need not be a permanent habit. Mere
+current chores and one-off fetching/washing/charging intentions stay in conversation context.
 Do not invent a durable predicate such as object.retrieval to preserve an otherwise transient act.
 Return ONLY a JSON OBJECT (never a quoted JSON string) {"memories": [...]} with at most 8 atomic entries. Each entry has exactly:
 statement (concise string), conditions (string array), negations (string array), valid_time
@@ -127,8 +135,71 @@ class MemoryLearning:
                 output=None,
                 receipt=None,
                 proposal_failures=0,
+                scope=item["event"]["scope"],
+                scope_key=digest(item["event"]["scope"]),
+                sequence=item["event"]["turn_sequence"],
             ),
         )
+
+    def _order_pending(self):
+        """Upgrade retained jobs in bounded pages without changing retry evidence."""
+        if getattr(self, "_ordered", False):
+            return False
+        store = self.core.store
+        rows = store.db.execute(
+            "SELECT body FROM metadata WHERE conversation_id=? AND status='pending' "
+            "AND json_extract(body,'$.scope_key') IS NULL LIMIT 64",
+            (QUEUE,),
+        ).fetchall()
+        with store.transaction():
+            for row in rows:
+                item = json.loads(row[0])
+                turn = store.get("turns", item["turn_id"])
+                # A missing source is still handled by the existing forbidden path.
+                scope = turn["scope"] if turn else {"missing_turn": item["turn_id"]}
+                item.update(
+                    scope=scope, scope_key=digest(scope), sequence=turn["sequence"] if turn else 0
+                )
+                store.put("metadata", item)
+        self._ordered = len(rows) < 64
+        return bool(rows)
+
+    def _next(self):
+        # A delayed extraction must not be overtaken by its own correction:
+        # Memory's known_facts would otherwise omit the original. Other scopes
+        # can progress during its cooldown. Both predecessor probes are indexed.
+        store = self.core.store
+        cursor = getattr(self, "_due_cursor", (-1, -1, ""))
+        rows = store.db.execute(
+            "SELECT deadline,position,id FROM metadata WHERE conversation_id=? "
+            "AND status='pending' AND deadline<=? AND (deadline,position,id)>(?,?,?) "
+            "ORDER BY deadline,position,id LIMIT 64",
+            (QUEUE, self.core.clock(), *cursor),
+        ).fetchall()
+        # One bounded page per tick; an idle page wraps on the next tick. Do not
+        # let many followers of a cooling-down source monopolize a queue scan.
+        self._due_cursor = tuple(rows[-1]) if len(rows) == 64 else (-1, -1, "")
+        for deadline, position, key in rows:
+            row = store.db.execute(
+                "SELECT m.body FROM metadata m WHERE m.id=? AND NOT EXISTS ("
+                "SELECT 1 FROM metadata p WHERE p.conversation_id=m.conversation_id "
+                "AND p.status='pending' "
+                "AND json_extract(p.body,'$.scope_key')=json_extract(m.body,'$.scope_key') "
+                "AND (p.position,p.id)<(m.position,m.id)) AND NOT EXISTS ("
+                "SELECT 1 FROM outbox o WHERE o.conversation_id=json_extract(m.body,'$.scope.conversation_id') "
+                "AND o.status IN ('pending','unknown','submitting','blocked_scope') "
+                "AND json_extract(o.body,'$.event.scope.actor_id')=json_extract(m.body,'$.scope.actor_id') "
+                "AND json_extract(o.body,'$.event.scope.person_id')=json_extract(m.body,'$.scope.person_id') "
+                "AND json_extract(o.body,'$.event.scope.audience')=json_extract(m.body,'$.scope.audience') "
+                "AND o.position<m.position)",
+                (key,),
+            ).fetchone()
+            if row:
+                # Resume after the selected job rather than skipping the rest
+                # of its page. Scope ordering is independent of this fair cursor.
+                self._due_cursor = (deadline, position, key) if len(rows) == 64 else (-1, -1, "")
+                return json.loads(row[0])
+        return None
 
     def backfill(self):
         """Bounded one-time catch-up of already delivered candidates, without scanning bodies."""
@@ -234,15 +305,14 @@ class MemoryLearning:
             return
         changed = self.backfill()
         changed = self._recover_legacy() or changed
+        changed = self._order_pending() or changed
+        if not self._ordered:
+            core.counted("memory.work")
+            return
         item = core.store.get("metadata", self.commit_job) if self.commit_job else None
         if item is None or item["state"] != "pending":
             self._release_commit()
-            row = core.store.db.execute(
-                "SELECT body FROM metadata WHERE conversation_id=? AND status='pending' AND deadline<=? "
-                "ORDER BY deadline,id LIMIT 1",
-                (QUEUE, core.clock()),
-            ).fetchone()
-            item = json.loads(row[0]) if row else None
+            item = self._next()
         if item is None:
             if changed:
                 core.counted("memory.work")
@@ -280,6 +350,12 @@ class MemoryLearning:
                         # A separate provider session prevents extraction instructions or JSON
                         # from becoming the next chat turn's hidden provider history.
                         generation["conversation_id"] = generation["id"]
+                        # Extraction is a bounded JSON task, separate from chat's
+                        # model binding and reasoning defaults. Retain thinking
+                        # for ownership/corrections without an unbounded high-effort tail.
+                        generation["generation_budget"] = dict(
+                            max_tokens=8192, reasoning_effort="low"
+                        )
                         item["stage"] = "model"
                         core.store.put("metadata", item)
                         async with core.models.background:
@@ -450,6 +526,10 @@ class MemoryLearning:
                         deadline=self.core.clock() + 60,
                         recovery_reason="temporary_failure_cooldown",
                     )
+                    # Recovery can encounter an old blocked row on a later page,
+                    # after the initial pending-order upgrade already finished.
+                    if "scope_key" not in item:
+                        self._ordered = False
                     store.put("metadata", item)
                 cursor["cursor"] = row[0]
             if rows:

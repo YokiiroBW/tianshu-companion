@@ -38,6 +38,22 @@ class _Checkpoint:
         await _finish(list(self.reads.values()), cancel=True)
 
 
+async def read_parallel(reads):
+    """Independent prompt reads, bounded to four and drained on cancellation."""
+    slots = asyncio.Semaphore(4)
+
+    async def run(read):
+        async with slots:
+            return await read()
+
+    tasks = [_start(run(read)) for read in reads]
+    try:
+        await _finish(tasks)
+        return [task.result() for task in tasks]
+    finally:
+        await _finish(tasks, cancel=True)
+
+
 async def verify_checks(checks, verify, *, verified=None):
     # Callers may share exact results only while assembling this one prompt.
     # No authority task or result survives a later preflight/delivery checkpoint.

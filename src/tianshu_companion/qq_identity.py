@@ -136,6 +136,7 @@ def dialogue_sources(turn, context):
     """Separate trusted source metadata from grouped, untrusted human quotations."""
     current = turn["bundle"]["messages"]
     reference = current[-1]
+    requester = (reference["author"], reference["person_id"])
     received = epoch(reference["accepted_at"])
     entries = [(f"m{i}", message) for i, message in enumerate(current, 1)]
     entries.extend(
@@ -148,9 +149,19 @@ def dialogue_sources(turn, context):
         author = message["author"]
         key = (author["namespace"], author["immutable_account_id"], message["person_id"])
         speaker = speakers.setdefault(key, "p" + str(len(speakers) + 1))
+        relation = (
+            "current_requester"
+            if (author, message["person_id"]) == requester
+            else "other_participant"
+        )
         participant = participants.setdefault(
             speaker,
-            dict(speaker_ref=speaker, person_ref=message["person_id"], message_refs=[]),
+            dict(
+                speaker_ref=speaker,
+                person_ref=message["person_id"],
+                relation_to_requester=relation,
+                message_refs=[],
+            ),
         )
         participant["message_refs"].append(ref)
         sources.append(
@@ -158,6 +169,7 @@ def dialogue_sources(turn, context):
                 message_ref=ref,
                 speaker_ref=speaker,
                 person_ref=message["person_id"],
+                relation_to_requester=relation,
                 message_sent_at=message["sent_at"],
                 message_received_at=message["accepted_at"],
                 received_seconds_before_current=round(received - epoch(message["accepted_at"]), 3),
@@ -173,7 +185,12 @@ def dialogue_sources(turn, context):
     )
     by_ref = {source["message_ref"]: source for source in sources}
     view = {
-        speaker: dict(speaker_ref=speaker, person_ref=p["person_ref"], messages=[])
+        speaker: dict(
+            speaker_ref=speaker,
+            person_ref=p["person_ref"],
+            relation_to_requester=p["relation_to_requester"],
+            messages=[],
+        )
         for speaker, p in participants.items()
     }
     # Keep each person's older selected messages before their current input.
@@ -184,6 +201,8 @@ def dialogue_sources(turn, context):
             dict(
                 message_ref=ref,
                 message_received_at=message["accepted_at"],
+                first_person_ref=source["speaker_ref"],
+                time_basis="message_timestamp_not_event_time",
                 text="\n".join(p["text"] for p in message["parts"] if p["kind"] == "text"),
             )
         )

@@ -237,6 +237,103 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.flush()
         self.assertEqual(self.task()["state"], "completed")
 
+    async def test_correction_waits_for_original_retry_but_other_person_can_progress(self):
+        self.unique_jobs()
+        await self.chat()
+        self.model_fail = True
+        await self.flush()
+        original = self.task()
+        self.model_fail = False
+        await self.h.ingest(text="入口还是改成东门吧。")
+        await self.h.cycles()
+        correction_turn = self.h.turns()[-1]["id"]
+        await self.h.ingest(text="我每天早上喝红茶。", account="b", channel="private:b")
+        await self.h.cycles()
+        await self.h.core.flush_outbox()
+        tasks = self.h.core.store.list("metadata", "memory:learning")
+        correction = next(x for x in tasks if x["turn_id"] == correction_turn)
+        unrelated = next(x for x in tasks if x["id"] not in {original["id"], correction["id"]})
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.calls[-1][0], unrelated["job_id"])
+        self.assertNotIn(correction["job_id"], [job for job, _ in self.calls])
+        self.completed = None
+        await self.restart()
+        await self.h.core.memory_learning.work()
+        self.assertNotIn(correction["job_id"], [job for job, _ in self.calls])
+        self.h.clock.advance(10)
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.calls[-1][0], original["job_id"])
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.calls[-1][0], correction["job_id"])
+
+    async def test_later_candidate_waits_for_older_unknown_outbox_acceptance(self):
+        self.unique_jobs()
+        await self.chat()
+        original = self.h.core.store.list("outbox")[0]
+        original.update(state="unknown", deadline=self.h.clock() + 60)
+        self.h.core.store.put("outbox", original)
+        await self.h.ingest(text="现在改到周日了。")
+        await self.h.cycles()
+        await self.flush()
+        self.assertEqual(self.generated, [])
+        self.h.clock.advance(61)
+        await self.flush()
+        self.assertEqual(self.generated[0]["sequence"], 1)
+
+    def unique_jobs(self):
+        commit = self.h.memory.commit
+
+        async def unique(event):
+            receipt = await commit(event)
+            receipt["candidate_job_ref"] = "candidate:" + event["event_id"]
+            return receipt
+
+        self.h.memory.commit = unique
+
+    async def test_many_waiting_followers_do_not_starve_an_independent_scope(self):
+        from tianshu_companion.contracts import digest
+
+        await self.chat()
+        self.model_fail = True
+        await self.flush()
+        original = self.task()
+        original["deadline"] = self.h.clock() + 600
+        self.h.core.store.put("metadata", original)
+        for index in range(2, 140):
+            follower = dict(original, id=f"follower:{index}", sequence=index, deadline=0)
+            self.h.core.store.put("metadata", follower)
+        scope = dict(original["scope"], person_id="person:independent")
+        independent = dict(
+            original,
+            id="independent",
+            sequence=200,
+            deadline=0,
+            scope=scope,
+            scope_key=digest(scope),
+        )
+        self.h.core.store.put("metadata", independent)
+        worker = self.h.core.memory_learning
+        worker._due_cursor = (-1, -1, "")
+        self.assertIsNone(worker._next())
+        self.assertIsNone(worker._next())
+        self.assertEqual(worker._next()["id"], "independent")
+
+    async def test_existing_pending_jobs_gain_order_without_resetting_attempts(self):
+        await self.chat()
+        self.model_fail = True
+        await self.flush()
+        old = self.task()
+        for key in ("scope_key", "sequence", "scope"):
+            old.pop(key, None)
+        self.h.core.store.put("metadata", old)
+        await self.restart()
+        await self.h.core.memory_learning.work()
+        migrated = self.task()
+        self.assertEqual(migrated["attempts"], old["attempts"])
+        self.assertEqual(migrated["deadline"], old["deadline"])
+        self.assertEqual(migrated["sequence"], 1)
+        self.assertTrue(migrated["scope_key"])
+
     async def test_malformed_receipt_does_not_discard_uncertain_proposal(self):
         await self.chat()
         self.lose_response = True

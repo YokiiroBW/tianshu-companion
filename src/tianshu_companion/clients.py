@@ -184,6 +184,17 @@ class JsonService:
 
     @classmethod
     def _is_query(cls, path, body):
+        if path == "/internal/v1/memory/candidates/process":
+            # This endpoint has both receipt lookup and proposal submission.
+            # Only the exact null-output lookup can recover a stale connection
+            # without spending another extraction attempt or replaying a write.
+            return (
+                type(body) is dict
+                and set(body) == {"job_id", "output"}
+                and isinstance(body["job_id"], str)
+                and bool(body["job_id"])
+                and body["output"] is None
+            )
         return (body is not None and path in cls.QUERY_PATHS) or (
             body is None
             and re.fullmatch(r"/internal/v1/model-requests/model:[0-9a-f]{32}", path) is not None
@@ -768,6 +779,11 @@ class Gateway:
             )
         # Model is intentionally absent: only the gateway's published workload binding selects it.
         body = dict(messages=messages, stream=True)
+        if "generation_budget" in turn:
+            budget = turn["generation_budget"]
+            body.update(
+                max_tokens=budget["max_tokens"], reasoning_effort=budget["reasoning_effort"]
+            )
         if tools:
             body.update(tools=tools, tool_choice="auto")
         self.contracts.check("model#native_request", body)
