@@ -69,6 +69,7 @@ class JsonService:
             "/internal/v1/origins/resolve",
             "/internal/v1/identity/resolve",
             "/internal/v1/qq-admin/check",
+            "/internal/v1/books/reading",
             "/internal/v1/memory/select",
             "/internal/v1/relationships/read",
             "/internal/v1/relationships/check",
@@ -339,6 +340,20 @@ class JsonService:
 class Origins:
     def __init__(self, contracts, issuers):
         self.contracts, self.issuers = contracts, issuers
+
+    async def book_snapshot(self, service, origin, scope, *, grant_id=None):
+        if service not in self.issuers or "reading-state" not in self.contracts.schemas:
+            return None
+        issuer, client = self.issuers[service]
+        if issuer != "platform":
+            return None
+        request = dict(schema_version=1, query=query(origin), scope=scope, grant_id=grant_id)
+        self.contracts.check("reading-state#request", request)
+        response = await client.call("/internal/v1/books/reading", request)
+        self.contracts.check("reading-state#response", response)
+        if response["request_id"] != request["query"]["request_id"] or response["scope"] != scope:
+            raise Fault("forbidden")
+        return response
 
     async def input_access(self, service, ingest):
         if service not in {"platform", "nonebot"} or service not in self.issuers:

@@ -111,6 +111,7 @@ class Contracts:
             "knowledge-content/v1": "knowledge-content",
             "image-backend/v1": "image-backend",
             "skills/v1": "skills",
+            "reading-state/v1": "reading-state",
         }
         for package in (
             "text-dialogue/v1",
@@ -125,6 +126,11 @@ class Contracts:
             "knowledge-content/v1",
             "image-backend/v1",
             "skills/v1",
+            *(
+                ("reading-state/v1",)
+                if (packages / "reading-state/v1/manifest.json").is_file()
+                else ()
+            ),
         ):
             package_root = (packages / package).resolve()
             manifest = read(package_root / "manifest.json")

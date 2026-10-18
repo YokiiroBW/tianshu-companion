@@ -54,6 +54,7 @@ from .qq_identity import (
 )
 
 from .delivery import Delivery, TERMINAL
+from .book_reading import BookReading, INSTRUCTION as BOOK_READING_INSTRUCTION
 
 ACTIVE = {
     "preparing",
@@ -144,6 +145,7 @@ class Core(Delivery):
         self._outbox_lock = asyncio.Lock()
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
+        self.book_reading = BookReading(origins, clock)
         from .memory_learning import MemoryLearning
 
         self.memory_learning = MemoryLearning(self)
@@ -1509,6 +1511,10 @@ class Core(Delivery):
                 await self._preflight(turn)
                 prompt = json.loads(messages[1]["content"])
                 prompt.update(context.data)
+                book_material, book_check = await self.book_reading.capture(turn)
+                if book_material is not None:
+                    prompt["book_reading"] = book_material
+                    messages[0]["content"] += BOOK_READING_INSTRUCTION
                 human_sources = dialogue_sources(turn, context.data)
                 prompt["human_source_view"] = human_sources["view"]
                 messages[1]["content"] = canonical(prompt)
@@ -1535,6 +1541,7 @@ class Core(Delivery):
                         return
                     fresh.update(
                         short_context=context_metadata,
+                        book_reading_check=book_check,
                         context_checks=checks,
                         profile_checks=profiles,
                         history_snapshot=history_snapshot,
@@ -2032,6 +2039,7 @@ class Core(Delivery):
                 turn.get("profile_checks", []),
             ),
         )
+        await self.book_reading.verify(turn)
         self._check_input_versions(turn)
 
     async def _check_qq_admin(self, turn):
