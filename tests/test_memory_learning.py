@@ -25,6 +25,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.lose_response = False
         self.reject = False
         self.model_fail = False
+        self.source_text = TEXT
         self.h.memory.process_candidate = self.process
         self.original_generate = self.h.gateway.generate
         self.h.gateway.generate = self.generate
@@ -40,7 +41,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
             return dict(
                 state="pending",
                 result=None,
-                content=[dict(index=0, text=TEXT, sent_at="2026-10-11T00:00:00Z")],
+                content=[dict(index=0, text=self.source_text, sent_at="2026-10-11T00:00:00Z")],
             )
         if self.reject:
             self.reject = False
@@ -122,6 +123,126 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["retained_learning"]["completed"])
         self.assertFalse(status["retained_learning"]["pending"])
 
+    async def test_empty_mixed_extraction_reviews_once_and_reconciles_uncertain_write(self):
+        await self.chat()
+        self.source_text = "钥匙一直放在门边抽屉，我现在去倒垃圾。"
+        original = self.generate
+
+        async def first_empty(turn, messages):
+            result = await original(turn, messages)
+            return (['{"memories":[]}'], {}) if len(self.generated) == 1 else result
+
+        self.h.gateway.generate = first_empty
+        await self.flush()
+        self.assertEqual(self.task()["stage"], "empty_review")
+        self.assertGreater(self.h.core.pass_count("memory.work"), 0)
+        self.assertEqual(self.task()["empty_review"][0]["quote"], "钥匙一直放在门边抽屉")
+        self.assertFalse(any(output is not None for _, output in self.calls))
+        await self.restart()
+        self.lose_response = True
+        await self.flush()
+        self.assertEqual(len(self.generated), 2)
+        self.assertEqual(self.generated[1]["generation_budget"]["reasoning_effort"], "low")
+        self.assertIn(
+            "review hints, not accepted facts", self.extraction_messages[1][-2]["content"]
+        )
+        self.assertIsNotNone(self.task()["output"])
+        await self.restart()
+        self.h.clock.advance(10)
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(len(self.generated), 2)
+        self.assertEqual(sum(output is not None for _, output in self.calls), 1)
+
+    async def test_mixed_review_can_legitimately_remain_empty_without_looping(self):
+        await self.chat()
+        self.source_text = "我平时坐609路上班，先去洗手。"
+
+        async def empty(turn, messages):
+            self.generated.append(turn)
+            return ['{"memories":[]}'], {}
+
+        self.h.gateway.generate = empty
+        await self.flush()
+        await self.flush()
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(len(self.generated), 2)
+        self.assertEqual(self.calls[-1][1], {"memories": []})
+
+    async def test_group_commit_does_not_wait_for_unrelated_group_or_private_generation(self):
+        await self.h.ingest(text=TEXT, group=True, channel="group:a")
+        await self.h.cycles()
+        gate = asyncio.Event()
+        original = self.generate
+
+        async def slow_chat(turn, messages):
+            if not turn["id"].startswith("memory-generation:"):
+                await gate.wait()
+            return await original(turn, messages)
+
+        self.h.gateway.generate = slow_chat
+        await self.h.ingest(text="另一群慢回复", group=True, channel="group:b")
+        await self.h.ingest(text="私聊慢回复", channel="private:c", account="c")
+        await self.h.cycles()
+        self.assertEqual(sum(t["phase"] == "generating" for t in self.h.turns()), 2)
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+        gate.set()
+        await self.h.cycles(80)
+        self.assertTrue(all(t["phase"] == "sent" for t in self.h.turns()))
+
+    async def test_group_commit_wait_allows_new_unrelated_room_to_start(self):
+        await self.h.ingest(text=TEXT, group=True, channel="group:a")
+        await self.h.cycles()
+        gate = asyncio.Event()
+        original = self.generate
+
+        async def slow(turn, messages):
+            if self.h.core._input_text(turn) == "慢回复":
+                await gate.wait()
+            return await original(turn, messages)
+
+        self.h.gateway.generate = slow
+        await self.h.ingest(text="慢回复", group=True, channel="group:a")
+        await self.h.cycles()
+        await self.flush()
+        self.assertEqual(self.task()["stage"], "commit_wait")
+        await self.h.ingest(text="同群排队", group=True, channel="group:a")
+        await self.h.ingest(text="另一群继续", group=True, channel="group:b")
+        await self.h.ingest(text="私聊继续", channel="private:c", account="c")
+        await self.h.cycles(100)
+        phases = {self.h.core._input_text(t): t["phase"] for t in self.h.turns()}
+        self.assertEqual(phases["同群排队"], "queued")
+        self.assertEqual(phases["另一群继续"], "sent")
+        self.assertEqual(phases["私聊继续"], "sent")
+        gate.set()
+        await self.h.cycles()
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.task()["state"], "completed")
+
+    async def test_private_commit_still_waits_for_potentially_associated_private_scope(self):
+        await self.chat()
+        gate = asyncio.Event()
+        original = self.generate
+
+        async def slow(turn, messages):
+            if not turn["id"].startswith("memory-generation:"):
+                await gate.wait()
+            return await original(turn, messages)
+
+        self.h.gateway.generate = slow
+        await self.h.ingest(text="另一个私聊", channel="private:c", account="c")
+        await self.h.cycles()
+        await self.flush()
+        self.assertEqual(self.task()["stage"], "commit_wait")
+        self.assertTrue(self.h.core.memory_learning.admission_blocked(self.h.turns()[-1]["scope"]))
+        self.assertFalse(any(output is not None for _, output in self.calls))
+        gate.set()
+        await self.h.cycles()
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.task()["state"], "completed")
+
     async def test_lost_commit_ack_reconciles_after_restart_without_model_or_commit_replay(self):
         await self.chat()
         self.lose_response = True
@@ -199,7 +320,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.task()["state"], "completed")
         self.assertEqual(self.task()["attempts"], 1)
         self.assertEqual(len(self.generated), 1)
-        self.assertFalse(self.h.core.memory_learning.admission_blocked("actor:a"))
+        self.assertFalse(self.h.core.memory_learning.admission_blocked(self.h.turns()[0]["scope"]))
 
     async def test_empty_proposal_finishes_while_dialogue_is_generating(self):
         await self.chat()
@@ -218,7 +339,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.flush()
         self.assertEqual(self.task()["state"], "completed")
         self.assertEqual(self.task()["attempts"], 1)
-        self.assertFalse(self.h.core.memory_learning.admission_blocked("actor:a"))
+        self.assertFalse(self.h.core.memory_learning.admission_blocked(self.h.turns()[0]["scope"]))
         self.assertEqual(self.calls[-1][1], {"memories": []})
         self.assertEqual(self.h.turns()[-1]["phase"], "generating")
         gate.set()
@@ -369,7 +490,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         worker.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await worker
-        self.assertFalse(self.h.core.memory_learning.admission_blocked("actor:a"))
+        self.assertFalse(self.h.core.memory_learning.admission_blocked(self.h.turns()[0]["scope"]))
         self.assertIsNotNone(self.task()["output"])
         self.assertGreater(self.task()["deadline"], self.h.clock())
         self.h.memory.process_candidate = self.process

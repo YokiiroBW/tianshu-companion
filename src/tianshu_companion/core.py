@@ -1087,7 +1087,7 @@ class Core(Delivery):
                 for turn in queued[: 2 - len(active)]:
                     if not self._preparation_available():
                         break
-                    if self.memory_learning.admission_blocked(turn["scope"]["actor_id"]):
+                    if self.memory_learning.admission_blocked(turn["scope"]):
                         break
                     if not self._responses_released(turn):
                         break
@@ -1160,9 +1160,11 @@ class Core(Delivery):
         if self.store.db.total_changes > before:
             self.counted("core.tick")
 
-    def has_active_dialogue(self, actor_id):
+    def has_active_dialogue(self, scope):
+        from .memory_learning import memory_scopes_overlap
+
         return any(
-            turn["scope"]["actor_id"] == actor_id
+            memory_scopes_overlap(turn["scope"], scope)
             for turn in self.store.list("turns", states=ACTIVE)
         )
 
@@ -1438,7 +1440,8 @@ class Core(Delivery):
                     "completion state unless the question needs it and the sources support it. "
                     "Keep each stated reason attached to the particular change it explains. "
                     "A reason for an earlier change does not explain a later reversal; if no reason "
-                    "was stated for that step, say it was not stated rather than filling one in. "
+                    "is visible for that step, say its reason is unclear in the available context; "
+                    "this never proves the person has not said it elsewhere. "
                     "For a recall question, answer the requested detail and its necessary qualifiers; "
                     "do not add other remembered topics or offer to store what was only just recalled. "
                     "Prefer a short direct answer over a narrative of previous exchanges. "
@@ -1522,10 +1525,8 @@ class Core(Delivery):
                 messages[0]["content"] += "\nMaterial provenance: " + canonical(
                     material_sources(context.data)
                 )
-                messages[0]["content"] += (
-                    "\nHuman source timeline: "
-                    + canonical(human_sources["metadata"])
-                    + SOURCE_INSTRUCTION
+                messages[0]["content"] += "\nHuman source timeline: " + canonical(
+                    human_sources["metadata"]
                 )
                 if len(canonical(messages).encode()) > 524288:
                     raise Fault("budget_exceeded")
@@ -1647,10 +1648,13 @@ class Core(Delivery):
         native = hasattr(self.gateway, "complete")
         instruction = self.skills.instructions(turn) if native else ""
         instruction += self.memory_learning.dialogue_context(turn)
+        instruction += SOURCE_INSTRUCTION
         if messages and messages[0]["role"] == "system":
             messages[0] = dict(messages[0], content=messages[0]["content"] + "\n" + instruction)
         else:
             messages.insert(0, dict(role="system", content=instruction))
+        if len(canonical(messages).encode()) > 524288:
+            raise Fault("budget_exceeded")
         if not native:
             return await self.gateway.generate(turn, messages)
         from .expression import Segments
@@ -1671,9 +1675,36 @@ class Core(Delivery):
             if iteration:
                 fresh["model_calls"] += 1
                 self._save_turn(fresh)
-            message, receipt = await self.gateway.complete(
-                fresh, messages, tools=self.role_actions.tools(fresh), on_delta=delta
-            )
+            for attempt in range(2):
+                try:
+                    message, receipt = await self.gateway.complete(
+                        fresh, messages, tools=self.role_actions.tools(fresh), on_delta=delta
+                    )
+                    break
+                except Fault as error:
+                    if (
+                        not error.retryable_model
+                        or iteration
+                        or attempt
+                        or fresh.get("model_connection_retries", 0)
+                    ):
+                        raise
+                    # Only an initial, output-free transport failure is eligible.
+                    # Reserve before waiting so restart/cancellation never resets
+                    # the allowance. Tools and partially delivered replies never replay.
+                    fresh = self.store.get("turns", turn["id"])
+                    fresh["model_connection_retries"] = 1
+                    self._save_turn(fresh)
+                    await asyncio.sleep(0.2)
+                    fresh = self.store.get("turns", turn["id"])
+                    if fresh["cancelled"] or fresh["phase"] in TERMINAL:
+                        raise Fault("scope_changed")
+                    self._check_role(fresh)
+                    await self._preflight(fresh)
+                    if fresh.get("model_selection"):
+                        verify_lease(fresh["model_selection"]["expires_at"], self.clock())
+                    fresh["model_calls"] += 1
+                    self._save_turn(fresh)
             route_receipts.append(receipt)
             if message.get("content"):
                 output.append(message["content"])

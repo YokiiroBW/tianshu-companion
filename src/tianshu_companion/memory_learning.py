@@ -6,7 +6,7 @@ import json
 
 from .contracts import Fault, canonical, digest, strict_json
 from .model_selection import SelectionRequest, resolve_selection
-from .memory_admission import empty_extraction_reason
+from .memory_admission import empty_extraction_reason, mixed_stable_hints
 
 QUEUE = "memory:learning"
 MAX_ATTEMPTS = 3
@@ -102,16 +102,31 @@ Return {"memories": []} if nothing durable. No tools, markdown or commentary.
 """
 
 
+def memory_scopes_overlap(left, right):
+    """Automatic writes stay in their source audience and conversation.
+
+    Explicit private associations can cross people/conversations; keep their
+    barrier conservative until Memory's complete association snapshot is known.
+    Group profiles and history may include other people in the same room.
+    """
+    return left["actor_id"] == right["actor_id"] and (
+        left["conversation_id"] == right["conversation_id"]
+        or left["audience"] == right["audience"] == "self_private"
+    )
+
+
 class MemoryLearning:
     def __init__(self, core):
         self.core = core
         self.lock = asyncio.Lock()
-        self.commit_job = self.commit_actor = None
+        self.commit_job = self.commit_scope = None
 
-    def admission_blocked(self, actor_id):
-        # A ready proposal gets a short write window between dialogue batches.
-        # Actor-wide coordination also covers explicitly associated memory scopes.
-        return self.core.automatic_memory_candidates and self.commit_actor == actor_id
+    def admission_blocked(self, scope):
+        return bool(
+            self.core.automatic_memory_candidates
+            and self.commit_scope
+            and memory_scopes_overlap(self.commit_scope, scope)
+        )
 
     def _commit_ready(self, item, turn):
         if item["output"] == {"memories": []}:
@@ -120,11 +135,11 @@ class MemoryLearning:
             if self.commit_job == item["id"]:
                 self._release_commit()
             return True
-        self.commit_job, self.commit_actor = item["id"], turn["scope"]["actor_id"]
-        return not self.core.has_active_dialogue(self.commit_actor)
+        self.commit_job, self.commit_scope = item["id"], turn["scope"]
+        return not self.core.has_active_dialogue(self.commit_scope)
 
     def _release_commit(self):
-        self.commit_job = self.commit_actor = None
+        self.commit_job = self.commit_scope = None
 
     def queue(self, item):
         receipt = item.get("receipt") or {}
@@ -282,7 +297,10 @@ class MemoryLearning:
             "自动提取启用时，不要因为显式记忆工具不可用就声称无法保存或更正；"
             "后台是否已经保存仍需实际回执，启用状态不是保存凭证。"
             "通常直接依据相关记录回答；仅在用户询问来源、保存情况或不确定性影响答案时"
-            "解释这些边界，不必每次复述内部记录编号、版本或推断标签。"
+            "解释这些边界。自动整理的 inferred 标签不是对明确原话的怀疑；"
+            "姓名、地点和偏好有直接来源时，按‘你提到的是……’回答即可，"
+            "不要为这个标签附加‘只是推断，请再确认’或主动建议再保存一次。"
+            "只保留原话本身的条件和歧义，不在普通回忆回答中复述内部编号、版本或分类。"
             "来源提取不是亲眼核实，也不等于作者从未说过；不能把摘要冒充逐字原文。"
             "显式记忆操作后，回执的 record_ids 才是实际受影响目标；按本次工具参数和"
             "用户原始意图说明结果。刷新的 evidence 只列出操作后仍可见的记录，"
@@ -390,7 +408,9 @@ class MemoryLearning:
                         # than repeating an ineffective fast attempt. Chat is unchanged.
                         generation["generation_budget"] = dict(
                             max_tokens=8192,
-                            reasoning_effort="low" if item.get("proposal_failures") else "none",
+                            reasoning_effort="low"
+                            if item.get("proposal_failures") or item.get("empty_review")
+                            else "none",
                         )
                         item["stage"] = "model"
                         core.store.put("metadata", item)
@@ -438,6 +458,22 @@ class MemoryLearning:
                                         ),
                                     ),
                                 )
+                            if item.get("empty_review"):
+                                source = strict_json(messages[-1]["content"])
+                                source["empty_review_hints"] = item["empty_review"]
+                                messages[-1]["content"] = canonical(source)
+                                messages.insert(
+                                    -1,
+                                    dict(
+                                        role="system",
+                                        content="The first extraction was empty. Reconsider the exact source "
+                                        "clauses in empty_review_hints independently of the temporary action. "
+                                        "These are review hints, not accepted facts. Keep only independently "
+                                        "supported durable information with its actual speaker, qualifiers and "
+                                        "evidence. Do not store the temporary action or invent a time. "
+                                        "An empty result is still correct if nothing qualifies.",
+                                    ),
+                                )
                             segments, _ = await asyncio.wait_for(
                                 core.gateway.generate(generation, messages), MODEL_TIMEOUT_SECONDS
                             )
@@ -446,13 +482,24 @@ class MemoryLearning:
                         if len(raw.encode()) > 32768:
                             raise Fault("budget_exceeded")
                         item["output"] = strict_json(raw)
+                        if item["output"] == {"memories": []} and not item.get("empty_review"):
+                            hints = mixed_stable_hints(content)
+                            if hints:
+                                # Yield the background slot and durably reserve one review.
+                                # A restart resumes it within the existing job retry budget;
+                                # it cannot submit an empty receipt prematurely. This path
+                                # is never entered after an uncertain Memory commit.
+                                item.update(output=None, empty_review=hints, stage="empty_review")
+                                core.store.put("metadata", item)
+                                core.counted("memory.work")
+                                return
                     # Persist exact proposal before the uncertain remote commit; on restart
                     # read its receipt first, then resend these same bytes if still pending.
                     core.store.put("metadata", item)
                 core._check_role(turn)
                 if not self._commit_ready(item, turn):
                     # Keep the exact proposal, let existing replies finish, and stop
-                    # new snapshots for this actor until the commit has settled.
+                    # affected snapshots until the commit has settled.
                     item["stage"] = "commit_wait"
                     core.store.put("metadata", item)
                     core.counted("memory.work")

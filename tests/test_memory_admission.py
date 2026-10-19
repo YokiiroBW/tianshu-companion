@@ -1,6 +1,6 @@
 import pytest
 
-from tianshu_companion.memory_admission import empty_extraction_reason
+from tianshu_companion.memory_admission import empty_extraction_reason, mixed_stable_hints
 
 
 @pytest.mark.parametrize(
@@ -59,3 +59,32 @@ def test_statements_names_mixed_messages_and_stances_keep_model_extraction(text)
 
 def test_every_message_must_be_proven_empty():
     assert empty_extraction_reason([{"text": "谁同意了？"}, {"text": "我同意北门。"}]) is None
+
+
+@pytest.mark.parametrize(
+    "text,quote",
+    [
+        ("钥匙一直放在门边抽屉，我现在去倒垃圾。", "钥匙一直放在门边抽屉"),
+        ("我平时坐609路去上班，先去接个电话。", "我平时坐609路去上班"),
+        ("先去洗手，我不喜欢香菜。", "我不喜欢香菜"),
+    ],
+)
+def test_mixed_stable_review_preserves_exact_source_clause(text, quote):
+    assert mixed_stable_hints([dict(index=7, text=text)]) == [dict(source_index=7, quote=quote)]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我现在去倒垃圾，杯子先放这儿。",
+        "钥匙一直放在门边抽屉吗？我现在去倒垃圾。",
+        "如果钥匙一直放在门边抽屉，我现在去倒垃圾。",
+        "他说钥匙一直放在门边抽屉，我现在去倒垃圾。",
+        "朋友说他的钥匙一直放门边，我现在去洗手。",
+        "“钥匙一直放在门边抽屉”，我现在去倒垃圾。",
+        "我平时去哪里吃饭呢，我先去接电话。",
+        "钥匙一直放在门边抽屉。",
+    ],
+)
+def test_no_empty_review_for_transient_question_quotation_or_hypothesis(text):
+    assert mixed_stable_hints([dict(index=0, text=text)]) == []

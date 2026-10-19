@@ -32,6 +32,48 @@ RECALL_PREFACE = re.compile(
 )
 
 
+STABLE_CLAUSE = re.compile(
+    r"(?:一直|平时|通常|每天|每周|习惯|长期|固定).{0,18}(?:放|收|住|坐|喝|吃|用|戴|带|走|喜欢)|"
+    r"(?:我|我家|我的).{0,12}(?:住在|叫(?!醒|我|你|他|她)|名字是|喜欢|不喜欢|过敏)|"
+    r"\b(?:I (?:always|usually|live|prefer)|my .{1,20} (?:is|are))\b",
+    re.I,
+)
+TEMPORARY_CLAUSE = re.compile(
+    r"(?:我)?(?:现在|这会儿|先|马上|等会儿?).{0,8}(?:去|倒|拿|放|接|洗|扔|吃|喝)|"
+    r"临时|待会.{0,8}(?:拿|收|放)|\b(?:right now|for a minute)\b",
+    re.I,
+)
+NON_ASSERTION = re.compile(
+    r"[?？《》「」『』\"“”‘’]|如果|假如|要是|比如|例如|据说|听说|他说|她说|朋友说|同事说|[说讲](?:他|她|它)|"
+    r"可能|也许|大概|不一定|是否|是不是|\b(?:if|might|perhaps|said)\b",
+    re.I,
+)
+
+
+def mixed_stable_hints(content):
+    """Exact source hints for a bounded empty-proposal review, never stored facts.
+
+    Review only a stable assertion alongside a temporary action. Attribution and
+    validity still belong to Memory, including after a successful model review.
+    """
+    hints = []
+    for message in content:
+        text = message["text"]
+        if NON_ASSERTION.search(text):
+            continue
+        clauses = [c.strip() for c in re.split(r"[，,。.!！;；\n]", text) if c.strip()]
+        if len(clauses) < 2 or not any(TEMPORARY_CLAUSE.search(c) for c in clauses):
+            continue
+        for clause in clauses:
+            if (
+                STABLE_CLAUSE.search(clause)
+                and not TEMPORARY_CLAUSE.search(clause)
+                and not QUESTION.search(clause)
+            ):
+                hints.append(dict(source_index=message["index"], quote=clause))
+    return hints[:8]
+
+
 def empty_extraction_reason(content):
     """Skip only inputs whose every clause is a greeting or an explicit query.
 

@@ -128,10 +128,16 @@ class JsonService:
                     headers=request_headers,
                     timeout=httpx.Timeout(30),
                 ) as response:
-                    if (
-                        response.status_code != 200
-                        or response.headers.get("content-encoding", "identity") != "identity"
-                    ):
+                    if response.status_code != 200:
+                        # No completion stream has begun. Only transient service
+                        # statuses permit the dialogue owner to retry generation;
+                        # authorization, quota and invalid requests do not.
+                        raise Fault(
+                            "dependency_unavailable",
+                            unknown=True,
+                            retryable_model=response.status_code in {502, 503, 504},
+                        )
+                    if response.headers.get("content-encoding", "identity") != "identity":
                         raise Fault("dependency_unavailable")
                     async for chunk in response.aiter_bytes():
                         total += len(chunk)
@@ -154,8 +160,14 @@ class JsonService:
                                 yield strict_json(data)
                         if len(pending) > 200000:
                             raise Fault("budget_exceeded", unknown=True)
-            raise Fault("result_unknown", unknown=True)
-        except (httpx.HTTPError, TimeoutError, ValueError, UnicodeError):
+            raise Fault("result_unknown", unknown=True, retryable_model=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            raise Fault("dependency_unavailable", retryable_model=True) from None
+        except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, TimeoutError):
+            # The completion owner decides whether any answer/tool output was
+            # observed. A truncated reasoning-only stream has no delivered result.
+            raise Fault("dependency_unavailable", unknown=True, retryable_model=True) from None
+        except (httpx.HTTPError, ValueError, UnicodeError):
             raise Fault("dependency_unavailable", unknown=True) from None
 
     async def call(self, path, body=None, headers=None, *, uncertain_write=False):
@@ -794,6 +806,12 @@ class Gateway:
                 text = result.consume(chunk)
                 if text and on_delta:
                     await on_delta(text)
+        except Fault as error:
+            # A callback can fail after partial output. Never label that failure
+            # as safe to retry even if it happens to carry a transport flag.
+            if result.content or result.tools or result.finish_reason:
+                error.retryable_model = False
+            raise
         except asyncio.CancelledError:
             try:
                 await asyncio.shield(
@@ -805,7 +823,16 @@ class Gateway:
         finally:
             if self.active_requests.get(turn["id"]) == request_id:
                 self.active_requests.pop(turn["id"], None)
-        message = result.message()
+        try:
+            message = result.message()
+        except Fault as error:
+            # [DONE] without a completed choice is also an interrupted result.
+            # Hidden reasoning is never a user reply or a completed tool call.
+            if error.code == "dependency_unavailable" and not (
+                result.content or result.tools or result.finish_reason
+            ):
+                error.retryable_model = True
+            raise
         receipt = await self.client.call("/internal/v1/model-requests/" + request_id)
         self.contracts.check("model#route_receipt", receipt)
         if (

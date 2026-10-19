@@ -19,12 +19,21 @@ LIFE_READ_MANIFEST_HASH = RELEASES["life-read/v1"]
 
 
 class Fault(Exception):
-    def __init__(self, code, *, unknown=False, current_version=None, retryable_read=False):
+    def __init__(
+        self,
+        code,
+        *,
+        unknown=False,
+        current_version=None,
+        retryable_read=False,
+        retryable_model=False,
+    ):
         super().__init__(code)
         self.code = code
         self.unknown = unknown
         self.current_version = current_version
         self.retryable_read = retryable_read
+        self.retryable_model = retryable_model
 
     @property
     def status(self):
