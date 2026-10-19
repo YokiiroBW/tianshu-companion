@@ -390,6 +390,8 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.task()["state"], "completed")
         self.assertEqual(len(self.extraction_messages[0]), 2)
         self.assertIn("rejected without committing", self.extraction_messages[1][1]["content"])
+        self.assertEqual(self.generated[0]["generation_budget"]["reasoning_effort"], "none")
+        self.assertEqual(self.generated[1]["generation_budget"]["reasoning_effort"], "low")
 
     async def test_disabled_candidates_do_not_run_model_or_write(self):
         await self.chat()
@@ -399,6 +401,54 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.flush()
         self.assertEqual(self.generated, [])
         self.assertEqual(self.calls, [])
+
+    async def test_pure_query_skips_model_but_gets_memory_owned_receipt(self):
+        await self.chat()
+        original = self.process
+
+        async def query(job, output):
+            value = await original(job, output)
+            if output is None:
+                value["content"] = [
+                    dict(index=0, text="狗叫什么来着？", sent_at="2026-10-11T00:00:00Z")
+                ]
+            return value
+
+        self.h.memory.process_candidate = query
+        await self.flush()
+        self.assertEqual(self.generated, [])
+        self.assertEqual([v for _, v in self.calls], [None, {"memories": []}])
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["admission_reason"], "question_only")
+
+    async def test_due_retry_is_not_starved_by_continuous_new_independent_jobs(self):
+        from tianshu_companion.contracts import digest
+
+        await self.chat()
+        self.model_fail = True
+        await self.flush()
+        retry = self.task()
+        self.h.clock.advance(3)
+        worker = self.h.core.memory_learning
+        worker._fresh_grants = 0
+        for index in range(1, 6):
+            scope = dict(retry["scope"], person_id=f"person:new:{index}")
+            job = dict(
+                retry,
+                id=f"new:{index}",
+                scope=scope,
+                scope_key=digest(scope),
+                sequence=index + 1,
+                deadline=0,
+            )
+            self.h.core.store.put("metadata", job)
+            chosen = worker._next()
+            if index == 4:
+                self.assertEqual(chosen["id"], retry["id"])
+                break
+            self.assertNotEqual(chosen["id"], retry["id"])
+            chosen["state"] = "completed"
+            self.h.core.store.put("metadata", chosen)
 
     async def test_preexisting_delivered_candidate_is_backfilled(self):
         await self.chat()
@@ -456,11 +506,13 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.chat()
         chat_calls = len(self.h.gateway.calls)
         self.model_fail = True
-        for _ in range(3):
+        for index in range(3):
             await self.flush()
-            self.h.clock.advance(10)
+            if index < 2:
+                self.h.clock.advance(10)
         self.assertEqual(self.task()["state"], "pending")
         self.assertGreater(self.task()["deadline"], self.h.clock())
+        self.assertEqual(self.task()["deadline"] - self.h.clock(), 8)
         self.assertEqual(self.task()["attempts"], 3)
         await self.restart()
         self.model_fail = False

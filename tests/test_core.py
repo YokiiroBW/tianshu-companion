@@ -20,6 +20,24 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         await self.h.core.close()
         self.h = Harness(**policy)
 
+    async def test_production_default_replies_earlier_and_still_combines_a_short_burst(self):
+        from tianshu_companion.core import Policy
+
+        await self.replace(silence_ms=Policy().silence_ms)
+        self.assertLess(Policy().silence_ms, 5000)
+        await self.h.ingest(text="明天去书店")
+        self.h.clock.advance(0.6)
+        await self.h.ingest(text="在北门碰头吧")
+        self.h.clock.advance(1.4)
+        await self.h.cycles()
+        self.assertFalse(self.h.turns())
+        self.h.clock.advance(0.11)
+        await self.h.cycles()
+        self.assertEqual(len(self.h.turns()), 1)
+        self.assertEqual(len(self.h.turns()[0]["bundle"]["messages"]), 2)
+        self.assertEqual(len(self.h.gateway.calls), 1)
+        self.assertEqual(self.h.turns()[0]["phase"], "sent")
+
     async def test_sliding_window_duplicates_and_old_timers(self):
         h = self.h
         r = h.request(text="第一句")

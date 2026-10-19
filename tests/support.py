@@ -390,6 +390,9 @@ def persona_config(version=1, **entries):
 
 class Harness:
     def __init__(self, path=":memory:", *, direct_options=None, personas=None, **policy):
+        # Existing timer scenarios explicitly exercise the former five-second
+        # window. Production defaults are covered separately by collector tests.
+        policy.setdefault("silence_ms", 5000)
         self.clock, self.contracts = Clock(), contracts()
         self.origins, self.memory = FakeOrigins(self.clock), FakeMemory(self.clock)
         self.gateway, self.sender = FakeGateway(), FakeSender(self.clock)

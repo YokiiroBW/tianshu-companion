@@ -174,6 +174,10 @@ class ContextRetrievalTests(unittest.IsolatedAsyncioTestCase):
             ("a", "那现在谁同意去青石馆，谁说去不了了？"),
         ]:
             await self.say(text, group=True, channel="group:withdrawal", account=account)
+            if text == "现在都有哪些人已经明确同意了？":
+                generic = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+                self.assertIn("我想从西侧入口进去", canonical(generic))
+                self.assertIn("西侧入口都行，我同意", canonical(generic))
         recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
         for text in ("我想从西侧入口进去", "西侧入口都行，我同意", "我就不去了"):
             self.assertIn(text, canonical(recent))

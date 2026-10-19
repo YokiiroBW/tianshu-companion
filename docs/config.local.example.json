@@ -4,7 +4,7 @@
   "config_version": null,
   "short_context": {"max_turns": 4, "max_bytes": 8192, "max_age_seconds": 1800},
   "policy": {
-    "silence_ms": 5000,
+    "silence_ms": 1500,
     "max_wait_ms": null,
     "max_queued_turns": 8,
     "max_collection_messages": 256,

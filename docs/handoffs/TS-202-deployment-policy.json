@@ -1,0 +1,17 @@
+{
+  "task": "TS-202",
+  "status": "prepared_not_applied",
+  "target": "existing Companion runtime configuration",
+  "change": {
+    "path": "policy.silence_ms",
+    "expected_before": 5000,
+    "after": 1500
+  },
+  "must_preserve": [
+    "all other policy fields",
+    "daily Gemini and function/role bindings",
+    "comics/audio/co-reading",
+    "Books/Ebooks mounts"
+  ],
+  "note": "Apply this single configuration field together with the reviewed candidate in a future authorized serial deployment; current NAS and shared deployment template remain unchanged."
+}

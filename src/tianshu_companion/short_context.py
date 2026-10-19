@@ -67,6 +67,12 @@ def select_recent(store, turn, policy, now):
         return [], metadata
     candidates = []
     for previous in store.recent_turns(turn["conversation_id"], turn["sequence"], 128):
+        recover_input = (
+            previous["phase"] == "failed"
+            and previous.get("failure") == "dependency_unavailable"
+            and previous.get("model_calls", 0) > 0
+            and previous.get("input_history_snapshot") is not None
+        )
         expiry = epoch(previous["bundle"]["sealed_at"]) + policy.max_age_seconds
         if expiry <= now:
             break
@@ -97,11 +103,15 @@ def select_recent(store, turn, policy, now):
             or previous["bundle"]["possibly_incomplete"]
             or previous["bundle"]["continuation_of"]
             or previous["cancelled"]
-            or previous["phase"] in {"queued", "failed", "cancelled"}
+            or previous["phase"] in {"queued", "cancelled"}
+            or (previous["phase"] == "failed" and not recover_input)
             or not sources_current(store, previous)
         ):
             continue
-        replies = store.turn_replies(previous["id"], "sent")
+        # A provider failure says nothing about the already accepted human
+        # input. Retain only that input through its independent fresh checks;
+        # never revive partial/unknown bot output or authorization failures.
+        replies = [] if recover_input else store.turn_replies(previous["id"], "sent")
         replies = [
             r
             for r in replies
@@ -132,6 +142,8 @@ def select_recent(store, turn, policy, now):
                 for r in replies
             ],
         )
+        if recover_input:
+            group["input_only"] = True
         candidates.append((group, expiry))
 
     from .context_relevance import retrieval_batches

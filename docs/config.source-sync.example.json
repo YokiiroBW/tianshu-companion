@@ -3,7 +3,7 @@
   "database_path": ".runtime/source-sync-isolated.db",
   "config_version": null,
   "policy": {
-    "silence_ms": 5000,
+    "silence_ms": 1500,
     "max_wait_ms": null,
     "max_active_turns": 2,
     "max_collectors_per_conversation": 32,

@@ -24,6 +24,45 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
         await self.h.ingest(text=text, **kwargs)
         await self.h.cycles()
 
+    async def test_transient_model_failure_keeps_verified_human_input_until_retracted(self):
+        self.h.memory.input_history = self.h.memory.history
+        self.h.gateway.fail = True
+        await self.say("我同意周六从北门进去。", message="source:assent")
+        failed = self.h.turns()[-1]
+        self.assertEqual(failed["phase"], "failed")
+        self.assertEqual(failed["failure"], "dependency_unavailable")
+        self.assertIsNotNone(failed["input_history_snapshot"])
+        self.h.gateway.fail = False
+        await self.say("我刚才有没有同意北门？")
+        groups = self.prompt()["recent_dialogue"]
+        source = next(g for g in groups if g["turn_id"] == failed["id"])
+        self.assertTrue(source["input_only"])
+        self.assertEqual(source["replies"], [])
+        self.assertIn("我同意周六从北门进去", canonical(source))
+        await self.h.ingest(message="source:assent", revision=2, kind="retract")
+        await self.say("我刚才的表态还有原话吗？")
+        self.assertNotIn("我同意周六从北门进去", canonical(self.prompt()["recent_dialogue"]))
+
+    async def test_failed_input_without_independent_history_or_with_authority_failure_stays_out(
+        self,
+    ):
+        self.h.gateway.fail = True
+        await self.say("我同意周六从北门进去。")
+        self.h.gateway.fail = False
+        await self.say("刚才谁同意北门？")
+        self.assertNotIn("我同意周六从北门进去", canonical(self.prompt()["recent_dialogue"]))
+        self.h.memory.input_history = self.h.memory.history
+        generate = self.h.gateway.generate
+
+        async def denied(*args, **kwargs):
+            raise Fault("forbidden")
+
+        self.h.gateway.generate = denied
+        await self.say("我同意从西门进去。")
+        self.h.gateway.generate = generate
+        await self.say("刚才谁同意西门？")
+        self.assertNotIn("我同意从西门进去", canonical(self.prompt()["recent_dialogue"]))
+
     async def test_fact_recall_uses_inputs_and_bot_address_question_keeps_sent_replies(self):
         h = self.h
         h.gateway.segments = ["小明你好，收到你的名字。"]

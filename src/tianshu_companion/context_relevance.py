@@ -108,6 +108,21 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
             # recent question. Its words are retrieval cues, never factual evidence.
             query_tokens |= tokens(input_text(previous))
             scores = {g["turn_id"]: relevance(query_tokens, g) for g, _ in candidates}
+    if POSITION_STATEMENT.search(query_text):
+        # "Who has agreed?" may name no place/time. Use the best matching
+        # human stance as a search cue to retain its proposal too, otherwise
+        # the initiator's source disappears and silence is invented for them.
+        # These remain independently checked original inputs, not a consensus
+        # judgement or authority derived from the current question.
+        anchors = [
+            g
+            for g, _ in candidates
+            if all(scores[g["turn_id"]]) and POSITION_STATEMENT.search(input_text(g))
+        ]
+        if anchors:
+            anchor = max(anchors, key=lambda g: (scores[g["turn_id"]][0], g["turn_sequence"]))
+            query_tokens |= tokens(input_text(anchor))
+            scores = {g["turn_id"]: relevance(query_tokens, g) for g, _ in candidates}
     topic_return = any(scores[g["turn_id"]][0] > 0 for g, _ in candidates[limit:]) or (
         compact and any(score > 0 for score, _ in scores.values())
     )
