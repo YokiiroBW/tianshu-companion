@@ -1164,8 +1164,8 @@ class Core(Delivery):
         from .memory_learning import memory_scopes_overlap
 
         return any(
-            memory_scopes_overlap(turn["scope"], scope)
-            for turn in self.store.list("turns", states=ACTIVE)
+            memory_scopes_overlap(other, scope)
+            for other in self.store.active_scopes(ACTIVE, scope["actor_id"])
         )
 
     def _preparation_available(self):
@@ -1173,11 +1173,8 @@ class Core(Delivery):
         # preparation worker. Both stages stay bounded, including queued models.
         if len(self.jobs) >= 2 * self.preparation_slots:
             return False
-        preparing = 0
-        for key in self.jobs:
-            turn = self.store.get("turns", key) if isinstance(key, str) else None
-            if turn is None or turn["phase"] != "generating":
-                preparing += 1
+        phases = self.store.turn_phases(self.jobs)
+        preparing = sum(phases.get(key) != "generating" for key in self.jobs)
         return preparing < self.preparation_slots
 
     def _pin_role(self, actor):
@@ -2259,6 +2256,7 @@ class Core(Delivery):
         for job in jobs:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
+        await self.memory_learning.close()
         await self.image_backend.close()
         self.store.close()
         if getattr(self, "storage_runtime", None) is not None:

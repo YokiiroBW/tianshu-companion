@@ -649,7 +649,10 @@ def create_app(core=None, tokens=None, life_readers=None):
                     loop("core.tick", core.tick, 0.05, _counter(core, "core.tick")),
                     loop("core.outbox", core.flush_outbox, 0.5, _counter(core, "core.outbox")),
                     loop(
-                        "memory.work", core.memory_learning.work, 1, _counter(core, "memory.work")
+                        "memory.work",
+                        lambda: core.memory_learning.work(wait=False),
+                        1,
+                        _counter(core, "memory.work"),
                     ),
                     loop("life.work", core.life.work, 2, _counter(core, "life.work")),
                     loop("images.work", core.images.work, 2, _counter(core, "images.work")),

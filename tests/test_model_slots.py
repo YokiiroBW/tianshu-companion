@@ -52,6 +52,37 @@ def test_background_does_not_fill_all_model_capacity():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("capacity", [1, 2, 3, 4, 8])
+def test_background_ceiling_keeps_configured_foreground_reserve(capacity):
+    async def run():
+        slots = ModelSlots(capacity)
+        ceiling = max(1, capacity // 2)
+        entered = []
+        release = asyncio.Event()
+
+        async def work(number):
+            async with slots.background:
+                entered.append(number)
+                await release.wait()
+
+        jobs = [asyncio.create_task(work(i)) for i in range(capacity + 1)]
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(entered) == ceiling
+        if capacity > 1:
+            async with asyncio.timeout(0.5):
+                async with slots:
+                    pass
+        release.set()
+        await asyncio.gather(*jobs)
+        for _ in range(capacity):
+            await slots.acquire()
+        for _ in range(capacity):
+            slots.release()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("grant_before_cancel", [False, True])
 def test_cancellation_does_not_lose_capacity(background, grant_before_cancel):

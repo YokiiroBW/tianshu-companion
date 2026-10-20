@@ -170,6 +170,28 @@ def test_context_projection_and_batch_queries_preserve_types_and_latest_revision
         )
         store.put("admissions", admission)
         assert store.get_many("admissions", ["admission", "missing"]) == {"admission": admission}
+        assert store.turn_phases(["turn", "missing", ("direct", "room")]) == {"turn": "sent"}
+        assert store.active_scopes(["generating"], "actor") == []
+        active = dict(turn, phase="generating")
+        store.put("turns", active)
+        assert store.active_scopes(["generating"], "actor") == [turn["scope"]]
+        assert store.active_scopes(["generating"], "other-actor") == []
+        from types import SimpleNamespace
+        from tianshu_companion.memory_learning import MemoryLearning
+
+        learning = MemoryLearning(SimpleNamespace(store=store, automatic_memory_candidates=True))
+        barrier = dict(
+            id="waiting",
+            conversation_id="memory:learning",
+            state="pending",
+            stage="commit_wait",
+            scope=turn["scope"],
+        )
+        store.put("metadata", barrier)
+        assert learning.admission_blocked(dict(turn["scope"], person_id="other-person"))
+        assert not learning.admission_blocked(dict(turn["scope"], conversation_id="other-room"))
+        store.put("metadata", dict(barrier, state="completed"))
+        assert not learning.admission_blocked(turn["scope"])
         reply, _ = media_reply()
         store.put("replies", reply)
         assert store.replies_for_turns(["turn", "missing"]) == {"turn": [reply], "missing": []}

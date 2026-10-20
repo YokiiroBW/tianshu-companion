@@ -5,7 +5,7 @@ from collections import deque
 
 
 class ModelSlots:
-    """Keep the existing capacity; at most one background job can occupy it.
+    """Keep the configured capacity and reserve half for dialogue.
 
     Work already sent to a model is never preempted or replayed. At a free slot,
     waiting dialogue has preference for up to three grants before a waiting
@@ -16,6 +16,7 @@ class ModelSlots:
         if type(capacity) is not int or capacity < 1:
             raise ValueError("Model capacity must be positive")
         self._capacity = self._available = capacity
+        self.background_limit = max(1, capacity // 2)
         self._foreground = deque()
         self._background = deque()
         self._background_active = 0
@@ -42,7 +43,7 @@ class ModelSlots:
 
     def _wake(self):
         while self._available:
-            background_ready = self._background and not self._background_active
+            background_ready = self._background and self._background_active < self.background_limit
             if self._foreground and (not background_ready or self._foreground_streak < 3):
                 queue, background = self._foreground, False
             elif background_ready:

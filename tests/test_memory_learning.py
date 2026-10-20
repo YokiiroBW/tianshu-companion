@@ -733,6 +733,187 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.generated, [])
         self.assertEqual(self.calls, [])
 
+    async def test_slow_receipt_does_not_hold_other_rooms_or_get_claimed_twice(self):
+        self.unique_jobs()
+        await self.chat()
+        first_turn = self.h.turns()[0]["id"]
+        await self.h.ingest(text=TEXT, group=True, channel="group:independent", account="b")
+        await self.h.cycles()
+        await self.h.core.flush_outbox()
+        worker = self.h.core.memory_learning
+        tasks = self.h.core.store.list("metadata", "memory:learning")
+        first = next(job for job in tasks if job["turn_id"] == first_turn)
+        second = next(job for job in tasks if job["turn_id"] != first_turn)
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+        original = self.process
+        reads = []
+
+        async def slow(job, output):
+            if job == first["job_id"] and output is None:
+                reads.append(job)
+                entered.set()
+                await gate.wait()
+            return await original(job, output)
+
+        self.h.memory.process_candidate = slow
+        await worker.work(wait=False)
+        await asyncio.wait_for(entered.wait(), 2)
+        for _ in range(60):
+            await asyncio.sleep(0)
+        self.assertEqual(self.h.core.store.get("metadata", second["id"])["state"], "completed")
+        self.assertEqual(self.h.core.store.get("metadata", first["id"])["state"], "pending")
+        await worker.work(wait=False)
+        self.assertEqual(len(reads), 1)
+        gate.set()
+        await worker.work()
+        self.assertEqual(self.h.core.store.get("metadata", first["id"])["state"], "completed")
+
+    async def test_background_models_overlap_but_same_scope_correction_keeps_order(self):
+        from tianshu_companion.model_slots import ModelSlots
+
+        self.unique_jobs()
+        self.h.core.models = ModelSlots(4)
+        turn_ids = []
+        for index, (account, channel) in enumerate(
+            [("a", "private:a"), ("a", "private:a"), ("b", "private:b")]
+        ):
+            text = TEXT + f"，来源{index}"
+            await self.h.ingest(text=text, account=account, channel=channel)
+            await self.h.cycles()
+            turn_ids.append(
+                next(turn["id"] for turn in self.h.turns() if self.h.core._input_text(turn) == text)
+            )
+        await self.h.core.flush_outbox()
+        tasks = self.h.core.store.list("metadata", "memory:learning")
+        first, correction, unrelated = [
+            next(job for job in tasks if job["turn_id"] == turn_id) for turn_id in turn_ids
+        ]
+        gate = asyncio.Event()
+        entered = []
+        original = self.generate
+
+        async def slow(turn, messages):
+            if turn["id"].startswith("memory-generation:"):
+                entered.append(turn["sequence"])
+                await gate.wait()
+            return await original(turn, messages)
+
+        self.h.gateway.generate = slow
+        worker = self.h.core.memory_learning
+        await worker.work(wait=False)
+        for _ in range(60):
+            await asyncio.sleep(0)
+        self.assertEqual(len(entered), 2)
+        self.assertEqual(self.h.core.store.get("metadata", correction["id"])["attempts"], 0)
+        self.assertEqual(self.h.core.store.get("metadata", first["id"])["attempts"], 1)
+        self.assertEqual(self.h.core.store.get("metadata", unrelated["id"])["attempts"], 1)
+        gate.set()
+        await asyncio.gather(*worker.jobs.values())
+        self.completed = None
+        await worker.work()
+        self.assertEqual(self.h.core.store.get("metadata", correction["id"])["state"], "completed")
+
+    async def test_waiting_commit_does_not_hold_independent_extraction(self):
+        self.unique_jobs()
+        await self.h.ingest(text=TEXT, group=True, channel="group:a")
+        await self.h.cycles()
+        gate = asyncio.Event()
+        original = self.generate
+
+        async def slow(turn, messages):
+            if self.h.core._input_text(turn) == "慢回复":
+                await gate.wait()
+            return await original(turn, messages)
+
+        self.h.gateway.generate = slow
+        await self.h.ingest(text="慢回复", group=True, channel="group:a")
+        await self.h.cycles()
+        await self.flush()
+        first = self.task()
+        self.assertEqual(first["stage"], "commit_wait")
+        await self.h.ingest(text=TEXT, group=True, channel="group:b", account="b")
+        await self.h.cycles()
+        await self.h.core.flush_outbox()
+        await self.h.core.memory_learning.work()
+        jobs = self.h.core.store.list("metadata", "memory:learning")
+        self.assertEqual(self.h.core.store.get("metadata", first["id"])["stage"], "commit_wait")
+        self.assertEqual(sum(job["state"] == "completed" for job in jobs), 1)
+        gate.set()
+        await self.h.cycles()
+
+    async def test_close_cancels_owned_generation_and_restart_keeps_attempt(self):
+        await self.chat()
+        gate = asyncio.Event()
+        original = self.generate
+
+        async def slow(turn, messages):
+            await gate.wait()
+            return await original(turn, messages)
+
+        self.h.gateway.generate = slow
+        await self.h.core.flush_outbox()
+        worker = self.h.core.memory_learning
+        await worker.work(wait=False)
+        for _ in range(30):
+            await asyncio.sleep(0)
+        self.assertEqual(self.task()["stage"], "model")
+        await worker.close()
+        self.assertFalse(worker.jobs)
+        self.assertEqual(self.task()["last_error"], "cancelled")
+        self.assertIsNone(self.task()["output"])
+        await self.restart()
+        self.h.clock.advance(10)
+        gate.set()
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["attempts"], 2)
+
+    async def test_reconcile_inflight_commit_checks_receipt_without_a_second_submit(self):
+        await self.chat()
+        started = asyncio.Event()
+
+        async def slow(job, output):
+            result = await self.process(job, output)
+            if output is not None:
+                started.set()
+                await asyncio.Event().wait()
+            return result
+
+        self.h.memory.process_candidate = slow
+        await self.h.core.flush_outbox()
+        worker = self.h.core.memory_learning
+        await worker.work(wait=False)
+        await asyncio.wait_for(started.wait(), 2)
+        result = await worker.reconcile(self.task()["job_id"])
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(sum(output is not None for _, output in self.calls), 1)
+        self.assertEqual(len(self.generated), 1)
+
+    async def test_role_failure_while_waiting_for_model_slot_prevents_generation(self):
+        from tianshu_companion.model_slots import ModelSlots
+
+        await self.chat()
+        self.h.core.models = ModelSlots(1)
+        await self.h.core.models.acquire()
+        await self.h.core.flush_outbox()
+        worker = self.h.core.memory_learning
+        await worker.work(wait=False)
+        for _ in range(30):
+            await asyncio.sleep(0)
+        self.assertEqual(self.task()["stage"], "model")
+
+        def revoked(turn):
+            raise Fault("forbidden")
+
+        self.h.core._check_role = revoked
+        self.h.core.models.release()
+        await asyncio.gather(*worker.jobs.values())
+        self.assertEqual(self.generated, [])
+        self.assertEqual(self.task()["state"], "blocked")
+        self.assertEqual(self.task()["last_error"], "forbidden")
+
     async def test_native_catalog_keeps_completed_empty_recall_separate_from_disabled_skill(self):
         from test_skills import manage
 

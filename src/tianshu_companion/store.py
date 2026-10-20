@@ -437,6 +437,35 @@ class Store:
                 result[row[0]] = self.payloads.restore(table, json.loads(row[1]))
         return result
 
+    def turn_phases(self, keys):
+        """Scheduling reads columns, without decoding provider/context payloads."""
+        keys = list(dict.fromkeys(key for key in keys if isinstance(key, str)))
+        result = {}
+        for offset in range(0, len(keys), 256):
+            batch = keys[offset : offset + 256]
+            result.update(
+                self.db.execute(
+                    "SELECT id,status FROM turns WHERE id IN ("
+                    + ",".join("?" for _ in batch)
+                    + ")",
+                    batch,
+                )
+            )
+        return result
+
+    def active_scopes(self, states, actor):
+        return [
+            json.loads(row[0])
+            for row in self.db.execute(
+                "SELECT CAST(json_extract(body,'$.scope') AS TEXT) FROM turns INDEXED BY turns_work "
+                "WHERE status IN ('queued','preparing','generating','waiting_dependency',"
+                "'ready_to_send','sending','reconciling') AND status IN ("
+                + ",".join("?" for _ in states)
+                + ") AND json_extract(body,'$.scope.actor_id')=?",
+                (*states, actor),
+            )
+        ]
+
     def delete(self, table, key):
         """Bounded housekeeping delete for derived rows; never used for fact tables."""
         assert table in TABLES and table not in FACT_TABLES

@@ -25,6 +25,17 @@ MESSAGE_CLOCK_QUESTION = re.compile(
     r"\b(?:when|what time)\b.{0,40}\b(?:sent|received|said|tell|told|message|reply)\b",
     re.I,
 )
+MESSAGE_EVENT_COMPARISON = re.compile(
+    r"(?:还是|或是|不是|而是|指的是?|算是?|区分|分清|说的是?).{0,30}"
+    r"(?:发(?:言|送|消息)|说(?:话|这句话)|消息).{0,10}(?:时间|时候|时刻|钟点)?|"
+    r"(?:发(?:言|送|消息)|说(?:话|这句话)|消息).{0,10}(?:时间|时候|时刻|钟点)"
+    r".{0,30}(?:还是|或是|不是|而是|发生)",
+)
+
+
+def requests_message_clock(text):
+    """A literal time or an event/message comparison needs labelled source clocks."""
+    return bool(MESSAGE_CLOCK_QUESTION.search(text) or MESSAGE_EVENT_COMPARISON.search(text))
 
 
 def reported_times(text):
@@ -60,7 +71,7 @@ def dialogue_time_view(prompt, metadata):
     """Keep raw clocks only in the labelled provenance section when requested."""
     current = prompt["messages"]
     question = "\n".join(p["text"] for m in current for p in m["parts"] if p["kind"] == "text")
-    clocks = bool(MESSAGE_CLOCK_QUESTION.search(question))
+    clocks = requests_message_clock(question)
 
     by_ref = {source["message_ref"]: source for source in metadata["sources"]}
 

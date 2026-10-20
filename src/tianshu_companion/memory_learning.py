@@ -118,14 +118,26 @@ def memory_scopes_overlap(left, right):
 class MemoryLearning:
     def __init__(self, core):
         self.core = core
+        self.dispatch_lock = asyncio.Lock()
         self.lock = asyncio.Lock()
+        self.jobs = {}
+        self.closed = False
         self.commit_job = self.commit_scope = None
 
     def admission_blocked(self, scope):
-        return bool(
-            self.core.automatic_memory_candidates
-            and self.commit_scope
-            and memory_scopes_overlap(self.commit_scope, scope)
+        if not self.core.automatic_memory_candidates:
+            return False
+        if self.commit_scope and memory_scopes_overlap(self.commit_scope, scope):
+            return True
+        # Persisted barriers survive restart. Waiting in one room must neither
+        # hold the commit lock nor prevent extraction in independent rooms.
+        return any(
+            memory_scopes_overlap(json.loads(row[0]), scope)
+            for row in self.core.store.db.execute(
+                "SELECT CAST(json_extract(body,'$.scope') AS TEXT) FROM metadata WHERE conversation_id=? "
+                "AND status='pending' AND json_extract(body,'$.stage')='commit_wait'",
+                (QUEUE,),
+            )
         )
 
     def _commit_ready(self, item, turn):
@@ -218,6 +230,8 @@ class MemoryLearning:
         # let many followers of a cooling-down source monopolize a queue scan.
         setattr(self, cursor_name, tuple(rows[-1]) if len(rows) == 64 else (-1, -1, ""))
         for deadline, position, key in rows:
+            if key in self.jobs and not self.jobs[key].done():
+                continue
             row = store.db.execute(
                 "SELECT m.body FROM metadata m WHERE m.id=? AND NOT EXISTS ("
                 "SELECT 1 FROM metadata p WHERE p.conversation_id=m.conversation_id "
@@ -233,6 +247,11 @@ class MemoryLearning:
                 (key,),
             ).fetchone()
             if row:
+                item = json.loads(row[0])
+                if item.get("stage") == "commit_wait" and self.core.has_active_dialogue(
+                    item["scope"]
+                ):
+                    continue
                 # Resume after the selected job rather than skipping the rest
                 # of its page. Scope ordering is independent of this fair cursor.
                 setattr(
@@ -243,7 +262,7 @@ class MemoryLearning:
                 self._fresh_grants = (
                     0 if deadline > 0 else min(3, getattr(self, "_fresh_grants", 0) + 1)
                 )
-                return json.loads(row[0])
+                return item
         return None
 
     def backfill(self):
@@ -309,62 +328,109 @@ class MemoryLearning:
 
     async def reconcile(self, job_id):
         """Explicit receipt-only recovery. Never regenerate or resend a bounded-out proposal."""
-        async with self.lock:
+        async with self.dispatch_lock:
             key = "memory-learn:" + digest(job_id)
-            item = self.core.store.get("metadata", key)
-            if not item:
-                raise Fault("not_found")
-            turn = self.core.store.get("turns", item["turn_id"])
-            if not turn or not self.core._turn_allows(turn, "memory.write"):
-                raise Fault("forbidden")
-            self.core._check_role(turn)
-            async with asyncio.timeout(45):
-                response = await self.core.memory.process_candidate(job_id, None)
-            if response["state"] in {"completed", "invalidated"}:
-                item.update(
-                    state=response["state"],
-                    receipt=response["result"],
-                    last_error=None,
-                    output=None,
-                    deadline=0,
-                )
-                self.core.store.put("metadata", item)
-            return response
+            running = self.jobs.pop(key, None)
+            if running is not None:
+                running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
+            async with self.lock:
+                return await self._reconcile(job_id, key)
 
-    async def work(self):
-        async with self.lock:
-            # Include source checks and commit I/O around the separately bounded model.
-            try:
-                async with asyncio.timeout(90):
-                    await self._work()
-            finally:
-                item = self.core.store.get("metadata", self.commit_job) if self.commit_job else None
-                if (
-                    not self.core.automatic_memory_candidates
-                    or not item
-                    or item["state"] != "pending"
-                    or item.get("stage") != "commit_wait"
-                ):
-                    self._release_commit()
+    async def _reconcile(self, job_id, key):
+        item = self.core.store.get("metadata", key)
+        if not item:
+            raise Fault("not_found")
+        turn = self.core.store.get("turns", item["turn_id"])
+        if not turn or not self.core._turn_allows(turn, "memory.write"):
+            raise Fault("forbidden")
+        self.core._check_role(turn)
+        async with asyncio.timeout(45):
+            response = await self.core.memory.process_candidate(job_id, None)
+        if response["state"] in {"completed", "invalidated"}:
+            item.update(
+                state=response["state"],
+                receipt=response["result"],
+                last_error=None,
+                output=None,
+                deadline=0,
+            )
+            self.core.store.put("metadata", item)
+        return response
 
-    async def _work(self):
+    async def work(self, *, wait=True):
+        """Pump bounded independent jobs; the runtime loop need not await model I/O."""
         core = self.core
-        if not core.automatic_memory_candidates or not hasattr(core.memory, "process_candidate"):
-            return
-        changed = self.backfill()
-        changed = self._recover_legacy() or changed
-        changed = self._order_pending() or changed
-        if not self._ordered:
-            core.counted("memory.work")
-            return
-        item = core.store.get("metadata", self.commit_job) if self.commit_job else None
-        if item is None or item["state"] != "pending":
-            self._release_commit()
-            item = self._next()
-        if item is None:
+        async with self.dispatch_lock:
+            if self.closed:
+                return
+            for key, job in list(self.jobs.items()):
+                if job.done():
+                    del self.jobs[key]
+                    if not job.cancelled():
+                        job.result()
+            if not core.automatic_memory_candidates or not hasattr(
+                core.memory, "process_candidate"
+            ):
+                return
+            changed = self.backfill()
+            changed = self._recover_legacy() or changed
+            changed = self._order_pending() or changed
             if changed:
                 core.counted("memory.work")
-            return
+            if not self._ordered:
+                return
+            # Bounded lookahead overlaps receipt/source I/O with generation. It
+            # does not increase provider capacity or bypass scope predecessors.
+            limit = max(2, 2 * core.models.background_limit)
+            while len(self.jobs) < limit:
+                item = self._next()
+                if item is None:
+                    break
+                self.jobs[item["id"]] = asyncio.create_task(self._work(item))
+            selected = list(self.jobs.values())
+        if wait and selected:
+            try:
+                done, _ = await asyncio.wait(selected, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                for job in selected:
+                    job.cancel()
+                await asyncio.gather(*selected, return_exceptions=True)
+                raise
+            for job in done:
+                if not job.cancelled():
+                    job.result()
+
+    async def close(self):
+        async with self.dispatch_lock:
+            self.closed = True
+            for job in self.jobs.values():
+                job.cancel()
+            await asyncio.gather(*self.jobs.values(), return_exceptions=True)
+            self.jobs.clear()
+
+    async def _commit(self, item, turn):
+        # Only commits serialize. Provider waits, extraction and unrelated
+        # receipt reads never occupy the single write boundary.
+        async with self.lock:
+            try:
+                if not self.core.automatic_memory_candidates:
+                    raise Fault("forbidden")
+                self.core._check_role(turn)
+                if not self._commit_ready(item, turn):
+                    item["stage"] = "commit_wait"
+                    self.core.store.put("metadata", item)
+                    self.core.counted("memory.work")
+                    return None
+                item["stage"] = "commit"
+                self.core.store.put("metadata", item)
+                async with asyncio.timeout(45):
+                    return await self.core.memory.process_candidate(item["job_id"], item["output"])
+            finally:
+                self._release_commit()
+
+    async def _work(self, item):
+        core = self.core
         resuming_commit = item.get("stage") == "commit_wait" and item["output"] is not None
         if item["attempts"] >= MAX_RECOVERY_ATTEMPTS and not resuming_commit:
             item.update(state="blocked", deadline=0)
@@ -379,12 +445,11 @@ class MemoryLearning:
             if turn is None or not core._turn_allows(turn, "memory.write"):
                 raise Fault("forbidden")
             core._check_role(turn)
-            if resuming_commit and not self._commit_ready(item, turn):
-                if changed:
-                    core.counted("memory.work")
+            if resuming_commit and core.has_active_dialogue(turn["scope"]):
                 return  # Waiting is not another attempt or an idle persistent write.
             item["stage"] = "receipt"
-            response = await core.memory.process_candidate(item["job_id"], None)
+            async with asyncio.timeout(45):
+                response = await core.memory.process_candidate(item["job_id"], None)
             if response["state"] == "pending":
                 if item["output"] is None:
                     content = response["content"]
@@ -415,6 +480,11 @@ class MemoryLearning:
                         item["stage"] = "model"
                         core.store.put("metadata", item)
                         async with core.models.background:
+                            if not core.automatic_memory_candidates or not core._turn_allows(
+                                turn, "memory.write"
+                            ):
+                                raise Fault("forbidden")
+                            core._check_role(turn)
                             if core.default_model_selector is not None:
                                 selected = await resolve_selection(
                                     core.default_model_selector,
@@ -496,17 +566,9 @@ class MemoryLearning:
                     # Persist exact proposal before the uncertain remote commit; on restart
                     # read its receipt first, then resend these same bytes if still pending.
                     core.store.put("metadata", item)
-                core._check_role(turn)
-                if not self._commit_ready(item, turn):
-                    # Keep the exact proposal, let existing replies finish, and stop
-                    # affected snapshots until the commit has settled.
-                    item["stage"] = "commit_wait"
-                    core.store.put("metadata", item)
-                    core.counted("memory.work")
+                response = await self._commit(item, turn)
+                if response is None:
                     return
-                item["stage"] = "commit"
-                core.store.put("metadata", item)
-                response = await core.memory.process_candidate(item["job_id"], item["output"])
                 if response["state"] == "rejected":
                     # Only this explicit Memory-owned rejection proves the proposal did
                     # not commit. Transport/schema failures retain the original proposal.

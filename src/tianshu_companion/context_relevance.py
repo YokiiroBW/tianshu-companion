@@ -3,6 +3,8 @@
 import re
 import unicodedata
 
+from .context_time import requests_message_clock
+
 SCAFFOLD = re.compile(
     r"(?:刚才|之前|以前|上次|现在|我们|咱们|你们|那个|这个|什么|怎么|哪里|哪个|"
     r"是不是|来着|记得|记住|知道|告诉|一下|关于|继续|好像|可以|时候|的|了|呢|呀|吗|是)"
@@ -133,7 +135,11 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
     asks_fact = not asks_assistant and (
         (
             QUESTION.search(query)
-            and (FACT_LOOKUP.search(query) or any(score > 0 for score, _ in scores.values()))
+            and (
+                FACT_LOOKUP.search(query)
+                or requests_message_clock(query)
+                or any(score > 0 for score, _ in scores.values())
+            )
         )
         or state_lookup
     )

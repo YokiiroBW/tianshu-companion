@@ -10,6 +10,26 @@ from tianshu_companion.core import ACTIVE
 
 
 class CoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduler_counts_phases_and_overlaps_without_loading_turn_payloads(self):
+        from unittest.mock import patch
+
+        await self.replace(silence_ms=0)
+        await self.h.ingest(text="群里的独立话题", group=True, channel="group:a")
+        await self.h.cycles()
+        turn = self.h.turns()[0]
+        turn["phase"] = "generating"
+        turn["large_context_fixture"] = "body" * 100000
+        self.h.core.store.put("turns", turn)
+        job = asyncio.create_task(asyncio.Event().wait())
+        self.h.core.jobs[turn["id"]] = job
+        self.h.core.jobs[("direct", "room")] = asyncio.create_task(asyncio.Event().wait())
+        with patch.object(self.h.core.store, "get", side_effect=AssertionError("Full body read")):
+            self.assertTrue(self.h.core._preparation_available())
+            self.assertTrue(self.h.core.has_active_dialogue(turn["scope"]))
+            self.assertFalse(
+                self.h.core.has_active_dialogue(dict(turn["scope"], conversation_id="other-room"))
+            )
+
     async def asyncSetUp(self):
         self.h = Harness()
 
