@@ -165,6 +165,7 @@ def select_recent(store, turn, policy, now):
             author=previous["bundle"]["collection_key"]["author"],
             phase=previous["phase"],
             delivery_state=previous["delivery_state"],
+            confirmed_sent_segments=len(replies),
             messages=previous["bundle"]["messages"],
             replies=[
                 dict(

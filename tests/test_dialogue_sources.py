@@ -45,3 +45,57 @@ def test_source_timeline_groups_accounts_and_uses_metadata_not_dates_in_text():
         "m1",
     ]
     assert context == unchanged
+
+
+def test_current_response_boundary_keeps_other_turn_requests_without_adopting_them():
+    def message(account, text):
+        return dict(
+            author=dict(namespace="qq", immutable_account_id=account),
+            person_id="person:" + account,
+            sent_at="2026-10-21T01:00:00Z",
+            accepted_at="2026-10-21T01:00:00Z",
+            parts=[dict(kind="text", text=text)],
+        )
+
+    current = message("1001", "糯米今天午睡挺安静。")
+    other = message("1002", "书店暗号再提醒一下。")
+    older = message("1001", "我上次问的那本书呢？")
+    context = dict(
+        recent_dialogue=[
+            dict(
+                messages=[other],
+                phase="preparing",
+                delivery_state="not_started",
+                replies=[],
+                confirmed_sent_segments=0,
+                input_only=True,
+            ),
+            dict(
+                messages=[older],
+                phase="sent",
+                delivery_state="sent",
+                replies=[],
+                confirmed_sent_segments=1,
+                input_only=True,
+                reply_text_visibility="omitted",
+            ),
+        ]
+    )
+    saved = copy.deepcopy(context)
+    timeline = dialogue_sources(dict(bundle=dict(messages=[current])), context)
+    boundary = timeline["response_scope"]
+    assert boundary["current_message_refs"] == ["m1"]
+    assert boundary["requester_speaker_ref"] == "p1"
+    parallel, prior = boundary["context_turns"]
+    assert parallel["message_refs"] == ["recent_dialogue:1:m1"]
+    assert parallel["phase_at_selection"] == "preparing"
+    assert parallel["confirmed_sent_segments"] == 0
+    assert prior["phase_at_selection"] == "sent"
+    assert prior["reply_text_visibility"] == "omitted"
+    assert prior["confirmed_sent_segments"] == 1
+    assert all(
+        group["responsibility"] == "other_turn_source_not_current_request"
+        for group in boundary["context_turns"]
+    )
+    assert context == saved
+    assert "暗号" not in str(timeline) and "上次问" not in str(timeline)

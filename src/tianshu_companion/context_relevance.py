@@ -3,7 +3,7 @@
 import re
 import unicodedata
 
-from .context_time import requests_message_clock
+from .context_time import time_intent
 
 SCAFFOLD = re.compile(
     r"(?:刚才|之前|以前|上次|现在|我们|咱们|你们|那个|这个|什么|怎么|哪里|哪个|"
@@ -64,6 +64,11 @@ def changes_plan(text):
 
 def input_text(group):
     return " ".join(p["text"] for m in group["messages"] for p in m["parts"] if p["kind"] == "text")
+
+
+def input_only(group):
+    """Omit answer text without turning a delivery fact into an unanswered task."""
+    return dict(group, replies=[], input_only=True, reply_text_visibility="omitted")
 
 
 def tokens(text):
@@ -137,7 +142,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
             QUESTION.search(query)
             and (
                 FACT_LOOKUP.search(query)
-                or requests_message_clock(query)
+                or time_intent(query) != "none"
                 or any(score > 0 for score, _ in scores.values())
             )
         )
@@ -159,7 +164,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
             return batch
         # A bot's old guesses are not fresh human evidence, even when its
         # delivery and authority are still valid. Keep the original statements.
-        return [(dict(g, replies=[], input_only=True), expiry) for g, expiry in batch]
+        return [(input_only(g), expiry) for g, expiry in batch]
 
     def priority(item):
         score, assertion = scores[item[0]["turn_id"]]

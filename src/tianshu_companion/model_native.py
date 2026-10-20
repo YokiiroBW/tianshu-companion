@@ -12,8 +12,23 @@ class Completion:
         self.tools = {}
         self.finish_reason = None
         self.usage = None
+        self.rate_limited = False
 
     def consume(self, chunk):
+        if (
+            isinstance(chunk, dict)
+            and isinstance(chunk.get("error"), dict)
+            and chunk["error"].get("type") == "rate_limit_error"
+        ):
+            # A frame cannot be both a rejection and a completion delta. Never
+            # skip tool/content/finish facts by treating a mixed frame as error-only.
+            fields = {"choices", "content", "tool_calls", "finish_reason"}
+            if fields.intersection(chunk) or fields.intersection(chunk["error"]):
+                raise Fault("invalid_input", unknown=True)
+            # This is only a signal to query the owning Gateway's final receipt,
+            # never proof of nonexecution or permission to regenerate.
+            self.rate_limited = True
+            return ""
         if not isinstance(chunk, dict) or not isinstance(chunk.get("choices"), list):
             raise Fault("invalid_input", unknown=True)
         if chunk.get("usage") is not None:

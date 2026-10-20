@@ -64,3 +64,29 @@ def test_unknown_and_confirmed_assistant_material_remains_distinct_from_human_so
     assert result["recent_dialogue"][0]["replies"] == [dict(text="大家已同意")]
     assert len(timeline["sources"]) == 2
     assert "大家已同意" not in json.dumps(timeline, ensure_ascii=False)
+
+
+def test_projection_retains_a_parallel_request_when_current_input_explicitly_quotes_it():
+    current = source("1001", "也帮我看看小周刚才问的入口。", "2026-10-21T01:00:02Z")
+    other = source("1002", "我们最后从哪个门进去？", "2026-10-21T01:00:00Z")
+    prompt = dict(
+        messages=[current],
+        earlier_fragment=[],
+        recent_dialogue=[
+            dict(
+                messages=[other],
+                replies=[],
+                phase="generating",
+                delivery_state="not_started",
+                confirmed_sent_segments=0,
+            )
+        ],
+    )
+    saved = copy.deepcopy(prompt)
+    result, timeline = dialogue_time_view(
+        prompt, dialogue_sources(dict(bundle=dict(messages=[current])), prompt)
+    )
+    assert result["recent_dialogue"][0]["messages"][0]["parts"] == other["parts"]
+    assert result["messages"][0]["parts"] == current["parts"]
+    assert timeline["response_scope"]["context_turns"][0]["phase_at_selection"] == "generating"
+    assert prompt == saved

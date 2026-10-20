@@ -1478,7 +1478,9 @@ class Core(Delivery):
                 source_metadata = dialogue_sources(turn, context.data)
                 from .context_time import dialogue_time_view
 
-                prompt, source_timeline = dialogue_time_view(prompt, source_metadata)
+                prompt, source_timeline = dialogue_time_view(
+                    prompt, source_metadata, observed_at=utc(self.clock())
+                )
                 context_bytes = len(canonical({k: prompt[k] for k in context.data}).encode())
                 messages[1]["content"] = canonical(prompt)
                 messages[0]["content"] += "\nMaterial provenance: " + canonical(
@@ -1625,6 +1627,16 @@ class Core(Delivery):
                 for segment in pending.feed(text):
                     await self.stream_segment(turn["id"], segment)
 
+        def closed_or_started(value):
+            return (
+                value is None
+                or value["cancelled"]
+                or value["phase"] in TERMINAL
+                or value.get("expression_id")
+                or value.get("native_execution")
+                or self._replies(value)
+            )
+
         for iteration in range(8):
             fresh = self.store.get("turns", turn["id"])
             if fresh["cancelled"] or fresh["phase"] in TERMINAL:
@@ -1639,29 +1651,41 @@ class Core(Delivery):
                     )
                     break
                 except Fault as error:
+                    fresh = self.store.get("turns", turn["id"])
                     if (
                         not error.retryable_model
                         or iteration
                         or attempt
+                        or closed_or_started(fresh)
                         or fresh.get("model_connection_retries", 0)
                     ):
                         raise
-                    # Only an initial, output-free transport failure is eligible.
-                    # Reserve before waiting so restart/cancellation never resets
-                    # the allowance. Tools and partially delivered replies never replay.
-                    fresh = self.store.get("turns", turn["id"])
+                    # Gateway permits an output-free transport cut or a proved
+                    # terminal typed rejection. Neither may have crossed this
+                    # durable send/tool boundary. Discard only unsent local text.
+                    pending = Segments()
                     fresh["model_connection_retries"] = 1
                     self._save_turn(fresh)
                     await asyncio.sleep(0.2)
                     fresh = self.store.get("turns", turn["id"])
-                    if fresh["cancelled"] or fresh["phase"] in TERMINAL:
+                    if closed_or_started(fresh):
                         raise Fault("scope_changed")
                     self._check_role(fresh)
                     await self._preflight(fresh)
-                    if fresh.get("model_selection"):
-                        verify_lease(fresh["model_selection"]["expires_at"], self.clock())
-                    fresh["model_calls"] += 1
-                    self._save_turn(fresh)
+                    # Peer checks yield. Cancellation, source withdrawal or a
+                    # send intent accepted during that wait must not be erased
+                    # by saving the preflight's older object. No await follows
+                    # this durable recheck before the next model invocation.
+                    with self.store.transaction():
+                        fresh = self.store.get("turns", turn["id"])
+                        if closed_or_started(fresh):
+                            raise Fault("scope_changed")
+                        self._check_input_versions(fresh)
+                        self._check_role(fresh)
+                        if fresh.get("model_selection"):
+                            verify_lease(fresh["model_selection"]["expires_at"], self.clock())
+                        fresh["model_calls"] += 1
+                        self._save_turn(fresh)
             route_receipts.append(receipt)
             if message.get("content"):
                 output.append(message["content"])
@@ -1940,7 +1964,9 @@ class Core(Delivery):
             visited.update(ids)
             variants = [batch]
             if any(member["replies"] for member in batch):
-                variants.append([dict(member, replies=[], input_only=True) for member in batch])
+                from .context_relevance import input_only
+
+                variants.append([input_only(member) for member in batch])
             for candidate in variants:
                 try:
                     inherited = []

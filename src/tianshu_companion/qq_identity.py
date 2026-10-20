@@ -8,14 +8,18 @@ from .contracts import Fault
 
 SOURCE_INSTRUCTION = """
 Human source timeline 只提供来源和人物对应；原话仅在 messages、recent_dialogue、
-earlier_fragment 中。用 source_ref 定位消息，按 chronological_message_refs 的顺序理解。
+earlier_fragment 中。response_scope 的 current_message_refs 才是本轮要回应的输入；
+context_turns 是其他轮的来源，其他人的并发提问或自己的历史提问都不是本轮待办，
+只有当前输入明确引用并要求处理时才一并回答。用 source_ref 定位消息，按
+chronological_message_refs 的顺序理解；阶段和投递状态是选取上下文时的快照。
 同一 speaker_ref/person_ref 是同一个人；“你”指 current_request 的作者，原话的“我”
 属于该消息的 speaker_ref。跨人、跨物品、跨事件不转移事实、原因、意向或更正。
 可回答当前会话里其他人的可见发言；提问者没有个人档案不妨碍回答。人物称呼用实际
 名字或原话；资料未明确性别时只用名字或“那位/对方”，不用“他/她”，不输出内部
 编号，不从昵称猜性别、职业或习惯。
 画像、摘要、自动抽取是解释材料；有原文引用不等于已确认事实，摘要不能冒充原话。
-助手旧回复、建议或重复不是人的经历、承诺或同意；input_only 不含助手旧答。
+助手旧回复、建议或重复不是人的经历、承诺或同意；input_only 不含助手旧答，
+omitted 只表示正文省略，confirmed_sent_segments 只证明交付，不证明问题已解决。
 
 问多人状态时先逐人读取 participants.message_refs 的有序原话，再合并回答；不能
 搜到一句“同意”就停止。提议者随后敲定自己的安排也算确认；自然采纳与直说同意
@@ -27,7 +31,9 @@ earlier_fragment 中。用 source_ref 定位消息，按 chronological_message_r
 更正只覆盖同一人的同一事项；把每次更正和它自己的理由相连，理由未说就保留未知。
 “我们”的普通聚会回忆不等于邀请助手到场；日常暗号按用途理解，不自动当认证凭据。
 
-transport_clock 才是核实的消息时间，带 Z 表示 UTC。自述“我这里现在几点”只是
+time_request 区分本轮要问的时间来源。transport_clock 才是核实的消息时间，
+current_clock 只是构造本轮提示时的 Core 时钟观察，不是消息或事件的时间。
+带 Z 表示 UTC；未明确时区时不能当成本地日期。自述“我这里现在几点”只是
 参考钟，不是发言时刻。reported_time_phrases 的位置及 clause 边界帮助定位原话；
 role 不把原话提升为核实事实。相对日期只修饰对应事件，不修饰同句姓名、起名日
 或事实有效期；没有明确参考日期和时区时保留原话，不猜日历日期。
@@ -232,5 +238,31 @@ def dialogue_sources(turn, context):
         population_scope="authors_of_selected_messages_only_not_full_group_membership",
         participants=list(participants.values()),
         chronological_message_refs=chronological,
+        response_scope=dict(
+            current_message_refs=[f"m{i}" for i in range(1, len(current) + 1)],
+            requester_speaker_ref=sources[len(current) - 1]["speaker_ref"],
+            continuation_message_refs=[
+                f"earlier_fragment:m{i}"
+                for i in range(1, len(context.get("earlier_fragment", [])) + 1)
+            ],
+            context_turns=[
+                dict(
+                    message_refs=[
+                        f"recent_dialogue:{i}:m{j}" for j in range(1, len(group["messages"]) + 1)
+                    ],
+                    responsibility="other_turn_source_not_current_request",
+                    phase_at_selection=group.get("phase"),
+                    delivery_state_at_selection=group.get("delivery_state"),
+                    confirmed_sent_segments=group.get(
+                        "confirmed_sent_segments", len(group.get("replies", []))
+                    ),
+                    reply_text_visibility=group.get(
+                        "reply_text_visibility",
+                        "included" if group.get("replies") else "not_included",
+                    ),
+                )
+                for i, group in enumerate(context.get("recent_dialogue", []), 1)
+            ],
+        ),
     )
     return metadata

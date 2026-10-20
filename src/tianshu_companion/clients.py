@@ -806,16 +806,33 @@ class Gateway:
         result = Completion()
         self.active_requests[turn["id"]] = request_id
         try:
-            async for chunk in self.client.stream("/v1/chat/completions", body, headers):
-                text = result.consume(chunk)
-                if text and on_delta:
-                    await on_delta(text)
-        except Fault as error:
-            # A callback can fail after partial output. Never label that failure
-            # as safe to retry even if it happens to carry a transport flag.
-            if result.content or result.tools or result.finish_reason:
-                error.retryable_model = False
-            raise
+            interrupted = None
+            try:
+                async for chunk in self.client.stream("/v1/chat/completions", body, headers):
+                    text = result.consume(chunk)
+                    if text and on_delta:
+                        await on_delta(text)
+            except Fault as error:
+                interrupted = error
+            if result.rate_limited:
+                # Drain the stream first. A typed rejection is not an unknown
+                # transport cut: its own Gateway must confirm a terminal failure.
+                allowed = (
+                    not result.tools
+                    and result.finish_reason is None
+                    and (
+                        interrupted is None
+                        or interrupted.code in {"dependency_unavailable", "result_unknown"}
+                    )
+                    and await self._rejected_rate_limit(turn, request_id)
+                )
+                raise Fault("dependency_unavailable", unknown=True, retryable_model=allowed)
+            if interrupted is not None:
+                # Ordinary cuts and callback faults retain the original output
+                # boundary. The explicit rejection case above never broadens it.
+                if result.content or result.tools or result.finish_reason:
+                    interrupted.retryable_model = False
+                raise interrupted
         except asyncio.CancelledError:
             try:
                 await asyncio.shield(
@@ -847,6 +864,40 @@ class Gateway:
         ):
             raise Fault("dependency_unavailable")
         return message, receipt
+
+    async def _rejected_rate_limit(self, turn, request_id):
+        """One short read window for the stream owner's durable terminal receipt."""
+        try:
+            async with asyncio.timeout(1):
+                for attempt in range(3):
+                    receipt = await self.client.call("/internal/v1/model-requests/" + request_id)
+                    self.contracts.check("model#route_receipt", receipt)
+                    if (
+                        receipt["request_id"] != request_id
+                        or receipt["config_version"] != turn["config_version"]
+                        or receipt["caller_service"] != "companion"
+                    ):
+                        return False
+                    execution = receipt.get("execution") or {}
+                    if receipt["outcome"] == "failed":
+                        return (
+                            execution.get("state") == "failed"
+                            and execution.get("error_code") == "upstream_http_error"
+                            and execution.get("upstream_started") is True
+                            and execution.get("cancel_requested") is False
+                            and execution.get("finish_reasons") == []
+                        )
+                    if (
+                        receipt["outcome"] != "unknown"
+                        or execution.get("state") not in {"queued", "running"}
+                        or execution.get("cancel_requested")
+                        or attempt == 2
+                    ):
+                        return False
+                    await asyncio.sleep(0.05 * 2**attempt)
+        except (Fault, TimeoutError):
+            return False
+        return False
 
     async def generate(self, turn, messages):
         message, receipt = await self.complete(turn, messages)

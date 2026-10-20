@@ -95,6 +95,8 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("source:name", recent[0]["messages"][0]["message_key"]["message_id"])
         self.assertEqual([], recent[0]["replies"])
         self.assertTrue(recent[0]["input_only"])
+        self.assertEqual(1, recent[0]["confirmed_sent_segments"])
+        self.assertEqual("omitted", recent[0]["reply_text_visibility"])
         await self.say("那你怎么称呼我呢")
         self.assertEqual(2, len(self.prompt()["recent_dialogue"]))
         self.assertIn("你叫小明。", canonical(self.prompt()["recent_dialogue"]))
@@ -195,6 +197,7 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("从未发送第三段", canonical(recent))
         self.assertEqual("unknown", recent[0]["delivery_state"])
         self.assertEqual(1, len(recent[0]["replies"]))
+        self.assertEqual(1, recent[0]["confirmed_sent_segments"])
 
     async def test_inflight_send_is_not_a_delivered_reply(self):
         h = self.h
