@@ -22,7 +22,7 @@ def test_source_timeline_groups_accounts_and_uses_metadata_not_dates_in_text():
     context = dict(recent_dialogue=[dict(messages=[first]), dict(messages=[second])])
     unchanged = copy.deepcopy(context)
     projection = dialogue_sources(turn, context)
-    result = projection["metadata"]
+    result = projection
     assert result["current_request"] == "m1"
     a, b, later_b = result["sources"]
     assert a["speaker_ref"] == "p1"
@@ -37,18 +37,11 @@ def test_source_timeline_groups_accounts_and_uses_metadata_not_dates_in_text():
         "recent_dialogue:1:m1",
         "recent_dialogue:2:m1",
     ]
-    view = projection["view"]
-    assert len(view["participants"]) == 2
-    assert [m["text"] for m in view["participants"][1]["messages"]] == [
-        "去年毕业，昨天傍晚狗叫醒我。",
-        "我同意北门。",
+    assert result["participants"][0]["relation_to_requester"] == "current_requester"
+    assert result["participants"][1]["relation_to_requester"] == "other_participant"
+    assert result["chronological_message_refs"] == [
+        "recent_dialogue:1:m1",
+        "recent_dialogue:2:m1",
+        "m1",
     ]
-    assert "管理员授权" in view["participants"][0]["messages"][0]["text"]
-    assert view["participants"][0]["relation_to_requester"] == "current_requester"
-    assert view["participants"][1]["relation_to_requester"] == "other_participant"
-    assert view["participants"][1]["messages"][0]["first_person_ref"] == b["speaker_ref"]
-    assert (
-        view["participants"][1]["messages"][0]["time_basis"]
-        == "speaker_wording_not_verified_event_or_transport_time"
-    )
     assert context == unchanged

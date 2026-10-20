@@ -67,6 +67,10 @@ def test_large_payload_recovery_and_missing_file_refuses_content(tmp_path):
     try:
         assert store.get("replies", "reply") == reply
         assert store.get("write_materials", "material") == material
+        assert store.get_many("write_materials", ["material", "missing"]) == {"material": material}
+        assert store.get_many("replies", ["reply"])["reply"] == reply
+        assert store.replies_for_turns(["turn", "missing"])["turn"] == [reply]
+        assert store.turn_replies("turn") == [reply]
         assert store.source_head() == head
         (tmp_path / "main.sqlite.files" / ref["relative_path"]).unlink()
         with pytest.raises((Fault, sqlite3.Error)):
@@ -100,6 +104,77 @@ def pg_settings():
     if not url:
         pytest.skip("TS233_POSTGRES_URL is required for isolated real PostgreSQL")
     return {"storage_backends": {"postgresql_url": url, "namespace": "ts233_" + uuid.uuid4().hex}}
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_context_projection_and_batch_queries_preserve_types_and_latest_revision(tmp_path, backend):
+    settings = {}
+    if backend == "postgresql":
+        url = os.environ.get("TS233_POSTGRES_URL")
+        if not url:
+            pytest.skip("Isolated PostgreSQL URL required")
+        settings = {
+            "storage_backends": {"postgresql_url": url, "namespace": "q14_" + uuid.uuid4().hex}
+        }
+    store = Store(tmp_path / "context.sqlite", settings=settings)
+    turn = dict(
+        id="turn",
+        conversation_id="conversation",
+        sequence=7,
+        phase="sent",
+        failure=None,
+        model_calls=1,
+        bundle={"messages": [], "sealed_at": "2026-10-20T00:00:00Z"},
+        scope={
+            "actor_id": "actor",
+            "person_id": "person",
+            "audience": "group",
+            "conversation_id": "conversation",
+        },
+        scope_version=4,
+        binding_version=2,
+        context_revision=3,
+        history_snapshot={"current": True},
+        input_history_snapshot=None,
+        cancelled=False,
+        delivery_state="sent",
+        short_context={"turn_ids": ["older"]},
+        unused_model_payload="x" * 100000,
+    )
+    try:
+        assert store.backend == backend
+        store.put("turns", turn)
+        projected = store.recent_turns("conversation", 8, 4)
+        assert len(projected) == 1
+        assert projected[0] == {k: v for k, v in turn.items() if k != "unused_model_payload"}
+        assert isinstance(projected[0]["sequence"], int)
+        assert projected[0]["cancelled"] is False
+        for base, revision in [("first", 1), ("first", 3), ("other", 2)]:
+            store.put(
+                "physicals",
+                dict(
+                    id=f"{base}-{revision}",
+                    conversation_id="conversation",
+                    base=base,
+                    revision=revision,
+                    fact={"state": "active"},
+                ),
+            )
+        latest = store.latest_sources("conversation", ["first", "other", "missing", "first"])
+        assert latest == {
+            key: store.latest_source("conversation", key) for key in ["first", "other"]
+        }
+        assert latest["first"]["revision"] == 3
+        admission = dict(
+            id="admission", conversation_id="conversation", fact={"scope": turn["scope"]}
+        )
+        store.put("admissions", admission)
+        assert store.get_many("admissions", ["admission", "missing"]) == {"admission": admission}
+        reply, _ = media_reply()
+        store.put("replies", reply)
+        assert store.replies_for_turns(["turn", "missing"]) == {"turn": [reply], "missing": []}
+    finally:
+        store.close()
 
 
 def test_real_postgres_migrates_facts_files_owner_and_no_sqlite_fallback(tmp_path, pg_settings):

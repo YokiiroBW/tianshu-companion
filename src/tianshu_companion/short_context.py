@@ -36,6 +36,10 @@ def message_current(store, scope, message):
     chosen = selector(message, scope["actor_id"])
     latest = store.latest_source(scope["conversation_id"], digest(chosen["key"]))
     row = store.get("admissions", digest(chosen))
+    return _source_matches(scope, message, latest, row)
+
+
+def _source_matches(scope, message, latest, row):
     return bool(
         latest
         and row
@@ -65,12 +69,12 @@ def select_recent(store, turn, policy, now):
     )
     if not policy.max_turns or not policy.max_bytes or not policy.max_age_seconds:
         return [], metadata
-    candidates = []
+    eligible = []
     for previous in store.recent_turns(turn["conversation_id"], turn["sequence"], 128):
         recover_input = (
             previous["phase"] == "failed"
             and previous.get("failure") == "dependency_unavailable"
-            and previous.get("model_calls", 0) > 0
+            and (previous.get("model_calls") or 0) > 0
             and previous.get("input_history_snapshot") is not None
         )
         expiry = epoch(previous["bundle"]["sealed_at"]) + policy.max_age_seconds
@@ -105,13 +109,45 @@ def select_recent(store, turn, policy, now):
             or previous["cancelled"]
             or previous["phase"] in {"queued", "cancelled"}
             or (previous["phase"] == "failed" and not recover_input)
-            or not sources_current(store, previous)
+        ):
+            continue
+        eligible.append((previous, expiry, recover_input))
+
+    # This snapshot lives only during this synchronous selection. Network/model
+    # and delivery boundaries still recheck their own current authority. Reading
+    # 128 candidates need not execute three SQL statements for every message.
+    lookups = {}
+    for previous, _, _ in eligible:
+        entries = []
+        for message in previous["bundle"]["messages"]:
+            chosen = selector(message, previous["scope"]["actor_id"])
+            entries.append((message, digest(chosen["key"]), digest(chosen)))
+        lookups[previous["id"]] = entries
+    admissions = store.get_many(
+        "admissions", [key for entries in lookups.values() for _, _, key in entries]
+    )
+    latest = store.latest_sources(
+        turn["conversation_id"], [base for entries in lookups.values() for _, base, _ in entries]
+    )
+    candidates, links = [], {}
+    replies_by_turn = store.replies_for_turns(
+        [p["id"] for p, _, recover in eligible if not recover], "sent"
+    )
+    for previous, expiry, recover_input in eligible:
+        if not all(
+            _source_matches(
+                previous["scope"],
+                message,
+                latest.get(base),
+                admissions.get(key),
+            )
+            for message, base, key in lookups[previous["id"]]
         ):
             continue
         # A provider failure says nothing about the already accepted human
         # input. Retain only that input through its independent fresh checks;
         # never revive partial/unknown bot output or authorization failures.
-        replies = [] if recover_input else store.turn_replies(previous["id"], "sent")
+        replies = replies_by_turn.get(previous["id"], [])
         replies = [
             r
             for r in replies
@@ -145,20 +181,27 @@ def select_recent(store, turn, policy, now):
         if recover_input:
             group["input_only"] = True
         candidates.append((group, expiry))
+        # Earlier selections are retrieval hints, never inherited answers or
+        # permissions. Only candidates passing today's source checks can enter.
+        links[previous["id"]] = (previous.get("short_context") or {}).get("turn_ids", [])
 
     from .context_relevance import retrieval_batches
 
     ordinary = [group for group, _ in candidates[: policy.max_turns]]
-    batches, topic_return = retrieval_batches(
+    batches, topic_return, requires = retrieval_batches(
         turn,
         candidates,
         policy.max_turns,
         compact=len(canonical(ordinary).encode("utf-8")) > policy.max_bytes,
+        links=links,
     )
     chosen = []
     linked = []
     oldest_expiry = None
     for batch in batches:
+        available = {g["turn_id"] for g, _ in batch} | {g["turn_id"] for g in chosen}
+        if any(requires.get(g["turn_id"], g["turn_id"]) not in available for g, _ in batch):
+            continue
         candidate = sorted([g for g, _ in batch] + chosen, key=lambda item: item["turn_sequence"])
         size = len(canonical(candidate).encode("utf-8"))
         if size > policy.max_bytes or len(candidate) > policy.max_turns:
@@ -173,6 +216,13 @@ def select_recent(store, turn, policy, now):
         oldest_expiry = expiry if oldest_expiry is None else min(oldest_expiry, expiry)
         if len(chosen) == policy.max_turns:
             break
+    chosen_ids = {g["turn_id"] for g in chosen}
+    by_head = {}
+    for child, head in requires.items():
+        if {child, head} <= chosen_ids:
+            by_head.setdefault(head, {head}).add(child)
+    positions = {g["turn_id"]: g["turn_sequence"] for g in chosen}
+    linked.extend(sorted(ids, key=positions.__getitem__) for ids in by_head.values())
     metadata.update(
         turn_ids=[g["turn_id"] for g in chosen],
         reply_ids=[r["reply_id"] for g in chosen for r in g["replies"]],

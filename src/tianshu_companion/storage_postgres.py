@@ -14,6 +14,7 @@ import uuid
 from tianshu_storage import MemoryCursor
 
 JSON_VALUE = re.compile(r"json_extract\((\w+(?:\.\w+)?),'\$\.([^']+)'\)")
+JSON_ARRAY = re.compile(r"json_extract\((\w+(?:\.\w+)?),('\$\.[^']+'(?:,'\$\.[^']+')+)\)")
 NUMBERS = {
     "revision",
     "command_version",
@@ -56,6 +57,16 @@ def json_expression(match):
     return value
 
 
+def json_array_projection(match):
+    """Keep SQLite multi-path projection values typed, including objects/nulls."""
+    column, paths = match.groups()
+    values = [
+        column + "::jsonb #> '{" + ",".join(path.split(".")) + "}'"
+        for path in re.findall(r"'\$\.([^']+)'", paths)
+    ]
+    return "jsonb_build_array(" + ",".join(values) + ")::text"
+
+
 def translate(sql):
     # Only the fixed syntax used by this product is translated. Unknown syntax
     # continues to PostgreSQL and fails visibly rather than being ignored.
@@ -63,6 +74,7 @@ def translate(sql):
         "json_each(t.body,'$.preparation.selected_units') u",
         "LATERAL jsonb_array_elements(t.body::jsonb #> '{preparation,selected_units}') AS u(value)",
     )
+    sql = JSON_ARRAY.sub(json_array_projection, sql)
     sql = JSON_VALUE.sub(json_expression, sql)
     sql = sql.replace("? IS NULL", "CAST(? AS TEXT) IS NULL")
     sql = re.sub(r"\s+INDEXED BY \w+", "", sql, flags=re.I)

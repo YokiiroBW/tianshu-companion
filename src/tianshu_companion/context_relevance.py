@@ -19,6 +19,13 @@ FACT_LOOKUP = re.compile(r"叫什么|叫啥|名字|姓什么|在哪里|在哪|�
 POSITION_STATEMENT = re.compile(
     r"同意|赞成|反对|不参加|参加不了|去不了|不去了|\b(?:agree|agreed|disagree|can't come)\b", re.I
 )
+STATE_LOOKUP = re.compile(
+    r"(?:谁|哪些人|哪几位|几个人|大家|所有人|全员).{0,20}"
+    r"(?:参加|同意|确认|确定|说好|去不了|安排)|"
+    r"(?:同意|确认|确定).{0,12}(?:谁|哪些|哪几)|都.{0,6}(?:说好|同意|确定)|"
+    r"\b(?:who|everyone|anyone)\b.{0,40}\b(?:coming|agreed|confirmed|join)\b",
+    re.I,
+)
 FOLLOWUP_QUESTION = re.compile(
     r"^(?:那|我们|咱们)?(?:中间|后来|当时|之前)(?:还|又|为什么|为啥|怎么|考虑|是为|呢|[，,？?])|"
     r"^(?:那|我们|咱们)?(?:为什么|为啥)(?:又|还|没|不)"
@@ -69,28 +76,30 @@ def tokens(text):
     return result
 
 
-def relevance(query, group):
-    # Assistant answers cannot turn a hallucinated detail into a history anchor.
-    value = input_text(group)
-    content = tokens(value)
-    score = len(query.intersection(content)) / max(1, len(query))
-    # A repeated question is a weaker anchor than the source assertion at the
-    # same lexical overlap. This never promotes an assistant answer as evidence.
-    question = bool(QUESTION.search(value))
-    return score, not question
-
-
-def retrieval_batches(turn, candidates, limit, *, compact=False):
+def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
     """Keep an older anchor with its nearby follow-ups, without resolving their meaning.
 
     A change often omits the original topic words. Carry the intervening human
     inputs too: their speakers and other plans are needed to interpret that change.
     The batch is indivisible; an oversized or revoked follow-up must not leave an
     isolated obsolete anchor. This is conversation context, never a fact update.
+    The final map binds older state to its latest human source for budget and
+    independent verification; it is never a model-generated state judgement.
     """
     query_text = input_text(turn["bundle"])
     query_tokens = tokens(query_text)
-    scores = {g["turn_id"]: relevance(query_tokens, g) for g, _ in candidates}
+    # Parse human inputs once. Query expansion and ranking share these features;
+    # neither bot replies nor summaries can manufacture an anchor.
+    texts = {g["turn_id"]: input_text(g) for g, _ in candidates}
+    features = {key: (tokens(text), not bool(QUESTION.search(text))) for key, text in texts.items()}
+
+    def score(query):
+        return {
+            key: (len(query & content) / max(1, len(query)), assertion)
+            for key, (content, assertion) in features.items()
+        }
+
+    scores = score(query_tokens)
     if (
         candidates
         and QUESTION.search(query_text)
@@ -107,22 +116,8 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
             # Resolve an elliptical follow-up through the same speaker's most
             # recent question. Its words are retrieval cues, never factual evidence.
             query_tokens |= tokens(input_text(previous))
-            scores = {g["turn_id"]: relevance(query_tokens, g) for g, _ in candidates}
-    if POSITION_STATEMENT.search(query_text):
-        # "Who has agreed?" may name no place/time. Use the best matching
-        # human stance as a search cue to retain its proposal too, otherwise
-        # the initiator's source disappears and silence is invented for them.
-        # These remain independently checked original inputs, not a consensus
-        # judgement or authority derived from the current question.
-        anchors = [
-            g
-            for g, _ in candidates
-            if all(scores[g["turn_id"]]) and POSITION_STATEMENT.search(input_text(g))
-        ]
-        if anchors:
-            anchor = max(anchors, key=lambda g: (scores[g["turn_id"]][0], g["turn_sequence"]))
-            query_tokens |= tokens(input_text(anchor))
-            scores = {g["turn_id"]: relevance(query_tokens, g) for g, _ in candidates}
+            scores = score(query_tokens)
+    state_lookup = bool(STATE_LOOKUP.search(query_text) or POSITION_STATEMENT.search(query_text))
     topic_return = any(scores[g["turn_id"]][0] > 0 for g, _ in candidates[limit:]) or (
         compact and any(score > 0 for score, _ in scores.values())
     )
@@ -140,12 +135,12 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
             QUESTION.search(query)
             and (FACT_LOOKUP.search(query) or any(score > 0 for score, _ in scores.values()))
         )
-        or POSITION_STATEMENT.search(query)
+        or state_lookup
     )
 
     def updates_plan(group):
         text = input_text(group)
-        if asks_fact and POSITION_STATEMENT.search(query):
+        if asks_fact and state_lookup:
             # A person's acceptance/withdrawal is their stance, not a change to
             # everybody's plan. Keep those source statements independently so
             # an unrelated interlude cannot make the whole consent set too big.
@@ -188,6 +183,62 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
     # This applies before byte compaction too: short bot replies must not make
     # the ordinary recent window drop the thing that was changed.
     topic_return = topic_return or needs_origin
+    if state_lookup and not asks_assistant and ranked and not needs_origin:
+        # A withdrawal often repeats no venue, time or other participant's
+        # words. Follow the source references selected in earlier turns, even
+        # through an intervening question. These are retrieval hints only: the
+        # candidates and their current authority were independently checked.
+        # Do not re-read the model's previous answer as a group-state ledger.
+        by_id = {item[0]["turn_id"]: item for item in candidates}
+        seeds = [item for item in ranked if all(scores[item[0]["turn_id"]])][:limit]
+        if not seeds:
+            seeds = [item for item in candidates if scores[item[0]["turn_id"]][1]][:1]
+        pool = {g["turn_id"] for g, _ in seeds}
+        frontier = set(pool)
+        for _ in range(3):
+            predecessors = {
+                ref
+                for key in frontier
+                for ref in (links or {}).get(key, [])
+                if ref in by_id and ref not in pool
+            }
+            # Follow later uses too: a person's exit can omit every word in
+            # the original venue query. Going backwards alone revives consent.
+            successors = {
+                key
+                for key in by_id
+                if key not in pool and frontier.intersection((links or {}).get(key, []))
+            }
+            frontier = predecessors | successors
+            pool.update(frontier)
+        # Older call sites/fixtures need no stored links to keep direct human
+        # evidence. A request-local lexical pass supplies the same small cues.
+        pool.update(g["turn_id"] for g, _ in ranked if all(scores[g["turn_id"]]))
+        assertions = [by_id[key] for key in pool if scores[key][1]]
+        assertions.sort(key=lambda item: item[0]["turn_sequence"], reverse=True)
+        selected, heads = [], {}
+
+        def people(item):
+            # A verified person can use more than one account. Participation is
+            # personal state; this never transfers an account's administrator grant.
+            return frozenset(m["person_id"] for m in item[0]["messages"])
+
+        for item in assertions:
+            key = people(item)
+            if key not in heads:
+                selected.append(item)
+                heads[key] = item[0]["turn_id"]
+        # Spend the remaining window on the original context before repeating
+        # a later stance by the same author. The reader, not a regex, decides
+        # whether each natural statement is adoption, uncertainty or exit.
+        remainder = sorted(
+            (item for item in assertions if item not in selected),
+            key=lambda item: item[0]["turn_sequence"],
+        )
+        # Older state is context for a newer source, never a substitute when
+        # that source is too large or fails its independent freshness check.
+        requires = {item[0]["turn_id"]: heads[people(item)] for item in remainder}
+        return [project([item]) for item in selected + remainder], True, requires
     recent_fact = bool(
         asks_fact
         and ranked
@@ -212,7 +263,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
                 for item in candidates
                 if item[0]["turn_sequence"] > newest and scores[item[0]["turn_id"]][1]
             ]
-            return [project([item]) for item in following + assertions], True
+            return [project([item]) for item in following + assertions], True, {}
     if not topic_return or (
         (not compact or recent_fact)
         and ranked[0][0]["turn_id"] in recent_ids
@@ -223,7 +274,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
         # not overlapping historical spans that crowd out the preceding turn.
         # Raw recent confirmations can fit even when verbose bot replies cannot.
         # A correction anchor still needs its earlier description as one batch.
-        return [project([item]) if asks_fact else [item] for item in candidates], False
+        return [project([item]) if asks_fact else [item] for item in candidates], False, {}
     chronological = list(reversed(candidates))
     positions = {g["turn_id"]: i for i, (g, _) in enumerate(chronological)}
 
@@ -266,4 +317,4 @@ def retrieval_batches(turn, candidates, limit, *, compact=False):
             seen.update(ids)
         # Never trim a required follow-up merely because an overlapping batch
         # appeared earlier in the priority list: that earlier batch may not fit.
-    return batches, True
+    return batches, True, {}
