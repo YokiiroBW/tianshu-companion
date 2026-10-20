@@ -8,6 +8,7 @@ import sqlite3
 import shutil
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 import uuid
 
@@ -450,3 +451,97 @@ def test_real_postgres_read_only_maintenance_uses_bound_backend(tmp_path, pg_set
         assert store.source_head() == head
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    "component,missing",
+    [
+        ("main", "replies"),
+        ("main", "companion_schema"),
+        ("main", "*"),
+        ("observations", "inbox"),
+        ("journal", "outbound"),
+        ("rpc", "deliveries"),
+        ("rpc", "nonebot_schema"),
+    ],
+)
+def test_ready_postgres_missing_business_tables_never_recreates_empty_facts(
+    tmp_path, pg_settings, component, missing
+):
+    from tianshu_storage import StorageOptions, StorageRuntime
+    from tianshu_companion.observation import Observations
+    from tianshu_nonebot.journal import Journal
+    from tianshu_nonebot.rpc import AdapterService
+
+    path = tmp_path / "synthetic.sqlite"
+
+    async def accounts():
+        return []
+
+    async def send(*args):
+        raise AssertionError("Recovery must not send")
+
+    def open_component():
+        if component == "main":
+            store = Store(path, settings=pg_settings)
+            return store.db, store.storage_runtime, store.close
+        if component == "journal":
+            journal = Journal(path, storage_backends=pg_settings["storage_backends"])
+            return journal.db, journal.storage_runtime, journal.close
+        if component == "rpc":
+            rpc = AdapterService(
+                path, "nonebot", accounts, send, storage_backends=pg_settings["storage_backends"]
+            )
+            return rpc.db, rpc.storage_runtime, rpc.close
+        runtime = StorageRuntime(
+            StorageOptions.from_settings(pg_settings),
+            service="companion",
+            state_directory=str(path) + ".storage",
+        )
+        runtime.start()
+        try:
+            observations = Observations(path, None, storage_runtime=runtime)
+            runtime.finalize()
+            db = observations.database.connect(isolation_level=None)
+        except BaseException:
+            runtime.close()
+            raise
+
+        def close():
+            db.close()
+            runtime.close()
+
+        return db, runtime, close
+
+    db, runtime, close = open_component()
+    assert runtime.backend == "postgresql"
+    marker = runtime.state_path.read_bytes()
+    state_directory = runtime.state_directory
+    if missing == "*":
+        missing_tables = [
+            row[0]
+            for row in db.native(
+                "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname=current_schema() "
+                "AND tablename!='__tianshu_storage_binding'"
+            )
+        ]
+    else:
+        missing_tables = [missing]
+    db.native("DROP TABLE " + ",".join(missing_tables))
+    close()
+    legacy = path.read_bytes() if path.exists() else None
+    with pytest.raises(RuntimeError, match="PostgreSQL tables missing"):
+        open_component()
+    assert runtime.state_path.read_bytes() == marker
+    assert (path.read_bytes() if path.exists() else None) == legacy
+    with closing(
+        StorageRuntime.open_existing(
+            StorageOptions.from_settings(pg_settings),
+            service="companion" if component in {"main", "observations"} else "nonebot",
+            state_directory=state_directory,
+            name=component,
+            path=path,
+        )
+    ) as current:
+        for table in missing_tables:
+            assert current.execute("SELECT to_regclass(?)", (table,)).fetchone()[0] is None

@@ -91,6 +91,26 @@ def verify_rows(connection, table, columns, order, checksum, count):
         raise RuntimeError("Companion migration field verification failed")
 
 
+def existing_schema(connection, required):
+    """A ready shared binding is recovery evidence, never permission to recreate facts."""
+    state = connection.native(
+        "SELECT state FROM __tianshu_storage_binding WHERE singleton=1"
+    ).fetchone()
+    if state is None or state[0] not in {"initializing", "ready"}:
+        raise RuntimeError("Companion PostgreSQL binding state invalid")
+    if state[0] == "initializing":
+        return False
+    tables = {
+        row[0]
+        for row in connection.native(
+            "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname=current_schema()"
+        )
+    }
+    if not set(required) <= tables:
+        raise RuntimeError("Companion PostgreSQL tables missing")
+    return True
+
+
 def dialect(connection, sql, parameters):
     text = sql.strip().rstrip(";")
     if text.upper() == "PRAGMA USER_VERSION":
@@ -146,6 +166,11 @@ def prepare(connection, source, payloads=None):
     version = source.execute("PRAGMA user_version").fetchone()[0] if source else 0
     if version not in range(11):
         raise RuntimeError("Unsupported Companion migration source")
+    if existing_schema(connection, TABLES | {"companion_schema", "companion_indexes"}):
+        existing = connection.native("SELECT version FROM companion_schema WHERE id=1").fetchone()
+        if existing is None or existing[0] not in range(11) or source is not None:
+            raise RuntimeError("Unsupported Companion target schema")
+        return
     connection.native(
         "CREATE TABLE IF NOT EXISTS companion_schema(id INTEGER PRIMARY KEY,version INTEGER NOT NULL)"
     )

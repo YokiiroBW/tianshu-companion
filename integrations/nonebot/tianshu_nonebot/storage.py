@@ -53,6 +53,25 @@ def open_database(path, logical_name, schema_sql, tables, *, settings=None, orde
     )
 
     def prepare(connection, source):
+        state = connection.native(
+            "SELECT state FROM __tianshu_storage_binding WHERE singleton=1"
+        ).fetchone()
+        if state is None or state[0] not in {"initializing", "ready"}:
+            raise RuntimeError("NoneBot PostgreSQL binding state invalid")
+        if state[0] == "ready":
+            actual = {
+                row[0]
+                for row in connection.native(
+                    "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname=current_schema()"
+                )
+            }
+            required = set(tables) | {"nonebot_schema"}
+            if not required <= actual:
+                raise RuntimeError("NoneBot PostgreSQL tables missing")
+            version = connection.native("SELECT version FROM nonebot_schema").fetchone()
+            if version is None or version[0] != 1 or source is not None:
+                raise RuntimeError("Unsupported NoneBot target schema")
+            return
         if (
             source is not None
             and logical_name == "journal"

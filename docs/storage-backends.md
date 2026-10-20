@@ -29,6 +29,8 @@ python -m pip install --no-deps -e .
 
 Companion 启动把 `main` 和启用时的 `observations` 作为同一激活集合。迁移读取原 SQLite 一致快照，保留文档、rowid 顺序、schema 版本、source_head 和所有幂等/回执状态，完成后才激活。原 SQLite 保留；应用新写入只去 PG，不双写。PG 主库用 session advisory lock 保持单运行时，写事务保留最外层提交和 source_head 推进，日记读取使用独立只读一致快照。原生 jsonb 路径、数字/布尔类型、数组展开、表达式及部分索引由 `storage_postgres.py` 明确拥有；索引定义不一致拒绝启动。
 
+共享绑定已 `ready` 时，四种逻辑库均在任何 CREATE 之前验证产品必需表集及版本。关键表、版本表或整组产品表丢失都拒绝启动，不能建空表掩盖回执/幂等丢失。共享 0.1 迁移合同允许产品在 prepare 中只读绑定状态（`initializing` 为新库、`ready` 为已接续）；产品不修改共享绑定。恢复应补回一致 SQL/文件/控制副本后重试。
+
 `replies.v2_request` 中的 base64 媒体先以内容摘要命名写入文件，SQL 保存文件引用和原完整请求摘要。读取时核对文件哈希并重建相同 wire，不能读取时明确不可用；unknown 仍只查询回执，不自动发送。大于等于 64 KiB 的 `write_materials.material` 同样外置；日记、人格文本、人工原创章节及其修订继续放 SQL。文件提交先于 SQL 引用提交，没有自动删除引用文件。已有内联载荷会在受控启动中外置，SQLite 首次转换前保留独立备份；表示方式转换不推进 source_head。
 
 NoneBot 的独立进程可以使用不同 PG 地址和命名空间。两种已有接入方式保留：pull 插件的 `Journal` 和主动 RPC 插件分别登记 `journal` / `rpc`，不合并账本。NoneBot 配置支持同形 `storage_backends`；独立 OneBot 主机也可通过 `--storage-config /config/storage.json` 读取包含上述字段的 JSON，或直接使用环境变量。`python -m tianshu_nonebot.onebot --show-key --data-dir /data` 和 `python -m tianshu_nonebot.rpc show-key /data/adapter.sqlite3` 只读当前后端；配置文件可带 `--storage-config`，不会打开旧 SQLite 作为 PG 的替代。事件排序、连接绑定、pending/inflight/unknown、claimed→unknown、SDK 回执和 ACK 保持原规则。共享 RPC 源与 NoneBot/AstrBot 现有分发副本继续同步，AstrBot 默认账本没有切换后端。

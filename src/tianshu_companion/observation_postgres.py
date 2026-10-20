@@ -2,10 +2,12 @@
 
 import hashlib
 
-from .storage_postgres import hash_row, verify_rows
+from .storage_postgres import existing_schema, hash_row, verify_rows
 
 
 def prepare(connection, source):
+    if existing_schema(connection, {"inbox"}):
+        return
     connection.native("""CREATE TABLE IF NOT EXISTS inbox (
         source_ref TEXT COLLATE "C" PRIMARY KEY,digest TEXT NOT NULL,
         instance_id TEXT NOT NULL,self_id TEXT NOT NULL,
