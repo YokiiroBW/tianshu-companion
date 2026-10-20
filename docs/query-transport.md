@@ -15,7 +15,7 @@ Memory 查询与 check 的来源屏障可能提交水位/失效记录。因此�
 
 所有 JsonService.call 调用点已核对：Origins.input_access/resolve、Memory.identity/check_sources/select/profiles/commit、Gateway.generate（生成及回执）、Sender.send，以及 NoneBot Bridge.flush 的 ingest-actors。source-access/read 的 operation=input 可能冻结路由集合或签发 actor context，明确排除；即使名字含 read，也不属于本次恢复范围。register、turn-commits/consume、revise、ingest、ingest-actors、渠道 send 和 chat/completions 均不重放；未来新路径默认不重试。
 
-获取响应头之前的 HTTPX RemoteProtocolError、ReadError、WriteError 可以触发一次连接恢复；第二次仍失败则沿用 dependency_unavailable。既有查询白名单在 HTTP 429/503 且响应明确为 `execution_state=not_started`、`retryable=true`、错误为 `queue_full` 或 `dependency_unavailable` 时退避重试。TS-160 将这层尝试从四次降到两次，减少与服务端 barrier、持久准备队列叠加后的重复工作。其余 HTTP 错误/拒绝/重定向、JSON/schema/业务校验失败、响应体中途断开、连接建立/证书错误、连接/读取/连接池超时均不重试。
+获取响应头之前的 HTTPX RemoteProtocolError、ReadError、WriteError 可以触发一次连接恢复；第二次仍失败则沿用 dependency_unavailable。既有查询白名单在 HTTP 429/503、错误为 `queue_full` 或 `dependency_unavailable`，或 HTTP 408、错误为 `timeout` 时，只有响应同时明确为 `execution_state=not_started`、`retryable=true` 才退避重试。TS-160 将这层尝试从四次降到两次，TS-218 补齐明确未执行的只读 408，两次仍共用原 15 秒总预算。其余 HTTP 错误/拒绝/重定向、JSON/schema/业务校验失败、响应体中途断开、连接建立/证书错误、连接/读取/连接池超时均不重试；408 的执行状态未知、缺失或不可重试，以及任何写命令也不重放。
 
 准备工作全局受既有 model_slots 约束，按会话游标轮转，保留每会话两个活动轮次和既有队列上限。开始准备及模型前复用 Platform 的原回复 context 续办：仍核对当前角色、连接、策略、来源和精确账户/会话，不能本地延长授权。历史上下文保留 source_turn_id，原发言人的租约不足时续办原授权；不会拿当前提问者的授权冒充另一人。完整上下文组装后统一做模型前 preflight，各读取自身仍验证权限与版本。
 
@@ -30,6 +30,8 @@ TS-171：准备与生成分阶段计数，生成不再同时占住准备名额�
 一次 `_prepare_context` 内，依赖和近期对话继承的完全相同核验按完整签名合并，成功或失败只在这次准备中复用；下一次准备、模型前和每次表达发送前都重新核验。不存在跨轮次或按时间失效的授权缓存。不同来源轮次仍逐项核对作者、范围、渠道、绑定版本及当前来源；需要续办时只续办该历史作者的原租约。
 
 TS-190：单个核验阶段中，最多四项独立检查并行执行，仍受各 JsonService 现有四路查询容量和总超时约束。同阶段中 service、完整 origin、channel、scope 完全一致的授权读取可供文本/画像等不同域共用；不同来源租约即使属于同一人物也不合并。原来源轮次的续办最多一次，域版本和当前本地来源状态仍各自检查。阶段退出或取消时回收全部读取任务，未完成或失败的检查不能记为成功；不把这次权限结果带到下次模型前或发送前核验。此改动没有新增端口、权限、配置项或模型容量。
+
+TS-218：模型前和每次发送前也创建新的 `VerificationCheckpoint`。续办当前来源后，授权、管理员状态、当前记忆快照、继承材料及陪读状态独立核验；完全相同的读取仅在本次检查点共享，所有来源的本地作者、渠道、绑定与版本仍各自检查。任一失败立即取消并等待其他只读任务结束，避免已失败的准备继续等慢查询；不保留跨检查点权限缓存，不重放已开始的模型或表达。
 
 TS-192：对本会话已经关闭流、处于reconciling的原生表达，使用现有work_turns索引与_reconcile收敛回执，不必等较早轮次结束生成。Platform继续拥有原表达的发送顺序；这条路径不生成新消息，只查询已有表达并按原幂等规则结束表达。未知回执仍保持未知及原恢复期限，不重发已发送片段。普通待发送回复仍通过first_work_turn依次发送，尚在生成的开放流不由此提前终结。计时区分最后实际发送和Core完成确认，收尾改善不冒称模型生成提速。
 

@@ -281,8 +281,12 @@ class JsonService:
                 code = value.get("code") if isinstance(value, dict) else None
                 if (
                     retry_query
-                    and response.status_code in {429, 503}
-                    and code in {"queue_full", "dependency_unavailable"}
+                    and (
+                        response.status_code in {429, 503}
+                        and code in {"queue_full", "dependency_unavailable"}
+                        or response.status_code == 408
+                        and code == "timeout"
+                    )
                     and not_started
                     and value.get("retryable") is True
                 ):

@@ -4,6 +4,7 @@ import re
 
 from .clients import epoch, uid
 from .contracts import Fault
+from .context_time import reported_times
 
 
 SOURCE_INSTRUCTION = """
@@ -20,7 +21,10 @@ human_source_view 按发言者汇集选中的原话。同一 speaker_ref/person_
 问“说好了/大家都同意了吗”时，先说明证据支持的状态：仅有提议或部分人的确认就
 明确说是提议或部分确认，不要先回答“是的/已经定下”再补充别人尚未确认。
 这里只包含选中消息的作者，不是完整群成员名册；缺少消息不能证明未曾表达态度。
-时间戳是消息时间，不是正文事件时间。相对日期属于含有该时间词的具体事件，
+transport_clock 才是系统核实的消息钟点，不是正文事件时间；reported_time_phrases
+只定位原话里的时间词。发言者自述“我这里是×点”是自述参考钟点，不是系统核实的发送时刻。
+问某个时间词指事件还是发言，只回答该归属，不额外补另一个钟点。
+相对日期属于含有该时间词的具体事件，
 不得顺带限定同句中的姓名、物品名称、习惯等其他事实。同一个人后来明确报告
 已完成的事，是对先前打算的进展更新；仅凭消息间隔短、先前计划在明天，不能
 推断后来报告不可信或事情不可能完成。发生的具体时刻没说就保留未知，不拿
@@ -243,11 +247,12 @@ def dialogue_sources(turn, context):
         view[source["speaker_ref"]]["messages"].append(
             dict(
                 message_ref=ref,
-                message_received_at=message["accepted_at"],
-                message_sent_at=message["sent_at"],
                 first_person_ref=source["speaker_ref"],
-                time_basis="message_timestamp_not_event_time",
+                time_basis="speaker_wording_not_verified_event_or_transport_time",
                 text="\n".join(p["text"] for p in message["parts"] if p["kind"] == "text"),
+                reported_time_phrases=reported_times(
+                    "\n".join(p["text"] for p in message["parts"] if p["kind"] == "text")
+                ),
             )
         )
     return dict(

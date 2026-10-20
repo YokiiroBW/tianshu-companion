@@ -8,6 +8,53 @@ from tianshu_companion.contracts import Fault
 
 
 class CongestionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_nonexecuted_read_timeout_recovers_once_with_the_same_request(self):
+        seen = []
+
+        async def handle(request):
+            seen.append((request.content, request.headers))
+            if len(seen) == 1:
+                return httpx.Response(
+                    408, json=dict(code="timeout", execution_state="not_started", retryable=True)
+                )
+            return httpx.Response(200, json={"ok": True})
+
+        client = JsonService(
+            "https://synthetic.invalid", "synthetic", transport=httpx.MockTransport(handle)
+        )
+        self.addAsyncCleanup(client.close)
+        self.assertEqual(
+            {"ok": True},
+            await client.call("/internal/v1/memory/context/query", {"request_id": "same"}),
+        )
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], seen[1])
+
+    async def test_timeout_without_nonexecution_proof_and_commands_never_replay(self):
+        for path, state, retryable in [
+            ("/internal/v1/memory/context/query", "unknown", True),
+            ("/internal/v1/memory/context/query", "not_started", False),
+            ("/internal/v1/memory/context/query", None, True),
+            ("/internal/v1/identity/register", "not_started", True),
+        ]:
+            calls = []
+
+            async def handle(request):
+                calls.append(request)
+                return httpx.Response(
+                    408, json=dict(code="timeout", execution_state=state, retryable=retryable)
+                )
+
+            client = JsonService(
+                "https://synthetic.invalid", "synthetic", transport=httpx.MockTransport(handle)
+            )
+            self.addAsyncCleanup(client.close)
+            with self.assertRaises(Fault):
+                await client.call(
+                    path, {"request_id": "same"}, uncertain_write=path.endswith("register")
+                )
+            self.assertEqual(len(calls), 1)
+
     async def test_preparation_is_globally_bounded_and_queued_conversations_drain(self):
         h = Harness(silence_ms=0)
         self.addAsyncCleanup(h.core.close)

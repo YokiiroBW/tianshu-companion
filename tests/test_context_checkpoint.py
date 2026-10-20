@@ -15,6 +15,87 @@ class ContextCheckpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.h.core.close()
 
+    async def test_peer_failure_cancels_and_drains_slow_independent_reads(self):
+        from tianshu_companion.context_checks import read_parallel
+
+        entered, stopped = asyncio.Event(), asyncio.Event()
+
+        async def slow():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        async def failed():
+            await entered.wait()
+            raise Fault("scope_changed")
+
+        with self.assertRaises(Fault) as error:
+            await asyncio.wait_for(read_parallel([slow, failed]), 1)
+        self.assertEqual(error.exception.code, "scope_changed")
+        self.assertTrue(stopped.is_set())
+
+    async def test_preflight_overlaps_independent_reads_and_rechecks_revocation(self):
+        previous = (await self.turns())[0]
+        entered, release = set(), asyncio.Event()
+        together = asyncio.Event()
+        original_resolve = self.h.origins.resolve
+        original_select = self.h.memory.select
+        original_book = self.h.core.book_reading.verify
+
+        async def wait(name):
+            entered.add(name)
+            if len(entered) == 3:
+                together.set()
+            await release.wait()
+
+        async def resolve(*args, **kwargs):
+            await wait("authority")
+            return await original_resolve(*args, **kwargs)
+
+        async def select(*args, **kwargs):
+            await wait("memory")
+            return await original_select(*args, **kwargs)
+
+        async def book(*args, **kwargs):
+            await wait("reading")
+            return await original_book(*args, **kwargs)
+
+        self.h.origins.resolve = resolve
+        self.h.memory.select = select
+        self.h.core.book_reading.verify = book
+        job = asyncio.create_task(self.h.core._preflight(previous))
+        try:
+            await asyncio.wait_for(together.wait(), 1)
+        finally:
+            release.set()
+            await job
+        self.assertEqual(entered, {"authority", "memory", "reading"})
+        self.h.origins.values[previous["origin"]["assertion_ref"]]["revoked"] = True
+        with self.assertRaises(Fault):
+            await self.h.core._preflight(previous)
+
+    async def test_same_snapshot_with_distinct_local_turn_refs_shares_only_the_peer_read(self):
+        previous = (await self.turns())[0]
+        first = scope_check(previous)
+        # Both local rows still receive local provenance validation. Their exact
+        # remote request can coincide after a previous valid snapshot is reused.
+        second = dict(first, source_turn_id=None)
+        calls = 0
+        original = self.h.memory.history
+
+        async def history(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return await original(*args, **kwargs)
+
+        self.h.memory.history = history
+        await self.h.core._verify_checks(previous, [first, second])
+        self.assertEqual(calls, 1)
+        await self.h.core._verify_checks(previous, [first, second])
+        self.assertEqual(calls, 2)
+
     async def turns(self, count=1):
         for i in range(count):
             await self.h.ingest(text=f"第{i}本书放在桌上", group=True, channel="group:checks")

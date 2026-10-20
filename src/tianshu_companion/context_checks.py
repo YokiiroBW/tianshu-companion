@@ -24,14 +24,26 @@ async def _finish(tasks, *, cancel=False):
             task.exception()
 
 
-class _Checkpoint:
+class VerificationCheckpoint:
     def __init__(self):
         self.reads = {}
+        self.slots = asyncio.Semaphore(4)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        await self.close()
 
     async def once(self, key, read):
         signature = digest(key)
         if signature not in self.reads:
-            self.reads[signature] = _start(read())
+
+            async def bounded():
+                async with self.slots:
+                    return await read()
+
+            self.reads[signature] = _start(bounded())
         return await self.reads[signature]
 
     async def close(self):
@@ -48,13 +60,12 @@ async def read_parallel(reads):
 
     tasks = [_start(run(read)) for read in reads]
     try:
-        await _finish(tasks)
-        return [task.result() for task in tasks]
+        return await asyncio.gather(*tasks)
     finally:
         await _finish(tasks, cancel=True)
 
 
-async def verify_checks(checks, verify, *, verified=None):
+async def verify_checks(checks, verify, *, verified=None, checkpoint=None):
     # Callers may share exact results only while assembling this one prompt.
     # No authority task or result survives a later preflight/delivery checkpoint.
     verified = {} if verified is None else verified
@@ -68,7 +79,8 @@ async def verify_checks(checks, verify, *, verified=None):
             pending.append((signature, check))
     if not pending:
         return
-    checkpoint = _Checkpoint()
+    owns_checkpoint = checkpoint is None
+    checkpoint = VerificationCheckpoint() if owns_checkpoint else checkpoint
     slots = asyncio.Semaphore(4)
 
     async def run(signature, check):
@@ -82,9 +94,8 @@ async def verify_checks(checks, verify, *, verified=None):
 
     tasks = [_start(run(*item)) for item in pending]
     try:
-        await _finish(tasks)
-        for task in tasks:
-            task.result()
+        await asyncio.gather(*tasks)
     finally:
         await _finish(tasks, cancel=True)
-        await checkpoint.close()
+        if owns_checkpoint:
+            await checkpoint.close()

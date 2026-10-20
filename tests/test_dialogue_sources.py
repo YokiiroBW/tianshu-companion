@@ -48,6 +48,7 @@ def test_source_timeline_groups_accounts_and_uses_metadata_not_dates_in_text():
     assert view["participants"][1]["relation_to_requester"] == "other_participant"
     assert view["participants"][1]["messages"][0]["first_person_ref"] == b["speaker_ref"]
     assert (
-        view["participants"][1]["messages"][0]["time_basis"] == "message_timestamp_not_event_time"
+        view["participants"][1]["messages"][0]["time_basis"]
+        == "speaker_wording_not_verified_event_or_transport_time"
     )
     assert context == unchanged

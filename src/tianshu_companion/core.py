@@ -1521,13 +1521,15 @@ class Core(Delivery):
                     messages[0]["content"] += BOOK_READING_INSTRUCTION
                 human_sources = dialogue_sources(turn, context.data)
                 prompt["human_source_view"] = human_sources["view"]
+                from .context_time import dialogue_time_view
+
+                prompt, source_timeline = dialogue_time_view(prompt, human_sources["metadata"])
+                context_bytes = len(canonical({k: prompt[k] for k in context.data}).encode())
                 messages[1]["content"] = canonical(prompt)
                 messages[0]["content"] += "\nMaterial provenance: " + canonical(
                     material_sources(context.data)
                 )
-                messages[0]["content"] += "\nHuman source timeline: " + canonical(
-                    human_sources["metadata"]
-                )
+                messages[0]["content"] += "\nHuman source timeline: " + canonical(source_timeline)
                 if len(canonical(messages).encode()) > 524288:
                     raise Fault("budget_exceeded")
                 with self.store.transaction():
@@ -1545,7 +1547,7 @@ class Core(Delivery):
                     turn = fresh
                     turn["context_revision"] = context_metadata["context_revision"]
                     turn["short_context"] = context_metadata
-                    turn["context_budget_used"] = dict(tokens=context.used, bytes=context.used)
+                    turn["context_budget_used"] = dict(tokens=context_bytes, bytes=context_bytes)
                     if turn.get("model_selection"):
                         verify_lease(turn["model_selection"]["expires_at"], self.clock())
                     turn["phase"] = "generating"
@@ -1824,11 +1826,12 @@ class Core(Delivery):
             if not sources_current(self.store, previous):
                 raise Fault("scope_changed")
 
-    async def _verify_checks(self, turn, checks, *, verified=None):
+    async def _verify_checks(self, turn, checks, *, verified=None, checkpoint=None):
         await verify_checks(
             checks,
             lambda check, checkpoint: self._verify_context_check(turn, check, checkpoint),
             verified=verified,
+            checkpoint=checkpoint,
         )
 
     async def _verify_context_check(self, turn, check, checkpoint):
@@ -1871,31 +1874,65 @@ class Core(Delivery):
         if binding != check["binding_version"]:
             raise Fault("scope_changed")
         if check["version_domain"] == PROFILE_DOMAIN:
-            await self.memory.profiles(
-                check["origin"],
-                scope,
-                check["target"],
-                check["text"],
-                check["selection"],
-                dict(tokens=0, bytes=0),
-                check["scope_version"],
-            )
-        elif check["version_domain"] == TEXT_INPUT_DOMAIN:
-            await self.memory.input_history(check["origin"], scope, known=check["history_snapshot"])
-        elif check["version_domain"] == TEXT_DOMAIN:
-            if check.get("history_snapshot") is not None:
-                await self.memory.history(check["origin"], scope, known=check["history_snapshot"])
-            else:
-                await self.memory.select(
+            await checkpoint.once(
+                [
+                    "profiles",
                     check["origin"],
                     scope,
-                    "context validity",
+                    check["target"],
+                    check["text"],
+                    check["selection"],
+                    check["scope_version"],
+                ],
+                lambda: self.memory.profiles(
+                    check["origin"],
+                    scope,
+                    check["target"],
+                    check["text"],
+                    check["selection"],
                     dict(tokens=0, bytes=0),
                     check["scope_version"],
-                    known=check.get("memory_snapshot"),
+                ),
+            )
+        elif check["version_domain"] == TEXT_INPUT_DOMAIN:
+            await checkpoint.once(
+                ["input_history", check["origin"], scope, check["history_snapshot"]],
+                lambda: self.memory.input_history(
+                    check["origin"], scope, known=check["history_snapshot"]
+                ),
+            )
+        elif check["version_domain"] == TEXT_DOMAIN:
+            if check.get("history_snapshot") is not None:
+                await checkpoint.once(
+                    ["history", check["origin"], scope, check["history_snapshot"]],
+                    lambda: self.memory.history(
+                        check["origin"], scope, known=check["history_snapshot"]
+                    ),
+                )
+            else:
+                await checkpoint.once(
+                    [
+                        "select",
+                        check["origin"],
+                        scope,
+                        "context validity",
+                        check["scope_version"],
+                        check.get("memory_snapshot"),
+                    ],
+                    lambda: self.memory.select(
+                        check["origin"],
+                        scope,
+                        "context validity",
+                        dict(tokens=0, bytes=0),
+                        check["scope_version"],
+                        known=check.get("memory_snapshot"),
+                    ),
                 )
         elif check["version_domain"] == RELATIONSHIP_DOMAIN:
-            await verify_relationship(self.relationships, check, self.clock())
+            await checkpoint.once(
+                ["relationship", check],
+                lambda: verify_relationship(self.relationships, check, self.clock()),
+            )
         else:
             raise Fault("invalid_input")
 
@@ -2050,32 +2087,69 @@ class Core(Delivery):
             raise Fault("scope_changed")
         self._check_input_versions(turn)
         await self.continue_delivery_origin(turn)
-        await self._check_qq_admin(turn)
-        envelope = command(turn["origin"], uid("check"), self.clock())
-        _, _, binding = await self._authorize(
-            turn["service"],
-            envelope,
-            turn["bundle"]["collection_key"]["channel"],
-            scope=turn["scope"],
-        )
-        if binding != turn["binding_version"]:
-            raise Fault("scope_changed")
-        await self.memory.select(
-            turn["origin"],
-            turn["scope"],
-            self._input_text(turn) or "media",
-            dict(tokens=0, bytes=0),
-            turn["scope_version"],
-            known=turn.get("preparation"),
-        )
-        await self._verify_checks(
-            turn,
-            merge_checks(
-                turn.get("context_checks", []),
-                turn.get("profile_checks", []),
-            ),
-        )
-        await self.book_reading.verify(turn)
+        from .context_checks import VerificationCheckpoint, read_parallel
+
+        # A fresh checkpoint at each model/send boundary. Independent peer
+        # checks overlap; exact authority reads share only this checkpoint.
+        async with VerificationCheckpoint() as checkpoint:
+
+            async def authorize():
+                _, _, binding = await checkpoint.once(
+                    [
+                        "authorize",
+                        dict(
+                            service=turn["service"],
+                            origin=turn["origin"],
+                            channel=turn["bundle"]["collection_key"]["channel"],
+                            scope=turn["scope"],
+                        ),
+                    ],
+                    lambda: self._authorize(
+                        turn["service"],
+                        command(turn["origin"], uid("check"), self.clock()),
+                        turn["bundle"]["collection_key"]["channel"],
+                        scope=turn["scope"],
+                    ),
+                )
+                if binding != turn["binding_version"]:
+                    raise Fault("scope_changed")
+
+            await read_parallel(
+                [
+                    authorize,
+                    lambda: checkpoint.once(
+                        ["qq_admin", turn["id"]], lambda: self._check_qq_admin(turn)
+                    ),
+                    lambda: checkpoint.once(
+                        [
+                            "select",
+                            turn["origin"],
+                            turn["scope"],
+                            self._input_text(turn) or "media",
+                            turn["scope_version"],
+                            turn.get("preparation"),
+                        ],
+                        lambda: self.memory.select(
+                            turn["origin"],
+                            turn["scope"],
+                            self._input_text(turn) or "media",
+                            dict(tokens=0, bytes=0),
+                            turn["scope_version"],
+                            known=turn.get("preparation"),
+                        ),
+                    ),
+                    lambda: self._verify_checks(
+                        turn,
+                        merge_checks(
+                            turn.get("context_checks", []), turn.get("profile_checks", [])
+                        ),
+                        checkpoint=checkpoint,
+                    ),
+                    lambda: checkpoint.once(
+                        ["book_reading", turn["id"]], lambda: self.book_reading.verify(turn)
+                    ),
+                ]
+            )
         self._check_input_versions(turn)
 
     async def _check_qq_admin(self, turn):

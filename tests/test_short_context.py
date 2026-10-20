@@ -300,6 +300,16 @@ class ShortContextTests(unittest.IsolatedAsyncioTestCase):
         await h.cycles()
         payload = self.prompt()["recent_dialogue"]
         self.assertEqual(2, len(payload[0]["messages"]))
+        # Context admission budgets the original sourced rows. Model rendering
+        # now removes duplicate transport clocks, without changing this budget.
+        for group in payload:
+            source = h.core.store.get("turns", group["turn_id"])
+            group["messages"] = source["bundle"]["messages"]
+            receipts = {
+                r["id"]: r["receipt"] for r in h.core.store.turn_replies(group["turn_id"], "sent")
+            }
+            for reply in group["replies"]:
+                reply["observed_at"] = receipts[reply["reply_id"]]["observed_at"]
         size = len(canonical(payload).encode("utf-8"))
         turn = h.turns()[1]
         whole, meta = select_recent(
