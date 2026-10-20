@@ -6,6 +6,7 @@ import base64
 import csv
 import hashlib
 import io
+import shutil
 import sys
 import zipfile
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT.parent / ".runtime" / "adapter-artifacts"
 VERSION = "0.6.0"
+STORAGE_WHEEL = ROOT.parent / "vendor" / "tianshu_storage-0.1.0-py3-none-any.whl"
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
@@ -76,6 +78,7 @@ def main() -> None:
         f"Version: {VERSION}\nRequires-Python: >=3.12\n"
         "Requires-Dist: nonebot2[fastapi]>=2.5,<2.6\n"
         "Requires-Dist: nonebot-adapter-onebot>=2.4,<2.5\n"
+        "Requires-Dist: tianshu-storage==0.1.0\n"
     ).encode()
     entries[dist + "/README.md"] = (ROOT / "nonebot" / "ADAPTER.md").read_bytes()
     record = dist + "/RECORD"
@@ -84,7 +87,9 @@ def main() -> None:
     with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, data in sorted(entries.items()):
             _write_entry(archive, name, data)
-    for path in (astr_zip, wheel):
+    storage_wheel = OUT / STORAGE_WHEEL.name
+    shutil.copyfile(STORAGE_WHEEL, storage_wheel)
+    for path in (astr_zip, wheel, storage_wheel):
         print(f"{path} sha256={hashlib.sha256(path.read_bytes()).hexdigest()}")
 
 

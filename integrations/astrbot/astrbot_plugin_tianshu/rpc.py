@@ -212,17 +212,14 @@ class AdapterService:
         accounts: Callable[[], Awaitable[list[dict[str, str]]]],
         send: Callable[[str, str, str], Awaitable[str | int]],
         send_media: Callable[[str, str, str, list[dict]], Awaitable[str | int]] | None = None,
+        *,
+        storage_backends: dict | None = None,
     ):
         if adapter not in {"astrbot", "nonebot", "onebot"}:
             raise ValueError("adapter")
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        self.db.execute("PRAGMA busy_timeout=5000")
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript(
-            """
+        schema_sql = """
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS bindings (
                 connection_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
@@ -274,7 +271,33 @@ class AdapterService:
                 last_error TEXT, last_error_at REAL
             );
             """
-        )
+        self.storage_runtime = None
+        if adapter in {"nonebot", "onebot"}:
+            from tianshu_nonebot.storage import open_database
+
+            self.storage_runtime, self.db = open_database(
+                path,
+                "rpc",
+                schema_sql,
+                (
+                    "meta",
+                    "bindings",
+                    "apply_requests",
+                    "events",
+                    "deliveries",
+                    "observation_accounts",
+                    "observation_requests",
+                    "observations",
+                    "observation_health",
+                ),
+                settings={"storage_backends": storage_backends or {}},
+            )
+        else:
+            self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        self.db.execute("PRAGMA busy_timeout=5000")
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.executescript(schema_sql)
         try:
             if os.name != "nt":
                 os.chmod(path, 0o600)
@@ -303,7 +326,12 @@ class AdapterService:
         return value
 
     def close(self) -> None:
-        self.db.close()
+        if self.storage_runtime is not None:
+            from tianshu_nonebot.storage import close_database
+
+            close_database(self.storage_runtime, self.db)
+        else:
+            self.db.close()
 
     def _binding(self, connection_id: str) -> tuple | None:
         return self.db.execute(
@@ -1186,7 +1214,18 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description="Display an installed Tianshu plugin key locally")
     parser.add_argument("command", choices=["show-key"])
     parser.add_argument("database", type=Path)
+    parser.add_argument("--storage-config", type=Path)
     args = parser.parse_args()
+    if __package__ == "tianshu_nonebot" or Path(__file__).parent.name == "tianshu_nonebot":
+        from tianshu_nonebot.storage import read_access_key
+
+        settings = (
+            json.loads(args.storage_config.read_text(encoding="utf-8"))
+            if args.storage_config
+            else {}
+        )
+        print(read_access_key(args.database.resolve(), settings))
+        return
     uri = args.database.resolve().as_uri() + "?mode=ro"
     with sqlite3.connect(uri, uri=True) as db:
         row = db.execute("SELECT value FROM meta WHERE key='access_key'").fetchone()

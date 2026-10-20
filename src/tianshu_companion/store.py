@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from .contracts import canonical
 from .life_read_index import create_page_index, prepare_page_index
 from . import work_index
+from .payload_files import PayloadFiles
 
 LIFE_TABLES = {
     "life_worlds",
@@ -105,8 +107,12 @@ FACT_TABLES = {"physicals", "admissions", "turns", "replies", "outbox"}
 
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, *, settings=None, storage_runtime=None):
         self._lock = None
+        self.storage_runtime = storage_runtime
+        self._finalize_storage = storage_runtime is None
+        self._temporary_files = None
+        self._postgres_owner = False
         if str(path) != ":memory:":
             path = Path(path).resolve()
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,10 +132,46 @@ class Store:
             except OSError:
                 self._lock.close()
                 raise RuntimeError("Database already has a running owner") from None
-        self.db = sqlite3.connect(path, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
+        self.path = str(path)
+        if str(path) == ":memory:":
+            self._temporary_files = tempfile.TemporaryDirectory(prefix="companion-payloads-")
+            file_root = Path(self._temporary_files.name)
+        else:
+            file_root = Path(str(path) + ".files")
+        self.payloads = PayloadFiles(file_root)
+        self.db = None
         try:
+            if str(path) != ":memory:" or settings is not None or storage_runtime is not None:
+                from tianshu_storage import StorageOptions, StorageRuntime
+                from .storage_postgres import claim_owner, dialect, prepare
+
+                if self.storage_runtime is None:
+                    self.storage_runtime = StorageRuntime(
+                        StorageOptions.from_settings(settings or {}),
+                        service="companion",
+                        state_directory=Path(str(path) + ".storage"),
+                    )
+                    self.storage_runtime.start()
+                self.database = self.storage_runtime.database(
+                    "main",
+                    path,
+                    prepare=lambda connection, source: prepare(connection, source, self.payloads),
+                    dialect=dialect,
+                )
+                self.backend = self.database.backend
+                self.db = self.database.connect(isolation_level=None)
+                if self.backend == "postgresql":
+                    claim_owner(self.db)
+                    self._postgres_owner = True
+                    self.db.companion_indexes = True
+            else:
+                self.backend = "sqlite"
+                self.db = sqlite3.connect(path, isolation_level=None)
+            self.db.row_factory = sqlite3.Row
             self._initialize(path)
+            self._migrate_payloads()
+            if self.storage_runtime is not None and self._finalize_storage:
+                self.storage_runtime.finalize()
         except BaseException:
             self.close()
             raise
@@ -149,7 +191,7 @@ class Store:
         # so no intermediate step can start without a restore point. An intermediate restore
         # point requires upgrading one step at a time.
         backed_up = False
-        if 1 <= version <= 9 and str(path) != ":memory:":
+        if self.backend == "sqlite" and 1 <= version <= 9 and str(path) != ":memory:":
             label = ".pre-life-runtime-v10-"
             backup = sqlite3.connect(str(path) + label + uuid.uuid4().hex + ".bak")
             try:
@@ -162,8 +204,9 @@ class Store:
         # restore point of its own, WAL included - before this open runs any DDL. A database
         # that already carries the correct index adds no file and no fact, and an open that
         # already took a complete pre-DDL backup above reuses it instead of adding a second.
-        backed_up = work_index.prepare(self.db, path, restored=backed_up, fresh=version == 0)
-        prepare_page_index(self.db, path, restore_point_taken=backed_up, fresh=version == 0)
+        if self.backend == "sqlite":
+            backed_up = work_index.prepare(self.db, path, restored=backed_up, fresh=version == 0)
+            prepare_page_index(self.db, path, restore_point_taken=backed_up, fresh=version == 0)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
@@ -361,7 +404,7 @@ class Store:
         ):
             self._fact_dirty = True
         self.db.execute(
-            f"INSERT INTO {table} VALUES(?,?,?,?,?,?) "
+            f"INSERT INTO {table}(id,conversation_id,position,status,deadline,body) VALUES(?,?,?,?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, "
             "position=excluded.position,status=excluded.status,deadline=excluded.deadline,"
             "body=excluded.body",
@@ -371,14 +414,14 @@ class Store:
                 item.get("sequence", 0),
                 item.get("phase", item.get("state")),
                 item.get("deadline"),
-                canonical(item),
+                canonical(self.payloads.freeze(table, item)),
             ),
         )
 
     def get(self, table, key):
         assert table in TABLES
         row = self.db.execute(f"SELECT body FROM {table} WHERE id=?", (key,)).fetchone()
-        return json.loads(row[0]) if row else None
+        return self.payloads.restore(table, json.loads(row[0])) if row else None
 
     def delete(self, table, key):
         """Bounded housekeeping delete for derived rows; never used for fact tables."""
@@ -395,12 +438,59 @@ class Store:
             query += " AND status IN (" + ",".join("?" for _ in states) + ")"
             args.extend(states)
         query += " ORDER BY position,id"
-        return [json.loads(row[0]) for row in self.db.execute(query, args)]
+        return [
+            self.payloads.restore(table, json.loads(row[0])) for row in self.db.execute(query, args)
+        ]
 
     def close(self):
-        self.db.close()
+        if self.db is not None:
+            try:
+                if self._postgres_owner:
+                    try:
+                        self.db.native(
+                            "SELECT pg_advisory_unlock(hashtextextended(current_schema(),23300))"
+                        )
+                    except sqlite3.Error:
+                        pass  # A lost PG session has already released its owner.
+            finally:
+                self._postgres_owner = False
+                try:
+                    self.db.close()
+                except sqlite3.Error:
+                    pass
         if self._lock:
             self._lock.close()
+        if self.storage_runtime is not None:
+            self.storage_runtime.close()
+        if self._temporary_files is not None:
+            self._temporary_files.cleanup()
+
+    def _migrate_payloads(self):
+        """Representation-only migration: retain every source fact and frozen wire."""
+        backed_up = False
+        with self.transaction():
+            for table in ("replies", "write_materials"):
+                cursor = self.db.execute(f"SELECT id,body FROM {table} ORDER BY id")
+                while rows := cursor.fetchmany(64):
+                    for identity, raw in rows:
+                        item = json.loads(raw)
+                        stored = self.payloads.freeze(table, item)
+                        if stored == item:
+                            continue
+                        if self.payloads.restore(table, json.loads(canonical(stored))) != item:
+                            raise RuntimeError("Companion payload migration verification failed")
+                        if self.backend == "sqlite" and self.path != ":memory:" and not backed_up:
+                            # Back up through a separate reader: this writer is still
+                            # unmodified and its reserved lock includes the WAL view.
+                            with sqlite3.connect(self.path) as source:
+                                with sqlite3.connect(
+                                    self.path + ".pre-payload-files-" + uuid.uuid4().hex + ".bak"
+                                ) as backup:
+                                    source.backup(backup)
+                            backed_up = True
+                        self.db.execute(
+                            f"UPDATE {table} SET body=? WHERE id=?", (canonical(stored), identity)
+                        )
 
     def due(self, table, states, now, limit=64, conversation_id=None):
         assert table in {"outbox", "collections"}
@@ -548,4 +638,7 @@ class Store:
         if state is not None:
             sql += " AND status=?"
             args.append(state)
-        return [json.loads(row[0]) for row in self.db.execute(sql + " ORDER BY position", args)]
+        return [
+            self.payloads.restore("replies", json.loads(row[0]))
+            for row in self.db.execute(sql + " ORDER BY position", args)
+        ]

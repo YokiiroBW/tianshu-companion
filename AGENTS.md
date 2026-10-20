@@ -4,11 +4,11 @@
 
 只在分配的目录内实施，不改其他项目或共享合同；公共入口、依赖锁和迁移主线单人负责。禁止把未配置服务显示成成功。
 
-当前 Python >=3.12 模块化后端，SQLite/WAL 单进程所有者；真实记忆、网关、渠道、PostgreSQL 与多进程尚未验收。依赖替身只允许放 tests/。合同从已发布目录加载并校验 manifest/文件哈希，禁止复制或更改共享 schema。
+当前 Python >=3.12 模块化后端，默认 SQLite/WAL、可选 PostgreSQL，保留单进程所有者；PostgreSQL 已在本机隔离库验证，真实记忆、网关、渠道、生产 PostgreSQL 与多进程尚未验收。依赖替身只允许放 tests/。合同从已发布目录加载并校验 manifest/文件哈希，禁止复制或更改共享 schema。
 
 实际命令（项目根执行，Windows 用 `.venv/Scripts/python.exe`；其他平台用 `.venv/bin/python`）：
 
-- 初始化：`python -m venv .venv`；安装锁定开发依赖：`python -m pip install -r requirements-dev.txt`；登记两个包：`python -m pip install --no-deps -e .`（保留默认构建隔离）。
+- 初始化：`python -m venv .venv`；先安装固定共享包：`python -m pip install vendor/tianshu_storage-0.1.0-py3-none-any.whl`，再安装锁定开发依赖：`python -m pip install -r requirements-dev.txt`；登记产品包：`python -m pip install --no-deps -e .`（保留默认构建隔离）。
 - 格式检查：`python -m ruff format --check src integrations tests scripts`；静态检查：`python -m ruff check src integrations tests scripts`；语法：`python -m compileall -q src integrations tests scripts`。
 - 调度定向：`python -m pytest tests/test_core.py tests/test_edges.py -q`；边界定向：`python -m pytest tests/test_boundaries.py tests/test_gateway.py tests/test_bootstrap.py -q`；完整组件套件：`python -m pytest -q`。
 - 方案依赖定向：`python -m pytest tests/test_plan_dependencies.py -q`；依赖前序查询使用精确actor/person/audience/conversation索引和LIMIT 1，不筛掉未送达/失效的最近候选，不回退更旧方案；变更时同时验证调度、短期上下文与画像继承检查。
@@ -29,6 +29,8 @@
 数据库当前user_version=2。结构迁移前用SQLite backup保存 `数据库路径.pre-source-v2-随机值.bak`；随后Core在单事务中迁移可由原请求证明的actor，混组或缺原始归属的会话隔离503。迁移失败回滚事实并释放owner锁，修复故障后重试；恢复备份须停进程并隔离当前DB/WAL/SHM，不能在运行中覆盖或自行清除水位/隔离标记。完整步骤与边界见 `docs/source-sync.md`。
 
 本地隔离开发和提交用于审查；不自动推送、部署或操作真实设备。交付短记录 docs/handoffs/<任务编号>.md，含实际变更、验证、风险及下一步。
+
+TS-233：主库仍为 user_version=10，Companion 的 main/observations 同组激活，NoneBot journal/rpc 分别绑定。统一配置、迁移/停止写入规则、固定 wheel、文件根及备份见 docs/storage-backends.md；PG 激活后不能回写旧 SQLite。媒体发送载荷和大素材使用共享 FileStore，日记/人格/人工原创章节仍为 SQL；业务事实、核验、短期上下文和模型槽位不迁入 Redis。隔离真实 PG 定向：显式设置 TS233_POSTGRES_URL 后执行 `python -B -m pytest tests/test_storage_backends.py -q`，未设置即明确跳过。迁移/生命周期变更仍须完整组件套件，基线已有失败和跳过见本卡交接。
 
 TS-071：数据库现为user_version=3；v2结构升级前SQLite backup至pre-life-v3随机备份，恢复须停机隔离DB/WAL/SHM。生活、日记及可信同产品端口见docs/life.md；定向命令：python -m pytest tests/test_life.py -q。日记必须显式life_writing及独立life_config_version，不回退聊天配置；当前只用虚构素材，不是现实对话总结日记。共享生命周期/迁移改动后跑完整组件套件。
 

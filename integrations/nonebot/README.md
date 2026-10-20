@@ -11,11 +11,12 @@
 3. 在运行 NoneBot/NapCat 的机器安装本仓库包。Python 3.12 隔离环境示例：
 
    ```powershell
+   python -m pip install vendor/tianshu_storage-0.1.0-py3-none-any.whl
    python -m pip install -r requirements-nonebot.txt
    python -m pip install --no-deps -e .
    ```
 
-   发布安装可用 `python -m pip install '.[nonebot]'`；`requirements-nonebot.txt` 是本次实测环境的精确依赖版本。以上命令在 **Companion 项目根目录**执行。不要在生产宿主中盲目覆盖其已有 NoneBot 依赖版本。
+   发布安装先安装上述共享 wheel，再用 `python -m pip install '.[nonebot]'`；`requirements-nonebot.txt` 是本次实测环境的精确依赖版本。以上命令在 **Companion 项目根目录**执行。不要在生产宿主中盲目覆盖其已有 NoneBot 依赖版本。
 4. 在宿主入口按原有方式注册 `nonebot.adapters.onebot.v11.Adapter`，然后调用 `nonebot.load_plugin("tianshu_nonebot.plugin")`。插件必须在 `nonebot.init()` 后、`nonebot.run()` 前加载。已有适配器不重复注册。插件启动后只监听显式允许的会话；插件本身不会远程安装或开启 NapCat。
 
 ## NoneBot 配置

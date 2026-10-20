@@ -4,7 +4,7 @@
 
 ## 本地运行
 
-使用 Python 3.12，安装项目现有 `nonebot` extra 或构建出的 `tianshu_nonebot_adapter-0.6.0` wheel。设置 `TIANSHU_ONEBOT_TOKEN`，或让 `TIANSHU_ONEBOT_TOKEN_FILE` 指向可读的本地令牌文件，然后启动：
+使用 Python 3.12，先安装随产品或适配器产物提供的 `tianshu_storage-0.1.0-py3-none-any.whl`，再安装项目现有 `nonebot` extra 或构建出的 `tianshu_nonebot_adapter-0.6.0` wheel。可选 PG 配置与固定共享 wheel 校验见[存储后端说明](storage-backends.md)。设置 `TIANSHU_ONEBOT_TOKEN`，或让 `TIANSHU_ONEBOT_TOKEN_FILE` 指向可读的本地令牌文件，然后启动：
 
 ```text
 python -m tianshu_nonebot.onebot --host 127.0.0.1 --port 18765 --data-dir ./data/tianshu_onebot

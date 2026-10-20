@@ -26,6 +26,7 @@ class BotRuntime:
         poll_seconds=2,
         group_requires_mention=True,
         ca_file=None,
+        storage_backends=None,
     ):
         if not connection_id or not platform_id or not bot_self_id or not allowed_conversations:
             raise ValueError("Connection, platform ID, bot self ID and conversations are required")
@@ -35,7 +36,7 @@ class BotRuntime:
         self.allowed = frozenset(allowed_conversations)
         self.group_requires_mention = group_requires_mention
         self.instance_id = uuid4().hex
-        self.journal = Journal(journal_path)
+        self.journal = Journal(journal_path, storage_backends=storage_backends)
         self.journal.bind(connection_id, platform_id, bot_self_id)
         self.port = port or PlatformPort(platform_url, token, ca_file=ca_file)
         self.get_bot = get_bot

@@ -2303,3 +2303,7 @@ class Core(Delivery):
         await asyncio.gather(*jobs, return_exceptions=True)
         await self.image_backend.close()
         self.store.close()
+        if getattr(self, "storage_runtime", None) is not None:
+            self.storage_runtime.close()
+        if getattr(self, "storage_temporary", None) is not None:
+            self.storage_temporary.cleanup()

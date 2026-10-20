@@ -4,14 +4,14 @@
 
 ## 安装与获取密钥
 
-1. 从项目根运行 `python integrations/build_adapter_releases.py`，取得 `.runtime/adapter-artifacts/tianshu_nonebot_adapter-0.6.0-py3-none-any.whl`。在 NoneBot 宿主的隔离环境安装 wheel，不覆盖宿主框架依赖。通过宿主正常插件加载机制加载 `tianshu_nonebot.adapter_plugin`，须在 `nonebot.init()` 和 OneBot v11 Adapter 注册之后、`nonebot.run()` 之前。此为一次插件安装，不需为每个机器人编辑环境变量或配置文件。
+1. 从项目根运行 `python integrations/build_adapter_releases.py`，取得 `.runtime/adapter-artifacts/` 内的 `tianshu_nonebot_adapter-0.6.0-py3-none-any.whl` 和 `tianshu_storage-0.1.0-py3-none-any.whl`。将两个 wheel 一起带到 NoneBot 宿主的隔离环境，先安装共享 storage wheel，再安装 adapter wheel，不覆盖宿主框架依赖。通过宿主正常插件加载机制加载 `tianshu_nonebot.adapter_plugin`，须在 `nonebot.init()` 和 OneBot v11 Adapter 注册之后、`nonebot.run()` 之前。此为一次插件安装，不需为每个机器人编辑环境变量或配置文件。
 2. 首次加载会在宿主工作目录 `data/tianshu_nonebot/adapter.sqlite3` 生成稳定随机密钥。在宿主本机同一工作目录运行：
 
    ```text
    python -m tianshu_nonebot.rpc show-key data/tianshu_nonebot/adapter.sqlite3
    ```
 
-   只在当前终端显示密钥；普通日志、RPC 返回和网页回显均不包含它。保持 SQLite 数据目录私有且跨重启保存。
+   只在当前终端显示密钥；普通日志、RPC 返回和网页回显均不包含它。保持数据目录私有且跨重启保存。默认 SQLite；可选 PG、环境变量及配置文件见[存储后端说明](../../docs/storage-backends.md)，激活 PG 后命令读取当前绑定账本。
 3. RPC 挂在 NoneBot 现有 FastAPI driver 的监听端口，路径 `/tianshu/adapter/v1/*`。网页填写该宿主的私网 HTTP 地址和密钥，平台需允许私有 HTTP；若宿主已经使用受控 HTTPS，也可填写其地址。插件不启动第二端口或第二套 Core。宿主仍需把现有监听端口绑定或发布到平台可访问的私网，且不要向公网发布。
 4. 网页探测从在线 OneBot SDK `get_login_info()` 读取真实 QQ 账号；离线列表为空。管理员选择账号、群或私聊、明确作者、角色，保存后再启用。群没有隐含“所有作者”权限。
 

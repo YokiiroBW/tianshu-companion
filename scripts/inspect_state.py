@@ -2,14 +2,27 @@
 
 import argparse
 import json
-import sqlite3
 from pathlib import Path
+from tianshu_storage import StorageOptions, StorageRuntime
+from tianshu_companion.storage_postgres import dialect
 
 parser = argparse.ArgumentParser()
 parser.add_argument("database", type=Path)
 parser.add_argument("--include-context", action="store_true")
+parser.add_argument("--storage-config", type=Path)
 args = parser.parse_args()
-db = sqlite3.connect(args.database.resolve().as_uri() + "?mode=ro", uri=True)
+settings = (
+    json.loads(args.storage_config.read_text(encoding="utf-8")) if args.storage_config else {}
+)
+database = args.database.resolve()
+db = StorageRuntime.open_existing(
+    StorageOptions.from_settings(settings),
+    service="companion",
+    state_directory=str(database) + ".storage",
+    name="main",
+    path=database,
+    dialect=dialect,
+)
 db.execute("BEGIN")
 try:
     turns = [json.loads(row[0]) for row in db.execute("SELECT body FROM turns ORDER BY position")]

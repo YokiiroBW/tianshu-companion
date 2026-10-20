@@ -27,6 +27,7 @@ class Config(BaseModel):
     tianshu_adapter_data_dir: Path = Path("data/tianshu_nonebot")
     tianshu_adapter_priority: int = 5
     tianshu_adapter_kind: Literal["nonebot", "onebot"] = "nonebot"
+    storage_backends: dict = {}
 
 
 __plugin_meta__ = PluginMetadata(
@@ -90,6 +91,7 @@ service = AdapterService(
     _accounts,
     _send,
     _send,
+    storage_backends=settings.storage_backends,
 )
 semaphore = asyncio.Semaphore(8)
 app = get_asgi()

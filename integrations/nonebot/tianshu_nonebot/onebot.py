@@ -1,7 +1,6 @@
 """Standalone Tianshu OneBot host using the existing SDK and durable adapter."""
 
 import argparse
-from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -14,6 +13,7 @@ def parser():
     result.add_argument("--port", type=int, default=18765)
     result.add_argument("--data-dir", type=Path, default=Path("data/tianshu_onebot"))
     result.add_argument("--onebot-token-env", default="TIANSHU_ONEBOT_TOKEN")
+    result.add_argument("--storage-config", type=Path, help="JSON containing storage_backends")
     result.add_argument(
         "--show-key", action="store_true", help="Display the local Platform connection key"
     )
@@ -23,7 +23,7 @@ def parser():
     return result
 
 
-def create_host(*, host, port, data_dir, access_token):
+def create_host(*, host, port, data_dir, access_token, storage_backends=None):
     if not access_token or any(char.isspace() for char in access_token):
         raise ValueError("A OneBot access token is required")
     if not 1 <= port <= 65535:
@@ -40,6 +40,7 @@ def create_host(*, host, port, data_dir, access_token):
         onebot_access_token=access_token,
         tianshu_adapter_kind="onebot",
         tianshu_adapter_data_dir=str(data_dir),
+        storage_backends=storage_backends or {},
         _env_file=None,
     )
     nonebot.get_driver().register_adapter(Adapter)
@@ -68,15 +69,17 @@ def main():
     if not 1 <= args.port <= 65535:
         command.error("port must be between 1 and 65535")
     data = args.data_dir.resolve()
+    settings = (
+        json.loads(args.storage_config.read_text(encoding="utf-8")) if args.storage_config else {}
+    )
     if args.show_key:
+        from .storage import read_access_key
+
         database = data / "adapter.sqlite3"
-        if not database.is_file():
-            command.error("start the service once to initialize its connection key")
-        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
-            row = db.execute("SELECT value FROM meta WHERE key='access_key'").fetchone()
-        if row is None:
-            command.error("connection key is not initialized")
-        print(row[0])
+        try:
+            print(read_access_key(database, settings))
+        except (OSError, ValueError, RuntimeError, sqlite3.Error):
+            command.error("current backend or initialized connection key is unavailable")
         return
     if args.print_config:
         print(
@@ -102,7 +105,13 @@ def main():
         command.error(
             "configure the OneBot token environment variable or TIANSHU_ONEBOT_TOKEN_FILE"
         )
-    create_host(host=args.host, port=args.port, data_dir=data, access_token=access_token)
+    create_host(
+        host=args.host,
+        port=args.port,
+        data_dir=data,
+        access_token=access_token,
+        storage_backends=settings.get("storage_backends"),
+    )
     import nonebot
 
     nonebot.run()

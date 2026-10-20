@@ -1,4 +1,4 @@
-# Companion runtime image: one process, one SQLite owner, no baked credentials.
+# Companion runtime image: one process, one SQL owner, no baked credentials.
 #
 # The image is deliberately thin. It installs the exact runtime pins, copies the package, and
 # declares the deployment paths the runtime CLI already defaults to on Linux. It does not
@@ -34,7 +34,15 @@ RUN python -m pip install --no-cache-dir --only-binary=:all: --no-deps \
     "starlette==1.6.0" \
     "typing-inspection==0.4.4" \
     "typing_extensions==4.16.0" \
-    "uvicorn==0.42.0"
+    "uvicorn==0.42.0" \
+    "psycopg==3.3.6" \
+    "psycopg-binary==3.3.6" \
+    "psycopg-pool==3.3.3" \
+    "redis==7.4.1" \
+    "tzdata==2026.5"
+
+COPY vendor/tianshu_storage-0.1.0-py3-none-any.whl /tmp/tianshu_storage-0.1.0-py3-none-any.whl
+RUN python -m pip install --no-cache-dir --no-deps /tmp/tianshu_storage-0.1.0-py3-none-any.whl
 
 WORKDIR /app
 

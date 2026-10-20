@@ -120,10 +120,18 @@ def validate(request):
 
 
 class Observations:
-    def __init__(self, path, memory_client):
+    def __init__(self, path, memory_client, *, storage_runtime=None):
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.memory = memory_client
+        self.database = None
+        if storage_runtime is not None:
+            from .observation_postgres import prepare
+            from .storage_postgres import dialect
+
+            self.database = storage_runtime.database(
+                "observations", self.path, prepare=prepare, dialect=dialect
+            )
         with closing(self._db()) as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS inbox (
@@ -143,7 +151,11 @@ class Observations:
             """)
 
     def _db(self):
-        db = sqlite3.connect(self.path, timeout=5)
+        db = (
+            self.database.connect(timeout=5)
+            if self.database
+            else sqlite3.connect(self.path, timeout=5)
+        )
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")

@@ -28,6 +28,7 @@ class Config(BaseModel):
     tianshu_nonebot_ca_file: Path | None = None
     tianshu_nonebot_priority: int = 5
     tianshu_nonebot_group_requires_mention: bool = True
+    storage_backends: dict = {}
 
 
 __plugin_meta__ = PluginMetadata(
@@ -58,6 +59,7 @@ runtime = BotRuntime(
     get_bot=_connected_bot,
     group_requires_mention=settings.tianshu_nonebot_group_requires_mention,
     ca_file=settings.tianshu_nonebot_ca_file,
+    storage_backends=settings.storage_backends,
 )
 
 

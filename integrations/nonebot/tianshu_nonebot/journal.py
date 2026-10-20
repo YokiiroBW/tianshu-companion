@@ -24,33 +24,42 @@ class Conflict(ValueError):
     pass
 
 
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS inbound (
+  key TEXT PRIMARY KEY, signature TEXT NOT NULL, body TEXT NOT NULL,
+  state TEXT NOT NULL, response TEXT
+);
+CREATE TABLE IF NOT EXISTS outbound (
+  reply_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL,
+  signature TEXT NOT NULL, state TEXT NOT NULL,
+  ids TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
 class Journal:
-    def __init__(self, path):
+    def __init__(self, path, *, storage_backends=None):
         path = Path(path)
         if not path.is_absolute():
             raise ValueError("Journal path must be absolute")
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, isolation_level=None)
+        from .storage import open_database
+
+        self.storage_runtime, self.db = open_database(
+            path,
+            "journal",
+            SCHEMA_SQL,
+            ("metadata", "inbound", "outbound"),
+            settings={"storage_backends": storage_backends or {}},
+            ordered=("inbound", "outbound"),
+        )
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         if self.db.execute("PRAGMA user_version").fetchone()[0] not in (0, 1):
             raise ValueError("Unsupported NoneBot journal schema")
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS inbound (
-              key TEXT PRIMARY KEY, signature TEXT NOT NULL, body TEXT NOT NULL,
-              state TEXT NOT NULL, response TEXT
-            );
-            CREATE TABLE IF NOT EXISTS outbound (
-              reply_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL,
-              signature TEXT NOT NULL, state TEXT NOT NULL,
-              ids TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0
-            );
-            PRAGMA user_version=1;
-            """
-        )
+        self.db.executescript(SCHEMA_SQL + "PRAGMA user_version=1;")
 
     def bind(self, connection_id, platform_id, bot_self_id):
         identity = _json([connection_id, platform_id, str(bot_self_id)])
@@ -67,7 +76,9 @@ class Journal:
             raise
 
     def close(self):
-        self.db.close()
+        from .storage import close_database
+
+        close_database(self.storage_runtime, self.db)
 
     def capture(self, body):
         key = _digest([body["connection_id"], body["event_id"], body["account_id"]])

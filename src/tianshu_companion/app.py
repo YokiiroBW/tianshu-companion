@@ -6,8 +6,9 @@ import json
 import logging
 import os
 import sqlite3
+import tempfile
 import time
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -454,69 +455,96 @@ def build_runtime(config):
 
     memory = Memory(contracts, client("memory", "memory"))
     relationships = assemble_relationships(config.get("relationships"), memory.client)
-    core = Core(
-        Store(config["database_path"]),
-        contracts,
-        Origins(contracts, issuers),
-        memory,
-        Gateway(contracts, client("gateway", "gateway")),
-        outbound,
-        bindings=config.get("bindings", {}),
-        roles=config.get("roles", {}),
-        config_version=config.get("config_version"),
-        default_model_selector=provider_selector,
-        qq_admin=qq_admin,
-        qq_identity_required=qq_admission,
-        relationships=relationships,
-        knowledge_client=(
-            client("knowledge", "knowledge")
-            if "knowledge" in config.get("services", {})
-            else memory.client
+    from tianshu_storage import StorageOptions, StorageRuntime
+
+    storage_temporary = (
+        tempfile.TemporaryDirectory(prefix="companion-storage-")
+        if config["database_path"] == ":memory:"
+        else None
+    )
+    storage = StorageRuntime(
+        StorageOptions.from_settings(config),
+        service="companion",
+        state_directory=Path(
+            storage_temporary.name if storage_temporary else config["database_path"] + ".storage"
         ),
-        policy=Policy(**config.get("policy", {})),
-        short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
-        life_writing=config.get("life_writing"),
-        automatic_memory_candidates=automatic_memory_candidates,
-        life_config_version=config.get("life_config_version"),
-        life_timezone=config.get("life_timezone", "+08:00"),
-        image_options=image_options,
-        writing_options=config.get("writing"),
-        proactive_options=config.get("proactive"),
-        direct_options=direct_options,
-        web_sender=PlatformBotSender(contracts, platform_client),
-        personas=bool(persona_config),
-        # The whole deployment document: the persona module owns the rule for where a
-        # character is declared, so startup and the maintenance CLI read it identically.
-        persona_import=config if persona_config else None,
     )
-    core.image_backend.credentials = (
-        client("image_credentials", "platform")
-        if "image_credentials" in config.get("services", {})
-        else platform_client
-    )
-    if bot_binding_management:
-        from .bot_bindings import BotBindings
-
-        core.bot_bindings = BotBindings(core, outbound, config.get("bindings", {}))
-    observe_enabled = config.get("bot_observation_enabled", False)
-    if type(observe_enabled) is not bool:
-        raise ValueError("bot_observation_enabled must be boolean")
-    if observe_enabled:
-        if config.get("callers", {}).get("platform", {}).get("issuer") != "platform":
-            raise ValueError("Bot observation requires the registered Platform caller")
-        from .observation import Observations
-
-        core.observations = Observations(
-            config["database_path"] + ".observations.sqlite", core.memory.client
+    with ExitStack() as cleanup:
+        if storage_temporary is not None:
+            cleanup.callback(storage_temporary.cleanup)
+        cleanup.callback(storage.close)
+        storage.start()
+        store = Store(config["database_path"], storage_runtime=storage)
+        cleanup.callback(store.close)
+        core = Core(
+            store,
+            contracts,
+            Origins(contracts, issuers),
+            memory,
+            Gateway(contracts, client("gateway", "gateway")),
+            outbound,
+            bindings=config.get("bindings", {}),
+            roles=config.get("roles", {}),
+            config_version=config.get("config_version"),
+            default_model_selector=provider_selector,
+            qq_admin=qq_admin,
+            qq_identity_required=qq_admission,
+            relationships=relationships,
+            knowledge_client=(
+                client("knowledge", "knowledge")
+                if "knowledge" in config.get("services", {})
+                else memory.client
+            ),
+            policy=Policy(**config.get("policy", {})),
+            short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
+            life_writing=config.get("life_writing"),
+            automatic_memory_candidates=automatic_memory_candidates,
+            life_config_version=config.get("life_config_version"),
+            life_timezone=config.get("life_timezone", "+08:00"),
+            image_options=image_options,
+            writing_options=config.get("writing"),
+            proactive_options=config.get("proactive"),
+            direct_options=direct_options,
+            web_sender=PlatformBotSender(contracts, platform_client),
+            personas=bool(persona_config),
+            # The whole deployment document: the persona module owns the rule for where a
+            # character is declared, so startup and the maintenance CLI read it identically.
+            persona_import=config if persona_config else None,
         )
-    for spec in (routing or {}).get("commands", []):
-        core.direct.register_command(**spec)
-    # The optional authorized read port. Its deployment mapping is validated here, where the
-    # caller registry is known, so an entry naming a service that was never configured fails
-    # startup instead of becoming a reader that can never authenticate.
-    life_readers = config.get("life_readers")
-    if life_readers is not None:
-        read_reader_map(life_readers, set(config.get("callers", {})))
+        core.storage_runtime = storage
+        core.storage_temporary = storage_temporary
+        core.image_backend.credentials = (
+            client("image_credentials", "platform")
+            if "image_credentials" in config.get("services", {})
+            else platform_client
+        )
+        if bot_binding_management:
+            from .bot_bindings import BotBindings
+
+            core.bot_bindings = BotBindings(core, outbound, config.get("bindings", {}))
+        observe_enabled = config.get("bot_observation_enabled", False)
+        if type(observe_enabled) is not bool:
+            raise ValueError("bot_observation_enabled must be boolean")
+        if observe_enabled:
+            if config.get("callers", {}).get("platform", {}).get("issuer") != "platform":
+                raise ValueError("Bot observation requires the registered Platform caller")
+            from .observation import Observations
+
+            core.observations = Observations(
+                config["database_path"] + ".observations.sqlite",
+                core.memory.client,
+                storage_runtime=storage,
+            )
+        for spec in (routing or {}).get("commands", []):
+            core.direct.register_command(**spec)
+        # The optional authorized read port. Its deployment mapping is validated here, where the
+        # caller registry is known, so an entry naming a service that was never configured fails
+        # startup instead of becoming a reader that can never authenticate.
+        life_readers = config.get("life_readers")
+        if life_readers is not None:
+            read_reader_map(life_readers, set(config.get("callers", {})))
+        storage.finalize()
+        cleanup.pop_all()
     return core, incoming, clients, life_readers
 
 

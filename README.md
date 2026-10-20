@@ -12,6 +12,8 @@
 
 安装、启动和验证命令以 [AGENTS.md](AGENTS.md) 为唯一清单。依赖锁为 `requirements-dev.txt`，项目及两个包的清单为 `pyproject.toml`。系统 Python 不在 PATH 时，先用本机已安装的 Python >=3.12 路径创建虚拟环境。
 
+可选 PostgreSQL、固定共享 wheel 安装、原有路径锚点、媒体/大素材文件引用及独立 NoneBot 账本见[存储后端说明](docs/storage-backends.md)。默认仍为 SQLite；PG 激活后不会自动回写旧 SQLite。
+
 不设 `TIANSHU_COMPANION_CONFIG` 即可启动检查空配置行为：`GET /healthz` 只表示进程存活，业务 POST 返回 `dependency_unavailable`。指定该变量为一个服务端 JSON 文件路径才创建数据库；[本地空配置样例](docs/config.local.example.json) 不含绑定、凭据或可访问服务，不能当真实可用配置。相对路径按启动工作目录解析。
 
 实际接入时，由协调者配置 `services`（memory、gateway、nonebot 和 issuer 的固定 HTTPS `url`、读取凭据的 `token_env`）、`callers`（认证服务名到 `token_env`、`issuer`、`origin_service`）、`bindings`（绑定 ID 到 namespace、service、audience、actor_ids），以及平台已发布的 `config_version`。不同调用服务用独立凭据，不能复用相同 token。入口应由可信 TLS 终止代理保护，应用仅监听回环；不要让浏览器直接提交内部来源引用。
