@@ -235,3 +235,82 @@ def test_model_failure_after_tool_execution_does_not_replay_the_tool():
             await h.core.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mode", ["recover", "persistent", "revoked", "changed", "unknown", "forbidden", "cancelled"]
+)
+def test_source_preflight_rechecks_without_regenerating_a_completed_model_result(mode):
+    from test_delivery_v2 import NativeQueue
+
+    async def run():
+        h = Harness(silence_ms=0)
+
+        class SentQueue(NativeQueue):
+            async def finalize_expression(self, expression_id, origin):
+                self.final = True
+                return self.receipt()
+
+        queue = SentQueue(h.clock)
+        queue.states = ["sent"]
+        h.sender = h.core.sender = queue
+        generated = False
+        calls = []
+        rechecks = []
+        original = h.memory.select
+
+        async def complete(turn, messages, *, on_delta=None, **kwargs):
+            nonlocal generated
+            generated = True
+            calls.append(turn["id"])
+            text = "已经生成的固定答案。"
+            if on_delta:
+                await on_delta(text)
+            return dict(role="assistant", content=text), dict(fixture_only=True)
+
+        async def select(origin, scope, text, budget, *args, **kwargs):
+            if generated and budget == dict(tokens=0, bytes=0):
+                rechecks.append(scope)
+                if len(rechecks) <= (2 if mode == "recover" else 1) or mode == "persistent":
+                    turn = h.turns()[0]
+                    assert turn.get("native_execution")
+                    if mode == "revoked":
+                        h.origins.values[origin["assertion_ref"]]["revoked"] = True
+                    if mode == "changed":
+                        h.memory.scope_version += 1
+                    if mode == "cancelled":
+                        fresh = h.core.store.get("turns", turn["id"])
+                        h.core._cancel_turn(fresh, "user_requested")
+                    raise Fault(
+                        "forbidden" if mode == "forbidden" else "dependency_unavailable",
+                        retryable_read=mode != "forbidden",
+                        unknown=mode == "unknown",
+                    )
+            return await original(origin, scope, text, budget, *args, **kwargs)
+
+        h.gateway.complete = complete
+        h.memory.select = select
+        try:
+            await h.ingest(text="我上午一般喝无糖豆浆")
+            for _ in range(180):
+                await h.cycles(3)
+                if h.turns()[0]["phase"] in {"sent", "failed", "cancelled"}:
+                    break
+                await asyncio.sleep(0.01)
+            turn = h.turns()[0]
+            assert len(calls) == turn["model_calls"] == 1
+            assert turn["phase"] == (
+                "sent" if mode == "recover" else "cancelled" if mode == "cancelled" else "failed"
+            )
+            assert len(queue.requests) == (1 if mode == "recover" else 0)
+            if mode == "recover":
+                assert len(rechecks) == 3
+                assert h.core._replies(turn)[0]["text"] == "已经生成的固定答案。"
+            elif mode == "persistent":
+                assert len(rechecks) == 3
+            elif mode in {"unknown", "forbidden", "cancelled"}:
+                assert len(rechecks) == 1
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())

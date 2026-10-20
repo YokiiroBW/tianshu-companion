@@ -2031,6 +2031,25 @@ class Core(Delivery):
         )
 
     async def _preflight(self, turn):
+        # After generation, only a peer-confirmed, not-started read may repeat.
+        # Each attempt owns a fresh checkpoint; no model or send is replayed.
+        for attempt in range(3):
+            try:
+                return await self._preflight_once(turn)
+            except Fault as error:
+                if (
+                    not turn.get("model_calls")
+                    or not error.retryable_read
+                    or error.unknown
+                    or attempt == 2
+                ):
+                    raise
+                fresh = self.store.get("turns", turn["id"])
+                if fresh is None or fresh["cancelled"] or fresh["phase"] in TERMINAL:
+                    raise Fault("scope_changed") from None
+                await asyncio.sleep(0.1 * 2**attempt)
+
+    async def _preflight_once(self, turn):
         if (
             self.relationships is not None
             and self._turn_allows(turn, "memory.read")
