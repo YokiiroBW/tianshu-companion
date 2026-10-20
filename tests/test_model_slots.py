@@ -83,6 +83,47 @@ def test_background_ceiling_keeps_configured_foreground_reserve(capacity):
     asyncio.run(run())
 
 
+def test_queued_dialogue_gets_capacity_before_a_second_background_generation():
+    async def run():
+        slots = ModelSlots(4)
+        release_background, release_dialogue = asyncio.Event(), asyncio.Event()
+        entered = []
+
+        async def work(label, pool, gate):
+            async with pool:
+                entered.append(label)
+                await gate.wait()
+
+        first = asyncio.create_task(work("background-1", slots.background, release_background))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        for _ in range(3):
+            await slots.acquire()
+        second = asyncio.create_task(work("background-2", slots.background, release_background))
+        dialogue = [
+            asyncio.create_task(work(f"chat-{i}", slots, release_dialogue)) for i in range(4)
+        ]
+        await asyncio.sleep(0)
+        for _ in range(3):
+            slots.release()
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert entered == ["background-1", "chat-0", "chat-1", "chat-2"]
+        release_dialogue.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert entered.index("chat-3") < entered.index("background-2")
+        release_background.set()
+        await asyncio.gather(first, second, *dialogue)
+        async with asyncio.timeout(0.5):
+            for _ in range(4):
+                await slots.acquire()
+        for _ in range(4):
+            slots.release()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("grant_before_cancel", [False, True])
 def test_cancellation_does_not_lose_capacity(background, grant_before_cancel):
