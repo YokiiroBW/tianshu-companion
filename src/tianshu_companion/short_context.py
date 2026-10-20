@@ -188,7 +188,7 @@ def select_recent(store, turn, policy, now):
     from .context_relevance import retrieval_batches
 
     ordinary = [group for group, _ in candidates[: policy.max_turns]]
-    batches, topic_return = retrieval_batches(
+    batches, topic_return, requires = retrieval_batches(
         turn,
         candidates,
         policy.max_turns,
@@ -199,6 +199,9 @@ def select_recent(store, turn, policy, now):
     linked = []
     oldest_expiry = None
     for batch in batches:
+        available = {g["turn_id"] for g, _ in batch} | {g["turn_id"] for g in chosen}
+        if any(requires.get(g["turn_id"], g["turn_id"]) not in available for g, _ in batch):
+            continue
         candidate = sorted([g for g, _ in batch] + chosen, key=lambda item: item["turn_sequence"])
         size = len(canonical(candidate).encode("utf-8"))
         if size > policy.max_bytes or len(candidate) > policy.max_turns:
@@ -213,6 +216,13 @@ def select_recent(store, turn, policy, now):
         oldest_expiry = expiry if oldest_expiry is None else min(oldest_expiry, expiry)
         if len(chosen) == policy.max_turns:
             break
+    chosen_ids = {g["turn_id"] for g in chosen}
+    by_head = {}
+    for child, head in requires.items():
+        if {child, head} <= chosen_ids:
+            by_head.setdefault(head, {head}).add(child)
+    positions = {g["turn_id"]: g["turn_sequence"] for g in chosen}
+    linked.extend(sorted(ids, key=positions.__getitem__) for ids in by_head.values())
     metadata.update(
         turn_ids=[g["turn_id"] for g in chosen],
         reply_ids=[r["reply_id"] for g in chosen for r in g["replies"]],

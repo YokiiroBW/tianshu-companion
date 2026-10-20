@@ -2,11 +2,69 @@ import json
 import unittest
 
 from support import Harness
+from tianshu_companion.clients import uid
 from tianshu_companion.context_relevance import changes_plan
-from tianshu_companion.contracts import canonical
+from tianshu_companion.contracts import Fault, canonical
+from tianshu_companion.short_context import ShortContextPolicy
 
 
 class ContextRetrievalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_verified_same_persons_second_account_exit_still_protects_older_state(self):
+        person = uid("person")
+        for account in ("a", "alias"):
+            self.h.memory.accounts[
+                tuple(sorted(dict(namespace="qq", immutable_account_id=account).items()))
+            ] = person
+        for author, text in [
+            ("a", "周日去青石馆，九点东门集合，算我一个。"),
+            ("b", "我也同意九点东门这个安排。"),
+            ("alias", "周日我去不了了，你们照常。" + "临时工作还没有处理完。" * 500),
+        ]:
+            await self.say(text, group=True, channel="group:linked-state", account=author)
+        self.h.core.short_context_policy = ShortContextPolicy(max_bytes=3300)
+        await self.say(
+            "现在谁确定去青石馆？", group=True, channel="group:linked-state", account="b"
+        )
+        recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+        self.assertIn("我也同意九点东门", canonical(recent))
+        self.assertNotIn("算我一个", canonical(recent))
+
+    async def test_older_assent_cannot_outlive_its_oversized_later_exit(self):
+        for author, text in [
+            ("a", "周日去青石馆，九点东门集合，算我一个。"),
+            ("b", "我也同意九点东门这个安排。"),
+            ("a", "周日我去不了了，你们照常。" + "临时工作还没有处理完。" * 500),
+        ]:
+            await self.say(text, group=True, channel="group:state-budget", account=author)
+        self.h.core.short_context_policy = ShortContextPolicy(max_bytes=3300)
+        await self.say(
+            "现在谁确定去青石馆？", group=True, channel="group:state-budget", account="b"
+        )
+        recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+        self.assertIn("我也同意九点东门", canonical(recent))
+        self.assertNotIn("算我一个", canonical(recent))
+
+    async def test_older_assent_is_not_reintroduced_when_latest_source_verification_fails(self):
+        for author, text in [
+            ("a", "周日去青石馆，九点东门集合，算我一个。"),
+            ("b", "我也同意九点东门这个安排。"),
+            ("a", "周日我去不了了，你们照常。"),
+        ]:
+            await self.say(text, group=True, channel="group:state-check", account=author)
+        latest = self.h.turns()[-1]["id"]
+        verify = self.h.core._verify_checks
+
+        async def stale(turn, checks, **kwargs):
+            if any(check.get("source_turn_id") == latest for check in checks):
+                raise Fault("scope_changed")
+            return await verify(turn, checks, **kwargs)
+
+        self.h.core._verify_checks = stale
+        await self.say("现在谁确定去青石馆？", group=True, channel="group:state-check", account="b")
+        recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+        self.assertIn("我也同意九点东门", canonical(recent))
+        self.assertNotIn("算我一个", canonical(recent))
+
     def test_change_cues_distinguish_recall_from_new_proposals_and_statements(self):
         for text, expected in [
             ("之前为什么换到大厅？", False),

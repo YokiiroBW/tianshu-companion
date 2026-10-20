@@ -83,6 +83,8 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
     inputs too: their speakers and other plans are needed to interpret that change.
     The batch is indivisible; an oversized or revoked follow-up must not leave an
     isolated obsolete anchor. This is conversation context, never a fact update.
+    The final map binds older state to its latest human source for budget and
+    independent verification; it is never a model-generated state judgement.
     """
     query_text = input_text(turn["bundle"])
     query_tokens = tokens(query_text)
@@ -214,15 +216,18 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
         pool.update(g["turn_id"] for g, _ in ranked if all(scores[g["turn_id"]]))
         assertions = [by_id[key] for key in pool if scores[key][1]]
         assertions.sort(key=lambda item: item[0]["turn_sequence"], reverse=True)
-        selected, authors = [], set()
+        selected, heads = [], {}
+
+        def people(item):
+            # A verified person can use more than one account. Participation is
+            # personal state; this never transfers an account's administrator grant.
+            return frozenset(m["person_id"] for m in item[0]["messages"])
+
         for item in assertions:
-            people = frozenset(
-                (m["author"]["namespace"], m["author"]["immutable_account_id"], m["person_id"])
-                for m in item[0]["messages"]
-            )
-            if people not in authors:
+            key = people(item)
+            if key not in heads:
                 selected.append(item)
-                authors.add(people)
+                heads[key] = item[0]["turn_id"]
         # Spend the remaining window on the original context before repeating
         # a later stance by the same author. The reader, not a regex, decides
         # whether each natural statement is adoption, uncertainty or exit.
@@ -230,7 +235,10 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
             (item for item in assertions if item not in selected),
             key=lambda item: item[0]["turn_sequence"],
         )
-        return [project([item]) for item in selected + remainder], True
+        # Older state is context for a newer source, never a substitute when
+        # that source is too large or fails its independent freshness check.
+        requires = {item[0]["turn_id"]: heads[people(item)] for item in remainder}
+        return [project([item]) for item in selected + remainder], True, requires
     recent_fact = bool(
         asks_fact
         and ranked
@@ -255,7 +263,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
                 for item in candidates
                 if item[0]["turn_sequence"] > newest and scores[item[0]["turn_id"]][1]
             ]
-            return [project([item]) for item in following + assertions], True
+            return [project([item]) for item in following + assertions], True, {}
     if not topic_return or (
         (not compact or recent_fact)
         and ranked[0][0]["turn_id"] in recent_ids
@@ -266,7 +274,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
         # not overlapping historical spans that crowd out the preceding turn.
         # Raw recent confirmations can fit even when verbose bot replies cannot.
         # A correction anchor still needs its earlier description as one batch.
-        return [project([item]) if asks_fact else [item] for item in candidates], False
+        return [project([item]) if asks_fact else [item] for item in candidates], False, {}
     chronological = list(reversed(candidates))
     positions = {g["turn_id"]: i for i, (g, _) in enumerate(chronological)}
 
@@ -309,4 +317,4 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
             seen.update(ids)
         # Never trim a required follow-up merely because an overlapping batch
         # appeared earlier in the priority list: that earlier batch may not fit.
-    return batches, True
+    return batches, True, {}
