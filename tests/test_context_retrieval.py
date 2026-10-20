@@ -112,11 +112,9 @@ class ContextRetrievalTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(invented, canonical(recent))
         self.assertTrue(all(g.get("input_only") and not g["replies"] for g in recent))
         self.assertNotIn("昨天傍晚我家的狗把我叫醒", prompt_messages[0]["content"])
-        self.assertNotIn(invented, canonical(payload["human_source_view"]))
-        self.assertEqual(1, len(payload["human_source_view"]["participants"]))
+        self.assertNotIn("human_source_view", payload)
         self.assertEqual(
-            ["昨天傍晚我家的狗把我叫醒了，它叫团子。", "狗叫什么来着？"],
-            [m["text"] for m in payload["human_source_view"]["participants"][0]["messages"]],
+            payload["messages"][0]["speaker_ref"], recent[0]["messages"][0]["speaker_ref"]
         )
         await self.say("你刚才怎么回答的？")
         recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]

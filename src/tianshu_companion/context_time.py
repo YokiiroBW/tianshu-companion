@@ -39,18 +39,32 @@ def dialogue_time_view(prompt, metadata):
     question = "\n".join(p["text"] for m in current for p in m["parts"] if p["kind"] == "text")
     clocks = bool(MESSAGE_CLOCK_QUESTION.search(question))
 
-    def message(value):
-        return {k: v for k, v in value.items() if k not in {"sent_at", "accepted_at"}}
+    by_ref = {source["message_ref"]: source for source in metadata["sources"]}
 
-    result = dict(prompt, messages=[message(m) for m in current])
-    result["earlier_fragment"] = [message(m) for m in prompt.get("earlier_fragment", [])]
+    def message(value, ref):
+        result = {k: v for k, v in value.items() if k not in {"sent_at", "accepted_at"}}
+        result.update(source_ref=ref, speaker_ref=by_ref[ref]["speaker_ref"])
+        phrases = reported_times(
+            "\n".join(p["text"] for p in value["parts"] if p["kind"] == "text")
+        )
+        if phrases:
+            result["reported_time_phrases"] = phrases
+        return result
+
+    result = dict(prompt, messages=[message(m, f"m{i}") for i, m in enumerate(current, 1)])
+    result["earlier_fragment"] = [
+        message(m, f"earlier_fragment:m{i}")
+        for i, m in enumerate(prompt.get("earlier_fragment", []), 1)
+    ]
     result["recent_dialogue"] = [
         dict(
             g,
-            messages=[message(m) for m in g["messages"]],
+            messages=[
+                message(m, f"recent_dialogue:{i}:m{j}") for j, m in enumerate(g["messages"], 1)
+            ],
             replies=[{k: v for k, v in r.items() if k != "observed_at"} for r in g["replies"]],
         )
-        for g in prompt.get("recent_dialogue", [])
+        for i, g in enumerate(prompt.get("recent_dialogue", []), 1)
     ]
     # Ordering and exact author references are sufficient for ordinary factual
     # recall. Raw transport times elsewhere would duplicate this provenance.

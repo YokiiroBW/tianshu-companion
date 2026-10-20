@@ -23,9 +23,8 @@ def project(question):
         messages=[current], earlier_fragment=[], recent_dialogue=[dict(messages=[old], replies=[])]
     )
     sources = dialogue_sources(dict(bundle=dict(messages=[current])), prompt)
-    prompt["human_source_view"] = sources["view"]
     saved = copy.deepcopy(prompt)
-    value, timeline = dialogue_time_view(prompt, sources["metadata"])
+    value, timeline = dialogue_time_view(prompt, sources)
     assert prompt == saved
     return value, timeline
 
@@ -34,12 +33,13 @@ def test_name_recall_keeps_verbatim_time_phrase_without_transport_clock_cues():
     value, timeline = project("我的猫叫什么？")
     assert timeline["clock_visibility"] == "not_requested"
     assert "2026-10-" not in json.dumps(value) + json.dumps(timeline)
-    source = value["human_source_view"]["participants"][0]["messages"][0]
+    source = value["recent_dialogue"][0]["messages"][0]
     phrase = source["reported_time_phrases"][0]
-    assert source["text"][phrase["start"] : phrase["end"]] == "昨天傍晚"
+    text = source["parts"][0]["text"]
+    assert text[phrase["start"] : phrase["end"]] == "昨天傍晚"
     assert phrase["basis"] == "speaker_reported_wording"
-    assert source["time_basis"] == "speaker_wording_not_verified_event_or_transport_time"
-    assert "名字不是昨天才取的" in source["text"]
+    assert source["source_ref"] == "recent_dialogue:1:m1"
+    assert "名字不是昨天才取的" in text
 
 
 def test_genuine_message_time_question_keeps_verified_offset_in_its_own_provenance():
