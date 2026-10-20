@@ -11,6 +11,23 @@ from tianshu_companion.short_context import ShortContextPolicy, select_recent
 
 
 class ShortContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_reads_are_batched_without_mutating_authority_or_sources(self):
+        for i in range(12):
+            await self.say(f"花盆第{i}片叶子舒展开了。", message=f"leaf:{i}")
+        turn = self.h.turns()[-1]
+        before = self.h.core.store.source_head()
+        statements = []
+        self.h.core.store.db.set_trace_callback(statements.append)
+        try:
+            recent, _ = select_recent(self.h.core.store, turn, ShortContextPolicy(), self.h.clock())
+        finally:
+            self.h.core.store.db.set_trace_callback(None)
+        self.assertEqual(4, len(recent))
+        self.assertEqual(before, self.h.core.store.source_head())
+        reads = [s for s in statements if s.startswith(("SELECT", "WITH"))]
+        self.assertLessEqual(len(reads), 6)
+        self.assertFalse(any(s.startswith(("UPDATE", "INSERT", "DELETE")) for s in statements))
+
     async def asyncSetUp(self):
         self.h = Harness(silence_ms=0)
 

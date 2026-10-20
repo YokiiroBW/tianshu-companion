@@ -44,6 +44,8 @@ def test_each_human_quote_has_one_copy_and_exact_speaker_across_all_selected_inp
     )
     assert result["earlier_fragment"][0]["speaker_ref"] != result["messages"][0]["speaker_ref"]
     assert prompt == saved
+    requester = next(p for p in timeline["participants"] if p["speaker_ref"] == "p1")
+    assert requester["message_refs"] == ["recent_dialogue:1:m1", "m1"]
 
 
 def test_unknown_and_confirmed_assistant_material_remains_distinct_from_human_sources():

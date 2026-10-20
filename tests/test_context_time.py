@@ -71,6 +71,20 @@ def test_message_dates_and_current_clock_questions_keep_the_actual_clock_availab
         assert timeline["sources"][0]["transport_clock"]["received_at"] == "2026-10-20T01:02:03Z"
 
 
+def test_time_spans_distinguish_local_reference_clause_without_inventing_dates():
+    text = "我这里北京时间2026年10月20日凌晨一点四十，前天晚上小狗拽坏了窗帘，它叫饼干。"
+    phrases = reported_times(text)
+    assert [p["text"] for p in phrases] == ["2026年10月20日", "一点四十", "前天晚上"]
+    for phrase in phrases:
+        assert text[phrase["start"] : phrase["end"]] == phrase["text"]
+        assert phrase["clause_start"] <= phrase["start"] < phrase["end"] <= phrase["clause_end"]
+    assert all(p["role"] == "self_reported_reference_clock_not_message_time" for p in phrases[:2])
+    assert phrases[2]["role"] == "unresolved_clause_time"
+    assert "窗帘" in text[phrases[2]["clause_start"] : phrases[2]["clause_end"]]
+    assert "饼干" not in text[phrases[2]["clause_start"] : phrases[2]["clause_end"]]
+    assert reported_times("2026年10月20日才起的名字")[0]["role"] == "unresolved_clause_time"
+
+
 def test_prompt_projection_keeps_stored_sources_and_explicit_assistant_history():
     import asyncio
 

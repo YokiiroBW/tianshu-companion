@@ -380,6 +380,20 @@ class Store:
         row = self.db.execute(f"SELECT body FROM {table} WHERE id=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def get_many(self, table, keys):
+        """Bounded primary-key reads; missing rows remain missing, never substituted."""
+        assert table in TABLES
+        keys = list(dict.fromkeys(keys))
+        result = {}
+        for offset in range(0, len(keys), 256):
+            batch = keys[offset : offset + 256]
+            placeholders = ",".join("?" for _ in batch)
+            for row in self.db.execute(
+                f"SELECT id,body FROM {table} WHERE id IN ({placeholders})", batch
+            ):
+                result[row[0]] = json.loads(row[1])
+        return result
+
     def delete(self, table, key):
         """Bounded housekeeping delete for derived rows; never used for fact tables."""
         assert table in TABLES and table not in FACT_TABLES
@@ -493,12 +507,35 @@ class Store:
         return [json.loads(row[0])["source"] for row in rows][::-1]
 
     def recent_turns(self, conversation_id, before_sequence, limit):
+        # This is the short-context reader, not a full turn export. A completed
+        # row also contains provider/checkpoint/retry material which no history
+        # candidate uses. Keep it persisted and load full rows only for selected
+        # turns at their verification boundary.
+        fields = (
+            "id",
+            "conversation_id",
+            "sequence",
+            "phase",
+            "failure",
+            "model_calls",
+            "bundle",
+            "scope",
+            "scope_version",
+            "binding_version",
+            "context_revision",
+            "history_snapshot",
+            "input_history_snapshot",
+            "cancelled",
+            "delivery_state",
+            "short_context",
+        )
+        paths = ",".join("'$." + field + "'" for field in fields)
         rows = self.db.execute(
-            "SELECT body FROM turns WHERE conversation_id=? AND position<? "
+            f"SELECT json_extract(body,{paths}) FROM turns WHERE conversation_id=? AND position<? "
             "ORDER BY position DESC LIMIT ?",
             (conversation_id, before_sequence, limit),
         )
-        return [json.loads(row[0]) for row in rows]
+        return [dict(zip(fields, json.loads(row[0]), strict=True)) for row in rows]
 
     def previous_scope_turn(self, scope, before_sequence):
         """One indexed predecessor; retain invalid/unsent candidates for strict checks.
@@ -532,6 +569,27 @@ class Store:
         ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def latest_sources(self, conversation_id, bases):
+        """One indexed latest-revision probe per key, batched into bounded SQL reads.
+
+        Do not scan every historical revision with a window function: an old,
+        frequently edited source must cost one index probe here too.
+        """
+        bases = list(dict.fromkeys(bases))
+        result = {}
+        for offset in range(0, len(bases), 256):
+            batch = bases[offset : offset + 256]
+            values = ",".join("(?)" for _ in batch)
+            rows = self.db.execute(
+                f"WITH wanted(base) AS (VALUES {values}) SELECT base,"
+                "(SELECT body FROM physicals WHERE conversation_id=? "
+                "AND json_extract(body,'$.base')=wanted.base "
+                "ORDER BY json_extract(body,'$.revision') DESC LIMIT 1) FROM wanted",
+                [*batch, conversation_id],
+            )
+            result.update((row[0], json.loads(row[1])) for row in rows if row[1] is not None)
+        return result
+
     def source_head(self):
         item = self.get("metadata", "source_head")
         return {k: item[k] for k in ("generation", "sequence")}
@@ -544,8 +602,20 @@ class Store:
         return json.loads(row[0]) if row else None
 
     def turn_replies(self, turn_id, state=None):
-        sql, args = "SELECT body FROM replies WHERE json_extract(body,'$.turn_id')=?", [turn_id]
-        if state is not None:
-            sql += " AND status=?"
-            args.append(state)
-        return [json.loads(row[0]) for row in self.db.execute(sql + " ORDER BY position", args)]
+        return self.replies_for_turns([turn_id], state)[turn_id]
+
+    def replies_for_turns(self, turn_ids, state=None):
+        turn_ids = list(dict.fromkeys(turn_ids))
+        result = {key: [] for key in turn_ids}
+        for offset in range(0, len(turn_ids), 256):
+            batch = turn_ids[offset : offset + 256]
+            sql = "SELECT body FROM replies WHERE json_extract(body,'$.turn_id') IN ("
+            sql += ",".join("?" for _ in batch) + ")"
+            args = list(batch)
+            if state is not None:
+                sql += " AND status=?"
+                args.append(state)
+            for row in self.db.execute(sql + " ORDER BY position", args):
+                reply = json.loads(row[0])
+                result[reply["turn_id"]].append(reply)
+        return result

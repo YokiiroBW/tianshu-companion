@@ -17,17 +17,20 @@ earlier_fragment 中。用 source_ref 定位消息，按 chronological_message_r
 画像、摘要、自动抽取是解释材料；有原文引用不等于已确认事实，摘要不能冒充原话。
 助手旧回复、建议或重复不是人的经历、承诺或同意；input_only 不含助手旧答。
 
-按每个人的前后发言区分提议、确认、待定、拒绝和退出。确认看句意，不要求出现
-“同意”二字；明确采纳安排就是确认。提议和后来确定自己的安排都表达本人意向，
-不需要再重复确认。后来退出覆盖本人的早先确认，不能替其他人取消或确认。
-只问确认者就列有确认依据的人；闲聊、沉默和反问不算确认。这只是选中发言者的
-记录，不是完整群成员名册，不能据此声称全群一致；问整体状态时先说明已确认或待定。
+问多人状态时先逐人读取 participants.message_refs 的有序原话，再合并回答；不能
+搜到一句“同意”就停止。提议者随后敲定自己的安排也算确认；自然采纳与直说同意
+同等有效，不需要二次确认。待定不能算同意；后来退出仅覆盖同一人同一事项的
+早先表态，不改其他人的状态和原安排。列确认者时同时核对提议者、自然采纳者与
+直说同意者的最新有效表态。闲聊、沉默、提问和助手的总结都不算人的确认。
+提问者也是参与者；问“谁确认”不能默认排除当前提问者，仍看其本人先前表态。
+可见发言不是完整群成员名册；只说有依据的个人状态，不能声称全群一致。
 更正只覆盖同一人的同一事项；把每次更正和它自己的理由相连，理由未说就保留未知。
 “我们”的普通聚会回忆不等于邀请助手到场；日常暗号按用途理解，不自动当认证凭据。
 
-transport_clock 是核实的消息时间，带 Z 表示 UTC，不能冒充本地钟点或事件发生时间。
-reported_time_phrases 只是原话时间词；自述钟点未被系统核实。相对日期只修饰对应
-事件，不修饰同句的姓名或习惯；没有明确日期和时区依据时保留原话，不猜日历日期。
+transport_clock 才是核实的消息时间，带 Z 表示 UTC。自述“我这里现在几点”只是
+参考钟，不是发言时刻。reported_time_phrases 的位置及 clause 边界帮助定位原话；
+role 不把原话提升为核实事实。相对日期只修饰对应事件，不修饰同句姓名、起名日
+或事实有效期；没有明确参考日期和时区时保留原话，不猜日历日期。
 后来明确报告完成属于进展，不因前面计划较晚或消息间隔短就否定它；完成时刻未说
 仍未知。问事件与发言时间归属只回答归属，不附加任何具体日期、钟点、间隔或冲突猜测。
 
@@ -213,6 +216,14 @@ def dialogue_sources(turn, context):
                 received_seconds_before_current=round(received - epoch(message["accepted_at"]), 3),
             )
         )
+    chronological = [
+        ref
+        for ref, _ in sorted(entries[len(current) :], key=lambda p: epoch(p[1]["accepted_at"]))
+        + entries[: len(current)]
+    ]
+    positions = {ref: i for i, ref in enumerate(chronological)}
+    for participant in participants.values():
+        participant["message_refs"].sort(key=positions.__getitem__)
     metadata = dict(
         current_request="m" + str(len(current)),
         current_request_received_at=reference["accepted_at"],
@@ -220,10 +231,6 @@ def dialogue_sources(turn, context):
         sources=sources,
         population_scope="authors_of_selected_messages_only_not_full_group_membership",
         participants=list(participants.values()),
-        chronological_message_refs=[
-            ref
-            for ref, _ in sorted(entries[len(current) :], key=lambda p: epoch(p[1]["accepted_at"]))
-            + entries[: len(current)]
-        ],
+        chronological_message_refs=chronological,
     )
     return metadata

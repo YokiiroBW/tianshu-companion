@@ -12,7 +12,9 @@ REPORTED_TIME = re.compile(
     r"上周|这周|本周|下周|上个月|这个月|下个月|周[一二三四五六日天]|星期[一二三四五六日天]|"
     r"[一二三四五六七八九十两\d]+天[前后]|\d{4}年\d{1,2}月\d{1,2}日)"
     r"(?:清晨|早上|上午|中午|下午|傍晚|晚上|夜里)?|"
-    r"(?<!\d)\d{1,2}[:：]\d{2}(?!\d)|(?<!\d)\d{1,2}点(?:半|\d{1,2}分)?"
+    r"(?<!\d)\d{1,2}[:：]\d{2}(?!\d)|"
+    r"(?:\d{1,2}|[零〇一二三四五六七八九十两]{1,3})点"
+    r"(?:半|[零〇一二三四五六七八九十\d]{1,3}分?)?"
 )
 MESSAGE_CLOCK_QUESTION = re.compile(
     r"(?:几[点时]|哪天|哪一天|几号|什么时候|何时|哪个时间|实际时间|具体时间|时间戳|隔了多久|多久前)"
@@ -26,11 +28,32 @@ MESSAGE_CLOCK_QUESTION = re.compile(
 
 
 def reported_times(text):
-    """Exact spans of user wording, never verified dates or inferred fact scopes."""
-    return [
-        dict(text=m[0], start=m.start(), end=m.end(), basis="speaker_reported_wording")
-        for m in list(REPORTED_TIME.finditer(text))[:8]
-    ]
+    """Exact spans and their clause boundary; no inferred event or validity date."""
+    result = []
+    for clause in re.finditer(r"[^，,。；;！!？?\n]+", text):
+        # A literal local-clock report can anchor the speaker's relative words,
+        # but is never a verified send timestamp. Do not silently promote it.
+        reference = bool(
+            re.search(r"我(?:这里|这边|当地)|现在|此刻", clause[0])
+            and re.search(r"北京时间|当地时间|UTC|GMT|时区", clause[0], re.I)
+        )
+        for match in REPORTED_TIME.finditer(clause[0]):
+            result.append(
+                dict(
+                    text=match[0],
+                    start=clause.start() + match.start(),
+                    end=clause.start() + match.end(),
+                    clause_start=clause.start(),
+                    clause_end=clause.end(),
+                    basis="speaker_reported_wording",
+                    role="self_reported_reference_clock_not_message_time"
+                    if reference
+                    else "unresolved_clause_time",
+                )
+            )
+            if len(result) == 8:
+                return result
+    return result
 
 
 def dialogue_time_view(prompt, metadata):
@@ -69,15 +92,14 @@ def dialogue_time_view(prompt, metadata):
     # Ordering and exact author references are sufficient for ordinary factual
     # recall. Raw transport times elsewhere would duplicate this provenance.
     sources = []
-    for source in metadata["sources"]:
-        source = dict(source)
-        sent = source.pop("message_sent_at")
-        received = source.pop("message_received_at")
-        source.pop("received_seconds_before_current")
+    for original in metadata["sources"]:
+        # Participant rows already own the exact person and ordered references.
+        # Avoid three copies of those same IDs and relations in model input.
+        source = {key: original[key] for key in ("message_ref", "speaker_ref")}
         if clocks:
             source["transport_clock"] = dict(
-                sent_at=sent,
-                received_at=received,
+                sent_at=original["message_sent_at"],
+                received_at=original["message_received_at"],
                 basis="verified_transport_timestamp_with_explicit_offset_not_event_time",
             )
         sources.append(source)
