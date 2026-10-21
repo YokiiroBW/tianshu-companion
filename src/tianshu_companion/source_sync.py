@@ -28,18 +28,57 @@ def actor_key(data, actor):
     return digest([data["message_key"], actor])
 
 
-def needs_model_reservation(core, data, channel, cid, actor, now):
+def needs_model_reservation(core, data, channel, cid, actor, now, *, groups=None):
     """Read-only plan; accept_actor repeats the decision inside its transaction."""
     if core.store.get("inbox", actor_key(data, actor)):
         return False
     if cid is None:
         return True
     collection_key = dict(channel=channel, author=data["author"])
+    if groups is None:
+        groups = core.store.list("collections", cid, ["collecting"])
     return not any(
         c["collection_key"] == collection_key
         and c["scope"]["actor_id"] == actor
         and c["deadline"] > now
-        for c in core.store.list("collections", cid, ["collecting"])
+        for c in groups
+    )
+
+
+def _check_collector_capacity(core, collectors, queued, *, additional=1):
+    if (
+        collectors + additional > core.policy.max_collectors_per_conversation
+        or collectors + queued + additional > core.policy.max_queued_turns
+    ):
+        raise Fault("queue_full")
+
+
+def _precheck_capacity(core, data, channel, cid, actors, now):
+    """Reject only new ordinary fanouts whose read-only plan is already full.
+
+    Duplicates, historical revisions and appends keep their existing validation
+    order. Controls can free capacity and must reach the accepting transaction.
+    """
+    store = core.store
+    if (
+        data["kind"] != "message"
+        or not actors
+        or store.get("physicals", digest(data["message_key"])) is not None
+        or (cid is not None and store.latest_source(cid, digest(physical_key(data))) is not None)
+    ):
+        return
+    groups = store.list("collections", cid, ["collecting"]) if cid is not None else []
+    if any(
+        not needs_model_reservation(core, data, channel, cid, actor, now, groups=groups)
+        for actor in actors
+    ):
+        return
+    collectors = sum(c["deadline"] > now for c in groups)
+    queued = len(store.list("turns", cid, ["queued"])) if cid is not None else 0
+    # _seal_due moves expired collectors to queued before accept_actor checks.
+    # Each new authorized actor needs a separate collector in that same fanout.
+    _check_collector_capacity(
+        core, collectors, queued + len(groups) - collectors, additional=len(actors)
     )
 
 
@@ -379,12 +418,7 @@ def accept_actor(
             raise Fault("dependency_unavailable")
         verify_lease(selected["expires_at"], now)
     if collection is None:
-        if (
-            len(groups) >= core.policy.max_collectors_per_conversation
-            or len(groups) + len(store.list("turns", cid, ["queued"]))
-            >= core.policy.max_queued_turns
-        ):
-            raise Fault("queue_full")
+        _check_collector_capacity(core, len(groups), len(store.list("turns", cid, ["queued"])))
         if core.default_model_selector is not None:
             if reservation is None:
                 # A collector closed after the read-only plan. Replan outside the
@@ -613,6 +647,38 @@ async def _ingest(core, service, request, defer=False, *, legacy=False):
             core, service, data, ctx, actor, authority["audience"], cid, identity[0], legacy=legacy
         ):
             grants[actor] = ctx
+    now = core.clock()
+    if (
+        prior is None
+        and epoch(request["command"]["deadline_at"]) > now
+        and epoch(authority["expires_at"]) > now
+    ):
+        # Identity awaits may have admitted this exact command or revoked an
+        # earlier actor. Neither case may be turned into a capacity rejection.
+        _, _, fresh_prior = core._command_key(service, operation, original)
+        if fresh_prior is None:
+            _precheck_capacity(
+                core,
+                data,
+                channel,
+                cid,
+                [
+                    actor
+                    for actor, ctx in grants.items()
+                    if context_valid(
+                        core,
+                        service,
+                        data,
+                        ctx,
+                        actor,
+                        authority["audience"],
+                        cid,
+                        identity[0],
+                        legacy=legacy,
+                    )
+                ],
+                now,
+            )
     # Select before the accepting transaction. A queued turn then carries the exact version
     # even if the administrator changes the default before tick starts its background work.
     candidate_cid = cid or uid("conv")
