@@ -1676,7 +1676,8 @@ def test_concurrent_functional_and_chat_sends_never_duplicate_a_segment():
     asyncio.run(scenario())
 
 
-def test_a_cancelled_turn_releases_the_boundary_for_a_waiting_functional_reply():
+@pytest.mark.parametrize("preparation_busy", [False, True])
+def test_a_cancelled_turn_releases_the_boundary_for_a_waiting_functional_reply(preparation_busy):
     async def scenario():
         h = Harness()
         register(h, query_spec())
@@ -1701,6 +1702,23 @@ def test_a_cancelled_turn_releases_the_boundary_for_a_waiting_functional_reply()
                 == "outbound_band_busy"
             )
             await h.cancel(turn)
+            if preparation_busy:
+                # A released outbound band must wake Direct even while chat
+                # cannot claim another preparation worker.
+                busy = asyncio.Event()
+                for index in range(h.core.preparation_slots):
+                    key = f"busy:{index}"
+                    h.core.store.put(
+                        "turns",
+                        dict(id=key, conversation_id="busy", phase="preparing", retry_at=0),
+                    )
+                    h.core.jobs[key] = asyncio.create_task(busy.wait())
+                for _ in range(80):
+                    await h.core.tick()
+                    await asyncio.sleep(0)
+                    if h.core.direct.request_view(entry["request"]["id"])["reply_state"] == "sent":
+                        break
+                assert h.core.direct.request_view(entry["request"]["id"])["reply_state"] == "sent"
             await exit_.deliver_until(entry["request"]["id"])
             view = h.core.direct.request_view(entry["request"]["id"])
             assert view["reply_state"] == "sent" and view["deferred_reason"] is None

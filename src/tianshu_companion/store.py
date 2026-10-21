@@ -577,6 +577,70 @@ class Store:
         ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def work_candidates(self, conversation_ids):
+        """One tick's hints, without loading queued or in-flight turn payloads.
+
+        The caller holds its normal scheduling transaction. Claims and delivery
+        still reread their current facts; nothing here survives the tick.
+        """
+        conversation_ids = list(dict.fromkeys(conversation_ids))
+        result = {
+            cid: dict(conversation=None, active=0, queued=[], retry=[], deliver=False, direct=False)
+            for cid in conversation_ids
+        }
+        for offset in range(0, len(conversation_ids), 256):
+            batch = conversation_ids[offset : offset + 256]
+            placeholders = ",".join("?" for _ in batch)
+            for cid, body in self.db.execute(
+                f"SELECT conversation_id,body FROM conversations WHERE conversation_id IN ({placeholders})",
+                batch,
+            ):
+                result[cid]["conversation"] = json.loads(body)
+            for key, cid, phase, retry_at in self.db.execute(
+                "SELECT id,conversation_id,status,CASE WHEN status IN ('preparing','waiting_dependency') "
+                "THEN json_extract(body,'$.retry_at') END FROM turns INDEXED BY turns_work "
+                "WHERE status IN ('queued','preparing','generating','waiting_dependency',"
+                "'ready_to_send','sending','reconciling') "
+                f"AND conversation_id IN ({placeholders}) ORDER BY conversation_id,position,id",
+                batch,
+            ):
+                candidate = result[cid]
+                if phase == "queued":
+                    if len(candidate["queued"]) < 2:
+                        candidate["queued"].append(key)
+                else:
+                    candidate["active"] += 1
+                if phase in {"preparing", "waiting_dependency"}:
+                    candidate["retry"].append((key, retry_at))
+                if phase in {"ready_to_send", "sending", "reconciling"}:
+                    candidate["deliver"] = True
+            for (cid,) in self.db.execute(
+                "SELECT DISTINCT conversation_id FROM replies INDEXED BY replies_unknown "
+                f"WHERE status='unknown' AND conversation_id IN ({placeholders})",
+                batch,
+            ):
+                result[cid]["deliver"] = True
+            for (cid,) in self.db.execute(
+                "SELECT DISTINCT conversation_id FROM direct_requests INDEXED BY direct_waiting_band "
+                "WHERE status IN ('completed','failed') "
+                "AND json_extract(body,'$.reply_state')='ready_to_deliver' "
+                "AND json_extract(body,'$.deferred_reason')='outbound_band_busy' "
+                f"AND conversation_id IN ({placeholders})",
+                batch,
+            ):
+                result[cid]["direct"] = True
+        return result
+
+    def work_turn_count(self, cid, states):
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM turns INDEXED BY turns_work WHERE conversation_id=? "
+            "AND status IN ('queued','preparing','generating','waiting_dependency',"
+            "'ready_to_send','sending','reconciling') "
+            f"AND status IN ({','.join('?' for _ in states)})",
+            (cid, *states),
+        ).fetchone()
+        return row[0]
+
     def first_work_turn(self, cid):
         row = self.db.execute(
             "SELECT body FROM turns INDEXED BY turns_work WHERE conversation_id=? AND status IN ('queued','preparing','generating','waiting_dependency','ready_to_send','sending','reconciling') ORDER BY position,id LIMIT 1",

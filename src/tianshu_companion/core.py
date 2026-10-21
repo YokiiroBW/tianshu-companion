@@ -1075,17 +1075,27 @@ class Core(Delivery):
             if not conversations:
                 conversations = self.store.work_conversations()
             self._work_cursor = conversations[-1] if conversations else ""
+            candidates = self.store.work_candidates(conversations)
+            phases = self.store.turn_phases(self.jobs)
             for cid in conversations:
-                conv = self.store.conversation(cid)
+                candidate = candidates[cid]
+                conv = candidate["conversation"]
                 if conv is None:
                     continue
                 if conv.get("source_quarantined"):
                     continue
                 cid = conv["conversation_id"]
-                active = self.store.work_turns(cid, ACTIVE)
-                queued = self.store.work_turns(cid, ["queued"])
-                for turn in queued[: 2 - len(active)]:
-                    if not self._preparation_available():
+                queued = candidate["queued"][: max(0, 2 - candidate["active"])]
+                for turn_id in queued:
+                    if not self._preparation_available(phases):
+                        break
+                    turn = self.store.get("turns", turn_id)
+                    current = self.store.conversation(cid)
+                    if current is None or current.get("source_quarantined"):
+                        break
+                    if turn is None or turn["phase"] != "queued" or turn["cancelled"]:
+                        continue
+                    if self.store.work_turn_count(cid, ACTIVE) >= 2:
                         break
                     if self.memory_learning.admission_blocked(turn["scope"]):
                         break
@@ -1125,6 +1135,7 @@ class Core(Delivery):
                     # Reserve a worker immediately so this tick cannot start every
                     # conversation before any task gets a chance to prepare.
                     self.jobs[turn["id"]] = asyncio.create_task(self._process(turn["id"]))
+                    phases[turn["id"]] = "preparing"
                     self._work_cursor = cid
                     # Two turns per conversation at most; each admission is one real event.
                     obs.emit(
@@ -1133,19 +1144,32 @@ class Core(Delivery):
                         "started",
                         correlation_id=turn.get("correlation_id"),
                     )
-                for turn in self.store.work_turns(cid, ["preparing", "waiting_dependency"]):
+                for turn_id, retry_at in candidate["retry"]:
                     if (
-                        turn["id"] not in self.jobs
-                        and turn["retry_at"] <= self.clock()
-                        and self._preparation_available()
+                        turn_id not in self.jobs
+                        and retry_at <= self.clock()
+                        and self._preparation_available(phases)
                     ):
-                        self.jobs[turn["id"]] = asyncio.create_task(self._process(turn["id"]))
+                        turn = self.store.get("turns", turn_id)
+                        current = self.store.conversation(cid)
+                        if current is None or current.get("source_quarantined"):
+                            break
+                        if (
+                            turn is None
+                            or turn["cancelled"]
+                            or turn["phase"] not in {"preparing", "waiting_dependency"}
+                            or turn["retry_at"] > self.clock()
+                        ):
+                            continue
+                        self.jobs[turn_id] = asyncio.create_task(self._process(turn_id))
+                        phases[turn_id] = turn["phase"]
                         self._work_cursor = cid
-                if cid not in self.send_jobs:
+                if candidate["deliver"] and cid not in self.send_jobs:
                     self.send_jobs[cid] = asyncio.create_task(self._deliver(cid))
                 waiting = ("direct", cid)
                 if (
                     waiting not in self.jobs
+                    and candidate["direct"]
                     # Only a conversation that has handed a reply to the exit can have a
                     # functional reply parked on its band, so most ticks stop here.
                     and conv.get("send_band")
@@ -1168,12 +1192,13 @@ class Core(Delivery):
             for other in self.store.active_scopes(ACTIVE, scope["actor_id"])
         )
 
-    def _preparation_available(self):
+    def _preparation_available(self, phases=None):
         # Generation keeps its provider slot, but no longer also occupies a
         # preparation worker. Both stages stay bounded, including queued models.
         if len(self.jobs) >= 2 * self.preparation_slots:
             return False
-        phases = self.store.turn_phases(self.jobs)
+        if phases is None:
+            phases = self.store.turn_phases(self.jobs)
         preparing = sum(phases.get(key) != "generating" for key in self.jobs)
         return preparing < self.preparation_slots
 

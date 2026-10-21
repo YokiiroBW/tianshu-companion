@@ -374,7 +374,7 @@ class Delivery:
         cursors = getattr(self, "_reconcile_cursors", {})
         self._reconcile_cursors = cursors
         replies = self.store.unknown_replies(cid, cursors.get(cid, ""))
-        if not replies:
+        if not replies and cursors.get(cid):
             replies = self.store.unknown_replies(cid)
         if replies:
             cursors[cid] = replies[-1]["id"]
