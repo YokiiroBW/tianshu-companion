@@ -47,7 +47,7 @@ from .model_selection import verify_lease
 from .model_slots import ModelSlots
 from .qq_identity import (
     SOURCE_INSTRUCTION,
-    material_sources,
+    material_provenance,
     dialogue_sources,
     projection as qq_projection,
     validate_account,
@@ -1483,10 +1483,10 @@ class Core(Delivery):
                 )
                 context_bytes = len(canonical({k: prompt[k] for k in context.data}).encode())
                 messages[1]["content"] = canonical(prompt)
-                messages[0]["content"] += "\nMaterial provenance: " + canonical(
-                    material_sources(context.data)
+                provenance = (messages[0]["content"], source_timeline)
+                messages[0]["content"] += material_provenance(
+                    context.data, source_timeline, turn["scope"]["person_id"]
                 )
-                messages[0]["content"] += "\nHuman source timeline: " + canonical(source_timeline)
                 if len(canonical(messages).encode()) > 524288:
                     raise Fault("budget_exceeded")
                 with self.store.transaction():
@@ -1515,7 +1515,7 @@ class Core(Delivery):
                     self._save_turn(turn)
                 obs.emit(self.events, "turn.generation.started", "started")
                 segments, usage = await asyncio.wait_for(
-                    self._respond_native(turn, messages), timeout=180
+                    self._respond_native(turn, messages, provenance=provenance), timeout=180
                 )
             turn = self.store.get("turns", turn_id)
             if turn["cancelled"] or turn["phase"] in TERMINAL:
@@ -1602,16 +1602,23 @@ class Core(Delivery):
                 except (Fault, OSError):
                     pass
 
-    async def _respond_native(self, turn, messages):
+    async def _respond_native(self, turn, messages, *, provenance=None):
         """Native tools continue the same actor dialogue after actual domain receipts."""
         native = hasattr(self.gateway, "complete")
         instruction = self.skills.instructions(turn) if native else ""
         instruction += self.memory_learning.dialogue_context(turn)
         instruction += SOURCE_INSTRUCTION
         if messages and messages[0]["role"] == "system":
-            messages[0] = dict(messages[0], content=messages[0]["content"] + "\n" + instruction)
+            system = provenance[0] if provenance is not None else messages[0]["content"]
+            system += "\n" + instruction
+            messages[0] = dict(messages[0], content=system)
         else:
+            system = instruction
             messages.insert(0, dict(role="system", content=instruction))
+        if provenance is not None:
+            messages[0]["content"] += material_provenance(
+                json.loads(messages[1]["content"]), provenance[1], turn["scope"]["person_id"]
+            )
         if len(canonical(messages).encode()) > 524288:
             raise Fault("budget_exceeded")
         if not native:
@@ -1737,6 +1744,10 @@ class Core(Delivery):
                         dependency_groups=fresh["preparation"]["dependency_groups"],
                     )
                     messages[1]["content"] = canonical(prompt)
+                    if provenance is not None:
+                        messages[0]["content"] = system + material_provenance(
+                            prompt, provenance[1], fresh["scope"]["person_id"]
+                        )
                 with self.store.transaction():
                     fresh = self.store.get("turns", turn["id"])
                     fresh["native_execution"]["messages"].append(

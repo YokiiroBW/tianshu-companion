@@ -465,6 +465,26 @@ class Origins:
         return context
 
 
+def _group_context_owners(scope, checks):
+    """A viewer and exact same-group owners, never a member directory or association."""
+    if not 1 <= len(checks) <= 17 or checks[0]["scope"] != scope:
+        raise Fault("forbidden")
+    people = set()
+    for check in checks:
+        owner = check["scope"]
+        person = owner["person_id"]
+        if (
+            not isinstance(person, str)
+            or person in people
+            or any(owner[key] != scope[key] for key in ("actor_id", "audience", "conversation_id"))
+            or check["association_id"] is not None
+            or check["association_version"] != 1
+        ):
+            raise Fault("forbidden")
+        people.add(person)
+    return people
+
+
 class Memory:
     def __init__(self, contracts, client):
         self.contracts, self.client = contracts, client
@@ -557,18 +577,29 @@ class Memory:
             raise Fault("invalid_input")
         grouped = set()
         for group in groups:
-            members = {
-                u["record_id"]
-                for u in units
-                if u["semantic_group_id"] == group["semantic_group_id"]
-            }
-            if members != set(group["record_ids"]) or len(members) != len(group["record_ids"]):
+            group_units = [u for u in units if u["semantic_group_id"] == group["semantic_group_id"]]
+            members = {u["record_id"] for u in group_units}
+            if (
+                members != set(group["record_ids"])
+                or len(members) != len(group["record_ids"])
+                or len({u["subject_person_id"] for u in group_units}) > 1
+            ):
                 raise Fault("invalid_input")
             grouped.update(members)
         if grouped != ids or (units and len(canonical(units).encode()) > budget["bytes"]):
             raise Fault("budget_exceeded")
+        owners = {scope["person_id"]}
+        if scope["audience"] == "group":
+            owners = _group_context_owners(scope, response["scope_checks"])
+            unit_owners = {unit["subject_person_id"] for unit in units}
+            if response["scope_checks"][0]["scope_version"] != response["scope_version"]:
+                raise Fault("scope_changed")
+            # Content returns checks only for owners whose complete groups fit.
+            # A zero-budget recheck instead retains the already pinned owner set.
+            if (not known or all(budget.values())) and owners != unit_owners | {scope["person_id"]}:
+                raise Fault("forbidden")
         for unit in units:
-            if unit["subject_person_id"] != scope["person_id"]:
+            if unit["subject_person_id"] not in owners:
                 raise Fault("forbidden")
             if scope["audience"] == "group" and (
                 unit["visibility"] != "shared_projection"
@@ -604,6 +635,8 @@ class Memory:
         history_scopes = snapshot["history_checks"]
         if not history_scopes or history_scopes[0]["scope"] != scope:
             raise Fault("forbidden")
+        if scope["audience"] == "group":
+            _group_context_owners(scope, history_scopes)
         if expected is not None and (
             response["scope_version"] != expected["scope_version"]
             or snapshot["association_version"] != expected["association_version"]

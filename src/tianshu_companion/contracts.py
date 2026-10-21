@@ -147,7 +147,9 @@ class Contracts:
                 raise ValueError("Unrecognized contract release: " + package)
             release = json.loads(manifest)
             expected_version = (
-                "2.1.0"
+                "1.1.0"
+                if package in {"memory-context/v1", "context-history/v1"}
+                else "2.1.0"
                 if package.endswith("/v2.1")
                 else "2.0.0"
                 if package.endswith("/v2")

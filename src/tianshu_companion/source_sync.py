@@ -122,8 +122,9 @@ def make_admission(data, actor, scope, source, physical, binding_version, origin
     )
 
 
-def ensure_channel(store, channel):
-    conv = store.get("conversations", digest(channel))
+def ensure_channel(store, channel, *, known=None):
+    key = digest(channel)
+    conv = store.get("conversations", key) if known is None else known.get(key)
     if conv and conv.get("source_quarantined"):
         raise Fault("dependency_unavailable")
     return conv
@@ -240,17 +241,37 @@ def read_facts(store, contracts, service, request):
     contracts.check("sources#facts_request", request)
     with store.transaction():
         physicals, admissions, turns = [], [], []
-        keys = {}
+        keys = {digest(chosen["key"]): chosen["key"] for chosen in request["selectors"]}
+        selected_turns = store.get_many("turns", request["turn_ids"])
+        channels = {digest(key["channel"]): key["channel"] for key in keys.values()}
+        for turn in selected_turns.values():
+            channel = turn["bundle"]["collection_key"]["channel"]
+            channels[digest(channel)] = channel
+        conversations = store.get_many("conversations", channels)
+        for channel in channels.values():
+            ensure_channel(store, channel, known=conversations)
+        selected_admissions = store.get_many(
+            "admissions", [digest(chosen) for chosen in request["selectors"]]
+        )
+        by_conversation = {}
+        for base, key in keys.items():
+            conv = conversations.get(digest(key["channel"]))
+            if conv:
+                by_conversation.setdefault(conv["conversation_id"], []).append(base)
+        latest = {}
+        for cid, bases in by_conversation.items():
+            latest.update(store.latest_sources(cid, bases))
+        replies = store.replies_for_turns(selected_turns)
+        outboxes = store.outboxes_for_turns(selected_turns)
+        # All reads belong to the original owner snapshot. Preserve the caller's
+        # order, missing entries and the first event; none of these are caches.
         for chosen in request["selectors"]:
-            keys[digest(chosen["key"])] = chosen["key"]
-            ensure_channel(store, chosen["key"]["channel"])
-            row = store.get("admissions", digest(chosen))
+            row = selected_admissions.get(digest(chosen))
             admissions.append(
                 copy.deepcopy(row["fact"]) if row else dict(selector=chosen, state="missing")
             )
         for base, key in keys.items():
-            conv = ensure_channel(store, key["channel"])
-            row = store.latest_source(conv["conversation_id"], base) if conv else None
+            row = latest.get(base)
             if row:
                 fact = copy.deepcopy(row["fact"])
                 if not request["include_content"]:
@@ -259,16 +280,11 @@ def read_facts(store, contracts, service, request):
             else:
                 physicals.append(dict(key=key, state="missing"))
         for tid in request["turn_ids"]:
-            turn = store.get("turns", tid)
+            turn = selected_turns.get(tid)
             if not turn:
                 turns.append(dict(turn_id=tid, state="missing"))
                 continue
-            ensure_channel(store, turn["bundle"]["collection_key"]["channel"])
-            events = [
-                r
-                for r in store.list("outbox", turn["conversation_id"])
-                if r["event"]["aggregate_id"] == tid
-            ]
+            events = [r for r in outboxes[tid] if r["conversation_id"] == turn["conversation_id"]]
             saved = events[0]["event"] if events else None
             if saved and (saved["scope_version"] is None or saved["reality"] is None):
                 saved = None
@@ -286,7 +302,7 @@ def read_facts(store, contracts, service, request):
                     else "not_required",
                     reply_ids=[
                         r["id"]
-                        for r in store.turn_replies(tid)
+                        for r in replies[tid]
                         if r["state"] in {"sent", "unknown", "sending"}
                     ],
                     committed_event=saved,

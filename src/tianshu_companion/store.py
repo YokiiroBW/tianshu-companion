@@ -598,6 +598,23 @@ class Store:
             )
         ]
 
+    def outboxes_for_turns(self, turn_ids):
+        """Read only the requested turns through the existing outbox-turn index."""
+        turn_ids = list(dict.fromkeys(turn_ids))
+        result = {key: [] for key in turn_ids}
+        for offset in range(0, len(turn_ids), 256):
+            batch = turn_ids[offset : offset + 256]
+            rows = self.db.execute(
+                "SELECT body FROM outbox WHERE json_extract(body,'$.event.aggregate_id') IN ("
+                + ",".join("?" for _ in batch)
+                + ") ORDER BY position,id",
+                batch,
+            )
+            for row in rows:
+                item = self.payloads.restore("outbox", json.loads(row[0]))
+                result[item["event"]["aggregate_id"]].append(item)
+        return result
+
     def unknown_replies(self, cid, after="", limit=32):
         return [
             json.loads(row[0])
