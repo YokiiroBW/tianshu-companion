@@ -7,7 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import httpx
+
 from support import Harness
+from tianshu_companion.clients import JsonService, Memory
 from tianshu_companion.contracts import Fault
 from tianshu_companion.model_selection import ModelSelection
 
@@ -322,6 +325,55 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.generated), 1)
         self.assertFalse(self.h.core.memory_learning.admission_blocked(self.h.turns()[0]["scope"]))
 
+    async def test_commit_wait_barrier_survives_slow_receipt_cancel_and_restart(self):
+        await self.chat()
+        gate = asyncio.Event()
+        self.h.gateway.gates[2] = gate
+        await self.h.ingest(text="同范围正在回复")
+        await self.h.cycles()
+        await self.flush()
+        waiting = self.task()
+        self.assertEqual(waiting["stage"], "commit_wait")
+        proposal = copy.deepcopy(waiting["output"])
+        gate.set()
+        await self.h.cycles()
+        entered, read_gate = asyncio.Event(), asyncio.Event()
+
+        async def slow_receipt(job, output):
+            self.assertIsNone(output)
+            entered.set()
+            await read_gate.wait()
+            return await self.process(job, output)
+
+        self.h.memory.process_candidate = slow_receipt
+        worker = self.h.core.memory_learning
+        await worker.work(wait=False)
+        await asyncio.wait_for(entered.wait(), 2)
+        self.assertEqual(self.task()["stage"], "commit_wait")
+        self.assertTrue(worker.admission_blocked(waiting["scope"]))
+        await self.h.ingest(text="同范围应当排队")
+        await self.h.ingest(text="另一群正常回复", group=True, channel="group:other", account="b")
+        await self.h.cycles()
+        phases = {self.h.core._input_text(turn): turn["phase"] for turn in self.h.turns()}
+        self.assertEqual(phases["同范围应当排队"], "queued")
+        self.assertEqual(phases["另一群正常回复"], "sent")
+        await worker.close()
+        self.assertEqual(self.task()["stage"], "receipt")
+        self.assertFalse(worker.admission_blocked(waiting["scope"]))
+        self.assertEqual(self.task()["recovery_failures"], {"receipt": 1})
+        self.assertEqual(self.task()["output"], proposal)
+        await self.h.cycles()
+        queued = next(t for t in self.h.turns() if self.h.core._input_text(t) == "同范围应当排队")
+        self.assertEqual(queued["phase"], "sent")
+        await self.restart()
+        self.assertFalse(self.h.core.memory_learning.admission_blocked(waiting["scope"]))
+        self.h.memory.process_candidate = self.process
+        self.h.clock.advance(10)
+        await self.h.core.memory_learning.work()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["attempts"], 2)
+        self.assertEqual(len(self.generated), 1)
+
     async def test_empty_proposal_finishes_while_dialogue_is_generating(self):
         await self.chat()
         gate = asyncio.Event()
@@ -598,6 +650,293 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
                 "blocked"
             ]
         )
+
+    async def test_five_rate_limits_then_unknown_receipt_read_recovers_same_job(self):
+        await self.chat()
+        generate, process = self.generate, self.process
+        read_failed = False
+
+        async def pressure(turn, messages):
+            result = await generate(turn, messages)
+            if len(self.generated) <= 5:
+                error = Fault("dependency_unavailable", unknown=True)
+                error.rate_limited = True
+                raise error
+            return result
+
+        async def read_timeout(job, output):
+            nonlocal read_failed
+            if output is None and len(self.generated) == 5 and not read_failed:
+                read_failed = True
+                raise Fault("timeout", unknown=True)
+            return await process(job, output)
+
+        self.h.gateway.generate = pressure
+        self.h.memory.process_candidate = read_timeout
+        for _ in range(6):
+            await self.flush()
+            item = self.task()
+            self.assertEqual(item["state"], "pending")
+            self.assertIsNone(item["output"])
+            self.h.clock.advance(item["deadline"] - self.h.clock() + 1)
+        job_id = self.task()["job_id"]
+        self.assertEqual(self.task()["attempts"], 6)
+        self.assertEqual(self.task()["stage"], "receipt")
+        self.assertEqual(self.task()["recovery_failures"], {"rate_limit": 5, "receipt": 1})
+        self.assertEqual(self.task()["proposal_failures"], 0)
+        self.assertFalse(any(output is not None for _, output in self.calls))
+        await self.restart()
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["job_id"], job_id)
+        self.assertEqual(self.task()["attempts"], 7)
+        self.assertEqual(len(self.generated), 6)
+        self.assertEqual(sum(output is not None for _, output in self.calls), 1)
+
+    async def test_rate_limit_retry_after_is_persisted_without_holding_other_scopes(self):
+        self.unique_jobs()
+        await self.h.ingest(text=TEXT, group=True, channel="group:a")
+        await self.h.ingest(text=TEXT, group=True, channel="group:b", account="b")
+        await self.h.cycles()
+        generate = self.generate
+        receipts = {}
+
+        async def scoped_process(job, output):
+            # process() is an inline fixture. Its single receipt must be scoped
+            # when two independent real queue jobs run concurrently here.
+            saved, self.completed = self.completed, receipts.get(job)
+            try:
+                response = await self.process(job, output)
+                if self.completed:
+                    receipts[job] = self.completed
+                return response
+            finally:
+                self.completed = saved
+
+        async def pressure(turn, messages):
+            if turn["bundle"]["collection_key"]["channel"]["channel_conversation_id"] == "group:a":
+                self.generated.append(copy.deepcopy(turn))
+                failure = Fault("dependency_unavailable", unknown=True)
+                failure.rate_limited = True
+                failure.retry_after_seconds = 45
+                raise failure
+            return await generate(turn, messages)
+
+        self.h.gateway.generate = pressure
+        self.h.memory.process_candidate = scoped_process
+        await self.flush()
+        await self.h.core.memory_learning.work()
+        jobs = self.h.core.store.list("metadata", "memory:learning")
+        pending = next(item for item in jobs if item["state"] == "pending")
+        self.assertEqual(sum(item["state"] == "completed" for item in jobs), 1)
+        self.assertEqual(pending["recovery_reason"], "rate_limit_cooldown")
+        self.assertEqual(pending["deadline"] - self.h.clock(), 45)
+        calls = len(self.generated)
+        self.h.clock.advance(44)
+        await self.flush()
+        self.assertEqual(len(self.generated), calls)
+        await self.restart()
+        self.h.clock.advance(2)
+        self.h.gateway.generate = generate
+        await self.flush()
+        self.assertEqual(self.h.core.store.get("metadata", pending["id"])["state"], "completed")
+
+    async def test_saved_output_receipt_timeout_then_restart_never_regenerates(self):
+        await self.chat()
+        self.lose_response = True
+        await self.flush()
+        item = self.task()
+        proposal = copy.deepcopy(item["output"])
+
+        async def timeout(job, output):
+            self.assertEqual(job, item["job_id"])
+            self.assertIsNone(output)
+            raise Fault("timeout", unknown=True)
+
+        self.h.memory.process_candidate = timeout
+        self.h.clock.advance(10)
+        await self.flush()
+        self.assertEqual(self.task()["output"], proposal)
+        self.assertEqual(self.task()["recovery_failures"], {"temporary": 1, "receipt": 1})
+        self.assertEqual(self.task()["proposal_failures"], 0)
+        await self.restart()
+        self.h.memory.process_candidate = self.process
+        self.h.clock.advance(10)
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(len(self.generated), 1)
+        self.assertEqual(sum(output is not None for _, output in self.calls), 1)
+
+    async def test_unknown_commit_keeps_retry_after_and_retries_exact_output_after_query(self):
+        await self.chat()
+        requests, failures = [], []
+        submissions = 0
+
+        def handler(request):
+            nonlocal submissions
+            body = json.loads(request.content)
+            requests.append(body)
+            if body["output"] is None:
+                return httpx.Response(
+                    200,
+                    json=dict(
+                        state="pending",
+                        result=None,
+                        content=[dict(index=0, text=TEXT, sent_at="2026-10-11T00:00:00Z")],
+                    ),
+                )
+            submissions += 1
+            if submissions == 1:
+                return httpx.Response(
+                    503,
+                    json=dict(
+                        code="dependency_unavailable", execution_state="unknown", retryable=True
+                    ),
+                    headers={"Retry-After": "45"},
+                )
+            return httpx.Response(
+                200,
+                json=dict(
+                    state="completed",
+                    result=dict(
+                        state="committed",
+                        record_ids=["record:learned"],
+                        group_ids=["group:learned"],
+                    ),
+                    content=[],
+                ),
+            )
+
+        client = JsonService(
+            "https://fixture.invalid", "fixture", transport=httpx.MockTransport(handler)
+        )
+        self.addAsyncCleanup(client.close)
+        memory = Memory(self.h.contracts, client)
+
+        async def process(job, output):
+            try:
+                return await memory.process_candidate(job, output)
+            except Fault as error:
+                failures.append((error.unknown, error.retry_after_seconds))
+                raise
+
+        self.h.memory.process_candidate = process
+        await self.flush()
+        item = self.task()
+        proposal = copy.deepcopy(item["output"])
+        self.assertEqual(failures, [(True, 45)])
+        self.assertEqual(item["deadline"] - self.h.clock(), 45)
+        self.assertEqual(item["proposal_failures"], 0)
+        self.assertEqual(len(requests), 2)
+        self.h.clock.advance(44)
+        await self.flush()
+        self.assertEqual(len(requests), 2)
+        await self.restart()
+        self.h.clock.advance(2)
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(len(self.generated), 1)
+        self.assertEqual([body["output"] for body in requests], [None, proposal, None, proposal])
+        self.assertTrue(all(body["job_id"] == item["job_id"] for body in requests))
+
+    async def test_rate_limit_failures_have_a_durable_bound(self):
+        await self.chat()
+        generate = self.generate
+
+        async def pressure(turn, messages):
+            await generate(turn, messages)
+            failure = Fault("dependency_unavailable", unknown=True)
+            failure.rate_limited = True
+            raise failure
+
+        self.h.gateway.generate = pressure
+        for _ in range(6):
+            await self.flush()
+            await self.restart()
+            self.h.clock.advance(301)
+        self.assertEqual(self.task()["state"], "blocked")
+        self.assertEqual(self.task()["attempts"], 6)
+        self.assertEqual(self.task()["recovery_failures"], {"rate_limit": 6})
+        before = len(self.generated)
+        await self.flush()
+        self.assertEqual(len(self.generated), before)
+
+    async def test_null_output_receipt_failures_have_a_durable_bound(self):
+        await self.chat()
+
+        async def timeout(job, output):
+            self.assertIsNone(output)
+            raise Fault("timeout", unknown=True)
+
+        self.h.memory.process_candidate = timeout
+        for _ in range(6):
+            await self.flush()
+            await self.restart()
+            self.h.clock.advance(301)
+        self.assertEqual(self.task()["state"], "blocked")
+        self.assertEqual(self.task()["attempts"], 6)
+        self.assertEqual(self.task()["recovery_failures"], {"receipt": 6})
+        self.assertEqual(self.generated, [])
+
+    async def test_global_recovery_bound_stops_all_io_without_discarding_output(self):
+        from tianshu_companion.memory_learning import MAX_TOTAL_ATTEMPTS
+
+        await self.chat()
+        self.lose_response = True
+        await self.flush()
+        item = self.task()
+        proposal = copy.deepcopy(item["output"])
+        item.update(attempts=MAX_TOTAL_ATTEMPTS, deadline=0)
+        self.h.core.store.put("metadata", item)
+        calls = len(self.calls)
+        await self.restart()
+        await self.flush()
+        self.assertEqual(self.task()["state"], "blocked")
+        self.assertEqual(self.task()["output"], proposal)
+        self.assertEqual(len(self.calls), calls)
+        self.assertEqual(len(self.generated), 1)
+
+    async def test_withdrawn_source_during_receipt_wait_stops_generation(self):
+        from tianshu_companion.contracts import digest
+
+        await self.chat()
+        turn = self.h.turns()[0]
+        physical = self.h.core.store.get(
+            "physicals", digest(turn["bundle"]["messages"][0]["message_key"])
+        )
+        process = self.process
+
+        async def withdrawal(job, output):
+            response = await process(job, output)
+            physical["fact"]["state"] = "retracted"
+            self.h.core.store.put("physicals", physical)
+            return response
+
+        self.h.memory.process_candidate = withdrawal
+        await self.flush()
+        self.assertEqual(self.task()["state"], "blocked")
+        self.assertEqual(self.task()["last_error"], "scope_changed")
+        self.assertEqual(self.generated, [])
+        self.assertFalse(any(output is not None for _, output in self.calls))
+
+    async def test_cancellation_during_generation_retains_output_without_submitting(self):
+        await self.chat()
+        generate = self.generate
+
+        async def cancelled(turn, messages):
+            result = await generate(turn, messages)
+            fresh = self.h.turns()[0]
+            fresh["cancelled"] = True
+            self.h.core.store.put("turns", fresh)
+            return result
+
+        self.h.gateway.generate = cancelled
+        await self.flush()
+        self.assertEqual(self.task()["state"], "blocked")
+        self.assertEqual(self.task()["last_error"], "scope_changed")
+        self.assertIsNotNone(self.task()["output"])
+        self.assertEqual(len(self.generated), 1)
+        self.assertFalse(any(output is not None for _, output in self.calls))
 
     async def test_uncertain_output_survives_terminal_retry_state(self):
         await self.chat()

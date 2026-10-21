@@ -2,10 +2,13 @@ import asyncio
 import copy
 import json
 import unittest
+from unittest.mock import patch
 
 from support import Harness
-from tianshu_companion.context import scope_check
-from tianshu_companion.contracts import Fault, PROFILE_DOMAIN
+from tianshu_companion.clients import epoch, utc
+from tianshu_companion.context import profile_check, scope_check
+from tianshu_companion.context_checks import VerificationCheckpoint
+from tianshu_companion.contracts import Fault, PROFILE_DOMAIN, digest
 
 
 class ContextCheckpointTests(unittest.IsolatedAsyncioTestCase):
@@ -321,3 +324,247 @@ class ContextCheckpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"], []
         )
+
+    async def test_prepare_shares_successful_authority_across_candidate_groups_then_closes(self):
+        first, second, current = await self.turns(3)
+        for previous, text in ((first, "阅读"), (second, "周末")):
+            previous["profile_checks"] = [
+                profile_check(
+                    first,
+                    dict(kind="group", conversation_id=first["conversation_id"]),
+                    text,
+                    ["topic"],
+                    dict(scope_version=self.h.memory.profile_version),
+                )
+            ]
+            self.h.core.store.put("turns", previous)
+        calls, checkpoints = [], []
+        resolve = self.h.origins.resolve
+
+        async def counted(service, envelope, now):
+            calls.append(envelope["origin"])
+            return await resolve(service, envelope, now)
+
+        class Tracked(VerificationCheckpoint):
+            def __init__(self):
+                super().__init__()
+                self.closed = False
+                checkpoints.append(self)
+
+            async def close(self):
+                await super().close()
+                self.closed = True
+
+        self.h.origins.resolve = counted
+        with patch("tianshu_companion.core.VerificationCheckpoint", Tracked):
+            context, _, checks, profiles, _, _ = await self.h.core._prepare_context(current, [])
+        self.assertEqual(len(context.data["recent_dialogue"]), 2)
+        self.assertEqual(calls.count(first["origin"]), 1)
+        self.assertEqual(len(checkpoints), 1)
+        self.assertTrue(checkpoints[0].closed)
+        current.update(context_checks=checks, profile_checks=profiles)
+        await self.h.core._preflight(current)
+        self.assertEqual(calls.count(first["origin"]), 2)
+
+    async def test_prepare_transient_full_candidate_failure_reopens_for_raw_input(self):
+        self.h.memory.input_history = self.h.memory.history
+        previous, current = await self.turns(2)
+        calls, checkpoints = [], []
+        resolve = self.h.origins.resolve
+
+        async def transient(service, envelope, now):
+            if envelope["origin"] == previous["origin"]:
+                calls.append(envelope["origin"])
+                if len(calls) == 1:
+                    raise Fault("dependency_unavailable")
+            return await resolve(service, envelope, now)
+
+        class Tracked(VerificationCheckpoint):
+            async def close(self):
+                await super().close()
+                checkpoints.append(self)
+
+        self.h.origins.resolve = transient
+        with patch("tianshu_companion.core.VerificationCheckpoint", Tracked):
+            context, *_ = await self.h.core._prepare_context(current, [])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len({id(item) for item in checkpoints}), 2)
+        self.assertTrue(context.data["recent_dialogue"][0]["input_only"])
+        self.assertEqual(context.data["recent_dialogue"][0]["replies"], [])
+
+    async def test_cancelled_preparation_closes_the_shared_authority_graph(self):
+        await self.turns(2)
+        entered, stopped = asyncio.Event(), asyncio.Event()
+        checkpoints = []
+
+        async def blocked(*_):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        class Tracked(VerificationCheckpoint):
+            async def close(self):
+                await super().close()
+                checkpoints.append(self)
+
+        self.h.origins.resolve = blocked
+        with patch("tianshu_companion.core.VerificationCheckpoint", Tracked):
+            job = asyncio.create_task(self.h.core._prepare_context(self.h.turns()[-1], []))
+            await asyncio.wait_for(entered.wait(), 1)
+            job.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await job
+        self.assertTrue(stopped.is_set())
+        self.assertEqual(len(checkpoints), 1)
+        self.assertTrue(all(task.done() for task in checkpoints[0].reads.values()))
+
+    def lease_authority(self, turn, on_renew=None):
+        from test_delivery_v2 import NativeQueue
+
+        calls = []
+        issuer = self.h.origins.values[turn["origin"]["assertion_ref"]]
+        issuer["expires_at"] = utc(self.h.clock() + 60)
+        turn["source_deadline"] = epoch(issuer["expires_at"])
+        self.h.core.store.put("turns", turn)
+        queue = NativeQueue(self.h.clock)
+
+        async def context(source, scope, channel):
+            self.assertEqual(source["origin"], turn["origin"])
+            self.assertEqual(scope, turn["scope"])
+            if issuer["revoked"]:
+                raise Fault("forbidden")
+            calls.append(self.h.clock())
+            issuer["expires_at"] = utc(self.h.clock() + 60)
+            if on_renew:
+                on_renew()
+                await asyncio.sleep(0)
+            return dict(
+                origin=turn["origin"], scope=scope, channel=channel, expires_at=issuer["expires_at"]
+            )
+
+        queue.expression_context = context
+        self.h.core.sender = queue
+        return calls
+
+    async def test_expired_requester_is_authoritatively_renewed_before_late_profiles(self):
+        current = (await self.turns())[0]
+        renewals = self.lease_authority(current)
+        history, profiles = self.h.memory.history, self.h.memory.profiles
+        profile_calls = []
+
+        async def slow_history(*args, **kwargs):
+            result = await history(*args, **kwargs)
+            self.h.clock.advance(61)
+            return result
+
+        async def guarded_profiles(*args, **kwargs):
+            issuer = self.h.origins.values[current["origin"]["assertion_ref"]]
+            self.assertGreater(epoch(issuer["expires_at"]), self.h.clock())
+            profile_calls.append(args[2])
+            return await profiles(*args, **kwargs)
+
+        self.h.memory.history, self.h.memory.profiles = slow_history, guarded_profiles
+        await self.h.core._prepare_context(current, [])
+        self.assertEqual(len(renewals), 1)
+        self.assertEqual(len(profile_calls), 2)
+        self.assertGreater(
+            self.h.core.store.get("turns", current["id"])["source_deadline"], self.h.clock()
+        )
+
+    async def test_renewal_wait_reloads_cancellation_source_and_role(self):
+        current = (await self.turns())[0]
+        original = self.h.core.store.get("turns", current["id"])
+        for change in ("cancel", "source", "role"):
+            with self.subTest(change=change):
+                self.h.core.store.put("turns", copy.deepcopy(original))
+                current = self.h.core.store.get("turns", original["id"])
+                actor = current["scope"]["actor_id"]
+                role = self.h.core.roles.get(actor)
+                physical = self.h.core.store.get(
+                    "physicals", digest(current["bundle"]["messages"][0]["message_key"])
+                )
+
+                def revoke():
+                    fresh = self.h.core.store.get("turns", current["id"])
+                    if change == "cancel":
+                        fresh["cancelled"] = True
+                        self.h.core.store.put("turns", fresh)
+                    elif change == "source":
+                        withdrawn = copy.deepcopy(physical)
+                        withdrawn["fact"]["state"] = "retracted"
+                        self.h.core.store.put("physicals", withdrawn)
+                    else:
+                        self.h.core.roles.pop(actor)
+
+                self.lease_authority(current, revoke)
+                self.h.clock.advance(61)
+                try:
+                    with self.assertRaises(Fault):
+                        await self.h.core._refresh_preparation_origin(current)
+                finally:
+                    self.h.core.roles[actor] = role
+                    self.h.core.store.put("physicals", physical)
+
+    async def test_long_shared_checkpoint_does_not_reuse_a_previous_lease(self):
+        previous = (await self.turns())[0]
+        renewals = self.lease_authority(previous)
+        calls = []
+        original = self.h.origins.resolve
+
+        async def counted(*args):
+            calls.append(True)
+            return await original(*args)
+
+        self.h.origins.resolve = counted
+        text = scope_check(previous)
+        profile = profile_check(
+            previous,
+            dict(kind="group", conversation_id=previous["conversation_id"]),
+            "阅读",
+            ["topic"],
+            dict(scope_version=self.h.memory.profile_version),
+        )
+        async with VerificationCheckpoint() as checkpoint:
+            await self.h.core._verify_checks(previous, [text], checkpoint=checkpoint)
+            self.h.clock.advance(61)
+            await self.h.core._verify_checks(previous, [profile], checkpoint=checkpoint)
+        self.assertEqual(len(renewals), 1)
+        self.assertEqual(len(calls), 2)
+
+    async def test_profile_crossing_expiry_fails_closed_until_authority_continues_lease(self):
+        current = (await self.turns())[0]
+        renewals = self.lease_authority(current)
+        profiles = self.h.memory.profiles
+        crossing = True
+
+        async def expires_during_read(*args, **kwargs):
+            nonlocal crossing
+            if crossing:
+                crossing = False
+                self.h.clock.advance(61)
+            issuer = self.h.origins.values[current["origin"]["assertion_ref"]]
+            if epoch(issuer["expires_at"]) <= self.h.clock():
+                raise Fault("forbidden")
+            return await profiles(*args, **kwargs)
+
+        self.h.memory.profiles = expires_during_read
+        with self.assertRaises(Fault) as error:
+            await self.h.core._prepare_context(current, [])
+        self.assertEqual(error.exception.code, "forbidden")
+        self.assertEqual(renewals, [])
+        await self.h.core._prepare_context(current, [])
+        self.assertEqual(len(renewals), 1)
+
+    async def test_revoked_authority_cannot_be_replaced_with_a_local_extension(self):
+        current = (await self.turns())[0]
+        renewals = self.lease_authority(current)
+        deadline = current["source_deadline"]
+        self.h.origins.values[current["origin"]["assertion_ref"]]["revoked"] = True
+        self.h.clock.advance(61)
+        with self.assertRaises(Fault) as error:
+            await self.h.core._prepare_context(current, [])
+        self.assertEqual(error.exception.code, "forbidden")
+        self.assertEqual(renewals, [])
+        self.assertEqual(self.h.core.store.get("turns", current["id"])["source_deadline"], deadline)

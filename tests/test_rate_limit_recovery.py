@@ -2,13 +2,15 @@
 
 import asyncio
 import json
+import time
+from unittest.mock import patch
 
 import httpx
 import pytest
 
 from support import Harness
 from test_delivery_v2 import NativeQueue
-from tianshu_companion.clients import Gateway, JsonService
+from tianshu_companion.clients import Gateway, JsonService, _retry_after_seconds
 from tianshu_companion.contracts import Fault
 from tianshu_companion.contracts import digest
 
@@ -56,6 +58,88 @@ def chunk(delta, finish=None):
     return dict(choices=[dict(index=0, delta=delta, finish_reason=finish)])
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("45", 45),
+        (" 90 ", 90),
+        ("Thu, 01 Jan 1970 00:02:00 GMT", 60),
+        ("Thu, 01 Jan 1970 00:00:30 GMT", 0),
+        ("-1", None),
+        ("NaN", None),
+        ("1.5", None),
+        ("unknown", None),
+        (None, None),
+    ],
+)
+def test_retry_after_accepts_only_valid_delay_or_http_date(value, expected):
+    with patch("tianshu_companion.clients.time.time", return_value=60):
+        assert _retry_after_seconds(value) == expected
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_model_http_pressure_retains_retry_after_without_broadening_foreground_retry(status):
+    async def run():
+        h = Harness()
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            return httpx.Response(status, json={}, headers={"Retry-After": "90"})
+
+        client = JsonService(
+            "https://fixture.invalid", "fixture", transport=httpx.MockTransport(handler)
+        )
+        try:
+            gateway = Gateway(h.contracts, client)
+            with pytest.raises(Fault) as caught:
+                await gateway.generate(
+                    dict(id="turn:fixture", config_version=7),
+                    [dict(role="user", content="fixture")],
+                )
+            assert caught.value.retry_after_seconds == 90
+            assert caught.value.rate_limited is (status == 429)
+            assert caught.value.retryable_model is (status == 503)
+            assert calls[0] == "/v1/chat/completions"
+            assert len(calls) == (2 if status == 429 else 1)
+        finally:
+            await client.close()
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+def test_receipt_pressure_retry_after_is_returned_to_durable_owner_without_inline_replay():
+    async def run():
+        calls = []
+
+        def handler(request):
+            calls.append(json.loads(request.content))
+            return httpx.Response(
+                503,
+                json=dict(code="queue_full", execution_state="not_started", retryable=True),
+                headers={"Retry-After": "45"},
+            )
+
+        client = JsonService(
+            "https://fixture.invalid", "fixture", transport=httpx.MockTransport(handler)
+        )
+        try:
+            with pytest.raises(Fault) as caught:
+                await client.call(
+                    "/internal/v1/memory/candidates/process",
+                    dict(job_id="job:fixture", output=None),
+                )
+            assert caught.value.retryable_read
+            assert not caught.value.unknown
+            assert caught.value.retry_after_seconds == 45
+            assert calls == [dict(job_id="job:fixture", output=None)]
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
 def rejected_stream(text="", *, kind="rate_limit_error", extra=""):
     prefix = event(chunk(dict(content=text))) if text else ""
     return prefix + event(dict(error=dict(type=kind, message="fixture only"))) + extra
@@ -90,6 +174,32 @@ def rejected_stream(text="", *, kind="rate_limit_error", extra=""):
     ],
 )
 def test_retry_flag_requires_typed_signal_and_owned_terminal_receipt(mode, expected, reads):
+    retry_flag(mode, expected, reads)
+
+
+@pytest.mark.parametrize(
+    "mode,expected,reads",
+    [
+        ("terminal", True, 1),
+        ("running_then_terminal", True, 2),
+        ("running", False, 3),
+        ("unknown", False, 1),
+        ("wrong_id", False, 1),
+        ("wrong_version", False, 1),
+        ("wrong_caller", False, 1),
+        ("cancelled", False, 1),
+        ("not_started", False, 1),
+        ("missing_execution", False, 1),
+        ("wrong_error", False, 1),
+        ("not_found", False, 1),
+        ("succeeded", False, 1),
+    ],
+)
+def test_http_429_requires_the_same_owned_terminal_receipt(mode, expected, reads):
+    retry_flag(mode, expected, reads, http_429=True)
+
+
+def retry_flag(mode, expected, reads, *, http_429=False):
     async def run():
         h = Harness()
         observed = []
@@ -97,6 +207,8 @@ def test_retry_flag_requires_typed_signal_and_owned_terminal_receipt(mode, expec
 
         def handler(request):
             if request.url.path == "/v1/chat/completions":
+                if http_429:
+                    return httpx.Response(429, json=dict(error=dict(type="rate_limit_error")))
                 value = rejected_stream("\u200b")
                 if mode == "finish":
                     value = event(chunk({}, "length")) + value
@@ -266,6 +378,28 @@ def test_proved_rejection_discards_only_local_pending_text_and_regenerates_once(
     asyncio.run(native_recovery(text, "recover"))
 
 
+def test_http_429_uses_the_existing_single_recovery_and_honors_retry_after():
+    asyncio.run(native_recovery("", "recover", transport=429, retry_after=1))
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "persistent",
+        "revoked",
+        "cancelled",
+        "native_execution",
+        "v1_sending",
+        "v1_unknown",
+        "v1_sent",
+        "v1_pending",
+        "expression",
+    ],
+)
+def test_http_429_cannot_cross_a_durable_send_tool_or_authority_boundary(mode):
+    asyncio.run(native_recovery("", mode, transport=429))
+
+
 @pytest.mark.parametrize(
     "mode",
     [
@@ -286,7 +420,9 @@ def test_any_durable_send_or_tool_boundary_blocks_regeneration(mode):
     asyncio.run(native_recovery("\u200b", mode))
 
 
-@pytest.mark.parametrize("transport", [False, True], ids=["typed_cf", "transport_503"])
+@pytest.mark.parametrize(
+    "transport", [False, True, 429], ids=["typed_cf", "transport_503", "http_429"]
+)
 @pytest.mark.parametrize(
     "change",
     [
@@ -309,12 +445,13 @@ def test_retry_reloads_durable_state_after_preflight_yields(change, transport):
     )
 
 
-async def native_recovery(text, mode, *, during_preflight=None, transport=False):
+async def native_recovery(text, mode, *, during_preflight=None, transport=False, retry_after=None):
     h = Harness(silence_ms=0)
     queue = FinishedQueue(h.clock)
     queue.states = ["unknown" if mode == "partial_unknown" else "sent"]
     h.sender = h.core.sender = queue
     attempts = []
+    attempt_times = []
     changed = []
 
     def handler(request):
@@ -328,6 +465,7 @@ async def native_recovery(text, mode, *, during_preflight=None, transport=False)
                 )
             return httpx.Response(200, json=value)
         attempts.append(request.headers["X-Request-ID"])
+        attempt_times.append(time.monotonic())
         if len(attempts) == 1:
             turn = h.turns()[0]
             if mode == "revoked":
@@ -360,7 +498,10 @@ async def native_recovery(text, mode, *, during_preflight=None, transport=False)
                     ),
                 )
         if transport and len(attempts) == 1:
-            return httpx.Response(503)
+            return httpx.Response(
+                429 if transport == 429 else 503,
+                headers={"Retry-After": str(retry_after)} if retry_after is not None else {},
+            )
         if len(attempts) == 1 or mode == "persistent":
             partial = (
                 "已经越过实际发送边界的完整段落。" * 4 if mode.startswith("partial_") else text
@@ -429,7 +570,7 @@ async def native_recovery(text, mode, *, during_preflight=None, transport=False)
     h.core._preflight = yielding_preflight
     try:
         await h.ingest(text="今天午后还是喝那杯茶。")
-        for _ in range(100):
+        for _ in range(200 if retry_after else 100):
             await h.cycles(4)
             if attempts and not h.core.jobs:
                 break
@@ -437,6 +578,8 @@ async def native_recovery(text, mode, *, during_preflight=None, transport=False)
         turn = h.turns()[0]
         expected = 2 if mode in {"recover", "persistent"} else 1
         assert len(attempts) == turn["model_calls"] == expected
+        if retry_after is not None and expected == 2:
+            assert attempt_times[1] - attempt_times[0] >= retry_after
         if during_preflight:
             assert changed == [during_preflight]
             assert turn["model_connection_retries"] == 1

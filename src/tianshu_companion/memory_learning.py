@@ -7,10 +7,12 @@ import json
 from .contracts import Fault, canonical, digest, strict_json
 from .model_selection import SelectionRequest, resolve_selection
 from .memory_admission import empty_extraction_reason, mixed_stable_hints
+from .short_context import sources_current
 
 QUEUE = "memory:learning"
 MAX_ATTEMPTS = 3
 MAX_RECOVERY_ATTEMPTS = 6
+MAX_TOTAL_ATTEMPTS = 3 * MAX_RECOVERY_ATTEMPTS
 MODEL_TIMEOUT_SECONDS = 30
 PROMPT = """Extract only durable facts or stable preferences explicitly about the source author. Keep
 statements, conditions, negations, value and keywords in the SAME language as the original message.
@@ -169,6 +171,7 @@ class MemoryLearning:
                 state="pending",
                 deadline=0,
                 attempts=0,
+                recovery_failures={},
                 turn_id=item["event"]["aggregate_id"],
                 job_id=job,
                 output=None,
@@ -409,14 +412,12 @@ class MemoryLearning:
             await asyncio.gather(*self.jobs.values(), return_exceptions=True)
             self.jobs.clear()
 
-    async def _commit(self, item, turn):
+    async def _commit(self, item):
         # Only commits serialize. Provider waits, extraction and unrelated
         # receipt reads never occupy the single write boundary.
         async with self.lock:
             try:
-                if not self.core.automatic_memory_candidates:
-                    raise Fault("forbidden")
-                self.core._check_role(turn)
+                turn = self._source_turn(item)
                 if not self._commit_ready(item, turn):
                     item["stage"] = "commit_wait"
                     self.core.store.put("metadata", item)
@@ -429,10 +430,36 @@ class MemoryLearning:
             finally:
                 self._release_commit()
 
+    def _source_turn(self, item):
+        core = self.core
+        turn = core.store.get("turns", item["turn_id"])
+        if (
+            not core.automatic_memory_candidates
+            or turn is None
+            or turn["scope"]["actor_id"] not in core.roles
+            or not core._turn_allows(turn, "memory.write")
+        ):
+            raise Fault("forbidden")
+        if (
+            turn["cancelled"]
+            or item.get("scope", turn["scope"]) != turn["scope"]
+            or not sources_current(core.store, turn)
+        ):
+            raise Fault("scope_changed")
+        core._check_role(turn)
+        return turn
+
     async def _work(self, item):
         core = self.core
+        # Old retained jobs lack category evidence. Keep their spent attempts
+        # conservatively in the original temporary-failure budget, never reset it.
+        failures = item.setdefault("recovery_failures", {"temporary": item["attempts"]})
         resuming_commit = item.get("stage") == "commit_wait" and item["output"] is not None
-        if item["attempts"] >= MAX_RECOVERY_ATTEMPTS and not resuming_commit:
+        if not resuming_commit and (
+            item["attempts"] >= MAX_TOTAL_ATTEMPTS
+            or any(count >= MAX_RECOVERY_ATTEMPTS for count in failures.values())
+            or item.get("proposal_failures", 0) >= MAX_ATTEMPTS
+        ):
             item.update(state="blocked", deadline=0)
             core.store.put("metadata", item)
             return
@@ -441,15 +468,20 @@ class MemoryLearning:
             # Reserve an attempt durably before I/O; crashes must not reset the retry budget.
             core.store.put("metadata", item)
         try:
-            turn = core.store.get("turns", item["turn_id"])
-            if turn is None or not core._turn_allows(turn, "memory.write"):
-                raise Fault("forbidden")
-            core._check_role(turn)
+            turn = self._source_turn(item)
             if resuming_commit and core.has_active_dialogue(turn["scope"]):
                 return  # Waiting is not another attempt or an idle persistent write.
-            item["stage"] = "receipt"
+            if not resuming_commit:
+                item["stage"] = "receipt"
+                core.store.put("metadata", item)
+            # commit_wait is also the durable admission barrier. Keep it during
+            # the read await; its original failure cooldown releases the barrier.
             async with asyncio.timeout(45):
                 response = await core.memory.process_candidate(item["job_id"], None)
+            item["stage"] = "receipt"
+            turn = self._source_turn(item)
+            if response["state"] not in {"pending", "completed", "invalidated"}:
+                raise Fault("invalid_input")
             if response["state"] == "pending":
                 if item["output"] is None:
                     content = response["content"]
@@ -480,11 +512,7 @@ class MemoryLearning:
                         item["stage"] = "model"
                         core.store.put("metadata", item)
                         async with core.models.background:
-                            if not core.automatic_memory_candidates or not core._turn_allows(
-                                turn, "memory.write"
-                            ):
-                                raise Fault("forbidden")
-                            core._check_role(turn)
+                            turn = self._source_turn(item)
                             if core.default_model_selector is not None:
                                 selected = await resolve_selection(
                                     core.default_model_selector,
@@ -496,6 +524,7 @@ class MemoryLearning:
                                     core.clock,
                                 )
                                 generation["config_version"] = selected.config_version
+                            self._source_turn(item)
                             messages = [
                                 dict(role="system", content=PROMPT),
                                 dict(
@@ -564,9 +593,11 @@ class MemoryLearning:
                                 core.counted("memory.work")
                                 return
                     # Persist exact proposal before the uncertain remote commit; on restart
-                    # read its receipt first, then resend these same bytes if still pending.
+                    # read its receipt first. Only a valid Memory-owned pending
+                    # response permits the same job/exact output retry: Memory's
+                    # atomic job ledger consumes it once, including a lost ack.
                     core.store.put("metadata", item)
-                response = await self._commit(item, turn)
+                response = await self._commit(item)
                 if response is None:
                     return
                 if response["state"] == "rejected":
@@ -587,6 +618,8 @@ class MemoryLearning:
                 recovery_reason=None,
             )
         except asyncio.CancelledError:
+            if item.get("stage") == "commit_wait":
+                item["stage"] = "receipt"
             self._failed(item, "cancelled")
             core.store.put("metadata", item)
             raise
@@ -600,27 +633,48 @@ class MemoryLearning:
                     else "invalid_input"
                 )
             )
-            self._failed(item, code)
+            if item.get("stage") == "commit_wait":
+                item["stage"] = "receipt"
+            self._failed(item, code, error)
         core.store.put("metadata", item)
         core.counted("memory.work")
 
-    def _failed(self, item, code):
-        proposal_failure = item.get("stage") == "proposal"
+    def _failed(self, item, code, error=None):
+        stage = item.get("stage")
+        authorization = code in {"forbidden", "unauthorized", "scope_changed", "not_found"}
+        proposal_failure = stage == "proposal" and not authorization
         if proposal_failure:
             item["proposal_failures"] = item.get("proposal_failures", 0) + 1
-        authorization = code in {"forbidden", "unauthorized", "scope_changed", "not_found"}
+        # A null-output receipt/content read cannot submit a proposal, even if
+        # its timeout envelope says execution_state=unknown. Supplier pressure
+        # and safe reads must not spend each other's recovery allowance.
+        kind = (
+            "receipt"
+            if stage == "receipt"
+            else "rate_limit"
+            if stage == "model" and (code == "queue_full" or getattr(error, "rate_limited", False))
+            else "temporary"
+        )
+        failures = item.setdefault("recovery_failures", {})
+        if not authorization and not proposal_failure:
+            failures[kind] = failures.get(kind, 0) + 1
+        count = item.get("proposal_failures", 0) if proposal_failure else failures.get(kind, 0)
         terminal = (
             authorization
             or item.get("proposal_failures", 0) >= MAX_ATTEMPTS
-            or item["attempts"] >= MAX_RECOVERY_ATTEMPTS
+            or any(value >= MAX_RECOVERY_ATTEMPTS for value in failures.values())
+            or item["attempts"] >= MAX_TOTAL_ATTEMPTS
         )
-        delay = 2 ** min(item["attempts"], 8)
-        if item.get("stage") in {"model", "proposal"} and item["output"] is None:
+        delay = 2 ** min(count, 8)
+        if stage in {"model", "proposal"} and item["output"] is None:
             # No proposal reached Memory: retries only spend model capacity.
             # Keep a bounded exponential delay without the remote-commit cooldown.
             delay = min(32, delay)
-        elif item["attempts"] >= MAX_ATTEMPTS:
-            delay = min(300, 60 * 2 ** (item["attempts"] - MAX_ATTEMPTS))
+        elif count >= MAX_ATTEMPTS:
+            delay = min(300, 60 * 2 ** (count - MAX_ATTEMPTS))
+        # Persist the provider's valid lower bound; never hold a worker or a
+        # model slot asleep, and never shorten Retry-After to our backoff cap.
+        delay = max(delay, getattr(error, "retry_after_seconds", None) or 0)
         item.update(
             state="blocked" if terminal else "pending",
             last_error=code,
@@ -630,6 +684,10 @@ class MemoryLearning:
                 if authorization
                 else "proposal_rejected"
                 if proposal_failure
+                else "rate_limit_cooldown"
+                if kind == "rate_limit"
+                else "receipt_read_cooldown"
+                if kind == "receipt"
                 else "temporary_failure_cooldown"
             ),
         )

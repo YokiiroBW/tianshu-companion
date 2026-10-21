@@ -5,6 +5,8 @@ import re
 import time
 import uuid
 import ssl
+import math
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -51,6 +53,30 @@ def utc(seconds=None):
 
 def epoch(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def _retry_after_seconds(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    try:
+        if re.fullmatch(r"[0-9]+", value):
+            delay = float(value)
+        else:
+            moment = parsedate_to_datetime(value)
+            if moment.tzinfo is None:
+                return None
+            delay = max(0, moment.timestamp() - time.time())
+        return delay if math.isfinite(delay) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _retry_hint(error, response):
+    # Internal metadata only; never reinterpret a pressure hint as authority or
+    # evidence of whether a command executed.
+    error.retry_after_seconds = _retry_after_seconds(response.headers.get("retry-after"))
+    return error
 
 
 def query(origin):
@@ -132,11 +158,16 @@ class JsonService:
                         # No completion stream has begun. Only transient service
                         # statuses permit the dialogue owner to retry generation;
                         # authorization, quota and invalid requests do not.
-                        raise Fault(
-                            "dependency_unavailable",
-                            unknown=True,
-                            retryable_model=response.status_code in {502, 503, 504},
+                        failure = _retry_hint(
+                            Fault(
+                                "dependency_unavailable",
+                                unknown=True,
+                                retryable_model=response.status_code in {502, 503, 504},
+                            ),
+                            response,
                         )
+                        failure.rate_limited = response.status_code == 429
+                        raise failure
                     if response.headers.get("content-encoding", "identity") != "identity":
                         raise Fault("dependency_unavailable")
                     async for chunk in response.aiter_bytes():
@@ -188,7 +219,11 @@ class JsonService:
                                 path, body, headers, uncertain_write=uncertain_write
                             )
                         except Fault as error:
-                            if not error.retryable_read or attempt == 1:
+                            if (
+                                not error.retryable_read
+                                or attempt == 1
+                                or (getattr(error, "retry_after_seconds", None) or 0) > 0
+                            ):
                                 raise
                             await asyncio.sleep(0.1 * 2**attempt)
         except TimeoutError:
@@ -290,7 +325,7 @@ class JsonService:
                     and not_started
                     and value.get("retryable") is True
                 ):
-                    raise Fault(code, retryable_read=True)
+                    raise _retry_hint(Fault(code, retryable_read=True), response)
                 if code in {
                     "scope_changed",
                     "forbidden",
@@ -301,8 +336,10 @@ class JsonService:
                     "timeout",
                     "result_unknown",
                 }:
-                    raise Fault(code, unknown=value.get("execution_state") == "unknown")
-                raise Fault("dependency_unavailable")
+                    raise _retry_hint(
+                        Fault(code, unknown=value.get("execution_state") == "unknown"), response
+                    )
+                raise _retry_hint(Fault("dependency_unavailable"), response)
             self._report("succeeded", correlation, started, attempts)
             return value
         except (httpx.HTTPError, ValueError, TimeoutError, Fault) as error:
@@ -310,9 +347,9 @@ class JsonService:
             self._report("failed", correlation, started, attempts, error)
             if isinstance(error, Fault):
                 if uncertain_write and sent and not not_started:
-                    raise Fault(
-                        error.code, unknown=True, current_version=error.current_version
-                    ) from None
+                    failure = Fault(error.code, unknown=True, current_version=error.current_version)
+                    failure.retry_after_seconds = getattr(error, "retry_after_seconds", None)
+                    raise failure from None
                 raise
             raise Fault("dependency_unavailable", unknown=uncertain_write and sent) from None
 
@@ -814,9 +851,10 @@ class Gateway:
                         await on_delta(text)
             except Fault as error:
                 interrupted = error
-            if result.rate_limited:
+            if result.rate_limited or getattr(interrupted, "rate_limited", False):
                 # Drain the stream first. A typed rejection is not an unknown
-                # transport cut: its own Gateway must confirm a terminal failure.
+                # transport cut. HTTP 429 is also only a pressure signal: its
+                # own Gateway must confirm a terminal failure before recovery.
                 allowed = (
                     not result.tools
                     and result.finish_reason is None
@@ -826,7 +864,10 @@ class Gateway:
                     )
                     and await self._rejected_rate_limit(turn, request_id)
                 )
-                raise Fault("dependency_unavailable", unknown=True, retryable_model=allowed)
+                failure = Fault("dependency_unavailable", unknown=True, retryable_model=allowed)
+                failure.rate_limited = True
+                failure.retry_after_seconds = getattr(interrupted, "retry_after_seconds", None)
+                raise failure
             if interrupted is not None:
                 # Ordinary cuts and callback faults retain the original output
                 # boundary. The explicit rejection case above never broadens it.

@@ -28,7 +28,7 @@ from .context import (
     profile_targets,
     scope_check,
 )
-from .context_checks import verify_checks
+from .context_checks import VerificationCheckpoint, verify_checks
 from .short_context import (
     ShortContextPolicy,
     current_revision,
@@ -1661,12 +1661,12 @@ class Core(Delivery):
                     ):
                         raise
                     # Gateway permits an output-free transport cut or a proved
-                    # terminal typed rejection. Neither may have crossed this
+                    # terminal rate-limit rejection. Neither may have crossed this
                     # durable send/tool boundary. Discard only unsent local text.
                     pending = Segments()
                     fresh["model_connection_retries"] = 1
                     self._save_turn(fresh)
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(max(0.2, getattr(error, "retry_after_seconds", None) or 0))
                     fresh = self.store.get("turns", turn["id"])
                     if closed_or_started(fresh):
                         raise Fault("scope_changed")
@@ -1824,25 +1824,42 @@ class Core(Delivery):
         ):
             raise Fault("forbidden")
         source_turn_id = check.get("source_turn_id")
+        lease_deadline = turn["source_deadline"] if check["origin"] == turn["origin"] else None
         if source_turn_id:
-            previous = self.store.get("turns", source_turn_id)
-            if (
-                previous is None
-                or previous["origin"] != check["origin"]
-                or previous["scope"] != scope
-                or previous["service"] != check["service"]
-                or previous["binding_version"] != check["binding_version"]
-                or previous["bundle"]["collection_key"]["channel"] != check["channel"]
-                or not sources_current(self.store, previous)
-            ):
-                raise Fault("scope_changed")
+
+            def source():
+                previous = self.store.get("turns", source_turn_id)
+                if (
+                    previous is None
+                    or previous["origin"] != check["origin"]
+                    or previous["scope"] != scope
+                    or previous["service"] != check["service"]
+                    or previous["binding_version"] != check["binding_version"]
+                    or previous["bundle"]["collection_key"]["channel"] != check["channel"]
+                    or not sources_current(self.store, previous)
+                ):
+                    raise Fault("scope_changed")
+                return previous
+
+            previous = source()
             # Renew the original human's lease once, including parallel domain checks.
             if previous["source_deadline"] <= self.clock() + 20:
                 await checkpoint.once(
-                    ["renew", source_turn_id], lambda: self.continue_delivery_origin(previous)
+                    ["renew", source_turn_id, previous["source_deadline"]],
+                    lambda: self.continue_delivery_origin(previous),
                 )
+                # Parallel domain checks may have joined another caller's lease
+                # continuation; use the durable deadline, not this caller's copy.
+                previous = source()
+            # A long preparation can outlive a renewed source lease. The next
+            # lease must not reuse the authority or history proof of the old one.
+            lease_deadline = previous["source_deadline"]
         _, _, binding = await checkpoint.once(
-            ["authorize", {k: check[k] for k in ("service", "origin", "channel", "scope")}],
+            [
+                "authorize",
+                {k: check[k] for k in ("service", "origin", "channel", "scope")},
+                lease_deadline,
+            ],
             lambda: self._authorize(
                 check["service"],
                 command(check["origin"], uid("check"), self.clock()),
@@ -1862,6 +1879,7 @@ class Core(Delivery):
                     check["text"],
                     check["selection"],
                     check["scope_version"],
+                    lease_deadline,
                 ],
                 lambda: self.memory.profiles(
                     check["origin"],
@@ -1875,7 +1893,13 @@ class Core(Delivery):
             )
         elif check["version_domain"] == TEXT_INPUT_DOMAIN:
             await checkpoint.once(
-                ["input_history", check["origin"], scope, check["history_snapshot"]],
+                [
+                    "input_history",
+                    check["origin"],
+                    scope,
+                    check["history_snapshot"],
+                    lease_deadline,
+                ],
                 lambda: self.memory.input_history(
                     check["origin"], scope, known=check["history_snapshot"]
                 ),
@@ -1883,7 +1907,7 @@ class Core(Delivery):
         elif check["version_domain"] == TEXT_DOMAIN:
             if check.get("history_snapshot") is not None:
                 await checkpoint.once(
-                    ["history", check["origin"], scope, check["history_snapshot"]],
+                    ["history", check["origin"], scope, check["history_snapshot"], lease_deadline],
                     lambda: self.memory.history(
                         check["origin"], scope, known=check["history_snapshot"]
                     ),
@@ -1897,6 +1921,7 @@ class Core(Delivery):
                         "context validity",
                         check["scope_version"],
                         check.get("memory_snapshot"),
+                        lease_deadline,
                     ],
                     lambda: self.memory.select(
                         check["origin"],
@@ -1909,15 +1934,49 @@ class Core(Delivery):
                 )
         elif check["version_domain"] == RELATIONSHIP_DOMAIN:
             await checkpoint.once(
-                ["relationship", check],
+                ["relationship", check, lease_deadline],
                 lambda: verify_relationship(self.relationships, check, self.clock()),
             )
         else:
             raise Fault("invalid_input")
 
+    async def _refresh_preparation_origin(self, turn):
+        def current():
+            fresh = self.store.get("turns", turn["id"])
+            if (
+                fresh is None
+                or fresh["cancelled"]
+                or fresh["scope"]["actor_id"] not in self.roles
+                or any(fresh[key] != turn[key] for key in ("origin", "scope", "binding_version"))
+                or fresh["bundle"]["collection_key"]["channel"]
+                != turn["bundle"]["collection_key"]["channel"]
+                or not self._turn_allows(fresh, "dialogue")
+            ):
+                raise Fault("scope_changed")
+            self._check_role(fresh)
+            self._check_input_versions(fresh)
+            turn["source_deadline"] = fresh["source_deadline"]
+
+        current()
+        if turn["source_deadline"] > self.clock() + 20:
+            return False
+        await self.continue_delivery_origin(turn)
+        current()
+        _, _, binding = await self._authorize(
+            turn["service"],
+            command(turn["origin"], uid("check"), self.clock()),
+            turn["bundle"]["collection_key"]["channel"],
+            scope=turn["scope"],
+        )
+        current()
+        if binding != turn["binding_version"]:
+            raise Fault("scope_changed")
+        return True
+
     async def _prepare_context(self, turn, dependencies):
         from .context_checks import read_parallel
 
+        await self._refresh_preparation_origin(turn)
         if self._turn_allows(turn, "memory.read") and hasattr(self.memory, "history"):
             methods = ["history"]
             if hasattr(self.memory, "input_history"):
@@ -1942,53 +2001,66 @@ class Core(Delivery):
             checks = await self.relationships.prepare(self, turn, context)
         for dep in turn["bundle"]["dependencies"]:
             checks = merge_checks(checks, inherited_checks(self.store.get("turns", dep["turn_id"])))
-        verified = {}
-        await self._verify_checks(turn, checks, verified=verified)
-        policy = replace(
-            self.short_context_policy,
-            max_bytes=min(self.short_context_policy.max_bytes, context.remaining),
-        )
-        memory_read = self._turn_allows(turn, "memory.read")
-        recent, metadata = select_recent(self.store, turn, policy, self.clock())
-        if not memory_read:
-            recent = []
-        accepted = []
-        linked = {key: ids for ids in metadata.get("linked_turn_ids", []) for key in ids}
-        by_id = {g["turn_id"]: g for g in recent}
-        visited = set()
-        for group in recent:
-            if group["turn_id"] in visited:
-                continue
-            ids = linked.get(group["turn_id"], [group["turn_id"]])
-            batch = [by_id[key] for key in ids]
-            visited.update(ids)
-            variants = [batch]
-            if any(member["replies"] for member in batch):
-                from .context_relevance import input_only
-
-                variants.append([input_only(member) for member in batch])
-            for candidate in variants:
-                try:
-                    inherited = []
-                    for member in candidate:
-                        previous = self.store.get("turns", member["turn_id"])
-                        inherited = merge_checks(
-                            inherited,
-                            [scope_check(previous, input_only=True)]
-                            if member.get("input_only") or not member["replies"]
-                            else inherited_checks(previous),
-                        )
-                    proposed = merge_checks(checks, inherited)
-                    await self._verify_checks(turn, inherited, verified=verified)
-                except Fault:
-                    # A stale answer does not revoke the human source. Recheck the
-                    # whole raw batch independently; a withdrawn correction still
-                    # prevents its obsolete anchor from appearing on its own.
+        verified, checkpoint = {}, VerificationCheckpoint()
+        try:
+            if await self._refresh_preparation_origin(turn):
+                await checkpoint.close()
+                checkpoint = VerificationCheckpoint()
+            await self._verify_checks(turn, checks, verified=verified, checkpoint=checkpoint)
+            policy = replace(
+                self.short_context_policy,
+                max_bytes=min(self.short_context_policy.max_bytes, context.remaining),
+            )
+            memory_read = self._turn_allows(turn, "memory.read")
+            recent, metadata = select_recent(self.store, turn, policy, self.clock())
+            if not memory_read:
+                recent = []
+            accepted = []
+            linked = {key: ids for ids in metadata.get("linked_turn_ids", []) for key in ids}
+            by_id = {g["turn_id"]: g for g in recent}
+            visited = set()
+            for group in recent:
+                if group["turn_id"] in visited:
                     continue
-                if context.extend("recent_dialogue", candidate):
-                    checks = proposed
-                    accepted.extend(candidate)
-                break
+                ids = linked.get(group["turn_id"], [group["turn_id"]])
+                batch = [by_id[key] for key in ids]
+                visited.update(ids)
+                variants = [batch]
+                if any(member["replies"] for member in batch):
+                    from .context_relevance import input_only
+
+                    variants.append([input_only(member) for member in batch])
+                for candidate in variants:
+                    if await self._refresh_preparation_origin(turn):
+                        await checkpoint.close()
+                        checkpoint = VerificationCheckpoint()
+                    try:
+                        inherited = []
+                        for member in candidate:
+                            previous = self.store.get("turns", member["turn_id"])
+                            inherited = merge_checks(
+                                inherited,
+                                [scope_check(previous, input_only=True)]
+                                if member.get("input_only") or not member["replies"]
+                                else inherited_checks(previous),
+                            )
+                        proposed = merge_checks(checks, inherited)
+                        await self._verify_checks(
+                            turn, inherited, verified=verified, checkpoint=checkpoint
+                        )
+                    except Fault:
+                        # A failed peer task must not poison an independent raw
+                        # input fallback. Keep exact check outcomes, drain this
+                        # graph, then obtain fresh authority for the next variant.
+                        await checkpoint.close()
+                        checkpoint = VerificationCheckpoint()
+                        continue
+                    if context.extend("recent_dialogue", candidate):
+                        checks = proposed
+                        accepted.extend(candidate)
+                    break
+        finally:
+            await checkpoint.close()
         accepted.sort(key=lambda g: g["turn_sequence"])
         context.data["recent_dialogue"] = accepted
         metadata.update(
@@ -2003,6 +2075,7 @@ class Core(Delivery):
             if allowance <= 0:
                 break
             batch = targets[offset : offset + 4]
+            await self._refresh_preparation_origin(turn)
             responses = await read_parallel(
                 [
                     lambda target=target, selection=selection: self.memory.profiles(
@@ -2087,7 +2160,7 @@ class Core(Delivery):
             raise Fault("scope_changed")
         self._check_input_versions(turn)
         await self.continue_delivery_origin(turn)
-        from .context_checks import VerificationCheckpoint, read_parallel
+        from .context_checks import read_parallel
 
         # A fresh checkpoint at each model/send boundary. Independent peer
         # checks overlap; exact authority reads share only this checkpoint.
@@ -2103,6 +2176,7 @@ class Core(Delivery):
                             channel=turn["bundle"]["collection_key"]["channel"],
                             scope=turn["scope"],
                         ),
+                        turn["source_deadline"],
                     ],
                     lambda: self._authorize(
                         turn["service"],
