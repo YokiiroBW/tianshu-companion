@@ -6,11 +6,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
 from support import Harness
-from tianshu_companion.clients import JsonService, Memory
+from tianshu_companion.clients import Gateway, JsonService, Memory
 from tianshu_companion.contracts import Fault
 from tianshu_companion.model_selection import ModelSelection
 
@@ -409,6 +410,67 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.clock.advance(10)
         await self.flush()
         self.assertEqual(self.task()["state"], "completed")
+
+    async def test_model_timeout_confirms_owned_cancellation_and_keeps_request_after_recovery(self):
+        from test_completion_recovery import cancel_response, owned_receipt
+
+        await self.chat()
+        requests, terminal, streams = [], [], []
+
+        class Waiting(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                await asyncio.Event().wait()
+                yield  # pragma: no cover
+
+            async def aclose(self):
+                self.closed = True
+
+        def handler(request):
+            requests.append((request.method, request.url.path))
+            if request.url.path == "/v1/chat/completions":
+                stream = Waiting()
+                streams.append(stream)
+                return httpx.Response(200, stream=stream)
+            request_id = request.url.path.split("/")[-2 if request.method == "POST" else -1]
+            if request.method == "POST":
+                return httpx.Response(200, json=cancel_response(request_id))
+            terminal.append(request_id)
+            return httpx.Response(
+                200, json=owned_receipt(request_id, "cancelled", self.h.core.config_version)
+            )
+
+        client = JsonService(
+            "https://fixture.invalid", "secret", transport=httpx.MockTransport(handler)
+        )
+        self.addAsyncCleanup(client.close)
+        gateway = Gateway(self.h.contracts, client)
+        self.h.gateway.generate = gateway.generate
+        with patch("tianshu_companion.memory_learning.MODEL_TIMEOUT_SECONDS", 0.03):
+            await self.flush()
+        item = self.task()
+        self.assertEqual(item["state"], "pending")
+        self.assertEqual(item["recovery_failures"], {"temporary": 1})
+        diagnostic = item["first_failure"]
+        self.assertEqual(diagnostic["category"], "timeout")
+        self.assertEqual(diagnostic["exception_type"], "TimeoutError")
+        self.assertEqual(diagnostic["stage"], "model")
+        self.assertTrue(diagnostic["unknown"])
+        self.assertEqual(terminal, [diagnostic["model_request_id"]])
+        self.assertEqual(requests[-2][1], requests[-1][1] + "/cancel")
+        self.assertTrue(streams[0].closed)
+        self.assertFalse(gateway.active_requests)
+        self.assertFalse(any(output is not None for _, output in self.calls))
+        self.h.gateway.generate = self.generate
+        await self.restart()
+        self.h.clock.advance(10)
+        await self.flush()
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["first_failure"], diagnostic)
+        self.assertEqual(self.task()["last_failure"], diagnostic)
+        self.assertEqual(self.task()["failure_count"], 1)
+        self.assertEqual(sum(path == "/v1/chat/completions" for _, path in requests), 1)
 
     async def test_typed_receipt_failure_survives_restart_and_success_without_model_replay(self):
         await self.chat()

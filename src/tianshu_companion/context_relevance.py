@@ -17,6 +17,10 @@ UPDATE = re.compile(
     re.I,
 )
 QUESTION = re.compile(r"[?？]|什么|哪(?:个|里|儿)|多少|怎么|是否|是不是")
+UNCERTAIN_WHETHER = re.compile(
+    r"(?:不|没|未|无法|不能)(?:确定|确认|知道|决定|判断|说准|想好)\s*是否"
+)
+SELF_COMPARISON = re.compile(r"我(?:和|跟|与)[^，,。！？?；;\n]{1,40}(?:分别|各自)")
 FACT_LOOKUP = re.compile(r"叫什么|叫啥|名字|姓什么|在哪里|在哪|放哪|收在哪|什么时候|哪天|同意|来着")
 POSITION_STATEMENT = re.compile(
     r"同意|赞成|反对|不参加|参加不了|去不了|不去了|\b(?:agree|agreed|disagree|can't come)\b", re.I
@@ -25,6 +29,7 @@ STATE_LOOKUP = re.compile(
     r"(?:谁|哪些人|哪几位|几个人|大家|所有人|全员).{0,20}"
     r"(?:参加|同意|确认|确定|说好|去不了|安排)|"
     r"(?:同意|确认|确定).{0,12}(?:谁|哪些|哪几)|都.{0,6}(?:说好|同意|确定)|"
+    r"(?:我们|咱们|你们)(?:俩|两人|两位|两个(?:人)?).{0,12}都.{0,12}(?:能去|能来|参加|同意|确认|确定)|"
     r"\b(?:who|everyone|anyone)\b.{0,40}\b(?:coming|agreed|confirmed|join)\b",
     re.I,
 )
@@ -83,6 +88,16 @@ def tokens(text):
     return result
 
 
+def _is_statement(text):
+    # "Cannot decide whether" states uncertainty; it is not an assent and not
+    # an interrogative just because the embedded complement contains 是否.
+    # Explicit questions and their particles still remain questions.
+    if re.search(r"[?？]|[吗么]\s*[。！!]*$", text):
+        return False
+    text = UNCERTAIN_WHETHER.sub(lambda match: match[0].replace("是否", ""), text)
+    return not QUESTION.search(text)
+
+
 def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
     """Keep an older anchor with its nearby follow-ups, without resolving their meaning.
 
@@ -98,7 +113,12 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
     # Parse human inputs once. Query expansion and ranking share these features;
     # neither bot replies nor summaries can manufacture an anchor.
     texts = {g["turn_id"]: input_text(g) for g, _ in candidates}
-    features = {key: (tokens(text), not bool(QUESTION.search(text))) for key, text in texts.items()}
+    features = {key: (tokens(text), _is_statement(text)) for key, text in texts.items()}
+
+    def people(item):
+        # Personal context follows verified person IDs across their accounts;
+        # this never interprets a named entity as belonging to its source author.
+        return frozenset(m["person_id"] for m in item[0]["messages"])
 
     def score(query):
         return {
@@ -109,7 +129,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
     scores = score(query_tokens)
     if (
         candidates
-        and QUESTION.search(query_text)
+        and not _is_statement(query_text)
         and FOLLOWUP_QUESTION.search(query_text)
         and not any(score > 0 and assertion for score, assertion in scores.values())
     ):
@@ -119,12 +139,22 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
         if (last["author"], last["person_id"]) == (
             author["author"],
             author["person_id"],
-        ) and QUESTION.search(input_text(previous)):
+        ) and not _is_statement(input_text(previous)):
             # Resolve an elliptical follow-up through the same speaker's most
             # recent question. Its words are retrieval cues, never factual evidence.
             query_tokens |= tokens(input_text(previous))
             scores = score(query_tokens)
-    state_lookup = bool(STATE_LOOKUP.search(query_text) or POSITION_STATEMENT.search(query_text))
+    current_people = frozenset(m["person_id"] for m in turn["bundle"]["messages"])
+    compares_self = bool(
+        SELF_COMPARISON.search(query_text)
+        and any(
+            all(scores[g["turn_id"]]) and not current_people.intersection(people((g, expiry)))
+            for g, expiry in candidates
+        )
+    )
+    state_lookup = bool(
+        STATE_LOOKUP.search(query_text) or POSITION_STATEMENT.search(query_text) or compares_self
+    )
     topic_return = any(scores[g["turn_id"]][0] > 0 for g, _ in candidates[limit:]) or (
         compact and any(score > 0 for score, _ in scores.values())
     )
@@ -139,7 +169,7 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
     query = input_text(turn["bundle"])
     asks_fact = not asks_assistant and (
         (
-            QUESTION.search(query)
+            not _is_statement(query)
             and (
                 FACT_LOOKUP.search(query)
                 or time_intent(query) != "none"
@@ -204,6 +234,21 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
         seeds = [item for item in ranked if all(scores[item[0]["turn_id"]])][:limit]
         if not seeds:
             seeds = [item for item in candidates if scores[item[0]["turn_id"]][1]][:1]
+        if compares_self:
+            # "Me and X, respectively" needs the current speaker's own source
+            # even when it shares no bigram with the question. A different
+            # person's related assertion is already required above; unknown X
+            # or a bare "respectively" cannot expand the pool to every author.
+            own = next(
+                (
+                    item
+                    for item in candidates
+                    if scores[item[0]["turn_id"]][1] and current_people.intersection(people(item))
+                ),
+                None,
+            )
+            if own is not None:
+                seeds.append(own)
         pool = {g["turn_id"] for g, _ in seeds}
         frontier = set(pool)
         for _ in range(3):
@@ -228,11 +273,6 @@ def retrieval_batches(turn, candidates, limit, *, compact=False, links=None):
         assertions = [by_id[key] for key in pool if scores[key][1]]
         assertions.sort(key=lambda item: item[0]["turn_sequence"], reverse=True)
         selected, heads = [], {}
-
-        def people(item):
-            # A verified person can use more than one account. Participation is
-            # personal state; this never transfers an account's administrator grant.
-            return frozenset(m["person_id"] for m in item[0]["messages"])
 
         for item in assertions:
             key = people(item)

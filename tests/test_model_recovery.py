@@ -4,8 +4,21 @@ import httpx
 import pytest
 
 from support import Harness
+from test_rate_limit_recovery import receipt
 from tianshu_companion.clients import Gateway, JsonService
 from tianshu_companion.contracts import Fault
+
+
+def closed_attempt(request):
+    request_id = request.url.path.split("/")[-2 if request.method == "POST" else -1]
+    if request.method == "POST":
+        return httpx.Response(
+            200,
+            json=dict(
+                schema_version=1, request_id=request_id, state="terminal", upstream_outcome="failed"
+            ),
+        )
+    return httpx.Response(200, json=receipt(request_id))
 
 
 @pytest.mark.parametrize(
@@ -15,10 +28,16 @@ from tianshu_companion.contracts import Fault
 def test_only_transient_status_before_stream_is_eligible(status, retryable):
     async def run():
         h = Harness()
+
+        def handler(request):
+            if request.url.path == "/v1/chat/completions" or status == 429:
+                return httpx.Response(status)
+            return closed_attempt(request)
+
         client = JsonService(
             "https://test.invalid",
             "fixture",
-            transport=httpx.MockTransport(lambda _: httpx.Response(status)),
+            transport=httpx.MockTransport(handler),
         )
         try:
             gateway = Gateway(h.contracts, client)
@@ -76,10 +95,16 @@ def test_reasoning_only_interruption_can_recover_before_any_answer_or_tool(suffi
             b'data: {"choices":[{"index":0,"delta":{"reasoning_content":"synthetic test"},"finish_reason":null}]}\n\n'
             + suffix
         )
+
+        def handler(request):
+            if request.url.path == "/v1/chat/completions":
+                return httpx.Response(200, content=body)
+            return closed_attempt(request)
+
         client = JsonService(
             "https://test.invalid",
             "fixture",
-            transport=httpx.MockTransport(lambda _: httpx.Response(200, content=body)),
+            transport=httpx.MockTransport(handler),
         )
         visible = []
 
@@ -140,10 +165,15 @@ def test_transport_cut_distinguishes_hidden_reasoning_from_answer_text(field, re
                 yield ("data: " + json.dumps(chunk) + "\n\n").encode()
                 raise httpx.RemoteProtocolError("Synthetic truncated stream")
 
+        def handler(request):
+            if request.url.path == "/v1/chat/completions":
+                return httpx.Response(200, stream=BrokenStream())
+            return closed_attempt(request)
+
         client = JsonService(
             "https://test.invalid",
             "fixture",
-            transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=BrokenStream())),
+            transport=httpx.MockTransport(handler),
         )
         try:
             with pytest.raises(Fault) as caught:

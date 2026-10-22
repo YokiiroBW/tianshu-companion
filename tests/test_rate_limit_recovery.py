@@ -85,6 +85,19 @@ def test_model_http_pressure_retains_retry_after_without_broadening_foreground_r
 
         def handler(request):
             calls.append(request.url.path)
+            if status == 503 and request.url.path != "/v1/chat/completions":
+                request_id = request.url.path.split("/")[-2 if request.method == "POST" else -1]
+                if request.method == "POST":
+                    return httpx.Response(
+                        200,
+                        json=dict(
+                            schema_version=1,
+                            request_id=request_id,
+                            state="terminal",
+                            upstream_outcome="failed",
+                        ),
+                    )
+                return httpx.Response(200, json=receipt(request_id))
             return httpx.Response(status, json={}, headers={"Retry-After": "90"})
 
         client = JsonService(
@@ -101,7 +114,7 @@ def test_model_http_pressure_retains_retry_after_without_broadening_foreground_r
             assert caught.value.rate_limited is (status == 429)
             assert caught.value.retryable_model is (status == 503)
             assert calls[0] == "/v1/chat/completions"
-            assert len(calls) == (2 if status == 429 else 1)
+            assert len(calls) == (2 if status == 429 else 3)
         finally:
             await client.close()
             await h.core.close()
@@ -492,6 +505,16 @@ async def native_recovery(text, mode, *, during_preflight=None, transport=False,
 
     def handler(request):
         if request.url.path != "/v1/chat/completions":
+            if request.method == "POST":
+                return httpx.Response(
+                    200,
+                    json=dict(
+                        schema_version=1,
+                        request_id=request.url.path.split("/")[-2],
+                        state="terminal",
+                        upstream_outcome="failed",
+                    ),
+                )
             value = receipt(request.url.path.rsplit("/", 1)[-1])
             value["config_version"] = h.turns()[0]["config_version"]
             if len(attempts) == 2 and mode != "persistent":

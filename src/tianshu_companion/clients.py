@@ -6,7 +6,7 @@ import time
 import uuid
 import ssl
 import math
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, aclosing
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from datetime import datetime, timezone
@@ -955,10 +955,13 @@ class Gateway:
         try:
             interrupted = None
             try:
-                async for chunk in self.client.stream("/v1/chat/completions", body, headers):
-                    text = result.consume(chunk)
-                    if text and on_delta:
-                        await on_delta(text)
+                async with aclosing(
+                    self.client.stream("/v1/chat/completions", body, headers)
+                ) as stream:
+                    async for chunk in stream:
+                        text = result.consume(chunk)
+                        if text and on_delta:
+                            await on_delta(text)
             except Fault as error:
                 interrupted = error
             if result.rate_limited or getattr(interrupted, "rate_limited", False):
@@ -988,22 +991,11 @@ class Gateway:
                 # boundary. The explicit rejection case above never broadens it.
                 if result.content or result.tools or result.finish_reason:
                     interrupted.retryable_model = False
+                elif interrupted.retryable_model:
+                    interrupted.retryable_model = await self._settle_request(turn, request_id)
+                    if not interrupted.retryable_model:
+                        interrupted.unknown = True
                 raise interrupted
-        except asyncio.CancelledError:
-            try:
-                await asyncio.shield(
-                    self.client.call("/internal/v1/model-requests/" + request_id + "/cancel", {})
-                )
-            except (Fault, OSError):
-                pass
-            raise
-        except Fault as error:
-            error.model_request_id = request_id
-            raise
-        finally:
-            if self.active_requests.get(turn["id"]) == request_id:
-                self.active_requests.pop(turn["id"], None)
-        try:
             try:
                 message = result.message()
             except Fault as error:
@@ -1012,35 +1004,80 @@ class Gateway:
                 if error.code == "dependency_unavailable" and not (
                     result.content or result.tools or result.finish_reason
                 ):
-                    error.retryable_model = True
+                    error.retryable_model = await self._settle_request(turn, request_id)
                 raise
-            receipt = await self.client.call("/internal/v1/model-requests/" + request_id)
-            self.contracts.check("model#route_receipt", receipt)
-            if (
-                receipt["request_id"] != request_id
-                or receipt["config_version"] != turn["config_version"]
-                or receipt["outcome"] != "succeeded"
-                or receipt["caller_service"] != "companion"
-            ):
+            receipt = await self._route_receipt(turn, request_id)
+            if receipt["outcome"] != "succeeded":
                 raise Fault("dependency_unavailable")
             return message, receipt
+        except asyncio.CancelledError as error:
+            # Once caught, cancellation allows bounded cleanup in this task.
+            # A second cancel interrupts it directly; no shielded child request
+            # may survive after this task and its model slot have been released.
+            error.model_request_id = request_id
+            error.unknown = True
+            await self._settle_request(turn, request_id)
+            raise
         except Fault as error:
             error.model_request_id = request_id
             raise
+        finally:
+            if self.active_requests.get(turn["id"]) == request_id:
+                self.active_requests.pop(turn["id"], None)
+
+    async def _route_receipt(self, turn, request_id):
+        receipt = await self.client.call("/internal/v1/model-requests/" + request_id)
+        self.contracts.check("model#route_receipt", receipt)
+        if (
+            receipt["request_id"] != request_id
+            or receipt["config_version"] != turn["config_version"]
+            or receipt["caller_service"] != "companion"
+        ):
+            raise Fault("dependency_unavailable")
+        return receipt
+
+    async def _settle_request(self, turn, request_id):
+        """Request owned cancellation and briefly confirm local execution closure."""
+        try:
+            async with asyncio.timeout(1):
+                cancelled = await self.client.call(
+                    "/internal/v1/model-requests/" + request_id + "/cancel", {}
+                )
+                self.contracts.check("model#cancel_response", cancelled)
+                if cancelled["request_id"] != request_id or cancelled["state"] not in {
+                    "requested",
+                    "terminal",
+                }:
+                    return False
+                for attempt in range(3):
+                    receipt = await self._route_receipt(turn, request_id)
+                    execution = receipt.get("execution") or {}
+                    state = execution.get("state")
+                    # requested/unknown/not_active do not prove local execution
+                    # has closed. Cancellation never proves upstream nonexecution.
+                    if (
+                        (
+                            state == "cancelled"
+                            and execution.get("cancel_requested") is True
+                            and receipt["outcome"] == "unknown"
+                        )
+                        or (state == "completed" and receipt["outcome"] == "succeeded")
+                        or (state == "failed" and receipt["outcome"] == "failed")
+                    ):
+                        return True
+                    if state not in {"queued", "running"} or attempt == 2:
+                        return False
+                    await asyncio.sleep(0.05 * 2**attempt)
+        except (Fault, TimeoutError, OSError):
+            return False
+        return False
 
     async def _rejected_rate_limit(self, turn, request_id):
         """One short read window for the stream owner's durable terminal receipt."""
         try:
             async with asyncio.timeout(1):
                 for attempt in range(3):
-                    receipt = await self.client.call("/internal/v1/model-requests/" + request_id)
-                    self.contracts.check("model#route_receipt", receipt)
-                    if (
-                        receipt["request_id"] != request_id
-                        or receipt["config_version"] != turn["config_version"]
-                        or receipt["caller_service"] != "companion"
-                    ):
-                        return False
+                    receipt = await self._route_receipt(turn, request_id)
                     execution = receipt.get("execution") or {}
                     if receipt["outcome"] == "failed":
                         return (

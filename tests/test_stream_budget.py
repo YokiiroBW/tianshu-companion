@@ -8,6 +8,7 @@ import pytest
 
 from support import Harness, contracts
 from test_delivery_v2 import NativeQueue
+from test_model_recovery import closed_attempt
 from tianshu_companion.clients import Gateway, JsonService
 from tianshu_companion.contracts import Fault
 
@@ -77,6 +78,8 @@ def test_native_transport_cause_keeps_machine_request_link_without_secret_text(
 ):
     async def run():
         def handler(request):
+            if request.url.path != "/v1/chat/completions":
+                return closed_attempt(request)
             raise exception("secret URL, credential and upstream body")
 
         client = JsonService(
@@ -127,6 +130,8 @@ def test_native_completion_postprocessing_keeps_one_request_identity_and_retry_r
             requests.append(request)
             if request.url.path == "/v1/chat/completions":
                 return httpx.Response(200, stream=stream)
+            if failure == "empty_choice":
+                return closed_attempt(request)
             receipt = route(request)
             if failure == "invalid_receipt":
                 receipt.pop("caller_service")
@@ -234,6 +239,8 @@ def test_connect_and_reads_share_one_network_budget_without_replaying_partial_ou
 
         async def handler(request):
             requests.append(request.url.path)
+            if request.url.path != "/v1/chat/completions":
+                return closed_attempt(request)
             await asyncio.sleep(0.05)
             return httpx.Response(200, stream=stream)
 
@@ -250,7 +257,10 @@ def test_connect_and_reads_share_one_network_budget_without_replaying_partial_ou
             assert caught.value.code == "dependency_unavailable"
             assert caught.value.retryable_model is retryable
             assert 1 <= stream.reads < 4 and stream.closed
-            assert requests == ["/v1/chat/completions"]
+            assert requests[0] == "/v1/chat/completions"
+            assert len(requests) == (3 if retryable else 1)
+            if retryable:
+                assert requests[1] == requests[2] + "/cancel"
             assert not gateway.active_requests
         finally:
             await client.close()
@@ -265,6 +275,8 @@ def test_connection_and_response_headers_remain_bounded(failure):
 
         async def handler(request):
             requests.append(request.url.path)
+            if request.url.path != "/v1/chat/completions":
+                return closed_attempt(request)
             if failure == "connect":
                 raise httpx.ConnectTimeout("synthetic connection timeout")
             if failure == "read":
@@ -284,7 +296,8 @@ def test_connection_and_response_headers_remain_bounded(failure):
                 )
             assert caught.value.code == "dependency_unavailable"
             assert caught.value.retryable_model
-            assert requests == ["/v1/chat/completions"] and not gateway.active_requests
+            assert requests[0] == "/v1/chat/completions" and len(requests) == 3
+            assert requests[1] == requests[2] + "/cancel" and not gateway.active_requests
         finally:
             await client.close()
 

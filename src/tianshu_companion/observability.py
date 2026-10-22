@@ -405,6 +405,44 @@ def error_code(value):
     return value if isinstance(value, str) and value in ERROR_CODES else "internal_error"
 
 
+def failure_diagnostic(error, *, code, attempt, stage, observed_at):
+    """Bounded machine cause shared by the owners of durable recovery state."""
+    request_error = error
+    # wait_for wraps the cancelled model task in the standard TimeoutError.
+    # Keep that outer failure's type, borrowing only the original owned request
+    # link and uncertainty from this one known wrapper, never arbitrary chains.
+    if isinstance(error, TimeoutError) and isinstance(error.__cause__, asyncio.CancelledError):
+        request_error = error.__cause__
+    cause = getattr(error, "cause", None) or {}
+    diagnostic = dict(
+        attempt=attempt,
+        stage=stage,
+        observed_at=observed_at,
+        code=error_code(code),
+        category=cause.get("category", failure_class(error)),
+        unknown=bool(getattr(error, "unknown", False) or getattr(request_error, "unknown", False)),
+    )
+    if diagnostic["category"] not in {*FAILURE_CLASSES.values(), "internal_error"}:
+        diagnostic["category"] = "internal_error"
+    exception_type = cause.get("exception_type")
+    if not isinstance(exception_type, str) or exception_type not in FAILURE_CLASSES:
+        exception_type = failure_type(error)
+    if exception_type is not None:
+        diagnostic["exception_type"] = exception_type
+    if cause.get("peer") in PEER_LABELS | {"unknown"}:
+        diagnostic["peer"] = cause["peer"]
+    if cause.get("operation") in {"query", "command", "stream"}:
+        diagnostic["operation"] = cause["operation"]
+    if type(cause.get("http_status")) is int and 100 <= cause["http_status"] <= 599:
+        diagnostic["http_status"] = cause["http_status"]
+    request_id = getattr(error, "model_request_id", None) or getattr(
+        request_error, "model_request_id", None
+    )
+    if isinstance(request_id, str) and re.fullmatch(r"model:[0-9a-f]{32}", request_id):
+        diagnostic["model_request_id"] = request_id
+    return diagnostic
+
+
 def runtime_outcome(state):
     """Map a domain state onto the frozen runtime outcome, or None when it is not a state.
 

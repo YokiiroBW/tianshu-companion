@@ -1681,23 +1681,66 @@ class Core(Delivery):
                     message, receipt = await self.gateway.complete(
                         fresh, messages, tools=self.role_actions.tools(fresh), on_delta=delta
                     )
+                    if (
+                        not iteration
+                        and not message.get("content")
+                        and not message.get("tool_calls")
+                    ):
+                        fresh = self.store.get("turns", turn["id"])
+                        if not closed_or_started(fresh):
+                            # Only the first native response with no prior send
+                            # or tool execution can use the output-free recovery.
+                            # A tool-only dialogue may legitimately end quietly.
+                            execution = receipt.get("execution") or {}
+                            completed = (
+                                execution.get("state") == "completed"
+                                and execution.get("finish_reasons") == ["stop"]
+                                and execution.get("cancel_requested") is False
+                            )
+                            error = Fault(
+                                "dependency_unavailable",
+                                unknown=not completed,
+                                retryable_model=completed,
+                            )
+                            error.model_request_id = receipt.get("request_id")
+                            raise error
                     break
                 except Fault as error:
-                    fresh = self.store.get("turns", turn["id"])
-                    if (
-                        not error.retryable_model
-                        or iteration
-                        or attempt
-                        or closed_or_started(fresh)
-                        or fresh.get("model_connection_retries", 0)
-                    ):
+                    with self.store.transaction():
+                        fresh = self.store.get("turns", turn["id"])
+                        if (
+                            fresh is not None
+                            and not fresh["cancelled"]
+                            and fresh["phase"] not in TERMINAL
+                        ):
+                            diagnostic = obs.failure_diagnostic(
+                                error,
+                                code=error.code,
+                                attempt=fresh["model_calls"],
+                                stage="model",
+                                observed_at=self.clock(),
+                            )
+                            fresh.setdefault("first_failure", diagnostic)
+                            fresh["last_failure"] = diagnostic
+                            fresh["failure_count"] = fresh.get("failure_count", 0) + 1
+                            recover = (
+                                error.retryable_model
+                                and not iteration
+                                and not attempt
+                                and not closed_or_started(fresh)
+                                and not fresh.get("model_connection_retries", 0)
+                            )
+                            if recover:
+                                fresh["model_connection_retries"] = 1
+                            self._save_turn(fresh)
+                        else:
+                            recover = False
+                    if not recover:
                         raise
                     # Gateway permits an output-free transport cut or a proved
                     # terminal rate-limit rejection. Neither may have crossed this
                     # durable send/tool boundary. Discard only unsent local text.
                     pending = Segments()
-                    fresh["model_connection_retries"] = 1
-                    self._save_turn(fresh)
                     retry_deadline = time.monotonic() + max(
                         0.2, getattr(error, "retry_after_seconds", None) or 0
                     )

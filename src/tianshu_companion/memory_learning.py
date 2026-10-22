@@ -3,7 +3,6 @@
 import asyncio
 import copy
 import json
-import re
 
 from .contracts import Fault, canonical, digest, strict_json
 from .model_selection import SelectionRequest, resolve_selection
@@ -664,34 +663,16 @@ class MemoryLearning:
 
     def _failed(self, item, code, error=None, *, failed_stage=None):
         stage = item.get("stage")
-        cause = getattr(error, "cause", None) or {}
-        diagnostic = dict(
+        diagnostic = obs.failure_diagnostic(
+            error,
+            code=code,
             attempt=item["attempts"],
             stage=failed_stage or stage,
             observed_at=self.core.clock(),
-            code=obs.error_code(code),
-            category=cause.get("category", obs.failure_class(error)),
-            unknown=bool(getattr(error, "unknown", False)),
         )
         # This is a fixed machine projection, not the peer's error body or the
         # exception message. Keep the first cause and latest cause across success
         # and restart without an unbounded event history or a new ledger.
-        if diagnostic["category"] not in {*obs.FAILURE_CLASSES.values(), "internal_error"}:
-            diagnostic["category"] = "internal_error"
-        exception_type = cause.get("exception_type")
-        if not isinstance(exception_type, str) or exception_type not in obs.FAILURE_CLASSES:
-            exception_type = obs.failure_type(error)
-        if exception_type is not None:
-            diagnostic["exception_type"] = exception_type
-        if cause.get("peer") in obs.PEER_LABELS | {"unknown"}:
-            diagnostic["peer"] = cause["peer"]
-        if cause.get("operation") in {"query", "command", "stream"}:
-            diagnostic["operation"] = cause["operation"]
-        if type(cause.get("http_status")) is int and 100 <= cause["http_status"] <= 599:
-            diagnostic["http_status"] = cause["http_status"]
-        request_id = getattr(error, "model_request_id", None)
-        if isinstance(request_id, str) and re.fullmatch(r"model:[0-9a-f]{32}", request_id):
-            diagnostic["model_request_id"] = request_id
         item.setdefault("first_failure", diagnostic)
         item["last_failure"] = diagnostic
         item["failure_count"] = item.get("failure_count", 0) + 1

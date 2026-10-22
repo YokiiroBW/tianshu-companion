@@ -3,12 +3,95 @@ import unittest
 
 from support import Harness
 from tianshu_companion.clients import uid
-from tianshu_companion.context_relevance import changes_plan
+from tianshu_companion.context_relevance import _is_statement, changes_plan
 from tianshu_companion.contracts import Fault, canonical
 from tianshu_companion.short_context import ShortContextPolicy
 
 
 class ContextRetrievalTests(unittest.IsolatedAsyncioTestCase):
+    def test_embedded_whether_keeps_uncertainty_but_not_a_question(self):
+        for text, expected in [
+            ("周六先看看排班，暂时不能确定是否参加。", True),
+            ("我还不知道是否参加。", True),
+            ("目前无法确认是否出席。", True),
+            ("还没决定是否参加，先别算我。", True),
+            ("是否参加？", False),
+            ("周六是否参加", False),
+            ("你知道是否参加？", False),
+            ("你不能确定是否参加吗", False),
+            ("还不知道是否参加，怎么安排？", False),
+            ("我不确定是否参加，你知道吗", False),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(_is_statement(text), expected)
+
+    async def test_explicit_self_comparison_keeps_both_original_human_sources(self):
+        self.h.core.short_context_policy = ShortContextPolicy(max_turns=2)
+        for author, text in [
+            ("a", "我叫青芷，我家狗叫桑团，刚把球推到门边。"),
+            ("b", "我叫棠舟，我家猫叫榆饼，现在趴在窗台上。"),
+            ("a", "柏迟家那只猫叫什么来着？"),
+            ("b", "我家的猫叫什么、刚才在哪里？"),
+        ]:
+            await self.say(text, group=True, channel="group:compare", account=author)
+        await self.say(
+            "我和棠舟养的动物分别叫什么？刚才球和猫在哪儿？",
+            group=True,
+            channel="group:compare",
+            account="a",
+        )
+        recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+        self.assertEqual(len(recent), 2)
+        self.assertIn("狗叫桑团，刚把球推到门边", canonical(recent))
+        self.assertIn("猫叫榆饼，现在趴在窗台", canonical(recent))
+        self.assertNotIn("柏迟", canonical(recent))
+        self.assertTrue(all(group["input_only"] for group in recent))
+
+    async def test_unknown_comparison_or_bare_respectively_does_not_add_an_older_self_source(self):
+        self.h.core.short_context_policy = ShortContextPolicy(max_turns=2)
+        for text in ("我和未见过的人分别叫什么？", "这几样分别叫什么？"):
+            channel = "group:" + uid("compare")
+            for author, source in [
+                ("a", "我的旅行箱放在门边。"),
+                ("b", "我刚把窗帘拉开。"),
+                ("a", "早餐吃什么？"),
+                ("b", "下午怎么安排？"),
+            ]:
+                await self.say(source, group=True, channel=channel, account=author)
+            await self.say(text, group=True, channel=channel, account="a")
+            recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+            self.assertNotIn("旅行箱", canonical(recent))
+
+    async def test_collective_confirmation_keeps_uncertainty_as_the_original_statement(self):
+        for author, text in [
+            ("a", "我叫温槐，计划周六下午去槐溪展馆，入口还没选。"),
+            ("b", "我叫闻舟，周六先看看排班，暂时不能确定是否参加。"),
+        ]:
+            await self.say(text, group=True, channel="group:uncertain", account=author)
+        await self.say(
+            "所以周六我们俩都能去吧？", group=True, channel="group:uncertain", account="a"
+        )
+        recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+        self.assertEqual(len(recent), 2)
+        self.assertIn("计划周六下午去槐溪展馆，入口还没选", canonical(recent))
+        self.assertIn("暂时不能确定是否参加", canonical(recent))
+        self.assertTrue(all(group["input_only"] for group in recent))
+
+    async def test_old_assent_requires_the_later_uncertain_source_to_fit(self):
+        for author, text in [
+            ("a", "周六去青石馆，我同意参加。"),
+            ("b", "周六我也参加。"),
+            ("a", "周六我还不能确定是否参加。" + "排班还没有出来。" * 500),
+        ]:
+            await self.say(text, group=True, channel="group:uncertain-budget", account=author)
+        self.h.core.short_context_policy = ShortContextPolicy(max_bytes=3300)
+        await self.say(
+            "周六我们俩都能去吧？", group=True, channel="group:uncertain-budget", account="b"
+        )
+        recent = json.loads(self.h.gateway.calls[-1][1][1]["content"])["recent_dialogue"]
+        self.assertIn("周六我也参加", canonical(recent))
+        self.assertNotIn("我同意参加", canonical(recent))
+
     async def test_verified_same_persons_second_account_exit_still_protects_older_state(self):
         person = uid("person")
         for account in ("a", "alias"):
