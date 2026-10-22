@@ -114,7 +114,9 @@ to erase the source history.
 A denial of a former value is NOT a new positive current preference. '没有跟着换回去' and
 '口味没变' alone add no replacement fact; return no entry for that reaffirmation. When the
 author explicitly stops the CURRENT preference, preserve the denial without guessing a new
-positive value. A negative-only fact must include its denied object in value and negations.
+positive value. For predicates other than name/title, a negative-only fact must include its denied
+object in value and negations. A name/title denial without a positive literal name/title creates
+no positive name/title entry; a quoted negative-sounding literal name/title is still valid data.
 If the author names a new positive choice and rejects an old one, extract the new positive
 choice separately. Do not copy third-party or hypothetical choices into the author's preferences.
 Return {"memories": []} if nothing durable. No tools, markdown or commentary.
