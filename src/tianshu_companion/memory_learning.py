@@ -51,6 +51,9 @@ statement (concise string), conditions (string array), negations (string array),
 (nonempty string preserving the author's stated time; use "未说明有效时间" when unspecified,
 never an invented date; source sent_at means observation only), evidence (array of
 {source_index: integer, quote: exact substring of that numbered source}). Each fact needs evidence.
+negations contains only denials actually asserted by the source, preserving their target and scope,
+including explicit '不再/不是' corrections. A positive report of a former value ('原来叫/旧名是') is
+a historical fact, not a negation; a rename does not deny that history.
 When extraction_schema is 2 or 3, each entry additionally MUST have fact with:
 key (stable lowercase dotted predicate; no person's name or value in it), value (concise canonical
 value INCLUDING relevant conditions and negation), state (current or historical), valid_from and
