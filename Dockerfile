@@ -41,8 +41,8 @@ RUN python -m pip install --no-cache-dir --only-binary=:all: --no-deps \
     "redis==7.4.1" \
     "tzdata==2026.5"
 
-COPY vendor/tianshu_storage-0.1.0-py3-none-any.whl /tmp/tianshu_storage-0.1.0-py3-none-any.whl
-RUN python -m pip install --no-cache-dir --no-deps /tmp/tianshu_storage-0.1.0-py3-none-any.whl
+COPY vendor/tianshu_storage-0.1.3-py3-none-any.whl /tmp/tianshu_storage-0.1.3-py3-none-any.whl
+RUN python -m pip install --no-cache-dir --no-deps /tmp/tianshu_storage-0.1.3-py3-none-any.whl
 
 WORKDIR /app
 
