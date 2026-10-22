@@ -6,6 +6,7 @@ import time
 import uuid
 import ssl
 import math
+from contextlib import AsyncExitStack
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from datetime import datetime, timezone
@@ -111,6 +112,7 @@ class JsonService:
     )
     QUERY_BUDGET_SECONDS = 15
     COMMAND_BUDGET_SECONDS = 15
+    STREAM_BUDGET_SECONDS = 120
     MAX_RESPONSE_BYTES = 2_000_000
 
     def __init__(self, url=None, token=None, *, transport=None, ca_file=None, label=None):
@@ -145,52 +147,76 @@ class JsonService:
             **(headers or {}),
         }
         pending, event_data, total = bytearray(), [], 0
+        remaining = self.STREAM_BUDGET_SECONDS
+        loop = asyncio.get_running_loop()
+
+        async def receive(operation, *args):
+            nonlocal remaining
+            if remaining <= 0:
+                raise TimeoutError
+            started = loop.time()
+            try:
+                async with asyncio.timeout(remaining):
+                    return await operation(*args)
+            finally:
+                remaining -= loop.time() - started
+
         try:
-            async with asyncio.timeout(120):
-                async with self.client.stream(
-                    "POST",
-                    self.url.rstrip("/") + path,
-                    json=body,
-                    headers=request_headers,
-                    timeout=httpx.Timeout(30),
-                ) as response:
-                    if response.status_code != 200:
-                        # No completion stream has begun. Only transient service
-                        # statuses permit the dialogue owner to retry generation;
-                        # authorization, quota and invalid requests do not.
-                        failure = _retry_hint(
-                            Fault(
-                                "dependency_unavailable",
-                                unknown=True,
-                                retryable_model=response.status_code in {502, 503, 504},
-                            ),
-                            response,
-                        )
-                        failure.rate_limited = response.status_code == 429
-                        raise failure
-                    if response.headers.get("content-encoding", "identity") != "identity":
-                        raise Fault("dependency_unavailable")
-                    async for chunk in response.aiter_bytes():
-                        total += len(chunk)
-                        if total > self.MAX_RESPONSE_BYTES:
+            async with AsyncExitStack() as stack:
+                response = await receive(
+                    stack.enter_async_context,
+                    self.client.stream(
+                        "POST",
+                        self.url.rstrip("/") + path,
+                        json=body,
+                        headers=request_headers,
+                        timeout=httpx.Timeout(30),
+                    ),
+                )
+                if response.status_code != 200:
+                    # No completion stream has begun. Only transient service
+                    # statuses permit the dialogue owner to retry generation;
+                    # authorization, quota and invalid requests do not.
+                    failure = _retry_hint(
+                        Fault(
+                            "dependency_unavailable",
+                            unknown=True,
+                            retryable_model=response.status_code in {502, 503, 504},
+                        ),
+                        response,
+                    )
+                    failure.rate_limited = response.status_code == 429
+                    raise failure
+                if response.headers.get("content-encoding", "identity") != "identity":
+                    raise Fault("dependency_unavailable")
+                chunks = response.aiter_bytes().__aiter__()
+                while True:
+                    try:
+                        # No timeout context may survive the yield below: its
+                        # consumer can be awaiting a local delivery callback.
+                        chunk = await receive(anext, chunks)
+                    except StopAsyncIteration:
+                        break
+                    total += len(chunk)
+                    if total > self.MAX_RESPONSE_BYTES:
+                        raise Fault("budget_exceeded", unknown=True)
+                    pending.extend(chunk)
+                    while b"\n" in pending:
+                        line, _, rest = pending.partition(b"\n")
+                        pending = bytearray(rest)
+                        line = line.rstrip(b"\r")
+                        if len(line) > 200000:
                             raise Fault("budget_exceeded", unknown=True)
-                        pending.extend(chunk)
-                        while b"\n" in pending:
-                            line, _, rest = pending.partition(b"\n")
-                            pending = bytearray(rest)
-                            line = line.rstrip(b"\r")
-                            if len(line) > 200000:
-                                raise Fault("budget_exceeded", unknown=True)
-                            if line.startswith(b"data:"):
-                                event_data.append(line[5:].lstrip(b" "))
-                            elif not line and event_data:
-                                data = b"\n".join(event_data)
-                                event_data.clear()
-                                if data == b"[DONE]":
-                                    return
-                                yield strict_json(data)
-                        if len(pending) > 200000:
-                            raise Fault("budget_exceeded", unknown=True)
+                        if line.startswith(b"data:"):
+                            event_data.append(line[5:].lstrip(b" "))
+                        elif not line and event_data:
+                            data = b"\n".join(event_data)
+                            event_data.clear()
+                            if data == b"[DONE]":
+                                return
+                            yield strict_json(data)
+                    if len(pending) > 200000:
+                        raise Fault("budget_exceeded", unknown=True)
             raise Fault("result_unknown", unknown=True, retryable_model=True)
         except (httpx.ConnectError, httpx.ConnectTimeout):
             raise Fault("dependency_unavailable", retryable_model=True) from None
