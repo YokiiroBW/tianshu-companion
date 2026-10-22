@@ -3,11 +3,13 @@
 import asyncio
 import copy
 import json
+import re
 
 from .contracts import Fault, canonical, digest, strict_json
 from .model_selection import SelectionRequest, resolve_selection
 from .memory_admission import empty_extraction_reason, mixed_stable_hints
 from .short_context import sources_current
+from . import observability as obs
 
 QUEUE = "memory:learning"
 MAX_ATTEMPTS = 3
@@ -636,10 +638,11 @@ class MemoryLearning:
                 deadline=0,
                 recovery_reason=None,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            failed_stage = item.get("stage")
             if item.get("stage") == "commit_wait":
                 item["stage"] = "receipt"
-            self._failed(item, "cancelled")
+            self._failed(item, "cancelled", error, failed_stage=failed_stage)
             core.store.put("metadata", item)
             raise
         except (Fault, OSError, TimeoutError, ValueError, TypeError, KeyError) as error:
@@ -652,14 +655,46 @@ class MemoryLearning:
                     else "invalid_input"
                 )
             )
-            if item.get("stage") == "commit_wait":
+            failed_stage = item.get("stage")
+            if failed_stage == "commit_wait":
                 item["stage"] = "receipt"
-            self._failed(item, code, error)
+            self._failed(item, code, error, failed_stage=failed_stage)
         core.store.put("metadata", item)
         core.counted("memory.work")
 
-    def _failed(self, item, code, error=None):
+    def _failed(self, item, code, error=None, *, failed_stage=None):
         stage = item.get("stage")
+        cause = getattr(error, "cause", None) or {}
+        diagnostic = dict(
+            attempt=item["attempts"],
+            stage=failed_stage or stage,
+            observed_at=self.core.clock(),
+            code=obs.error_code(code),
+            category=cause.get("category", obs.failure_class(error)),
+            unknown=bool(getattr(error, "unknown", False)),
+        )
+        # This is a fixed machine projection, not the peer's error body or the
+        # exception message. Keep the first cause and latest cause across success
+        # and restart without an unbounded event history or a new ledger.
+        if diagnostic["category"] not in {*obs.FAILURE_CLASSES.values(), "internal_error"}:
+            diagnostic["category"] = "internal_error"
+        exception_type = cause.get("exception_type")
+        if not isinstance(exception_type, str) or exception_type not in obs.FAILURE_CLASSES:
+            exception_type = obs.failure_type(error)
+        if exception_type is not None:
+            diagnostic["exception_type"] = exception_type
+        if cause.get("peer") in obs.PEER_LABELS | {"unknown"}:
+            diagnostic["peer"] = cause["peer"]
+        if cause.get("operation") in {"query", "command", "stream"}:
+            diagnostic["operation"] = cause["operation"]
+        if type(cause.get("http_status")) is int and 100 <= cause["http_status"] <= 599:
+            diagnostic["http_status"] = cause["http_status"]
+        request_id = getattr(error, "model_request_id", None)
+        if isinstance(request_id, str) and re.fullmatch(r"model:[0-9a-f]{32}", request_id):
+            diagnostic["model_request_id"] = request_id
+        item.setdefault("first_failure", diagnostic)
+        item["last_failure"] = diagnostic
+        item["failure_count"] = item.get("failure_count", 0) + 1
         authorization = code in {"forbidden", "unauthorized", "scope_changed", "not_found"}
         proposal_failure = stage == "proposal" and not authorization
         if proposal_failure:

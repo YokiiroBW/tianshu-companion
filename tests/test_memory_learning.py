@@ -410,6 +410,49 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.flush()
         self.assertEqual(self.task()["state"], "completed")
 
+    async def test_typed_receipt_failure_survives_restart_and_success_without_model_replay(self):
+        await self.chat()
+
+        async def broken(request):
+            raise httpx.ReadTimeout(
+                "private URL, credential and response text must not be retained"
+            )
+
+        client = JsonService(
+            "https://fixture.invalid",
+            "fixture-secret",
+            transport=httpx.MockTransport(broken),
+            label="memory",
+        )
+        self.addAsyncCleanup(client.close)
+        memory = Memory(self.h.contracts, client)
+        self.h.memory.process_candidate = memory.process_candidate
+        await self.flush()
+        failed = self.task()
+        diagnostic = failed["first_failure"]
+        self.assertEqual(diagnostic["stage"], "receipt")
+        self.assertEqual(diagnostic["attempt"], 1)
+        self.assertEqual(diagnostic["category"], "read_error")
+        self.assertEqual(diagnostic["exception_type"], "ReadTimeout")
+        self.assertEqual(diagnostic["peer"], "memory")
+        self.assertEqual(diagnostic["operation"], "query")
+        self.assertNotIn("http_status", diagnostic)
+        self.assertNotIn("private", json.dumps(diagnostic))
+        self.assertNotIn("fixture", json.dumps(diagnostic))
+        self.assertEqual(self.generated, [])
+        await self.restart()
+        self.h.memory.process_candidate = self.process
+        self.h.clock.advance(10)
+        await self.flush()
+        completed = self.task()
+        self.assertEqual(completed["state"], "completed")
+        self.assertIsNone(completed["last_error"])
+        self.assertEqual(completed["first_failure"], diagnostic)
+        self.assertEqual(completed["last_failure"], diagnostic)
+        self.assertEqual(completed["failure_count"], 1)
+        self.assertEqual(completed["recovery_failures"], {"receipt": 1})
+        self.assertEqual(len(self.generated), 1)
+
     async def test_correction_waits_for_original_retry_but_other_person_can_progress(self):
         self.unique_jobs()
         await self.chat()
@@ -828,6 +871,13 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["deadline"] - self.h.clock(), 45)
         self.assertEqual(item["proposal_failures"], 0)
         self.assertEqual(len(requests), 2)
+        diagnostic = item["first_failure"]
+        self.assertEqual(diagnostic["stage"], "commit")
+        self.assertEqual(diagnostic["attempt"], 1)
+        self.assertEqual(diagnostic["http_status"], 503)
+        self.assertEqual(diagnostic["exception_type"], "Fault")
+        self.assertEqual(diagnostic["operation"], "command")
+        self.assertTrue(diagnostic["unknown"])
         self.h.clock.advance(44)
         await self.flush()
         self.assertEqual(len(requests), 2)
@@ -838,6 +888,8 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.generated), 1)
         self.assertEqual([body["output"] for body in requests], [None, proposal, None, proposal])
         self.assertTrue(all(body["job_id"] == item["job_id"] for body in requests))
+        self.assertEqual(self.task()["first_failure"], diagnostic)
+        self.assertEqual(self.task()["last_failure"], diagnostic)
 
     async def test_rate_limit_failures_have_a_durable_bound(self):
         await self.chat()

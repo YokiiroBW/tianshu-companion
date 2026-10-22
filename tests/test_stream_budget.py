@@ -58,6 +58,107 @@ class Stream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class SyntheticPrivateReadTimeout(httpx.ReadTimeout):
+    pass
+
+
+@pytest.mark.parametrize(
+    "exception,category,registered_type",
+    [
+        (httpx.ReadTimeout, "read_error", "ReadTimeout"),
+        (httpx.ReadError, "read_error", "ReadError"),
+        (httpx.ConnectTimeout, "connect_error", "ConnectTimeout"),
+        (httpx.ConnectError, "connect_error", "ConnectError"),
+        (SyntheticPrivateReadTimeout, "read_error", "ReadTimeout"),
+    ],
+)
+def test_native_transport_cause_keeps_machine_request_link_without_secret_text(
+    exception, category, registered_type
+):
+    async def run():
+        def handler(request):
+            raise exception("secret URL, credential and upstream body")
+
+        client = JsonService(
+            "https://synthetic.invalid",
+            "fixture",
+            transport=httpx.MockTransport(handler),
+            label="gateway",
+        )
+        try:
+            gateway = Gateway(contracts(), client)
+            with pytest.raises(Fault) as caught:
+                await gateway.complete(
+                    {"id": "turn:fixture", "config_version": 7},
+                    [{"role": "user", "content": "合成"}],
+                )
+            error = caught.value
+            assert error.cause == dict(
+                category=category,
+                exception_type=registered_type,
+                peer="gateway",
+                operation="stream",
+            )
+            assert error.model_request_id.startswith("model:")
+            assert error.retryable_model
+            assert "secret" not in json.dumps(error.cause)
+            assert not gateway.active_requests
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["incomplete_choice", "empty_choice", "invalid_receipt", "receipt_mismatch", "invalid_request"],
+)
+def test_native_completion_postprocessing_keeps_one_request_identity_and_retry_rules(failure):
+    async def run():
+        requests = []
+        chunks = [event({"content": "合成答复"})]
+        if failure == "empty_choice":
+            chunks = []
+        elif failure != "incomplete_choice":
+            chunks.append(event({}, "stop"))
+        stream = Stream([*chunks, b"data: [DONE]\n\n"])
+
+        def handler(request):
+            requests.append(request)
+            if request.url.path == "/v1/chat/completions":
+                return httpx.Response(200, stream=stream)
+            receipt = route(request)
+            if failure == "invalid_receipt":
+                receipt.pop("caller_service")
+            elif failure == "receipt_mismatch":
+                receipt["config_version"] = 8
+            return httpx.Response(200, json=receipt)
+
+        client = JsonService(
+            "https://synthetic.invalid", "fixture", transport=httpx.MockTransport(handler)
+        )
+        gateway = Gateway(contracts(), client)
+        try:
+            messages = [{"role": "user", "content": "合成"}]
+            if failure == "invalid_request":
+                messages = []
+            with pytest.raises(Fault) as caught:
+                await gateway.complete({"id": "turn:fixture", "config_version": 7}, messages)
+            error = caught.value
+            if failure == "invalid_request":
+                assert requests == []
+                assert not hasattr(error, "model_request_id")
+            else:
+                assert error.model_request_id == requests[0].headers["X-Request-ID"]
+            assert error.retryable_model == (failure == "empty_choice")
+            assert error.unknown == (failure in {"empty_choice", "incomplete_choice"})
+            assert not gateway.active_requests
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
 def test_slow_native_delivery_does_not_expire_the_network_stream_budget():
     async def run():
         h = Harness(silence_ms=0)

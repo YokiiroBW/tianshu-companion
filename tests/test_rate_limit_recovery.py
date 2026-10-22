@@ -382,6 +382,42 @@ def test_http_429_uses_the_existing_single_recovery_and_honors_retry_after():
     asyncio.run(native_recovery("", "recover", transport=429, retry_after=1))
 
 
+def test_foreground_recovery_rechecks_remaining_delay_after_an_early_wakeup():
+    from tianshu_companion import core as core_module
+
+    async def run():
+        now, waits = [100.0], []
+
+        class Clock:
+            def monotonic(self):
+                return now[0]
+
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+        class Runtime:
+            async def sleep(self, delay):
+                if delay > 0:
+                    waits.append(delay)
+                    now[0] += delay / 2 if len(waits) == 1 else delay
+                await asyncio.sleep(0)
+
+            def __getattr__(self, name):
+                return getattr(asyncio, name)
+
+        # Keep the real event loop's clock and sleep intact. Only Core's
+        # foreground retry timer receives the deterministic early wakeup.
+        with (
+            patch.object(core_module, "time", Clock()),
+            patch.object(core_module, "asyncio", Runtime()),
+        ):
+            await native_recovery("", "recover", transport=429)
+        assert waits == pytest.approx([0.2, 0.1])
+        assert now[0] >= 100.2
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     "mode",
     [

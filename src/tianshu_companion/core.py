@@ -1698,7 +1698,16 @@ class Core(Delivery):
                     pending = Segments()
                     fresh["model_connection_retries"] = 1
                     self._save_turn(fresh)
-                    await asyncio.sleep(max(0.2, getattr(error, "retry_after_seconds", None) or 0))
+                    retry_deadline = time.monotonic() + max(
+                        0.2, getattr(error, "retry_after_seconds", None) or 0
+                    )
+                    # asyncio timers may wake early on a coarse system clock.
+                    # Retry-After is a lower bound, not an approximate sleep.
+                    while True:
+                        remaining = retry_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        await asyncio.sleep(remaining)
                     fresh = self.store.get("turns", turn["id"])
                     if closed_or_started(fresh):
                         raise Fault("scope_changed")

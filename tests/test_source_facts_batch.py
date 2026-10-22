@@ -1,10 +1,13 @@
 """Owner snapshots preserve their facts while batching existing indexed reads."""
 
 import copy
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from test_source_sync import SourceHarness
-from tianshu_companion.clients import uid
+from tianshu_companion.clients import uid, utc
 from tianshu_companion.contracts import Fault, digest
 from tianshu_companion.source_sync import selector
 
@@ -28,6 +31,70 @@ class SourceFactsBatchTests(unittest.IsolatedAsyncioTestCase):
 
     def read(self, request):
         return self.h.core.source_facts("memory", request)
+
+    async def test_head_only_read_is_one_atomic_select_without_writer_transaction(self):
+        query = dict(self.query(), mode="head")
+        statements = []
+        self.h.core.store.db.set_trace_callback(statements.append)
+        try:
+            with patch.object(
+                self.h.core.store, "transaction", side_effect=AssertionError("Writer transaction")
+            ):
+                response = self.read(query)
+        finally:
+            self.h.core.store.db.set_trace_callback(None)
+        self.assertEqual(response["head"], self.h.core.store.source_head())
+        self.assertEqual(["SELECT"], [sql.split()[0] for sql in statements])
+        self.assertEqual([], response["turns"])
+        self.assertEqual([], response["physicals"])
+        self.assertEqual([], response["admissions"])
+        with self.assertRaises(Fault):
+            self.h.core.source_facts("channel", query)
+        with self.assertRaises(Fault):
+            self.read(dict(query, unexpected=True))
+
+    async def test_lease_continuation_persists_without_changing_exported_facts_or_head(self):
+        await self.h.core.close()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.h = SourceHarness(Path(temp.name) / "source-lease.sqlite")
+        turn = (await self.completed_turns())[0]
+        query = self.query(turns=[turn["id"]])
+        before = self.read(query)
+        deadline = turn["source_deadline"] + 600
+
+        class Sender:
+            async def expression_context(sender, origin, scope, channel):
+                return dict(
+                    origin=origin["origin"], scope=scope, channel=channel, expires_at=utc(deadline)
+                )
+
+        with patch.object(self.h.core, "expression_sender", return_value=Sender()):
+            await self.h.core.continue_delivery_origin(turn)
+        after = self.read(query)
+        self.assertEqual(before, after)
+        self.assertEqual(deadline, self.h.core.store.get("turns", turn["id"])["source_deadline"])
+        await self.h.core.close()
+        self.h.core = self.h.new_core()
+        self.h.core.recover()
+        self.assertEqual(before, self.read(query))
+        self.assertEqual(deadline, self.h.core.store.get("turns", turn["id"])["source_deadline"])
+
+    async def test_lease_exception_does_not_hide_mixed_transaction_or_other_turn_changes(self):
+        turn = (await self.completed_turns())[0]
+        store = self.h.core.store
+        before = store.source_head()
+        with store.transaction():
+            turn["source_deadline"] += 100
+            turn["bootstrap_until"] += 10
+            store.put("turns", turn)
+            self.assertEqual(before, store.source_head())
+            turn["context_revision"] += 1
+            self.h.core._save_turn(turn)
+        self.assertEqual(before["sequence"] + 1, store.source_head()["sequence"])
+        snapshot = self.read(self.query(turns=[turn["id"]]))
+        self.assertEqual(store.source_head(), snapshot["head"])
+        self.assertEqual(turn["context_revision"], snapshot["turns"][0]["context_revision"])
 
     async def test_max_selector_batch_has_bounded_sql_and_preserves_each_actor_and_channel(self):
         h = self.h

@@ -51,6 +51,34 @@ class QueryTransportTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(service.close)
         return service
 
+    async def test_transport_cause_is_internal_and_survives_unknown_write_wrapping(self):
+        for exception, category in (
+            (httpx.ConnectTimeout, "connect_error"),
+            (httpx.ReadTimeout, "read_error"),
+        ):
+            calls = []
+
+            async def handler(request):
+                calls.append(request)
+                raise exception("secret URL, token and peer text")
+
+            with self.assertRaises(Fault) as caught:
+                await self.service(handler).call(
+                    "/internal/v1/memory/candidates/process",
+                    {"job_id": "candidate:fixture", "output": {"memories": []}},
+                    uncertain_write=True,
+                )
+            error = caught.exception
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(error.unknown)
+            self.assertEqual(error.cause["category"], category)
+            self.assertEqual(error.cause["exception_type"], exception.__name__)
+            self.assertEqual(error.cause["operation"], "command")
+            self.assertNotIn("http_status", error.cause)
+            wire = error.wire("request:synthetic")
+            self.assertNotIn("cause", wire)
+            self.assertNotIn("secret", json.dumps([wire, error.cause]))
+
     async def test_exact_queries_retry_once_with_identical_wire_request(self):
         for path, body in QUERIES:
             for error in (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError):

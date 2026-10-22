@@ -136,6 +136,18 @@ class JsonService:
             timeout=15, follow_redirects=False, trust_env=False, transport=transport, verify=verify
         )
 
+    def _cause(self, error, operation, status=None):
+        # Never copy exception text, URLs, headers or peer response fields.
+        if isinstance(error, Fault) and error.cause is not None:
+            return error.cause
+        cause = dict(category=obs.failure_class(error), peer=self.label, operation=operation)
+        exception_type = obs.failure_type(error)
+        if exception_type is not None:
+            cause["exception_type"] = exception_type
+        if status is not None:
+            cause["http_status"] = status
+        return cause
+
     async def stream(self, path, body, headers=None):
         if not self.url or not self.token:
             raise Fault("dependency_unavailable")
@@ -149,6 +161,7 @@ class JsonService:
         pending, event_data, total = bytearray(), [], 0
         remaining = self.STREAM_BUDGET_SECONDS
         loop = asyncio.get_running_loop()
+        response = None
 
         async def receive(operation, *args):
             nonlocal remaining
@@ -218,14 +231,39 @@ class JsonService:
                     if len(pending) > 200000:
                         raise Fault("budget_exceeded", unknown=True)
             raise Fault("result_unknown", unknown=True, retryable_model=True)
-        except (httpx.ConnectError, httpx.ConnectTimeout):
-            raise Fault("dependency_unavailable", retryable_model=True) from None
-        except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, TimeoutError):
+        except Fault as error:
+            error.cause = self._cause(
+                error, "stream", response.status_code if response is not None else None
+            )
+            raise
+        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+            raise Fault(
+                "dependency_unavailable", retryable_model=True, cause=self._cause(error, "stream")
+            ) from None
+        except (
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+            TimeoutError,
+        ) as error:
             # The completion owner decides whether any answer/tool output was
             # observed. A truncated reasoning-only stream has no delivered result.
-            raise Fault("dependency_unavailable", unknown=True, retryable_model=True) from None
-        except (httpx.HTTPError, ValueError, UnicodeError):
-            raise Fault("dependency_unavailable", unknown=True) from None
+            raise Fault(
+                "dependency_unavailable",
+                unknown=True,
+                retryable_model=True,
+                cause=self._cause(
+                    error, "stream", response.status_code if response is not None else None
+                ),
+            ) from None
+        except (httpx.HTTPError, ValueError, UnicodeError) as error:
+            raise Fault(
+                "dependency_unavailable",
+                unknown=True,
+                cause=self._cause(
+                    error, "stream", response.status_code if response is not None else None
+                ),
+            ) from None
 
     async def call(self, path, body=None, headers=None, *, uncertain_write=False):
         retry_query = self._is_query(path, body)
@@ -252,8 +290,10 @@ class JsonService:
                             ):
                                 raise
                             await asyncio.sleep(0.1 * 2**attempt)
-        except TimeoutError:
-            raise Fault("dependency_unavailable", retryable_read=True) from None
+        except TimeoutError as error:
+            raise Fault(
+                "dependency_unavailable", retryable_read=True, cause=self._cause(error, "query")
+            ) from None
 
     @classmethod
     def _is_query(cls, path, body):
@@ -293,6 +333,7 @@ class JsonService:
         }
         started, attempts = time.perf_counter(), 0
         sent, not_started = False, False
+        response = None
         LOG_PORT.emit(
             "peer.call.started",
             "started",
@@ -371,13 +412,23 @@ class JsonService:
         except (httpx.HTTPError, ValueError, TimeoutError, Fault) as error:
             # Third-party exception text is never logged; only a fixed failure class.
             self._report("failed", correlation, started, attempts, error)
+            cause = self._cause(
+                error,
+                "query" if retry_query else "command",
+                response.status_code if response is not None else None,
+            )
             if isinstance(error, Fault):
+                error.cause = cause
                 if uncertain_write and sent and not not_started:
-                    failure = Fault(error.code, unknown=True, current_version=error.current_version)
+                    failure = Fault(
+                        error.code, unknown=True, current_version=error.current_version, cause=cause
+                    )
                     failure.retry_after_seconds = getattr(error, "retry_after_seconds", None)
                     raise failure from None
                 raise
-            raise Fault("dependency_unavailable", unknown=uncertain_write and sent) from None
+            raise Fault(
+                "dependency_unavailable", unknown=uncertain_write and sent, cause=cause
+            ) from None
 
     def _report(self, outcome, correlation, started, attempts, error=None):
         LOG_PORT.emit(
@@ -923,7 +974,12 @@ class Gateway:
                     )
                     and await self._rejected_rate_limit(turn, request_id)
                 )
-                failure = Fault("dependency_unavailable", unknown=True, retryable_model=allowed)
+                failure = Fault(
+                    "dependency_unavailable",
+                    unknown=True,
+                    retryable_model=allowed,
+                    cause=interrupted.cause if interrupted is not None else None,
+                )
                 failure.rate_limited = True
                 failure.retry_after_seconds = getattr(interrupted, "retry_after_seconds", None)
                 raise failure
@@ -941,29 +997,36 @@ class Gateway:
             except (Fault, OSError):
                 pass
             raise
+        except Fault as error:
+            error.model_request_id = request_id
+            raise
         finally:
             if self.active_requests.get(turn["id"]) == request_id:
                 self.active_requests.pop(turn["id"], None)
         try:
-            message = result.message()
-        except Fault as error:
-            # [DONE] without a completed choice is also an interrupted result.
-            # Hidden reasoning is never a user reply or a completed tool call.
-            if error.code == "dependency_unavailable" and not (
-                result.content or result.tools or result.finish_reason
+            try:
+                message = result.message()
+            except Fault as error:
+                # [DONE] without a completed choice is also an interrupted result.
+                # Hidden reasoning is never a user reply or a completed tool call.
+                if error.code == "dependency_unavailable" and not (
+                    result.content or result.tools or result.finish_reason
+                ):
+                    error.retryable_model = True
+                raise
+            receipt = await self.client.call("/internal/v1/model-requests/" + request_id)
+            self.contracts.check("model#route_receipt", receipt)
+            if (
+                receipt["request_id"] != request_id
+                or receipt["config_version"] != turn["config_version"]
+                or receipt["outcome"] != "succeeded"
+                or receipt["caller_service"] != "companion"
             ):
-                error.retryable_model = True
+                raise Fault("dependency_unavailable")
+            return message, receipt
+        except Fault as error:
+            error.model_request_id = request_id
             raise
-        receipt = await self.client.call("/internal/v1/model-requests/" + request_id)
-        self.contracts.check("model#route_receipt", receipt)
-        if (
-            receipt["request_id"] != request_id
-            or receipt["config_version"] != turn["config_version"]
-            or receipt["outcome"] != "succeeded"
-            or receipt["caller_service"] != "companion"
-        ):
-            raise Fault("dependency_unavailable")
-        return message, receipt
 
     async def _rejected_rate_limit(self, turn, request_id):
         """One short read window for the stream owner's durable terminal receipt."""

@@ -239,6 +239,10 @@ def read_facts(store, contracts, service, request):
     if service != "memory":
         raise Fault("forbidden")
     contracts.check("sources#facts_request", request)
+    if request["mode"] == "head" and not request["selectors"] and not request["turn_ids"]:
+        # One atomic row read already is the whole head snapshot. Do not acquire
+        # the writer/advisory lock for a query that reads no owner facts.
+        return _facts_response(contracts, request, store.source_head(), [], [], [])
     with store.transaction():
         physicals, admissions, turns = [], [], []
         keys = {digest(chosen["key"]): chosen["key"] for chosen in request["selectors"]}
@@ -308,19 +312,25 @@ def read_facts(store, contracts, service, request):
                     committed_event=saved,
                 )
             )
-        response = dict(
-            schema_version=1,
-            request_id=request["request_id"],
-            request_digest=digest(request),
-            head=store.source_head(),
-            physicals=physicals,
-            admissions=admissions,
-            turns=turns,
+        return _facts_response(
+            contracts, request, store.source_head(), physicals, admissions, turns
         )
-        contracts.check("sources#facts_response", response)
-        if len(canonical(response).encode()) > 1_048_576:
-            raise Fault("dependency_unavailable")
-        return response
+
+
+def _facts_response(contracts, request, head, physicals, admissions, turns):
+    response = dict(
+        schema_version=1,
+        request_id=request["request_id"],
+        request_digest=digest(request),
+        head=head,
+        physicals=physicals,
+        admissions=admissions,
+        turns=turns,
+    )
+    contracts.check("sources#facts_response", response)
+    if len(canonical(response).encode()) > 1_048_576:
+        raise Fault("dependency_unavailable")
+    return response
 
 
 def context_valid(core, service, data, context, actor, audience, cid, person=None, *, legacy=False):

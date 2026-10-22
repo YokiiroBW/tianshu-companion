@@ -98,6 +98,79 @@ def test_existing_inline_payload_is_externalized_without_source_fact(tmp_path):
         store.close()
 
 
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_source_head_single_read_and_lease_bookkeeping_survive_backend_restart(tmp_path, backend):
+    from support import contracts
+    from tianshu_companion.source_sync import read_facts
+
+    settings = None
+    if backend == "postgresql":
+        url = os.environ.get("TS233_POSTGRES_URL")
+        if not url:
+            pytest.skip("TS233_POSTGRES_URL is required for isolated real PostgreSQL")
+        settings = {
+            "storage_backends": {"postgresql_url": url, "namespace": "q19_" + uuid.uuid4().hex}
+        }
+    path = tmp_path / "source-head.sqlite"
+    store = Store(path, settings=settings)
+    turn = dict(
+        id="lease-turn",
+        conversation_id="lease-room",
+        phase="sent",
+        version=4,
+        source_deadline=100,
+        bootstrap_until=90,
+    )
+    try:
+        store.put("turns", turn)
+        head = store.source_head()
+        turn.update(source_deadline=200, bootstrap_until=190)
+        store.put("turns", turn)
+        assert store.source_head() == head
+        statements = []
+        connection = store.db
+
+        class ObservedConnection:
+            def execute(self, sql, *args, **kwargs):
+                statements.append(sql)
+                return connection.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+        store.db = ObservedConnection()
+        try:
+            response = read_facts(
+                store,
+                contracts(),
+                "memory",
+                dict(
+                    schema_version=1,
+                    request_id="head:fixture",
+                    mode="head",
+                    selectors=[],
+                    turn_ids=[],
+                    include_content=False,
+                ),
+            )
+        finally:
+            store.db = connection
+        assert response["head"] == head
+        assert len(statements) == 1 and statements[0].startswith("SELECT")
+    finally:
+        store.close()
+    store = Store(path, settings=settings)
+    try:
+        assert store.get("turns", turn["id"]) == turn
+        assert store.source_head() == head
+        with store.transaction():
+            store.put("turns", dict(turn, source_deadline=300))
+            store.put("turns", dict(turn, version=5, source_deadline=300))
+        assert store.source_head()["sequence"] == head["sequence"] + 1
+    finally:
+        store.close()
+
+
 @pytest.fixture
 def pg_settings():
     url = os.environ.get("TS233_POSTGRES_URL")

@@ -384,6 +384,13 @@ def correlation_scope(value=None):
         _correlation.reset(token)
 
 
+def failure_type(error):
+    """Registered exception type, excluding arbitrary subclass names and text."""
+    return next(
+        (kind.__name__ for kind in type(error).__mro__ if kind.__name__ in FAILURE_CLASSES), None
+    )
+
+
 def failure_class(error):
     """A fixed label for an exception, from its type only - never from its message."""
     for kind in type(error).__mro__:

@@ -27,6 +27,7 @@ class Fault(Exception):
         current_version=None,
         retryable_read=False,
         retryable_model=False,
+        cause=None,
     ):
         super().__init__(code)
         self.code = code
@@ -34,6 +35,8 @@ class Fault(Exception):
         self.current_version = current_version
         self.retryable_read = retryable_read
         self.retryable_model = retryable_model
+        # Internal machine metadata only; wire/status/retry semantics are unchanged.
+        self.cause = dict(cause) if cause is not None else None
 
     @property
     def status(self):

@@ -397,9 +397,21 @@ class Store:
                 self.put(table, item)
             return
         previous = self.get(table, item["id"]) if table in FACT_TABLES else None
+        lease_only = (
+            table == "turns"
+            and previous is not None
+            and {
+                k: v for k, v in previous.items() if k not in {"source_deadline", "bootstrap_until"}
+            }
+            == {k: v for k, v in item.items() if k not in {"source_deadline", "bootstrap_until"}}
+        )
         if (
             table in FACT_TABLES
             and previous != item
+            # These two lease fields are not exported by source-facts/read. A
+            # continuation must persist, but cannot invalidate an unchanged owner
+            # snapshot. Every other turn change, including version, still does.
+            and not lease_only
             and (table != "outbox" or previous is None or previous["event"] != item["event"])
         ):
             self._fact_dirty = True
