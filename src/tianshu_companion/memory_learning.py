@@ -56,9 +56,11 @@ including explicit '不再/不是' corrections. A positive report of a former va
 a historical fact, not a negation; a rename does not deny that history.
 When extraction_schema is 2 or 3, each entry additionally MUST have fact with:
 key (stable lowercase dotted predicate; no person's name or value in it), value (concise canonical
-value INCLUDING relevant conditions and negation), state (current or historical), valid_from and
-valid_to (RFC3339 timestamp or null when not explicitly known), keywords (2-8 topic terms/synonyms
-in the source language, not filler like user/fact/preference). Use distinct keys for distinct items.
+value INCLUDING relevant conditions and negation; for name/title, ONLY the complete literal value,
+including literal parentheses, '旧名' or negative wording, with no added labels or explanations),
+state (current or historical), valid_from and valid_to (RFC3339 timestamp or null when not explicitly
+known), keywords (2-8 topic terms/synonyms in the source language, not filler like
+user/fact/preference). Use distinct keys for distinct items.
 An explicit positive declaration of the source author's own name is durable, even beside a one-off
 action. Use key identity.name (never person.name, author.name or name), the stated name as value,
 and entity=null in schema 3. Preserve quotation marks within the literal name; quoting its value
@@ -102,10 +104,13 @@ Examples of general predicates: residence, hometown, occupation, employer, pet.c
 pet.dog.name, diet.<food>, beverage.<drink>, language.<language>, hobby.<activity>, event.<topic>.
 Match known_facts FIRST, subject to that author-name key rule: for equivalent meaning reuse its
 exact key, value, conditions and negations; for a changed value of the SAME entity reuse the same
-key with the new value. known_facts alone is NEVER
+key with the new value. If the source only says an object's name/title is unchanged and gives no
+value for it, add no entry for that object; known_facts cannot supply or decorate its unstated value.
+known_facts alone is NEVER
 evidence and may not be re-extracted. A reported old/ended fact is historical and does not replace
-current facts. Do not combine past and present values in one atomic entry. If a former preference
-changes, keep the new value; a correction is not a reason to erase the source history.
+current facts. Keep past and present in separate atomic entries; each name/title entry has only its
+own literal value. If a former preference changes, keep the new value; a correction is not a reason
+to erase the source history.
 A denial of a former value is NOT a new positive current preference. '没有跟着换回去' and
 '口味没变' alone add no replacement fact; return no entry for that reaffirmation. When the
 author explicitly stops the CURRENT preference, preserve the denial without guessing a new
