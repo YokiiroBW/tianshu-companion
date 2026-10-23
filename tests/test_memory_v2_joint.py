@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 import httpx
 import pytest
@@ -72,6 +73,43 @@ def client(h, *, transport=None):
         transport=transport or httpx.ASGITransport(app=h.client.app),
     )
     return Memory(ConsumerContracts(os.environ["TIANSHU_CONTRACTS"]), wire), wire
+
+
+def test_episode_capture_between_query_and_verify_requires_complete_reselection(sync):
+    from tianshu_companion.preparation_retry import retry_preparation, verify_prepared_memory
+
+    producer.setup(sync)
+
+    async def run():
+        memory, wire = client(sync)
+        try:
+            origin, scope = sync.command()["origin"], sync.scope()
+            old = await memory.query_context(origin, scope, "松林", dict(tokens=8192, bytes=8192))
+            # This real candidate read captures a new episode before any model
+            # output/commit. The unchanged old selection must now fail fresh verification.
+            producer.candidate(sync, "我打算周五去松林。", 1)
+            turn = dict(
+                origin=origin,
+                scope=scope,
+                memory_context=old,
+                preparation={"old": True},
+                model_calls=0,
+                source_deadline=time.time() + 60,
+            )
+            with pytest.raises(Fault) as caught:
+                await verify_prepared_memory(memory, turn, [])
+            assert caught.value.code == "scope_changed" and caught.value.memory_selection_invalid
+            assert retry_preparation(turn, caught.value, time.time())
+            assert turn["memory_context"] is None and turn["preparation"] is None
+            fresh = await memory.query_context(origin, scope, "松林", dict(tokens=8192, bytes=8192))
+            assert fresh["bundle"]["bundle_id"] != old["bundle"]["bundle_id"]
+            assert any(item["kind"] == "episode" for item in fresh["evidence"])
+            turn["memory_context"] = fresh
+            await verify_prepared_memory(memory, turn, [])
+        finally:
+            await wire.close()
+
+    asyncio.run(run())
 
 
 def test_real_producer_typed_read_and_combined_legacy_verification(sync):

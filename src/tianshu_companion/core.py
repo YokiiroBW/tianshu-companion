@@ -44,7 +44,12 @@ from .writing import Writing
 from .runtime_capabilities import candidates_enabled
 from .model_selection import verify_lease
 from .model_slots import ModelSlots
-from .preparation_retry import read_retry, recovery_deadline, retry_preparation
+from .preparation_retry import (
+    read_retry,
+    recovery_deadline,
+    retry_preparation,
+    verify_prepared_memory,
+)
 from .qq_identity import (
     SOURCE_INSTRUCTION,
     material_provenance,
@@ -1730,7 +1735,7 @@ class Core(Delivery):
                 self._record_turn_failure(
                     turn, error, "preparation" if not turn["model_calls"] else "generation"
                 )
-                if retry_preparation(turn, error, self.clock()):
+                if not self._replies(turn) and retry_preparation(turn, error, self.clock()):
                     self._save_turn(turn)
                     return
                 if turn.get("expression_id"):
@@ -2050,9 +2055,7 @@ class Core(Delivery):
                 # Each complete set gets a fresh barrier. A source lease may
                 # have been renewed while preparing another group; signatures
                 # alone must not reuse an earlier Memory proof of that lease.
-                await self.memory.verify_context(
-                    turn["origin"], turn["scope"], turn["memory_context"]["bundle"], ordered
-                )
+                await verify_prepared_memory(self.memory, turn, ordered)
             finally:
                 if owns_checkpoint:
                     await checkpoint.close()
@@ -2333,7 +2336,9 @@ class Core(Delivery):
                         turn, merge_checks(checks, *combined), checkpoint=checkpoint
                     )
                     prepared = [(inherited, None) for inherited in combined]
-                except Fault:
+                except Fault as error:
+                    if getattr(error, "memory_selection_invalid", False):
+                        raise
                     # A failed full set cannot attest any member. Isolate invalid
                     # old material using the existing independent group fallback.
                     await checkpoint.close()
