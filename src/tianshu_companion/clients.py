@@ -612,6 +612,8 @@ class Origins:
         if service not in self.issuers:
             raise Fault("unauthorized")
         issuer, client = self.issuers[service]
+        if issuer not in ("nonebot", "platform"):
+            raise Fault("dependency_unavailable")
         request = dict(
             schema_version=1,
             request_id=envelope["request_id"],

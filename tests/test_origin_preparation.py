@@ -151,6 +151,17 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual("forbidden", caught.exception.code)
                 self.assertEqual(403, caught.exception.cause["http_status"])
 
+    async def test_missing_or_invalid_issuer_config_fails_before_remote_read(self):
+        _, current = await self.turns()
+        for issuer in (None, "unknown", {}):
+            with self.subTest(issuer=issuer):
+                origins, wire = self.origins(lambda _: self.fail("invalid config reached issuer"))
+                origins.issuers["nonebot"] = (issuer, wire)
+                with self.assertRaises(Fault) as caught:
+                    await self.h.core._prepare_context(current, [])
+                self.assertEqual("dependency_unavailable", caught.exception.code)
+                self.assertFalse(getattr(caught.exception, "origin_read_unavailable", False))
+
     async def test_one_unproved_check_excludes_same_origin_with_another_valid_lease(self):
         previous, current = await self.turns()
         clone = dict(copy.deepcopy(previous), id="turn:another-lease")
