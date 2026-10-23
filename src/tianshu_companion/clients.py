@@ -819,10 +819,15 @@ class Memory:
 
     async def propose(self, request):
         self.contracts.check("memory-context#proposal_request", request)
+        return await self._memory_write(request, "/internal/v1/memory/context/propose")
+
+    async def forget_episode(self, request):
+        self.contracts.check("memory-context-v2#forget_request", request)
+        return await self._memory_write(request, "/internal/v2/memory/context/forget")
+
+    async def _memory_write(self, request, path):
         try:
-            response = await self.client.call(
-                "/internal/v1/memory/context/propose", request, uncertain_write=True
-            )
+            response = await self.client.call(path, request, uncertain_write=True)
         except Fault as error:
             if not error.unknown:
                 raise
@@ -833,7 +838,12 @@ class Memory:
             )
             if response is None:
                 raise Fault("result_unknown", unknown=True) from None
-        self.contracts.check("memory-context#receipt", response)
+        try:
+            self.contracts.check("memory-context#receipt", response)
+        except Fault:
+            # A successful transport with an unusable receipt does not prove
+            # the write failed. Preserve the submitted operation for recovery.
+            raise Fault("invalid_input", unknown=True) from None
         if (
             response["operation_id"] != request["command"]["idempotency_key"]
             or response["item_id"] != request["item_id"]

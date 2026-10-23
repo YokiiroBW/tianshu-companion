@@ -168,17 +168,24 @@ class RoleActions:
         if self.core._turn_allows(turn, "memory.write"):
             memory_schema = self.core.contracts.schemas["memory-context"]
             proposal = self._expand(memory_schema["$defs"]["proposal_request"], memory_schema)
+            kinds = ["upsert", "correct", "forget", "no_op"]
+            target_schema = proposal["properties"]["target"]
+            if turn.get("memory_context") is not None:
+                v2 = self.core.contracts.schemas["memory-context-v2"]
+                episode = self._expand(v2["$defs"]["forget_draft"], v2)
+                target_schema = {"oneOf": [target_schema, episode["properties"]["target"]]}
+                kinds.append("forget_episode")
             tools.append(
                 dict(
                     type="function",
                     function=dict(
                         name="memory_propose",
-                        description="Propose a sourced current user memory, correction or forgetting. Use real latest user input only. Correct/forget must target a recalled record/version. Report actual committed/corrected/tombstoned receipt, never claim rejected/unknown succeeded.",
+                        description="Propose a sourced current user memory, correction or forgetting. Use real latest user input only. Correct/forget targets a recalled record/version; forget_episode targets an exact recalled episode_ref/version with units=[], forgetting its entire original source and derived memory. Report actual committed/corrected/tombstoned receipt, never claim rejected/unknown succeeded.",
                         parameters=dict(
                             type="object",
                             properties=dict(
-                                kind={"enum": ["upsert", "correct", "forget", "no_op"]},
-                                target=proposal["properties"]["target"],
+                                kind={"enum": kinds},
+                                target=target_schema,
                                 units={
                                     "type": "array",
                                     "maxItems": 32,
@@ -470,6 +477,8 @@ class RoleActions:
         ):
             raise Fault("forbidden")
         sources = [latest["source"]]
+        episode_forget = value["kind"] == "forget_episode"
+        revision = value["kind"] in {"correct", "forget", "forget_episode"}
         intent = value["intent"]
         latest_text = "\n".join(part["text"] for part in latest["parts"] if part["kind"] == "text")
         if (
@@ -478,7 +487,8 @@ class RoleActions:
             or not isinstance(intent["source_quote"], str)
             or not intent["source_quote"]
             or intent["source_quote"] not in latest_text
-            or (value["kind"] in {"correct", "forget"} and intent["unambiguous_target"] is not True)
+            or (revision and intent["unambiguous_target"] is not True)
+            or (episode_forget and value["units"] != [])
         ):
             raise Fault("invalid_input")
         units = copy.deepcopy(value["units"])
@@ -504,6 +514,13 @@ class RoleActions:
         key = "memory-action:" + digest(operation_id)
         prior = self.core.store.get("metadata", key)
         if prior:
+            if episode_forget and (
+                prior["proposal"]["kind"] != value["kind"]
+                or prior["proposal"]["target"] != target
+                or prior["proposal"]["scope"] != turn["scope"]
+                or prior["proposal"]["evidence_refs"] != sources
+            ):
+                raise Fault("idempotency_conflict")
             if prior.get("receipt"):
                 return prior["receipt"]
             receipt = await self.core.memory.receipt(turn["origin"], turn["scope"], operation_id)
@@ -512,6 +529,21 @@ class RoleActions:
             prior.update(state=receipt["state"], receipt=receipt)
             self.core.store.put("metadata", prior)
             return receipt
+        if episode_forget:
+            recalled = next(
+                (
+                    item
+                    for item in turn.get("memory_context", {}).get("evidence", [])
+                    if item["kind"] == "episode"
+                    and item["episode_id"] == target.get("episode_ref")
+                    and item["episode_version"] == target.get("episode_version")
+                    and item["subject_person_id"] == turn["scope"]["person_id"]
+                    and item["owner_scope"] == turn["scope"]
+                ),
+                None,
+            )
+            if recalled is None:
+                raise Fault("not_found")
         proposal = dict(
             command=command(turn["origin"], operation_id, self.core.clock()),
             scope=turn["scope"],
@@ -519,27 +551,34 @@ class RoleActions:
             item_id="item:" + digest([turn["id"], tool_id]),
             kind=value["kind"],
             target=target,
-            units=units,
+            **({} if episode_forget else {"units": units}),
             evidence_refs=sources if value["kind"] != "no_op" else [],
             proof_ref=None,
         )
-        if value["kind"] in {"correct", "forget"}:
+        if revision:
             physical = self.core.store.get("physicals", digest(latest["message_key"]))
             issuer = self.core.origins.issuers.get(turn["service"])
             if not physical or not issuer:
                 raise Fault("dependency_unavailable")
             issue = dict(
-                schema_version=1,
+                schema_version=2 if episode_forget else 1,
                 request_id="proof:" + digest(operation_id),
                 origin=turn["origin"],
                 source=physical["request"],
                 proposal=proposal,
             )
-            self.core.contracts.check("memory-context#issue_request", issue)
-            proof = await issuer[1].call(
-                "/internal/v1/memory-context/proof/issue", issue, uncertain_write=True
+            issue_schema = (
+                "memory-context-v2#forget_issue" if episode_forget else "memory-context#issue"
             )
-            self.core.contracts.check("memory-context#issue_response", proof)
+            self.core.contracts.check(issue_schema + "_request", issue)
+            proof = await issuer[1].call(
+                "/internal/v2/memory-context/proof/issue"
+                if episode_forget
+                else "/internal/v1/memory-context/proof/issue",
+                issue,
+                uncertain_write=True,
+            )
+            self.core.contracts.check(issue_schema + "_response", proof)
             if (
                 not isinstance(proof, dict)
                 or set(proof)
@@ -562,7 +601,12 @@ class RoleActions:
             ):
                 raise Fault("invalid_input")
             proposal["proof_ref"] = proof["proof_ref"]
-        self.core.contracts.check("memory-context#proposal_request", proposal)
+        self.core.contracts.check(
+            "memory-context-v2#forget_request"
+            if episode_forget
+            else "memory-context#proposal_request",
+            proposal,
+        )
         key = "memory-action:" + digest(operation_id)
         old = self.core.store.get("metadata", key)
         if old and old.get("receipt"):
@@ -577,7 +621,11 @@ class RoleActions:
                 receipt=None,
             ),
         )
-        receipt = await self.core.memory.propose(proposal)
+        receipt = await (
+            self.core.memory.forget_episode(proposal)
+            if episode_forget
+            else self.core.memory.propose(proposal)
+        )
         self.core.store.put(
             "metadata",
             dict(

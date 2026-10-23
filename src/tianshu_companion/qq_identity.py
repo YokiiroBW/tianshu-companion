@@ -13,6 +13,7 @@ planned/conditional/uncertain 不能变成 observed：计划出发、确认能�
 observed_at 仅说明来源观测时间，valid_from/to 是事实有效范围，event_time 只承载有源的事件时间。
 没有实况更新时保留最新已知状态，不由计划或时间经过补写已执行，也不把未知说成确定未发生。
 episodes 可包含提问、暂时行动和未决指代；它们帮助理解上下文，不自动成为永久偏好或当前事实。
+episodes.reality=fictional 只表示虚构场景原话，不能用来断言现实世界的身份、经历或事件。
 Human source timeline 只提供来源和人物对应；原话在 messages、recent_dialogue、
 earlier_fragment、episodes 中。response_scope 的 current_message_refs 才是本轮要回应的输入；
 context_turns 是其他轮的来源，其他人的并发提问或自己的历史提问都不是本轮待办，

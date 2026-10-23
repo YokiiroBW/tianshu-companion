@@ -1,5 +1,7 @@
 # 自动记忆闭环
 
+长期原话没有事实record时也可以遗忘：现有 `memory_propose` 使用 `forget_episode` 和已召回的精确episode_ref/version，units为空；最新用户原话仍经Platform来源/账号/scope证明，Memory按来源删除所有重叠片段并阻止重建。操作仍写原metadata与Memory操作账本、返回旧tombstoned回执，record_ids可以为空；未决写入只读原回执，不为删除伪造事实。episode投影携reality，fictional不是现实事实。
+
 TS-307：新候选首次读取显式声明 `supported_extraction_schemas=[3,4]`。Memory 决定并锁定 job 的版本，Core 在调用模型前持久化返回版本；新版等待项可以明确恢复 Memory 已受理的 schema3 job。旧持久提案缺少 pin 时沿原请求和原提案恢复，不从 JSON 形状猜版本、不因400静默降级、不重新生成结果不明的提案。协商后的提交携带准确的 `extraction_schema`，读取回执、unknown 和幂等恢复继续复用现有队列。
 
 schema4 抽取使用发布合同的 output 定义，从现有 Registry 内联外部引用给模型；实际校验仍使用发布合同。模型提出 author/entity/event、原子 predicate/value、modality、single/set、operation 和精确 target_refs，每项保留原话证据、条件、否定和时间。Memory 负责身份绑定、规范 statement、更新及回执；Core 不建立第二份记忆账本。计划和已观察事实使用同一属性的不同 modality，不能互相覆盖或推断完成状态。schema4 不再调用旧中文空结果补抽规则，空 memories 是合法结果；既有 schema3 恢复保留其原行为。普通聊天不增加第二个审核模型。

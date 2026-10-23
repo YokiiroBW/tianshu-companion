@@ -22,12 +22,6 @@ def example(package, name):
             row for row in contracts().documents[package + "/examples.json"] if row["name"] == name
         )
     )
-    if "query_response" in result:
-        # Published examples illustrate shape and use placeholder usage. The
-        # consumer also enforces actual serialized UTF-8 bytes at runtime.
-        response = result["query_response"]
-        size = len(canonical(response["evidence"]).encode())
-        response["budget_used"] = dict(bytes=size, tokens=(size + 3) // 4)
     return result
 
 
@@ -37,6 +31,8 @@ class EvidenceProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_published_query_examples_validate_and_preserve_episodes(self):
         for fixture in self.contracts.documents["memory-context/v2/examples.json"]:
+            if "query_response" not in fixture:
+                continue
             with self.subTest(name=fixture["name"]):
                 fixture = example("memory-context/v2", fixture["name"])
                 request, response = fixture["query_request"], fixture["query_response"]
@@ -171,6 +167,21 @@ class EvidenceProtocolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ExtractionNegotiationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_episode_forget_malformed_commit_receipt_remains_unknown(self):
+        async def handler(request):
+            self.assertEqual("/internal/v2/memory/context/forget", request.url.path)
+            return httpx.Response(200, json={})
+
+        client = JsonService(
+            "https://synthetic.invalid", "synthetic-token", transport=httpx.MockTransport(handler)
+        )
+        self.addAsyncCleanup(client.close)
+        memory = Memory(contracts(), client)
+        request = example("memory-context/v2", "context-forget-positive")["forget_request"]
+        with self.assertRaises(Fault) as uncertain:
+            await memory.forget_episode(request)
+        self.assertTrue(uncertain.exception.unknown)
+
     async def test_negotiated_legacy_read_and_submit_are_explicit(self):
         fixture = example("memory-extraction/v1", "extraction-positive-legacy-negotiation")
         response = fixture["legacy_pending_response"]
@@ -281,6 +292,7 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 episode_version=1,
                 source_refs=[source],
                 text="当时我只是计划周五出发。",
+                reality="real",
                 observed_at=utc(self.h.clock() - 86400),
                 event_time=None,
             )
@@ -323,6 +335,115 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.h.memory.query_context = query_context
         self.h.memory.verify_context = verify_context
+
+    async def episode_forget(self, *, unknown=False):
+        text = "忘掉之前那段关于松林的原话。"
+        await self.h.ingest(text=text)
+        await self.h.cycles()
+        turn = self.h.turns()[-1]
+        issued, submitted = [], []
+        contracts = self.h.core.contracts
+
+        class Issuer:
+            async def call(inner, path, request, **kwargs):
+                contracts.check("memory-context-v2#forget_issue_request", request)
+                issued.append((path, copy.deepcopy(request)))
+                proposal = request["proposal"]
+                return dict(
+                    schema_version=1,
+                    request_id=request["request_id"],
+                    proof_ref="proof:synthetic",
+                    operation_digest=digest(
+                        {
+                            key: value
+                            for key, value in proposal.items()
+                            if key not in {"query", "command", "proof_ref"}
+                        }
+                    ),
+                    expires_at=utc(self.h.clock() + 60),
+                )
+
+        self.h.origins.issuers = {turn["service"]: ("platform", Issuer())}
+
+        async def forget(request):
+            contracts.check("memory-context-v2#forget_request", request)
+            submitted.append(copy.deepcopy(request))
+            if unknown:
+                raise Fault("result_unknown", unknown=True)
+            return receipt(request)
+
+        def receipt(request):
+            return dict(
+                schema_version=1,
+                request_id=request["command"]["request_id"],
+                operation_id=request["command"]["idempotency_key"],
+                state="tombstoned",
+                record_ids=[],
+                group_ids=[],
+                scope_version=1,
+                batch_ref=None,
+                item_id=request["item_id"],
+                error_code=None,
+                current_version=None,
+            )
+
+        self.h.memory.forget_episode = forget
+        value = dict(
+            kind="forget_episode",
+            target=dict(episode_ref="episode:old", episode_version=1),
+            units=[],
+            intent=dict(source_quote=text, unambiguous_target=True),
+        )
+        return turn, value, issued, submitted, receipt
+
+    async def test_episode_forget_uses_same_tool_exact_owner_and_source_proof(self):
+        turn, value, issued, submitted, receipt = await self.episode_forget()
+        tool = next(
+            tool
+            for tool in self.h.core.role_actions.tools(turn)
+            if tool["function"]["name"] == "memory_propose"
+        )
+        self.assertIn(
+            "forget_episode", tool["function"]["parameters"]["properties"]["kind"]["enum"]
+        )
+        for change in (
+            dict(episode_ref="episode:other", episode_version=1),
+            dict(episode_ref="episode:old", episode_version=2),
+        ):
+            with self.assertRaises(Fault):
+                await self.h.core.role_actions.memory_propose(
+                    turn, "tool:bad", dict(value, target=change)
+                )
+        self.assertEqual([], issued)
+        result = await self.h.core.role_actions.memory_propose(turn, "tool:forget", value)
+        self.assertEqual("tombstoned", result["state"])
+        self.assertEqual([], result["record_ids"])
+        self.assertEqual("/internal/v2/memory-context/proof/issue", issued[0][0])
+        self.assertNotIn("units", submitted[0])
+        self.assertEqual(value["target"], submitted[0]["target"])
+
+    async def test_episode_forget_unknown_recovers_receipt_without_target_or_resubmission(self):
+        turn, value, issued, submitted, receipt = await self.episode_forget(unknown=True)
+        with self.assertRaises(Fault) as uncertain:
+            await self.h.core.role_actions.memory_propose(turn, "tool:forget", value)
+        self.assertTrue(uncertain.exception.unknown)
+        turn["memory_context"]["evidence"] = []
+
+        async def lookup(origin, scope, operation):
+            self.assertEqual(operation, submitted[0]["command"]["idempotency_key"])
+            return receipt(submitted[0])
+
+        self.h.memory.receipt = lookup
+        recovered = await self.h.core.role_actions.memory_propose(turn, "tool:forget", value)
+        self.assertEqual("tombstoned", recovered["state"])
+        self.assertEqual((1, 1), (len(issued), len(submitted)))
+        with self.assertRaises(Fault) as changed:
+            await self.h.core.role_actions.memory_propose(
+                turn,
+                "tool:forget",
+                dict(value, target=dict(episode_ref="episode:changed", episode_version=1)),
+            )
+        self.assertEqual("idempotency_conflict", changed.exception.code)
 
     async def test_recent_human_context_coexists_with_long_term_episode_and_checks_batch(self):
         for text in ("我们的旅行先保留计划", "后来提到的行程是什么？"):

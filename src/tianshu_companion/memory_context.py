@@ -246,6 +246,7 @@ def prompt_material(response):
                         "evidence_id",
                         "subject_person_id",
                         "text",
+                        "reality",
                         "observed_at",
                         "event_time",
                         "source_refs",
