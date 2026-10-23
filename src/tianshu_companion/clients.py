@@ -110,6 +110,8 @@ class JsonService:
             "/internal/v1/memory/context/receipt",
             "/internal/v2/memory/context/query",
             "/internal/v2/memory/context/verify",
+            "/internal/v2/memory/context/prepare",
+            "/internal/v2/memory/context/profiles",
             "/internal/v2/bot-delivery/query",
         }
     )
@@ -117,6 +119,23 @@ class JsonService:
     COMMAND_BUDGET_SECONDS = 15
     STREAM_BUDGET_SECONDS = 120
     MAX_RESPONSE_BYTES = 2_000_000
+
+    @staticmethod
+    def _optional_transport_failure(error):
+        # This is narrower than retryable_read. Trust/protocol failures and
+        # unclassified ConnectError cannot become optional-history omissions.
+        chain, current = [], error
+        while current is not None and all(current is not item for item in chain):
+            chain.append(current)
+            current = current.__cause__ or current.__context__
+        if any(isinstance(item, ssl.SSLError) for item in chain):
+            return False
+        if isinstance(error, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout)):
+            return True
+        return isinstance(error, (httpx.ReadError, httpx.WriteError)) and any(
+            isinstance(item, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError))
+            for item in chain
+        )
 
     def __init__(self, url=None, token=None, *, transport=None, ca_file=None, label=None):
         if url and (
@@ -361,6 +380,7 @@ class JsonService:
         started, attempts = time.perf_counter(), 0
         sent, not_started = False, False
         response = None
+        body_complete = False
         LOG_PORT.emit(
             "peer.call.started",
             "started",
@@ -402,6 +422,7 @@ class JsonService:
                         content.extend(chunk)
                 finally:
                     await response.aclose()
+                body_complete = True
             value = strict_json(content)
             if response.status_code >= 300:
                 not_started = (
@@ -453,6 +474,13 @@ class JsonService:
             )
             if isinstance(error, Fault):
                 error.cause = cause
+                if (
+                    path == "/internal/v1/origins/resolve"
+                    and body_complete
+                    and response.status_code in {403, 404}
+                    and not error.unknown
+                ):
+                    error.origin_response_unavailable = True
                 if uncertain_write and sent and not not_started:
                     failure = Fault(
                         error.code, unknown=True, current_version=error.current_version, cause=cause
@@ -477,6 +505,20 @@ class JsonService:
             )
             if recover_read:
                 failure.read_execution = "unconfirmed"
+                failure.optional_read_unavailable = self._optional_transport_failure(error)
+            if (
+                path == "/internal/v1/origins/resolve"
+                and body_complete
+                and not isinstance(error, UnicodeError)
+                and (
+                    response.status_code in {403, 404}
+                    or response.status_code == 200
+                    and isinstance(error, ValueError)
+                )
+            ):
+                # Only a complete bounded origin response can be discarded here.
+                # TLS, HTTP framing, body encoding/size and shared auth stay faults.
+                failure.origin_response_unavailable = True
             raise failure from None
 
     def _report(self, outcome, correlation, started, attempts, error=None):
@@ -575,8 +617,21 @@ class Origins:
             request_id=envelope["request_id"],
             assertion_ref=envelope["origin"]["assertion_ref"],
         )
-        value = await client.call("/internal/v1/origins/resolve", request)
-        self.contracts.check("common#origin_resolve_response", value)
+        try:
+            value = await client.call("/internal/v1/origins/resolve", request)
+        except Fault as error:
+            if not error.unknown and (
+                getattr(error, "origin_response_unavailable", False)
+                or getattr(error, "optional_read_unavailable", False)
+            ):
+                error.origin_read_unavailable = True
+            raise
+        try:
+            self.contracts.check("common#origin_resolve_response", value)
+        except Fault as error:
+            if error.code == "invalid_input" and not error.unknown:
+                error.origin_read_unavailable = True
+            raise
         context = value["context"]
         if (
             value["request_id"] != request["request_id"]
@@ -584,10 +639,14 @@ class Origins:
             or context["authenticated_service"] != service
             or context["audience_service"] != "companion"
             or context["assertion_ref"] != request["assertion_ref"]
-            or epoch(context["expires_at"]) <= now
-            or context["revoked"]
         ):
-            raise Fault("forbidden")
+            error = Fault("forbidden")
+            error.origin_read_unavailable = True
+            raise error
+        if epoch(context["expires_at"]) <= now or context["revoked"]:
+            from .context_checks import dependency_changed
+
+            raise dependency_changed("forbidden")
         return context
 
 
@@ -615,7 +674,9 @@ class Memory:
             request = dict(
                 command=command(origin, "register:" + digest(account), now), account=account
             )
-            response = await self.client.call("/internal/v1/identity/register", request)
+            response = await self.client.call(
+                "/internal/v1/identity/register", request, uncertain_write=True
+            )
             self.contracts.check("identity-memory#identity_response", response)
             if response["request_id"] != request["command"]["request_id"]:
                 raise Fault("dependency_unavailable")
@@ -788,6 +849,16 @@ class Memory:
                 raise Fault("invalid_input")
         return response
 
+    async def prepare_context(self, origin, scope, bundle, checks, required_check_ids):
+        from .memory_preparation import prepare
+
+        return await prepare(self, origin, scope, bundle, checks, required_check_ids)
+
+    async def profiles_batch(self, origin, scope, requests):
+        from .memory_preparation import profiles
+
+        return await profiles(self, origin, scope, requests)
+
     async def history(self, origin, scope, *, expected=None, known=None):
         return await self._history(origin, scope, expected=expected, known=known)
 
@@ -896,12 +967,22 @@ class Memory:
             known_scope_version=known_version,
             budget=budget,
         )
+        self._profile_request(request)
+        response = await self.client.call("/internal/v1/memory/profiles/select", request)
+        return self._profile_response(request, response)
+
+    def _profile_request(self, request):
+        scope, target = request["requester_scope"], request["target"]
         self.contracts.check("profiles#select_request", request)
         if target["kind"] == "group" and (
             scope["audience"] != "group" or target["conversation_id"] != scope["conversation_id"]
         ):
             raise Fault("forbidden")
-        response = await self.client.call("/internal/v1/memory/profiles/select", request)
+
+    def _profile_response(self, request, response):
+        scope, target = request["requester_scope"], request["target"]
+        selection, budget = request["selection"], request["budget"]
+        known_version = request["known_scope_version"]
         self.contracts.check("profiles#select_response", response)
         if (
             response["request_id"] != request["query"]["request_id"]

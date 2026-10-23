@@ -76,6 +76,122 @@ def client(h, *, transport=None):
     return Memory(ConsumerContracts(os.environ["TIANSHU_CONTRACTS"]), wire), wire
 
 
+def test_preparation_catalog_uses_one_real_barrier_and_keeps_failure_components(sync):
+    from tianshu_companion.clients import query
+
+    producer.setup(sync)
+
+    async def run():
+        memory, wire = client(sync)
+        calls = []
+        authority = sync.service.source_authority
+        original = authority.barrier
+
+        def barrier(*args, **kwargs):
+            calls.append(True)
+            return original(*args, **kwargs)
+
+        authority.barrier = barrier
+        try:
+            origin, scope = sync.command()["origin"], sync.scope()
+            selected = await memory.query_context(
+                origin, scope, "松林", dict(tokens=8192, bytes=8192)
+            )
+            current = dict(
+                version_domain="text-input/v1",
+                scope=scope,
+                history_snapshot=selected["bundle"]["input_history_snapshot"],
+            )
+            valid = legacy_check(current, query(origin))
+            wrong = copy.deepcopy(current)
+            wrong["version_domain"] = "text-dialogue/v1"
+            wrong["history_snapshot"]["history_checks"][0]["history_version"] += 1
+            rejected = legacy_check(wrong, query(origin))
+            before = len(calls)
+            result = await memory.prepare_context(
+                origin, scope, selected["bundle"], [rejected, valid], [valid["check_id"]]
+            )
+            assert result == {rejected["check_id"]: "rejected", valid["check_id"]: "valid"}
+            assert len(calls) == before + 1
+            with pytest.raises(Fault) as required:
+                await memory.prepare_context(
+                    origin, scope, selected["bundle"], [rejected], [rejected["check_id"]]
+                )
+            assert required.value.code == "scope_changed"
+            assert required.value.cause["http_status"] == 200
+            assert not getattr(required.value, "memory_selection_invalid", False)
+            requests = [
+                dict(
+                    query=query(origin),
+                    requester_scope=scope,
+                    target=dict(kind="person", person_id=scope["person_id"]),
+                    query_text="松林",
+                    selection=["interest"],
+                    known_scope_version=None,
+                    budget=dict(tokens=4096, bytes=4096),
+                )
+                for _ in range(4)
+            ]
+            before = len(calls)
+            profiles = await memory.profiles_batch(origin, scope, requests)
+            assert len(profiles) == 4 and all(not r["selected_units"] for r in profiles)
+            assert len(calls) == before + 1
+
+            # The real producer must isolate an unproved historical origin while
+            # retaining the complete main/required source barrier. revoked:true
+            # is deliberately invalid schema, never a forged valid denial.
+            optional_ref = "synthetic:optional-origin"
+            context = copy.deepcopy(sync.contexts[origin["assertion_ref"]])
+            context["assertion_ref"] = optional_ref
+            sync.contexts[optional_ref] = context
+            optional = [
+                legacy_check(
+                    dict(current, version_domain=domain), query(dict(assertion_ref=optional_ref))
+                )
+                for domain in ("text-input/v1", "text-dialogue/v1")
+            ]
+            mutate = sync.mutate
+            try:
+                for mode in ("403", "invalid_context"):
+
+                    def unproved(kind, body, value):
+                        mutate(kind, body, value)
+                        if kind == "origin":
+                            bad = body["assertion_ref"] == optional_ref
+                            sync.status["origin"] = 403 if bad and mode == "403" else 200
+                            if bad and mode == "invalid_context":
+                                value["context"]["revoked"] = True
+
+                    sync.mutate = unproved
+                    before = len(calls)
+                    result = await memory.prepare_context(
+                        origin, scope, selected["bundle"], [*optional, valid], [valid["check_id"]]
+                    )
+                    assert result == {
+                        **{item["check_id"]: "unavailable" for item in optional},
+                        valid["check_id"]: "valid",
+                    }
+                    assert len(calls) == before + 1
+                    with pytest.raises(Fault) as necessary:
+                        await memory.prepare_context(
+                            origin, scope, selected["bundle"], optional, [optional[-1]["check_id"]]
+                        )
+                    assert not getattr(necessary.value, "memory_selection_invalid", False)
+            finally:
+                sync.mutate = mutate
+                sync.status.pop("origin", None)
+            producer.candidate(sync, "我打算周五去松林。", 1)
+            with pytest.raises(Fault) as changed:
+                await memory.prepare_context(origin, scope, selected["bundle"], [], [])
+            assert changed.value.memory_selection_invalid
+            assert changed.value.cause["http_status"] == 200
+        finally:
+            authority.barrier = original
+            await wire.close()
+
+    asyncio.run(run())
+
+
 def test_episode_capture_between_query_and_verify_requires_complete_reselection(sync):
     from tianshu_companion.preparation_retry import retry_preparation, verify_prepared_memory
 

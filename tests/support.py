@@ -78,8 +78,12 @@ class FakeOrigins:
         if self.unavailable:
             raise Fault("dependency_unavailable")
         ctx = self.values.get(envelope["origin"]["assertion_ref"])
-        if not ctx or ctx["authenticated_service"] != service or ctx.get("revoked"):
+        if not ctx or ctx["authenticated_service"] != service:
             raise Fault("forbidden")
+        if ctx.get("revoked"):
+            from tianshu_companion.context_checks import dependency_changed
+
+            raise dependency_changed("forbidden")
         return copy.deepcopy(ctx)
 
 
@@ -194,6 +198,45 @@ class FakeMemory:
             budget_used=dict(tokens=0, bytes=0),
             omissions=["no_match"],
         )
+
+    async def prepare_context(self, origin, scope, bundle, checks, required_check_ids):
+        # Synthetic protocol stand-in. Actual producer/consumer authority is
+        # tested separately against the frozen Memory ASGI application.
+        try:
+            await self.verify_context(origin, scope, bundle, [])
+        except Fault as error:
+            if error.code == "scope_changed" and not error.unknown:
+                error.memory_selection_invalid = True
+            raise
+        results = {}
+        for check in checks:
+            try:
+                await self.verify_context(origin, scope, bundle, [check])
+            except Fault as error:
+                if (
+                    check["check_id"] in required_check_ids
+                    or error.code != "scope_changed"
+                    or error.unknown
+                ):
+                    raise
+                results[check["check_id"]] = "rejected"
+            else:
+                results[check["check_id"]] = "valid"
+        return results
+
+    async def profiles_batch(self, origin, scope, requests):
+        return [
+            await self.profiles(
+                origin,
+                scope,
+                r["target"],
+                r["query_text"],
+                r["selection"],
+                r["budget"],
+                r["known_scope_version"],
+            )
+            for r in requests
+        ]
 
     async def commit(self, event):
         if self.fail_commit:

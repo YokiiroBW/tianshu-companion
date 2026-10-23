@@ -356,7 +356,7 @@ class ContextCheckpointTests(unittest.IsolatedAsyncioTestCase):
                 self.closed = True
 
         self.h.origins.resolve = counted
-        with patch("tianshu_companion.core.VerificationCheckpoint", Tracked):
+        with patch("tianshu_companion.context_preparation.VerificationCheckpoint", Tracked):
             context, _, checks, profiles, _, _ = await self.h.core._prepare_context(current, [])
         self.assertEqual(len(context.data["recent_dialogue"]), 2)
         self.assertEqual(calls.count(first["origin"]), 1)
@@ -427,7 +427,7 @@ class ContextCheckpointTests(unittest.IsolatedAsyncioTestCase):
                 checkpoints.append(self)
 
         self.h.origins.resolve = transient
-        with patch("tianshu_companion.core.VerificationCheckpoint", Tracked):
+        with patch("tianshu_companion.context_preparation.VerificationCheckpoint", Tracked):
             context, *_ = await self.h.core._prepare_context(current, [])
         self.assertEqual(len(calls), 2)
         self.assertEqual(len({id(item) for item in checkpoints}), 2)
@@ -452,7 +452,7 @@ class ContextCheckpointTests(unittest.IsolatedAsyncioTestCase):
                 checkpoints.append(self)
 
         self.h.origins.resolve = blocked
-        with patch("tianshu_companion.core.VerificationCheckpoint", Tracked):
+        with patch("tianshu_companion.context_preparation.VerificationCheckpoint", Tracked):
             job = asyncio.create_task(self.h.core._prepare_context(self.h.turns()[-1], []))
             await asyncio.wait_for(entered.wait(), 1)
             job.cancel()

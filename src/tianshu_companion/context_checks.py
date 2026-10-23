@@ -6,6 +6,13 @@ from .context import merge_checks
 from .contracts import Fault, digest
 
 
+def dependency_changed(code="scope_changed"):
+    """A proved local dependency mismatch, never an unclassified peer failure."""
+    error = Fault(code)
+    error.context_dependency_invalid = True
+    return error
+
+
 def _start(read):
     # Python 3.12: synchronous local checks finish inline; only actual waits
     # enter the loop. Do not change the application's global task factory.

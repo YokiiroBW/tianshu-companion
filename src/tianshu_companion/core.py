@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 
 from .clients import command, epoch, query, uid, utc
 from . import clients
@@ -24,14 +24,11 @@ from .context import (
     TurnContext,
     inherited_checks,
     merge_checks,
-    profile_check,
-    profile_targets,
 )
 from .context_checks import VerificationCheckpoint, verify_checks
 from .short_context import (
     ShortContextPolicy,
     current_revision,
-    select_recent,
     sources_current,
     message_current,
 )
@@ -331,6 +328,8 @@ class Core(Delivery):
         )
 
     async def _authorize(self, service, envelope, channel=None, author=None, scope=None):
+        from .context_checks import dependency_changed
+
         ctx = await self.origins.resolve(service, envelope, self.clock())
         channel = ctx["verified_channel"] if channel is None else channel
         if self.qq_identity_required or self.qq_admin is not None:
@@ -350,22 +349,22 @@ class Core(Delivery):
             or not self._role_allows(allowed["actor_id"], "dialogue")
             or (author is not None and author != ctx["verified_account"])
         ):
-            raise Fault("forbidden")
+            raise dependency_changed("forbidden")
         if ctx["verified_account"]["namespace"] != channel["namespace"]:
-            raise Fault("forbidden")
+            raise dependency_changed("forbidden")
         person, binding_version = await self.memory.identity(
             envelope["origin"], ctx["verified_account"], self.clock()
         )
         if allowed["person_id"] not in (None, person):
-            raise Fault("scope_changed")
+            raise dependency_changed()
         if scope is not None and (
             scope["person_id"] != person
             or any(scope[k] != allowed[k] for k in ("actor_id", "audience"))
             or allowed["conversation_id"] not in (None, scope["conversation_id"])
         ):
-            raise Fault("forbidden")
+            raise dependency_changed("forbidden")
         if epoch(ctx["expires_at"]) <= self.clock():
-            raise Fault("forbidden")
+            raise dependency_changed("forbidden")
         return ctx, person, binding_version
 
     def _command_key(self, service, operation, request):
@@ -2068,6 +2067,8 @@ class Core(Delivery):
         )
 
     async def _verify_context_check(self, turn, check, checkpoint, *, memory_checks=None):
+        from .context_checks import dependency_changed
+
         scope = check["scope"]
         if (
             check["channel"] != turn["bundle"]["collection_key"]["channel"]
@@ -2076,7 +2077,7 @@ class Core(Delivery):
             )
             or (scope["audience"] != "group" and scope != turn["scope"])
         ):
-            raise Fault("forbidden")
+            raise dependency_changed("forbidden")
         source_turn_id = check.get("source_turn_id")
         lease_deadline = turn["source_deadline"] if check["origin"] == turn["origin"] else None
         if source_turn_id:
@@ -2092,16 +2093,22 @@ class Core(Delivery):
                     or previous["bundle"]["collection_key"]["channel"] != check["channel"]
                     or not sources_current(self.store, previous)
                 ):
-                    raise Fault("scope_changed")
+                    raise dependency_changed()
                 return previous
 
             previous = source()
             # Renew the original human's lease once, including parallel domain checks.
             if previous["source_deadline"] <= self.clock() + 20:
-                await checkpoint.once(
-                    ["renew", source_turn_id, previous["source_deadline"]],
-                    lambda: self.continue_delivery_origin(previous),
-                )
+                try:
+                    await checkpoint.once(
+                        ["renew", source_turn_id, previous["source_deadline"]],
+                        lambda: self.continue_delivery_origin(previous),
+                    )
+                except Fault as error:
+                    # Renewal is a control boundary, never optional pure-read
+                    # unavailability, even when its underlying transport timed out.
+                    error.context_renewal_failure = True
+                    raise
                 # Parallel domain checks may have joined another caller's lease
                 # continuation; use the durable deadline, not this caller's copy.
                 previous = source()
@@ -2122,7 +2129,7 @@ class Core(Delivery):
             ),
         )
         if binding != check["binding_version"]:
-            raise Fault("scope_changed")
+            raise dependency_changed()
         if memory_checks is not None:
             from .memory_context import legacy_check
 
@@ -2271,164 +2278,10 @@ class Core(Delivery):
             checks = await self.relationships.prepare(self, turn, context)
         for dep in turn["bundle"]["dependencies"]:
             checks = merge_checks(checks, inherited_checks(self.store.get("turns", dep["turn_id"])))
-        verified, checkpoint = {}, VerificationCheckpoint()
-        try:
-            if await self._refresh_preparation_origin(turn):
-                await checkpoint.close()
-                checkpoint = VerificationCheckpoint()
-            if turn.get("memory_context") is None:
-                await self._verify_checks(turn, checks, verified=verified, checkpoint=checkpoint)
-            policy = replace(
-                self.short_context_policy,
-                max_bytes=min(self.short_context_policy.max_bytes, context.remaining),
-            )
-            memory_read = self._turn_allows(turn, "memory.read")
-            recent, metadata = select_recent(self.store, turn, policy, self.clock())
-            if not memory_read:
-                recent = []
-            accepted = []
-            linked = {key: ids for ids in metadata.get("linked_turn_ids", []) for key in ids}
-            by_id = {g["turn_id"]: g for g in recent}
-            visited = set()
-            batches = []
-            for group in recent:
-                if group["turn_id"] in visited:
-                    continue
-                ids = linked.get(group["turn_id"], [group["turn_id"]])
-                batch = [by_id[key] for key in ids]
-                visited.update(ids)
-                batches.append(batch)
+        from . import context_preparation
 
-            def candidate_checks(candidate):
-                from .context import recent_checks
-
-                return recent_checks(self.store, candidate)
-
-            if turn.get("memory_context") is not None:
-                from .context import bound_recent_provenance
-
-                batches, metadata["reply_dependency_omissions"] = bound_recent_provenance(
-                    self.store, batches, checks
-                )
-
-            async def precheck(batch):
-                try:
-                    inherited = candidate_checks(batch)
-                    await self._verify_checks(
-                        turn, inherited, verified=verified, checkpoint=checkpoint
-                    )
-                    return inherited, None
-                except Fault as error:
-                    return None, error
-
-            # These groups share the same preparation boundary. Overlap their
-            # independent authority reads, then keep the original chronological
-            # assembly and whole-group budgets. No result crosses a model/send
-            # preflight, and the checkpoint still bounds peer I/O to four.
-            if await self._refresh_preparation_origin(turn):
-                await checkpoint.close()
-                checkpoint = VerificationCheckpoint()
-            prepared = None
-            if turn.get("memory_context") is not None:
-                combined = [candidate_checks(batch) for batch in batches]
-                try:
-                    await self._verify_checks(
-                        turn, merge_checks(checks, *combined), checkpoint=checkpoint
-                    )
-                    prepared = [(inherited, None) for inherited in combined]
-                except Fault as error:
-                    if getattr(error, "memory_selection_invalid", False):
-                        raise
-                    # A failed full set cannot attest any member. Isolate invalid
-                    # old material using the existing independent group fallback.
-                    await checkpoint.close()
-                    checkpoint = VerificationCheckpoint()
-                    # Optional recent material can be isolated, but mandatory
-                    # dependencies and the current bundle must still be valid.
-                    await self._verify_checks(turn, checks, checkpoint=checkpoint)
-            if prepared is None:
-                prepared = await read_parallel([lambda b=b: precheck(b) for b in batches])
-            reusable = True
-            for batch, primary in zip(batches, prepared):
-                variants = [batch]
-                if any(member["replies"] for member in batch):
-                    from .context_relevance import input_only
-
-                    variants.append([input_only(member) for member in batch])
-                for candidate in variants:
-                    if await self._refresh_preparation_origin(turn):
-                        await checkpoint.close()
-                        checkpoint = VerificationCheckpoint()
-                        reusable = False
-                    try:
-                        if reusable and candidate is batch:
-                            inherited, error = primary
-                            if error is not None:
-                                raise error
-                        else:
-                            inherited = candidate_checks(candidate)
-                            await self._verify_checks(
-                                turn, inherited, verified=verified, checkpoint=checkpoint
-                            )
-                        proposed = merge_checks(checks, inherited)
-                        if turn.get("memory_context") is None and len(proposed) > 64:
-                            # Retained v1 turns keep their previous optional
-                            # context budget. V2 validates the complete set in
-                            # bounded batches and has no 64-check rejection.
-                            raise Fault("budget_exceeded")
-                    except Fault:
-                        # A failed peer task must not poison an independent raw
-                        # input fallback. Keep exact check outcomes, drain this
-                        # graph, then obtain fresh authority for the next variant.
-                        await checkpoint.close()
-                        checkpoint = VerificationCheckpoint()
-                        reusable = False
-                        continue
-                    if context.extend("recent_dialogue", candidate):
-                        checks = proposed
-                        accepted.extend(candidate)
-                    break
-        finally:
-            await checkpoint.close()
-        accepted.sort(key=lambda g: g["turn_sequence"])
-        context.data["recent_dialogue"] = accepted
-        metadata.update(
-            turn_ids=[g["turn_id"] for g in accepted],
-            reply_ids=[r["reply_id"] for g in accepted for r in g["replies"]],
-            bytes_used=len(canonical(accepted).encode()) if accepted else 0,
-        )
-        text = self._input_text(turn) or "media"
-        targets = profile_targets(turn, accepted) if memory_read else []
-        for offset in range(0, len(targets), 4):
-            allowance = min(4096, context.remaining)
-            if allowance <= 0:
-                break
-            batch = targets[offset : offset + 4]
-            await self._refresh_preparation_origin(turn)
-            responses = await read_parallel(
-                [
-                    lambda target=target, selection=selection: self.memory.profiles(
-                        turn["origin"],
-                        turn["scope"],
-                        target,
-                        text,
-                        selection,
-                        dict(tokens=allowance, bytes=allowance),
-                    )
-                    for target, selection in batch
-                ]
-            )
-            # Arrival order cannot choose whose profile gets the prompt budget.
-            for (target, selection), response in zip(batch, responses):
-                if response["selected_units"] and context.append(
-                    "profiles",
-                    dict(
-                        target=target,
-                        selected_units=response["selected_units"],
-                        dependency_groups=response["dependency_groups"],
-                    ),
-                ):
-                    profiles.append(profile_check(turn, target, text, selection, response))
+        accepted, metadata, checks = await context_preparation.recent(self, turn, context, checks)
+        profiles = await context_preparation.profiles(self, turn, context, accepted)
         summary = self.life.summary(turn["scope"]["actor_id"], turn["scope"])
         if summary is not None:
             context.data["fictional_life"] = []
