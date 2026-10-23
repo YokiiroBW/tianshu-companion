@@ -99,6 +99,7 @@ def test_preparation_catalog_uses_one_real_barrier_and_keeps_failure_components(
             )
             current = dict(
                 version_domain="text-input/v1",
+                origin=origin,
                 scope=scope,
                 history_snapshot=selected["bundle"]["input_history_snapshot"],
             )
@@ -146,7 +147,8 @@ def test_preparation_catalog_uses_one_real_barrier_and_keeps_failure_components(
             sync.contexts[optional_ref] = context
             optional = [
                 legacy_check(
-                    dict(current, version_domain=domain), query(dict(assertion_ref=optional_ref))
+                    dict(current, origin=dict(assertion_ref=optional_ref), version_domain=domain),
+                    query(dict(assertion_ref=optional_ref)),
                 )
                 for domain in ("text-input/v1", "text-dialogue/v1")
             ]
