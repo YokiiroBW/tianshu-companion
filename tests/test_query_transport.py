@@ -51,6 +51,67 @@ class QueryTransportTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(service.close)
         return service
 
+    async def test_late_worker_is_not_replaced_during_peer_cooldown_or_local_wait_timeout(self):
+        # The HTTP owner can stop while a separately owned peer worker lives.
+        # A client retry must not pretend that cancelled HTTP released it.
+        release, stopped = asyncio.Event(), asyncio.Event()
+        workers, seen = [], []
+
+        async def late_worker():
+            try:
+                await release.wait()
+            finally:
+                stopped.set()
+
+        async def handler(request):
+            seen.append(request)
+            workers.append(asyncio.create_task(late_worker()))
+            await asyncio.Event().wait()
+
+        service = self.service(handler)
+        service.QUERY_BUDGET_SECONDS = 0.04
+        try:
+            with self.assertRaises(Fault) as first:
+                await service.call(SELECT, {})
+            self.assertTrue(first.exception.retryable_read)
+            self.assertEqual(first.exception.read_execution, "unconfirmed")
+            self.assertEqual(len(seen), 1)
+            self.assertFalse(stopped.is_set())
+            with self.assertRaises(Fault) as second:
+                await service.call(SELECT, {})
+            self.assertEqual(second.exception.read_execution, "waiting")
+            self.assertEqual(len(seen), 1)
+            self.assertFalse(stopped.is_set())
+            self.assertGreater(second.exception.retry_after_seconds, 0.8)
+        finally:
+            release.set()
+            await asyncio.gather(*workers)
+        self.assertTrue(stopped.is_set())
+
+    async def test_retry_after_is_peer_wide_and_cancellation_during_cooldown_sends_nothing(self):
+        seen = []
+
+        async def handler(request):
+            seen.append(request)
+            return httpx.Response(
+                429,
+                json=dict(code="queue_full", execution_state="not_started", retryable=True),
+                headers={"Retry-After": "1"},
+            )
+
+        service = self.service(handler)
+        with self.assertRaises(Fault) as first:
+            await service.call(SELECT, {})
+        self.assertEqual(first.exception.read_execution, "not_started")
+        self.assertGreaterEqual(first.exception.retry_after_seconds, 0.99)
+        tasks = [asyncio.create_task(service.call(SELECT, {})) for _ in range(4)]
+        await asyncio.sleep(0.02)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(all(task.cancelled() for task in tasks))
+
     async def test_transport_cause_is_internal_and_survives_unknown_write_wrapping(self):
         for exception, category in (
             (httpx.ConnectTimeout, "connect_error"),

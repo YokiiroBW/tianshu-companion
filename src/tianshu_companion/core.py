@@ -1319,9 +1319,61 @@ class Core(Delivery):
         turn = self.store.get("turns", turn_id)
         accepted = self._turn_correlation(turn) if turn else None
         with obs.correlation_scope(accepted):
-            await self._process_turn(turn_id)
+            recovery_started = (turn or {}).get("preparation_retry_started_at")
+            if recovery_started is None:
+                await self._process_turn(turn_id)
+                return
+            # The recovery window bounds work as well as the next retry time.
+            # Normal preparation before its first pressure failure consumes none
+            # of it. The timer is disabled at the existing model boundary.
+            remaining = max(0, recovery_started + 30 - self.clock())
+            try:
+                async with asyncio.timeout(remaining) as recovery_timeout:
+                    await self._process_turn(turn_id, preparation_timeout=recovery_timeout)
+            except TimeoutError:
+                with self.store.transaction():
+                    fresh = self.store.get("turns", turn_id)
+                    if fresh and not fresh["cancelled"] and fresh["phase"] not in TERMINAL:
+                        failure = Fault(
+                            "timeout", cause=dict(category="timeout", operation="query")
+                        )
+                        self._record_turn_failure(fresh, failure, "preparation")
+                        fresh["failure"] = failure.code
+                        self._finish(fresh, "failed", "failed")
 
-    async def _process_turn(self, turn_id):
+    def _record_turn_failure(self, turn, error, stage):
+        """Keep bounded causes once, even when a stream callback bubbles up."""
+        diagnostic = obs.failure_diagnostic(
+            error,
+            code=error.code if isinstance(error, Fault) else "internal_error",
+            attempt=max(1, turn["model_calls"] or turn.get("preparation_retries", 0) + 1),
+            stage=getattr(error, "companion_failure_stage", stage),
+            observed_at=self.clock(),
+        )
+        read_execution = getattr(error, "read_execution", None)
+        if read_execution in {"waiting", "not_started", "unconfirmed"}:
+            diagnostic["read_execution"] = read_execution
+        marker = getattr(error, "companion_failure", None)
+        if marker == (turn["id"], turn.get("failure_count")):
+            # Gateway learns its owned request ID after on_delta raises. Add
+            # that link to the original read cause without counting it twice.
+            if "model_request_id" in diagnostic:
+                turn["last_failure"]["model_request_id"] = diagnostic["model_request_id"]
+                if turn["failure_count"] == 1:
+                    turn["first_failure"]["model_request_id"] = diagnostic["model_request_id"]
+            return
+        turn.setdefault("first_failure", diagnostic)
+        turn["last_failure"] = diagnostic
+        turn["failure_count"] = turn.get("failure_count", 0) + 1
+        error.companion_failure = (turn["id"], turn["failure_count"])
+
+    def _preparation_expired(self, turn, timeout):
+        return timeout is not None and (
+            self.clock() >= turn["preparation_retry_started_at"] + 30
+            or asyncio.get_running_loop().time() >= timeout.when()
+        )
+
+    async def _process_turn(self, turn_id, *, preparation_timeout=None):
         generation_started = time.perf_counter()
         try:
             turn = self.store.get("turns", turn_id)
@@ -1529,12 +1581,26 @@ class Core(Delivery):
                     turn["context_budget_used"] = dict(tokens=context_bytes, bytes=context_bytes)
                     if turn.get("model_selection"):
                         verify_lease(turn["model_selection"]["expires_at"], self.clock())
+                    if self._preparation_expired(turn, preparation_timeout):
+                        raise Fault("timeout")
                     turn["phase"] = "generating"
                     turn["model_calls"] += 1
                     turn["timings"]["model_started_at"] = utc(self.clock())
                     turn["timings"]["context_prepared_at"] = context_prepared_at
                     turn["timings"]["model_slot_wait_ms"] = slot_wait_ms
                     self._save_turn(turn)
+                if preparation_timeout is not None:
+                    # A synchronous store write/commit can cross the deadline
+                    # before the event loop runs its timeout callback. No model
+                    # request exists yet, so undo only this local reservation.
+                    if self._preparation_expired(turn, preparation_timeout):
+                        with self.store.transaction():
+                            turn["model_calls"] -= 1
+                            turn["phase"] = "preparing"
+                            turn["timings"].pop("model_started_at", None)
+                            self._save_turn(turn)
+                        raise Fault("timeout")
+                    preparation_timeout.reschedule(None)
                 obs.emit(self.events, "turn.generation.started", "started")
                 segments, usage = await asyncio.wait_for(
                     self._respond_native(turn, messages, provenance=provenance), timeout=180
@@ -1603,6 +1669,9 @@ class Core(Delivery):
                 if turn["cancelled"] or turn["phase"] in TERMINAL:
                     return
                 turn["failure"] = error.code if isinstance(error, Fault) else type(error).__name__
+                self._record_turn_failure(
+                    turn, error, "preparation" if not turn["model_calls"] else "generation"
+                )
                 from .preparation_retry import retry_preparation
 
                 if retry_preparation(turn, error, self.clock()):
@@ -1710,16 +1779,7 @@ class Core(Delivery):
                             and not fresh["cancelled"]
                             and fresh["phase"] not in TERMINAL
                         ):
-                            diagnostic = obs.failure_diagnostic(
-                                error,
-                                code=error.code,
-                                attempt=fresh["model_calls"],
-                                stage="model",
-                                observed_at=self.clock(),
-                            )
-                            fresh.setdefault("first_failure", diagnostic)
-                            fresh["last_failure"] = diagnostic
-                            fresh["failure_count"] = fresh.get("failure_count", 0) + 1
+                            self._record_turn_failure(fresh, error, "model")
                             recover = (
                                 error.retryable_model
                                 and not iteration
@@ -2249,23 +2309,63 @@ class Core(Delivery):
         )
 
     async def _preflight(self, turn):
-        # After generation, only a peer-confirmed, not-started read may repeat.
-        # Each attempt owns a fresh checkpoint; no model or send is replayed.
-        for attempt in range(3):
+        from .preparation_retry import read_retry
+
+        # Before generation the durable preparation owner handles recovery.
+        # During streaming this await retains the same model and pending text;
+        # only authority reads repeat, each in a fresh checkpoint.
+        recovery = {}
+        while True:
             try:
-                return await self._preflight_once(turn)
+                if recovery:
+                    remaining = min(recovery["deadline"], turn["source_deadline"]) - self.clock()
+                    if remaining <= 0:
+                        raise Fault("timeout")
+                    async with asyncio.timeout(remaining) as deadline:
+                        result = await self._preflight_once(turn)
+                        if (
+                            self.clock() >= recovery["deadline"]
+                            or asyncio.get_running_loop().time() >= deadline.when()
+                        ):
+                            raise Fault("timeout")
+                        return result
+                else:
+                    return await self._preflight_once(turn)
             except Fault as error:
-                if (
-                    not turn.get("model_calls")
-                    or not error.retryable_read
-                    or error.unknown
-                    or attempt == 2
-                ):
+                error.companion_failure_stage = "preflight"
+                if not turn.get("model_calls"):
                     raise
-                fresh = self.store.get("turns", turn["id"])
-                if fresh is None or fresh["cancelled"] or fresh["phase"] in TERMINAL:
-                    raise Fault("scope_changed") from None
-                await asyncio.sleep(0.1 * 2**attempt)
+                with self.store.transaction():
+                    fresh = self.store.get("turns", turn["id"])
+                    if fresh is None or fresh["cancelled"]:
+                        raise Fault("scope_changed") from None
+                    if fresh["phase"] in TERMINAL:
+                        # Async image delivery can legitimately verify a closed
+                        # parent. Its own durable owner receives the original
+                        # failure; do not rewrite it or revive the chat turn.
+                        raise
+                    self._record_turn_failure(fresh, error, "preflight")
+                    self._save_turn(fresh)
+                delay = read_retry(recovery, error, self.clock(), turn["source_deadline"])
+                if delay is None:
+                    raise
+                retry_at = time.monotonic() + delay
+                while True:
+                    fresh = self.store.get("turns", turn["id"])
+                    if fresh is None or fresh["cancelled"] or fresh["phase"] in TERMINAL:
+                        raise Fault("scope_changed") from None
+                    self._check_input_versions(fresh)
+                    self._check_role(fresh)
+                    if self.clock() >= turn["source_deadline"]:
+                        raise Fault("forbidden") from None
+                    remaining = retry_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(0.2, remaining))
+            except TimeoutError:
+                failure = Fault("timeout", cause=dict(category="timeout", operation="query"))
+                failure.companion_failure_stage = "preflight"
+                raise failure from None
 
     async def _preflight_once(self, turn):
         if (

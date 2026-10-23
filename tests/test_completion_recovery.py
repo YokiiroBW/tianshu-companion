@@ -414,11 +414,15 @@ def test_native_recovery_is_single_output_and_diagnostics_survive_reopen(tmp_pat
             else:
                 assert turn["first_failure"]["stage"] == "model"
                 assert turn["first_failure"]["model_request_id"] == attempts[0]
-                assert turn["failure_count"] == (2 if mode == "persistent" else 1)
-                assert (
-                    turn["last_failure"]["model_request_id"]
-                    == attempts[-1 if mode == "persistent" else 0]
-                )
+                assert turn["failure_count"] == (2 if mode in {"persistent", "revoked"} else 1)
+                if mode == "revoked":
+                    assert turn["last_failure"]["stage"] == "preflight"
+                    assert turn["last_failure"]["code"] == "forbidden"
+                else:
+                    assert (
+                        turn["last_failure"]["model_request_id"]
+                        == attempts[-1 if mode == "persistent" else 0]
+                    )
                 assert "secret" not in json.dumps(turn["first_failure"])
                 if mode == "cut":
                     assert turn["first_failure"]["exception_type"] == "ReadTimeout"

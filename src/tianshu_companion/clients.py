@@ -126,6 +126,7 @@ class JsonService:
             raise ValueError("Internal service URL must be an explicitly configured HTTPS URL")
         self.url, self.token = url, token
         self.query_slots = asyncio.Semaphore(4)
+        self.query_not_before = 0.0
         # A registered interface label for the runtime event stream. It is never the
         # configured URL, host or any other deployment value.
         self.label = _label(label, obs.PEER_LABELS)
@@ -273,27 +274,44 @@ class JsonService:
         headers.setdefault(
             obs.CORRELATION_HEADER, obs.current_correlation_id() or obs.new_correlation_id()
         )
+        started = False
         try:
             # Share the peer's capacity fairly; commands never enter this replay path.
             async with asyncio.timeout(self.QUERY_BUDGET_SECONDS):
                 async with self.query_slots:
-                    for attempt in range(2):
-                        try:
-                            return await self._call_once(
-                                path, body, headers, uncertain_write=uncertain_write
-                            )
-                        except Fault as error:
-                            if (
-                                not error.retryable_read
-                                or attempt == 1
-                                or (getattr(error, "retry_after_seconds", None) or 0) > 0
-                            ):
-                                raise
-                            await asyncio.sleep(0.1 * 2**attempt)
+                    # Backpressure belongs to this peer, not just the caller
+                    # that happened to see it. Waiting consumes the same local
+                    # budget and never starts a second semantic request.
+                    while self.query_not_before > time.monotonic():
+                        await asyncio.sleep(self.query_not_before - time.monotonic())
+                    started = True
+                    return await self._call_once(
+                        path, body, headers, uncertain_write=uncertain_write
+                    )
         except TimeoutError as error:
-            raise Fault(
+            failure = Fault(
                 "dependency_unavailable", retryable_read=True, cause=self._cause(error, "query")
-            ) from None
+            )
+            failure.read_execution = "unconfirmed" if started else "waiting"
+            self._cool_query(failure)
+            raise failure from None
+        except Fault as error:
+            self._cool_query(error)
+            raise
+
+    def _cool_query(self, error):
+        if not error.retryable_read:
+            return
+        # A timed-out HTTP owner does not stop the peer's worker. Avoid
+        # immediately adding more work while that worker actually drains.
+        if getattr(error, "read_execution", None) != "waiting":
+            delay = 1.0 if getattr(error, "read_execution", None) == "unconfirmed" else 0.2
+            delay = max(delay, getattr(error, "retry_after_seconds", None) or 0)
+            self.query_not_before = max(self.query_not_before, time.monotonic() + delay)
+        error.retry_after_seconds = max(
+            getattr(error, "retry_after_seconds", None) or 0,
+            self.query_not_before - time.monotonic(),
+        )
 
     @classmethod
     def _is_query(cls, path, body):
@@ -392,7 +410,9 @@ class JsonService:
                     and not_started
                     and value.get("retryable") is True
                 ):
-                    raise _retry_hint(Fault(code, retryable_read=True), response)
+                    failure = _retry_hint(Fault(code, retryable_read=True), response)
+                    failure.read_execution = "not_started"
+                    raise failure
                 if code in {
                     "scope_changed",
                     "forbidden",
@@ -426,9 +446,24 @@ class JsonService:
                     failure.retry_after_seconds = getattr(error, "retry_after_seconds", None)
                     raise failure from None
                 raise
-            raise Fault(
-                "dependency_unavailable", unknown=uncertain_write and sent, cause=cause
-            ) from None
+            recover_read = retry_query and isinstance(
+                error,
+                (
+                    httpx.TimeoutException,
+                    httpx.NetworkError,
+                    httpx.RemoteProtocolError,
+                    TimeoutError,
+                ),
+            )
+            failure = Fault(
+                "dependency_unavailable",
+                unknown=uncertain_write and sent,
+                retryable_read=recover_read,
+                cause=cause,
+            )
+            if recover_read:
+                failure.read_execution = "unconfirmed"
+            raise failure from None
 
     def _report(self, outcome, correlation, started, attempts, error=None):
         LOG_PORT.emit(

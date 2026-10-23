@@ -322,7 +322,7 @@ def test_source_preflight_rechecks_without_regenerating_a_completed_model_result
         h.memory.select = select
         try:
             await h.ingest(text="我上午一般喝无糖豆浆")
-            for _ in range(180):
+            for _ in range(900):
                 await h.cycles(3)
                 if h.turns()[0]["phase"] in {"sent", "failed", "cancelled"}:
                     break
@@ -337,7 +337,8 @@ def test_source_preflight_rechecks_without_regenerating_a_completed_model_result
                 assert len(rechecks) == 3
                 assert h.core._replies(turn)[0]["text"] == "已经生成的固定答案。"
             elif mode == "persistent":
-                assert len(rechecks) == 3
+                assert len(rechecks) == 6
+                assert turn["failure_count"] == 6
             elif mode in {"unknown", "forbidden", "cancelled"}:
                 assert len(rechecks) == 1
         finally:

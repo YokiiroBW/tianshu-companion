@@ -215,6 +215,100 @@ def test_slow_native_delivery_does_not_expire_the_network_stream_budget():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("mode", ["recover", "cancel", "revoke"])
+def test_stream_authority_backpressure_keeps_one_model_and_a_fresh_send_boundary(mode):
+    async def run():
+        h = Harness(silence_ms=0)
+        text = "这一段是合成流式回复，验证临时读取拥塞恢复后仍沿用同一个模型流和同一待发内容，不会重复生成或重复发送。"
+        stream = Stream([event({"content": text}), event({}, "stop"), b"data: [DONE]\n\n"])
+        model_requests, memory_requests = [], []
+        pressure = asyncio.Event()
+        clock = asyncio.get_running_loop().time
+
+        def memory_handler(request):
+            memory_requests.append(clock())
+            if len(memory_requests) == 1:
+                pressure.set()
+                return httpx.Response(
+                    429,
+                    json=dict(code="queue_full", execution_state="not_started", retryable=True),
+                    headers={"Retry-After": "1"},
+                )
+            return httpx.Response(200, json={"ok": True})
+
+        def handler(request):
+            if request.url.path == "/v1/chat/completions":
+                model_requests.append(request.headers["X-Request-ID"])
+                return httpx.Response(200, stream=stream)
+            return (
+                httpx.Response(200, json=route(request, h.core.config_version))
+                if mode == "recover"
+                else closed_attempt(request)
+            )
+
+        class Finished(NativeQueue):
+            async def finalize_expression(self, expression_id, origin):
+                self.final = True
+                return self.receipt()
+
+        client = JsonService(
+            "https://gateway.synthetic.invalid", "fixture", transport=httpx.MockTransport(handler)
+        )
+        memory_client = JsonService(
+            "https://memory.synthetic.invalid",
+            "fixture",
+            label="memory",
+            transport=httpx.MockTransport(memory_handler),
+        )
+        queue = Finished(h.clock)
+        queue.states = ["sent"]
+        h.core.gateway = Gateway(h.contracts, client)
+        h.sender = h.core.sender = queue
+        select = h.memory.select
+
+        async def select_with_pressure(*args, **kwargs):
+            turn = h.turns()[0]
+            if turn["model_calls"]:
+                await memory_client.call("/internal/v1/memory/select", {"request_id": "synthetic"})
+            return await select(*args, **kwargs)
+
+        h.memory.select = select_with_pressure
+        try:
+            await h.ingest(text="合成的日常问题")
+            for _ in range(300):
+                await h.cycles(2)
+                if pressure.is_set() and mode != "recover":
+                    turn = h.turns()[0]
+                    if mode == "cancel":
+                        turn["cancelled"] = True
+                        h.core.store.put("turns", turn)
+                    else:
+                        h.origins.values[turn["origin"]["assertion_ref"]]["revoked"] = True
+                if not h.core.jobs and pressure.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            turn = h.turns()[0]
+            assert len(model_requests) == 1 and turn["model_calls"] == 1
+            assert stream.closed and not h.core.gateway.active_requests
+            assert len(queue.requests) == (1 if mode == "recover" else 0)
+            assert turn["first_failure"]["stage"] == "preflight"
+            assert turn["first_failure"]["peer"] == "memory"
+            assert turn["first_failure"]["operation"] == "query"
+            assert turn["first_failure"]["http_status"] == 429
+            assert turn["first_failure"]["read_execution"] == "not_started"
+            if mode == "recover":
+                assert turn["phase"] == "sent" and turn["failure_count"] == 1
+                assert memory_requests[1] - memory_requests[0] >= 1
+            else:
+                assert not turn.get("model_connection_retries")
+        finally:
+            await client.close()
+            await memory_client.close()
+            await h.core.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     "delta,retryable",
     [

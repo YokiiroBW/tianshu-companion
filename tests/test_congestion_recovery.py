@@ -5,10 +5,11 @@ import httpx
 from support import Harness
 from tianshu_companion.clients import JsonService
 from tianshu_companion.contracts import Fault
+from tianshu_companion.preparation_retry import read_retry, retry_preparation
 
 
 class CongestionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_explicit_nonexecuted_read_timeout_recovers_once_with_the_same_request(self):
+    async def test_explicit_nonexecuted_read_timeout_returns_to_the_logical_owner_once(self):
         seen = []
 
         async def handle(request):
@@ -23,12 +24,11 @@ class CongestionTests(unittest.IsolatedAsyncioTestCase):
             "https://synthetic.invalid", "synthetic", transport=httpx.MockTransport(handle)
         )
         self.addAsyncCleanup(client.close)
-        self.assertEqual(
-            {"ok": True},
-            await client.call("/internal/v1/memory/context/query", {"request_id": "same"}),
-        )
-        self.assertEqual(len(seen), 2)
-        self.assertEqual(seen[0], seen[1])
+        with self.assertRaises(Fault) as caught:
+            await client.call("/internal/v1/memory/context/query", {"request_id": "same"})
+        self.assertTrue(caught.exception.retryable_read)
+        self.assertEqual(caught.exception.read_execution, "not_started")
+        self.assertEqual(len(seen), 1)
 
     async def test_timeout_without_nonexecution_proof_and_commands_never_replay(self):
         for path, state, retryable in [
@@ -73,7 +73,7 @@ class CongestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(h.gateway.calls), 12)
         self.assertTrue(all(t["phase"] == "sent" for t in h.turns()))
 
-    async def test_explicit_query_congestion_reuses_request_but_never_replays_a_command(self):
+    async def test_explicit_query_congestion_returns_to_owner_and_never_replays_a_command(self):
         seen = []
 
         async def handle(request):
@@ -88,14 +88,148 @@ class CongestionTests(unittest.IsolatedAsyncioTestCase):
             "https://synthetic.invalid", "synthetic", transport=httpx.MockTransport(handle)
         )
         self.addAsyncCleanup(client.close)
-        self.assertEqual(
-            {"ok": True}, await client.call("/internal/v1/memory/select", {"request_id": "same"})
-        )
-        self.assertEqual(seen[0], seen[1])
+        with self.assertRaises(Fault) as caught:
+            await client.call("/internal/v1/memory/select", {"request_id": "same"})
+        self.assertTrue(caught.exception.retryable_read)
+        self.assertEqual(len(seen), 1)
         seen.clear()
         with self.assertRaises(Fault):
             await client.call("/internal/v1/identity/register", {"request_id": "command"})
         self.assertEqual(1, len(seen))
+
+    def test_first_recoverable_failure_after_normal_preparation_gets_its_own_window(self):
+        turn = dict(
+            model_calls=0,
+            created_at="2026-10-23T00:00:00Z",
+            timings={"started_at": "2026-10-23T00:00:00Z"},
+            source_deadline=160,
+        )
+        self.assertTrue(retry_preparation(turn, Fault("queue_full"), 131))
+        self.assertEqual(turn["preparation_retry_started_at"], 131)
+        self.assertEqual(turn["preparation_retries"], 1)
+        self.assertGreater(turn["retry_at"], 131)
+        self.assertIsNone(read_retry({}, Fault("queue_full"), 160, 160))
+
+    def test_read_policy_is_bounded_and_does_not_replay_commands_models_or_unknown_writes(self):
+        for error in (
+            Fault("queue_full", unknown=True),
+            Fault("dependency_unavailable", retryable_model=True),
+            Fault("queue_full", cause={"operation": "command"}),
+            Fault("queue_full", cause={"operation": "stream"}),
+            Fault("queue_full", cause={"operation": "query", "http_status": 429}),
+        ):
+            self.assertIsNone(read_retry({}, error, 100, 200))
+        state = {}
+        error = Fault("queue_full", retryable_read=True)
+        error.retry_after_seconds = 6
+        self.assertEqual(read_retry(state, error, 100, 200), 6)
+        self.assertEqual(read_retry(state, error, 107, 200), 6)
+        self.assertIsNone(read_retry(state, error, 125, 200))
+        state = {}
+        for attempt in range(5):
+            self.assertIsNotNone(read_retry(state, Fault("queue_full"), 100 + attempt, 200))
+        self.assertIsNone(read_retry(state, Fault("queue_full"), 105, 200))
+
+    async def test_prepare_recovery_window_bounds_running_reads(self):
+        from test_delivery_v2 import source_turn
+
+        h = Harness(silence_ms=0)
+        self.addAsyncCleanup(h.core.close)
+        turn = await source_turn(h)
+        turn.update(
+            phase="preparing",
+            config_version=h.core.config_version,
+            bootstrap_until=h.clock() + 5,
+            preparation_retry_started_at=h.clock() - 29.96,
+        )
+        h.core.store.put("turns", turn)
+        entered, stopped = asyncio.Event(), asyncio.Event()
+
+        async def blocked(*args, **kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        h.memory.select = blocked
+        await asyncio.wait_for(h.core._process(turn["id"]), 1)
+        fresh = h.core.store.get("turns", turn["id"])
+        self.assertTrue(entered.is_set() and stopped.is_set())
+        self.assertEqual(fresh["phase"], "failed")
+        self.assertEqual(fresh["model_calls"], 0)
+        self.assertEqual(fresh["last_failure"]["stage"], "preparation")
+        self.assertEqual(fresh["failure"], "timeout")
+
+    async def test_synchronous_work_cannot_disable_an_expired_prepare_recovery_timer(self):
+        from test_delivery_v2 import source_turn
+
+        for stage in ("context", "store", "normal"):
+            with self.subTest(stage=stage):
+                h = Harness(silence_ms=0)
+                try:
+                    turn = await source_turn(h)
+                    turn.update(
+                        phase="preparing",
+                        config_version=h.core.config_version,
+                        bootstrap_until=h.clock() + 5,
+                    )
+                    if stage != "normal":
+                        turn["preparation_retry_started_at"] = h.clock() - 29
+                    h.core.store.put("turns", turn)
+                    prepare = h.core._prepare_context
+                    save = h.core._save_turn
+
+                    async def synchronous_context(*args):
+                        result = await prepare(*args)
+                        h.clock.advance(31 if stage == "normal" else 2)
+                        return result
+
+                    def synchronous_store(value):
+                        save(value)
+                        if value["phase"] == "generating":
+                            h.clock.advance(2)
+
+                    if stage == "store":
+                        h.core._save_turn = synchronous_store
+                    else:
+                        h.core._prepare_context = synchronous_context
+                    await h.core._process(turn["id"])
+                    fresh = h.core.store.get("turns", turn["id"])
+                    if stage == "normal":
+                        self.assertEqual(len(h.gateway.calls), 1)
+                        self.assertEqual(fresh["model_calls"], 1)
+                    else:
+                        self.assertEqual(h.gateway.calls, [])
+                        self.assertEqual(fresh["model_calls"], 0)
+                        self.assertEqual(fresh["phase"], "failed")
+                        self.assertEqual(fresh["failure"], "timeout")
+                finally:
+                    await h.core.close()
+
+    async def test_synchronous_authority_completion_cannot_escape_read_recovery_deadline(self):
+        from test_delivery_v2 import source_turn
+
+        h = Harness(silence_ms=0)
+        self.addAsyncCleanup(h.core.close)
+        turn = await source_turn(h)
+        turn.update(model_calls=1, source_deadline=h.clock() + 600)
+        h.core.store.put("turns", turn)
+        attempts = []
+
+        async def synchronous_read(value):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise Fault("dependency_unavailable", retryable_read=True)
+            h.clock.advance(31)
+
+        h.core._preflight_once = synchronous_read
+        with self.assertRaises(Fault) as caught:
+            await h.core._preflight(turn)
+        self.assertEqual(caught.exception.code, "timeout")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(h.gateway.calls, [])
+        self.assertEqual(h.sender.calls, [])
 
     async def test_preparation_recovers_without_replaying_model(self):
         h = Harness(silence_ms=0)
