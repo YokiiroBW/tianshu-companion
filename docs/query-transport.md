@@ -1,5 +1,7 @@
 # 查询连接恢复
 
+TS-307 增加两条明确只读恢复路径：`POST /internal/v2/memory/context/query` 与 `/verify`。verify 在一个 Memory 屏障内核对 bundle 及继承的旧检查，Core 每次准备/模型前/发送边界仍建立新 checkpoint；不按 TTL 重用权限。单包最多64项检查，较大的必需依赖完整拆批且全部成功才继续。候选处理的能力协商读取只在 `output=null`、闭合请求字段及受支持版本列表时进入原查询恢复白名单；schema3/4提案提交仍是单次不确定写，不能被传输层重放。
+
 TS-023 在 JsonService 中只允许以下调用恢复一次；并非按 GET/POST 或路径中的 read/select 字样推断安全性。
 
 | 调用 | 已发布语义与决定 |

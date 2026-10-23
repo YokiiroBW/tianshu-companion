@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, replace
 
-from .clients import command, epoch, uid, utc
+from .clients import command, epoch, query, uid, utc
 from . import clients
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 from .direct import Direct
@@ -26,7 +26,6 @@ from .context import (
     merge_checks,
     profile_check,
     profile_targets,
-    scope_check,
 )
 from .context_checks import VerificationCheckpoint, verify_checks
 from .short_context import (
@@ -1441,9 +1440,18 @@ class Core(Delivery):
                 recall = self._turn_allows(turn, "memory.read")
                 budget = dict(tokens=8192 if recall else 0, bytes=8192 if recall else 0)
                 try:
-                    selection = await self.memory.select(
-                        turn["origin"], turn["scope"], text or "media", budget
-                    )
+                    memory_context = None
+                    if hasattr(self.memory, "query_context"):
+                        from .memory_context import selection as project_selection
+
+                        memory_context = await self.memory.query_context(
+                            turn["origin"], turn["scope"], text or "media", budget
+                        )
+                        selection = project_selection(memory_context)
+                    else:
+                        selection = await self.memory.select(
+                            turn["origin"], turn["scope"], text or "media", budget
+                        )
                 except Fault as error:
                     if error.retryable_read:
                         # Durable preparation recovery handles explicit peer congestion;
@@ -1467,6 +1475,8 @@ class Core(Delivery):
                 turn["scope_version"] = selection["scope_version"]
                 turn["bootstrap_mapping"] = False
                 turn["preparation"] = selection
+                if memory_context is not None:
+                    turn["memory_context"] = memory_context
                 turn["timings"]["memory_ms"] = (self.clock() - start) * 1000
                 if re.search(r"按你.*方案|刚才.*方案|照你.*说|your (?:plan|proposal)", text, re.I):
                     dep = self.store.previous_scope_turn(turn["scope"], turn["sequence"])
@@ -1923,6 +1933,33 @@ class Core(Delivery):
                         evidence=fresh["preparation"]["selected_units"],
                         dependency_groups=fresh["preparation"]["dependency_groups"],
                     )
+                    if fresh.get("memory_context") is not None:
+                        # A memory mutation may invalidate old replies/profiles.
+                        # Reuse normal assembly to retain only still-valid raw
+                        # context and restore the checks behind every retained item.
+                        (
+                            context,
+                            metadata,
+                            checks,
+                            profiles,
+                            history,
+                            inputs,
+                        ) = await self._prepare_context(
+                            fresh, prompt.get("delivered_dependencies", [])
+                        )
+                        prompt.update(context.data)
+                        with self.store.transaction():
+                            fresh = self.store.get("turns", turn["id"])
+                            self._check_input_versions(fresh)
+                            fresh.update(
+                                short_context=metadata,
+                                context_checks=checks,
+                                profile_checks=profiles,
+                                history_snapshot=history,
+                                input_history_snapshot=inputs,
+                            )
+                            self._save_turn(fresh)
+                        await self._preflight(fresh)
                     messages[1]["content"] = canonical(prompt)
                     if provenance is not None:
                         messages[0]["content"] = system + material_provenance(
@@ -1997,6 +2034,29 @@ class Core(Delivery):
                 raise Fault("scope_changed")
 
     async def _verify_checks(self, turn, checks, *, verified=None, checkpoint=None):
+        if turn.get("memory_context") is not None:
+            owns_checkpoint = checkpoint is None
+            checkpoint = checkpoint or VerificationCheckpoint()
+            memory_checks = {}
+            try:
+                await verify_checks(
+                    checks,
+                    lambda check, point: self._verify_context_check(
+                        turn, check, point, memory_checks=memory_checks
+                    ),
+                    checkpoint=checkpoint,
+                )
+                ordered = [memory_checks[key] for key in sorted(memory_checks)]
+                # Each complete set gets a fresh barrier. A source lease may
+                # have been renewed while preparing another group; signatures
+                # alone must not reuse an earlier Memory proof of that lease.
+                await self.memory.verify_context(
+                    turn["origin"], turn["scope"], turn["memory_context"]["bundle"], ordered
+                )
+            finally:
+                if owns_checkpoint:
+                    await checkpoint.close()
+            return
         await verify_checks(
             checks,
             lambda check, checkpoint: self._verify_context_check(turn, check, checkpoint),
@@ -2004,7 +2064,7 @@ class Core(Delivery):
             checkpoint=checkpoint,
         )
 
-    async def _verify_context_check(self, turn, check, checkpoint):
+    async def _verify_context_check(self, turn, check, checkpoint, *, memory_checks=None):
         scope = check["scope"]
         if (
             check["channel"] != turn["bundle"]["collection_key"]["channel"]
@@ -2060,6 +2120,13 @@ class Core(Delivery):
         )
         if binding != check["binding_version"]:
             raise Fault("scope_changed")
+        if memory_checks is not None:
+            from .memory_context import legacy_check
+
+            memory_check = legacy_check(check, query(check["origin"]))
+            if memory_check is not None:
+                memory_checks[memory_check["check_id"]] = memory_check
+                return
         if check["version_domain"] == PROFILE_DOMAIN:
             await checkpoint.once(
                 [
@@ -2168,7 +2235,11 @@ class Core(Delivery):
         from .context_checks import read_parallel
 
         await self._refresh_preparation_origin(turn)
-        if self._turn_allows(turn, "memory.read") and hasattr(self.memory, "history"):
+        if turn.get("memory_context") is not None:
+            bundle = turn["memory_context"]["bundle"]
+            turn["history_snapshot"] = bundle["history_snapshot"]
+            turn["input_history_snapshot"] = bundle["input_history_snapshot"]
+        elif self._turn_allows(turn, "memory.read") and hasattr(self.memory, "history"):
             methods = ["history"]
             if hasattr(self.memory, "input_history"):
                 methods.append("input_history")
@@ -2186,7 +2257,12 @@ class Core(Delivery):
             snapshots = await read_parallel([lambda m=m: snapshot(m) for m in methods])
             for method, value in zip(methods, snapshots):
                 turn[method + "_snapshot"] = value
-        context = TurnContext(turn["preparation"], self._continuation_messages(turn), dependencies)
+        context = TurnContext(
+            turn["preparation"],
+            self._continuation_messages(turn),
+            dependencies,
+            memory=turn.get("memory_context"),
+        )
         checks, profiles = [], []
         if self.relationships is not None:
             checks = await self.relationships.prepare(self, turn, context)
@@ -2197,7 +2273,8 @@ class Core(Delivery):
             if await self._refresh_preparation_origin(turn):
                 await checkpoint.close()
                 checkpoint = VerificationCheckpoint()
-            await self._verify_checks(turn, checks, verified=verified, checkpoint=checkpoint)
+            if turn.get("memory_context") is None:
+                await self._verify_checks(turn, checks, verified=verified, checkpoint=checkpoint)
             policy = replace(
                 self.short_context_policy,
                 max_bytes=min(self.short_context_policy.max_bytes, context.remaining),
@@ -2220,16 +2297,16 @@ class Core(Delivery):
                 batches.append(batch)
 
             def candidate_checks(candidate):
-                inherited = []
-                for member in candidate:
-                    previous = self.store.get("turns", member["turn_id"])
-                    inherited = merge_checks(
-                        inherited,
-                        [scope_check(previous, input_only=True)]
-                        if member.get("input_only") or not member["replies"]
-                        else inherited_checks(previous),
-                    )
-                return inherited
+                from .context import recent_checks
+
+                return recent_checks(self.store, candidate)
+
+            if turn.get("memory_context") is not None:
+                from .context import bound_recent_provenance
+
+                batches, metadata["reply_dependency_omissions"] = bound_recent_provenance(
+                    self.store, batches, checks
+                )
 
             async def precheck(batch):
                 try:
@@ -2248,7 +2325,24 @@ class Core(Delivery):
             if await self._refresh_preparation_origin(turn):
                 await checkpoint.close()
                 checkpoint = VerificationCheckpoint()
-            prepared = await read_parallel([lambda b=b: precheck(b) for b in batches])
+            prepared = None
+            if turn.get("memory_context") is not None:
+                combined = [candidate_checks(batch) for batch in batches]
+                try:
+                    await self._verify_checks(
+                        turn, merge_checks(checks, *combined), checkpoint=checkpoint
+                    )
+                    prepared = [(inherited, None) for inherited in combined]
+                except Fault:
+                    # A failed full set cannot attest any member. Isolate invalid
+                    # old material using the existing independent group fallback.
+                    await checkpoint.close()
+                    checkpoint = VerificationCheckpoint()
+                    # Optional recent material can be isolated, but mandatory
+                    # dependencies and the current bundle must still be valid.
+                    await self._verify_checks(turn, checks, checkpoint=checkpoint)
+            if prepared is None:
+                prepared = await read_parallel([lambda b=b: precheck(b) for b in batches])
             reusable = True
             for batch, primary in zip(batches, prepared):
                 variants = [batch]
@@ -2272,6 +2366,11 @@ class Core(Delivery):
                                 turn, inherited, verified=verified, checkpoint=checkpoint
                             )
                         proposed = merge_checks(checks, inherited)
+                        if turn.get("memory_context") is None and len(proposed) > 64:
+                            # Retained v1 turns keep their previous optional
+                            # context budget. V2 validates the complete set in
+                            # bounded batches and has no 64-check rejection.
+                            raise Fault("budget_exceeded")
                     except Fault:
                         # A failed peer task must not poison an independent raw
                         # input fallback. Keep exact check outcomes, drain this
@@ -2457,23 +2556,29 @@ class Core(Delivery):
                     lambda: checkpoint.once(
                         ["qq_admin", turn["id"]], lambda: self._check_qq_admin(turn)
                     ),
-                    lambda: checkpoint.once(
-                        [
-                            "select",
-                            turn["origin"],
-                            turn["scope"],
-                            self._input_text(turn) or "media",
-                            turn["scope_version"],
-                            turn.get("preparation"),
-                        ],
-                        lambda: self.memory.select(
-                            turn["origin"],
-                            turn["scope"],
-                            self._input_text(turn) or "media",
-                            dict(tokens=0, bytes=0),
-                            turn["scope_version"],
-                            known=turn.get("preparation"),
-                        ),
+                    *(
+                        []
+                        if turn.get("memory_context") is not None
+                        else [
+                            lambda: checkpoint.once(
+                                [
+                                    "select",
+                                    turn["origin"],
+                                    turn["scope"],
+                                    self._input_text(turn) or "media",
+                                    turn["scope_version"],
+                                    turn.get("preparation"),
+                                ],
+                                lambda: self.memory.select(
+                                    turn["origin"],
+                                    turn["scope"],
+                                    self._input_text(turn) or "media",
+                                    dict(tokens=0, bytes=0),
+                                    turn["scope_version"],
+                                    known=turn.get("preparation"),
+                                ),
+                            )
+                        ]
                     ),
                     lambda: self._verify_checks(
                         turn,

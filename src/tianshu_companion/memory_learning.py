@@ -215,6 +215,7 @@ class MemoryLearning:
                 scope=item["event"]["scope"],
                 scope_key=digest(item["event"]["scope"]),
                 sequence=item["event"]["turn_sequence"],
+                extraction_schema=getattr(self.core.memory, "extraction_schema", 3),
             ),
         )
 
@@ -384,7 +385,7 @@ class MemoryLearning:
             raise Fault("forbidden")
         self.core._check_role(turn)
         async with asyncio.timeout(45):
-            response = await self.core.memory.process_candidate(job_id, None)
+            response = await self._candidate(item, None)
         if response["state"] in {"completed", "invalidated"}:
             item.update(
                 state=response["state"],
@@ -461,7 +462,7 @@ class MemoryLearning:
                 item["stage"] = "commit"
                 self.core.store.put("metadata", item)
                 async with asyncio.timeout(45):
-                    return await self.core.memory.process_candidate(item["job_id"], item["output"])
+                    return await self._candidate(item, item["output"])
             finally:
                 self._release_commit()
 
@@ -483,6 +484,23 @@ class MemoryLearning:
             raise Fault("scope_changed")
         core._check_role(turn)
         return turn
+
+    async def _candidate(self, item, output):
+        # Missing pins belong to retained pre-upgrade proposals/jobs. Never infer
+        # a version from their JSON, and never regenerate an uncertain proposal.
+        schema = item.get("extraction_schema", 3)
+        if schema == 4 or item.get("extraction_negotiated"):
+            response = await self.core.memory.process_candidate(
+                item["job_id"], output, extraction_schema=schema
+            )
+            if output is None:
+                item["extraction_schema"] = response["extraction_schema"]
+                item["extraction_negotiated"] = True
+                self.core.store.put("metadata", item)
+            return response
+        if schema != 3:
+            raise Fault("invalid_input")
+        return await self.core.memory.process_candidate(item["job_id"], output)
 
     async def _work(self, item):
         core = self.core
@@ -512,7 +530,7 @@ class MemoryLearning:
             # commit_wait is also the durable admission barrier. Keep it during
             # the read await; its original failure cooldown releases the barrier.
             async with asyncio.timeout(45):
-                response = await core.memory.process_candidate(item["job_id"], None)
+                response = await self._candidate(item, None)
             item["stage"] = "receipt"
             turn = self._source_turn(item)
             if response["state"] not in {"pending", "completed", "invalidated"}:
@@ -520,7 +538,8 @@ class MemoryLearning:
             if response["state"] == "pending":
                 if item["output"] is None:
                     content = response["content"]
-                    skip_reason = empty_extraction_reason(content)
+                    schema4 = item.get("extraction_schema") == 4
+                    skip_reason = None if schema4 else empty_extraction_reason(content)
                     if (
                         core._event_reality(turn) not in {"real", "fictional"}
                         or not any(c["text"].strip() for c in content)
@@ -560,8 +579,12 @@ class MemoryLearning:
                                 )
                                 generation["config_version"] = selected.config_version
                             self._source_turn(item)
-                            hints = extraction_review_hints(
-                                content, response.get("known_facts", [])
+                            hints = (
+                                []
+                                if schema4
+                                else extraction_review_hints(
+                                    content, response.get("known_facts", [])
+                                )
                             )
                             source = dict(
                                 extraction_schema=response.get("extraction_schema", 1),
@@ -613,6 +636,14 @@ class MemoryLearning:
                                         "An empty result is still correct if nothing qualifies.",
                                     ),
                                 )
+                            if schema4:
+                                from .memory_extraction import messages as extraction_messages
+
+                                messages = extraction_messages(
+                                    core.contracts,
+                                    response,
+                                    rejected=bool(item.get("proposal_rejected")),
+                                )
                             segments, _ = await asyncio.wait_for(
                                 core.gateway.generate(generation, messages), MODEL_TIMEOUT_SECONDS
                             )
@@ -621,6 +652,8 @@ class MemoryLearning:
                         if len(raw.encode()) > 32768:
                             raise Fault("budget_exceeded")
                         item["output"] = strict_json(raw)
+                        if schema4:
+                            core.contracts.check("memory-extraction#output", item["output"])
                         if item["output"] == {"memories": []} and not item.get("empty_review"):
                             if hints:
                                 # Yield the background slot and durably reserve one review.

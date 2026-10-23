@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .contracts import Fault, canonical, digest, strict_json
+from .memory_context import group_context_owners
 from . import observability as obs
 
 # The process-wide runtime event port. The host assembles it once, at the same place the
@@ -107,6 +108,8 @@ class JsonService:
             "/internal/v1/memory/context/history",
             "/internal/v1/memory/context/input-history",
             "/internal/v1/memory/context/receipt",
+            "/internal/v2/memory/context/query",
+            "/internal/v2/memory/context/verify",
             "/internal/v2/bot-delivery/query",
         }
     )
@@ -321,7 +324,13 @@ class JsonService:
             # without spending another extraction attempt or replaying a write.
             return (
                 type(body) is dict
-                and set(body) == {"job_id", "output"}
+                and (
+                    set(body) == {"job_id", "output"}
+                    or (
+                        set(body) == {"job_id", "output", "supported_extraction_schemas"}
+                        and body["supported_extraction_schemas"] in ([3], [4], [3, 4])
+                    )
+                )
                 and isinstance(body["job_id"], str)
                 and bool(body["job_id"])
                 and body["output"] is None
@@ -577,27 +586,9 @@ class Origins:
         return context
 
 
-def _group_context_owners(scope, checks):
-    """A viewer and exact same-group owners, never a member directory or association."""
-    if not 1 <= len(checks) <= 17 or checks[0]["scope"] != scope:
-        raise Fault("forbidden")
-    people = set()
-    for check in checks:
-        owner = check["scope"]
-        person = owner["person_id"]
-        if (
-            not isinstance(person, str)
-            or person in people
-            or any(owner[key] != scope[key] for key in ("actor_id", "audience", "conversation_id"))
-            or check["association_id"] is not None
-            or check["association_version"] != 1
-        ):
-            raise Fault("forbidden")
-        people.add(person)
-    return people
-
-
 class Memory:
+    extraction_schema = 4
+
     def __init__(self, contracts, client):
         self.contracts, self.client = contracts, client
 
@@ -702,7 +693,7 @@ class Memory:
             raise Fault("budget_exceeded")
         owners = {scope["person_id"]}
         if scope["audience"] == "group":
-            owners = _group_context_owners(scope, response["scope_checks"])
+            owners = group_context_owners(scope, response["scope_checks"])
             unit_owners = {unit["subject_person_id"] for unit in units}
             if response["scope_checks"][0]["scope_version"] != response["scope_version"]:
                 raise Fault("scope_changed")
@@ -718,6 +709,64 @@ class Memory:
                 or any(s["kind"] != "shareable_projection" for s in unit["sources"])
             ):
                 raise Fault("forbidden")
+        return response
+
+    async def query_context(self, origin, scope, text, budget, *, queries=None, known_bundle=None):
+        from .memory_context import query_request, validate_response
+
+        request = query_request(
+            query(origin), scope, text, budget, queries=queries, known_bundle=known_bundle
+        )
+        self.contracts.check("memory-context-v2#query_request", request)
+        response = await self.client.call("/internal/v2/memory/context/query", request)
+        self.contracts.check("memory-context-v2#query_response", response)
+        return validate_response(request, response, time.time(), epoch)
+
+    async def verify_context(self, origin, scope, bundle, checks=()):
+        # The wire bound is per batch, never a new rejection of a long valid history.
+        # Every batch is awaited and validated before the caller can generate/send.
+        batches = [list(checks)[i : i + 64] for i in range(0, len(checks), 64)] or [[]]
+        for batch in batches:
+            request = dict(
+                schema_version=2,
+                query=query(origin),
+                requested_scope=scope,
+                bundle=bundle,
+                checks=batch,
+            )
+            self.contracts.check("memory-context-v2#verify_request", request)
+            response = await self.client.call("/internal/v2/memory/context/verify", request)
+            self.contracts.check("memory-context-v2#verify_response", response)
+            current = response["bundle"]
+            if (
+                response["request_id"] != request["query"]["request_id"]
+                or response["effective_scope"] != scope
+                or current["effective_scope"] != scope
+            ):
+                raise Fault("forbidden")
+            if (
+                epoch(response["valid_until"]) <= time.time()
+                or epoch(current["valid_until"]) <= time.time()
+            ):
+                raise Fault("scope_changed")
+            if any(
+                current[key] != bundle[key]
+                for key in (
+                    "queries",
+                    "selection",
+                    "include_associated",
+                    "budget",
+                    "limits",
+                    "evidence_ids",
+                    "evidence_digest",
+                    "group_dependencies",
+                    "episode_dependencies",
+                )
+            ):
+                raise Fault("scope_changed")
+            expected = [(c["check_id"], c["kind"], "valid") for c in batch]
+            if [(c["check_id"], c["kind"], c["status"]) for c in response["checks"]] != expected:
+                raise Fault("invalid_input")
         return response
 
     async def history(self, origin, scope, *, expected=None, known=None):
@@ -748,7 +797,7 @@ class Memory:
         if not history_scopes or history_scopes[0]["scope"] != scope:
             raise Fault("forbidden")
         if scope["audience"] == "group":
-            _group_context_owners(scope, history_scopes)
+            group_context_owners(scope, history_scopes)
         if expected is not None and (
             response["scope_version"] != expected["scope_version"]
             or snapshot["association_version"] != expected["association_version"]
@@ -886,12 +935,38 @@ class Memory:
             raise Fault("invalid_input", unknown=True)
         return value
 
-    async def process_candidate(self, job_id, output):
+    async def process_candidate(self, job_id, output, *, extraction_schema=None):
+        if extraction_schema is not None and (
+            type(extraction_schema) is not int or extraction_schema not in (3, 4)
+        ):
+            raise Fault("invalid_input")
+        request = dict(job_id=job_id, output=output)
+        if extraction_schema is not None:
+            if output is None:
+                request["supported_extraction_schemas"] = [3, 4] if extraction_schema == 4 else [3]
+            else:
+                request["extraction_schema"] = extraction_schema
+            self.contracts.check("memory-extraction#process_request", request)
         value = await self.client.call(
             "/internal/v1/memory/candidates/process",
-            dict(job_id=job_id, output=output),
+            request,
             uncertain_write=output is not None,
         )
+        if extraction_schema is not None:
+            try:
+                self.contracts.check("memory-extraction#process_response", value)
+            except Fault:
+                raise Fault("invalid_input", unknown=output is not None) from None
+            supported = request.get("supported_extraction_schemas", [extraction_schema])
+            if (
+                type(value["extraction_schema"]) is not int
+                or value["extraction_schema"] not in supported
+            ):
+                raise Fault("invalid_input", unknown=output is not None)
+            for index, source in enumerate(value["content"]):
+                if source["index"] != index:
+                    raise Fault("invalid_input", unknown=output is not None)
+            return value
         if (
             not isinstance(value, dict)
             or set(value)

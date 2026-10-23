@@ -589,12 +589,24 @@ class RoleActions:
             ),
         )
         if receipt["state"] in {"committed", "corrected", "tombstoned"}:
-            current = await self.core.memory.select(
-                turn["origin"],
-                turn["scope"],
-                self.core._input_text(turn),
-                dict(tokens=8192, bytes=8192),
-            )
+            memory_context = None
+            if hasattr(self.core.memory, "query_context"):
+                from .memory_context import selection
+
+                memory_context = await self.core.memory.query_context(
+                    turn["origin"],
+                    turn["scope"],
+                    self.core._input_text(turn),
+                    dict(tokens=8192, bytes=8192),
+                )
+                current = selection(memory_context)
+            else:
+                current = await self.core.memory.select(
+                    turn["origin"],
+                    turn["scope"],
+                    self.core._input_text(turn),
+                    dict(tokens=8192, bytes=8192),
+                )
             with self.core.store.transaction():
                 fresh = self.core.store.get("turns", turn["id"])
                 fresh.update(
@@ -608,6 +620,12 @@ class RoleActions:
                     profile_checks=[],
                     short_context=None,
                 )
+                if memory_context is not None:
+                    fresh["memory_context"] = memory_context
+                    fresh["history_snapshot"] = memory_context["bundle"]["history_snapshot"]
+                    fresh["input_history_snapshot"] = memory_context["bundle"][
+                        "input_history_snapshot"
+                    ]
                 self.core._save_turn(fresh)
                 if target.get("record_id") and value["kind"] in {"correct", "forget"}:
                     self.core.life.concerns.invalidate(

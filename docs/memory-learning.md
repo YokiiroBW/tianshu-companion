@@ -1,5 +1,9 @@
 # 自动记忆闭环
 
+TS-307：新候选首次读取显式声明 `supported_extraction_schemas=[3,4]`。Memory 决定并锁定 job 的版本，Core 在调用模型前持久化返回版本；新版等待项可以明确恢复 Memory 已受理的 schema3 job。旧持久提案缺少 pin 时沿原请求和原提案恢复，不从 JSON 形状猜版本、不因400静默降级、不重新生成结果不明的提案。协商后的提交携带准确的 `extraction_schema`，读取回执、unknown 和幂等恢复继续复用现有队列。
+
+schema4 抽取使用发布合同的 output 定义，从现有 Registry 内联外部引用给模型；实际校验仍使用发布合同。模型提出 author/entity/event、原子 predicate/value、modality、single/set、operation 和精确 target_refs，每项保留原话证据、条件、否定和时间。Memory 负责身份绑定、规范 statement、更新及回执；Core 不建立第二份记忆账本。计划和已观察事实使用同一属性的不同 modality，不能互相覆盖或推断完成状态。schema4 不再调用旧中文空结果补抽规则，空 memories 是合法结果；既有 schema3 恢复保留其原行为。普通聊天不增加第二个审核模型。
+
 正常对话沿用原有来源记录和候选 outbox。候选受理后，`MemoryLearning` 在现有 metadata 持久队列中登记候选 job，独立后台循环每秒取一条到期工作，不在聊天投递锁内等待模型。既有已受理候选通过有界 rowid 游标补入，每轮最多检查 64 条。
 
 TS-165 起，抽取与生活任务使用同一后台模型容量，合计最多一个活动请求；聊天优先且后台保留进展机会。总并发、持久恢复与模型选择沿用现有配置，具体调度和重新核验规则见 `query-transport.md`。这不表示候选任务完成前聊天必须等待，也不表示所有完成任务都会写入事实。

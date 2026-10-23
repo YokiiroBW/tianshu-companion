@@ -7,8 +7,14 @@ from .contracts import Fault, canonical
 
 
 SOURCE_INSTRUCTION = """
-Human source timeline 只提供来源和人物对应；原话仅在 messages、recent_dialogue、
-earlier_fragment 中。response_scope 的 current_message_refs 才是本轮要回应的输入；
+memory_state 的 fact 是规范状态，episodes 是有来源的当时原话，两者都不是权限。
+结合规范状态与原话理解同一人同一对象的变化，不用旧的自由描述覆盖更新属性。
+planned/conditional/uncertain 不能变成 observed：计划出发、确认能去、实际出发、到达分别需要自己的证据。
+observed_at 仅说明来源观测时间，valid_from/to 是事实有效范围，event_time 只承载有源的事件时间。
+没有实况更新时保留最新已知状态，不由计划或时间经过补写已执行，也不把未知说成确定未发生。
+episodes 可包含提问、暂时行动和未决指代；它们帮助理解上下文，不自动成为永久偏好或当前事实。
+Human source timeline 只提供来源和人物对应；原话在 messages、recent_dialogue、
+earlier_fragment、episodes 中。response_scope 的 current_message_refs 才是本轮要回应的输入；
 context_turns 是其他轮的来源，其他人的并发提问或自己的历史提问都不是本轮待办，
 只有当前输入明确引用并要求处理时才一并回答。用 source_ref 定位消息，按
 chronological_message_refs 的顺序理解；阶段和投递状态是选取上下文时的快照。
@@ -182,6 +188,8 @@ def material_sources(context):
     result = []
     for kind in (
         "evidence",
+        "memory_state",
+        "episodes",
         "profiles",
         "recent_dialogue",
         "earlier_fragment",
@@ -197,7 +205,12 @@ def material_sources(context):
 
 def _recalled_subjects(context, participants, requester):
     recalled = {}
-    for index, unit in enumerate(context.get("evidence", []), 1):
+    materials = [
+        (f"{kind}:{index}", unit)
+        for kind in ("evidence", "episodes")
+        for index, unit in enumerate(context.get(kind, []), 1)
+    ]
+    for reference, unit in materials:
         person = unit["subject_person_id"]
         subject = recalled.setdefault(
             person,
@@ -214,7 +227,7 @@ def _recalled_subjects(context, participants, requester):
                 ],
             ),
         )
-        subject["evidence_refs"].append(f"evidence:{index}")
+        subject["evidence_refs"].append(reference)
     return list(recalled.values())
 
 

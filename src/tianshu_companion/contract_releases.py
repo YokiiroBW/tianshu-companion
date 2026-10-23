@@ -1,6 +1,8 @@
 """Coordinator-published LF manifest pins, owned by the contract loader."""
 
 RELEASES = {
+    "memory-extraction/v1": "462b792b498d7f6663124be7db9b7e482528b3b97709205921d3cf11a87ae857",
+    "memory-context/v2": "9ed6364fee9f19a4a5392af753a47718ca7f716969e274d43a55d3580837799d",
     "reading-state/v1": "2dc05bb8658988a46e286de6ef283d49bfb286e45141a4d2cfc0501d79bf1ebb",
     "skills/v1": "0ad3a444e8bff26721c14664260d08b463feb3288a556364e1af35f3e277d0f2",
     "bot-connection/v1": "ba4c23494452e911526b10aa85fb8c2d994e7feaa1bc1e24e1f8f7cd69a4223d",
