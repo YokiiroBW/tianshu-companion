@@ -112,6 +112,61 @@ def test_episode_capture_between_query_and_verify_requires_complete_reselection(
     asyncio.run(run())
 
 
+def test_episode_capture_during_query_ranking_returns_to_complete_preparation(sync):
+    from test_retrieval import Backend
+    from tianshu_companion.preparation_retry import retry_preparation, verify_prepared_memory
+    from tianshu_memory.memory_reindex import MemoryReindexer
+    from tianshu_memory.retrieval import Retrieval
+
+    producer.setup(sync)
+    producer.candidate(sync, "我喜欢咖啡。", 1)
+    backend = Backend("hybrid")
+    sync.service.retrieval = Retrieval(backend)
+    sync.service.retrieval.store = sync.store
+    assert MemoryReindexer(sync.service).index_step()["indexed"] == 1
+
+    def capture_during_ranking():
+        # This runs after query releases its first source transaction and before
+        # the second full barrier. A candidate read alone captures the new episode.
+        producer.candidate(sync, "我带咖啡去松林。", 2)
+
+    backend.hook = capture_during_ranking
+    backend.calls.clear()
+
+    async def run():
+        memory, wire = client(sync)
+        try:
+            origin, scope = sync.command()["origin"], sync.scope()
+            turn = dict(
+                origin=origin,
+                scope=scope,
+                preparation=None,
+                memory_context=None,
+                model_calls=0,
+                source_deadline=time.time() + 60,
+            )
+            with pytest.raises(Fault) as caught:
+                await memory.query_context(origin, scope, "咖啡", dict(tokens=8192, bytes=8192))
+            failure = caught.value
+            assert failure.code == "scope_changed" and failure.cause["http_status"] == 409
+            assert failure.read_execution == "not_started" and not failure.unknown
+            assert failure.memory_selection_invalid and not failure.retryable_read
+            assert any(operation == "embed" for operation, _ in backend.calls)
+            assert retry_preparation(turn, failure, time.time())
+            assert turn["memory_context"] is None and turn["preparation"] is None
+            fresh = await memory.query_context(origin, scope, "咖啡", dict(tokens=8192, bytes=8192))
+            assert {row["text"] for row in fresh["evidence"] if row["kind"] == "episode"} == {
+                "我喜欢咖啡。",
+                "我带咖啡去松林。",
+            }
+            turn["memory_context"] = fresh
+            await verify_prepared_memory(memory, turn, [])
+        finally:
+            await wire.close()
+
+    asyncio.run(run())
+
+
 def test_real_producer_typed_read_and_combined_legacy_verification(sync):
     producer.setup(sync)
     text = "我喜欢乌龙茶。"

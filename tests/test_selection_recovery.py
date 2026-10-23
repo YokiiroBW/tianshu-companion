@@ -3,7 +3,9 @@
 import copy
 import unittest
 
+import httpx
 import test_memory_v2 as evidence
+from tianshu_companion.clients import JsonService, Memory
 from tianshu_companion.contracts import Fault, canonical
 from tianshu_companion.preparation_retry import retry_preparation, verify_prepared_memory
 
@@ -41,6 +43,29 @@ class SelectionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.h.memory.verify_context = verify
         return calls
 
+    def change_during_initial_query(self, *, repeatedly=False, revoke=False):
+        async def conflict(request):
+            return httpx.Response(
+                409, json=dict(code="scope_changed", execution_state="not_started")
+            )
+
+        wire = JsonService(
+            "https://synthetic.invalid", "synthetic", transport=httpx.MockTransport(conflict)
+        )
+        self.addAsyncCleanup(wire.close)
+        memory = Memory(evidence.contracts(), wire)
+        original = self.h.memory.query_context
+
+        async def query(*args):
+            if not self.queries or repeatedly:
+                self.queries.append(args)
+                self.denied = revoke
+                self.version += 1
+                await memory.query_context(*args)
+            return await original(*args)
+
+        self.h.memory.query_context = query
+
     async def start(self):
         await self.h.ingest(text="请回忆刚才提到的计划。")
         await self.h.cycles()
@@ -65,6 +90,67 @@ class SelectionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("第1版可见原话", prompt)
         self.assertGreaterEqual(len(calls), 3)
         self.assertEqual(1, fresh["preparation_retries"])
+
+    async def test_initial_query_conflict_reselects_before_any_model_or_send(self):
+        self.change_during_initial_query()
+        first = await self.start()
+        self.assertEqual("preparing", first["phase"])
+        self.assertIsNone(first["preparation"])
+        self.assertIsNone(first["memory_context"])
+        self.assertEqual([], self.h.gateway.calls)
+        self.h.clock.advance(0.3)
+        await self.h.cycles(80)
+        fresh = self.h.turns()[-1]
+        self.assertEqual("sent", fresh["phase"])
+        self.assertEqual((2, 1), (len(self.queries), len(self.h.gateway.calls)))
+        self.assertEqual(1, fresh["preparation_retries"])
+        self.assertIn("第2版可见原话", canonical(self.h.gateway.calls[-1][1]))
+
+    async def test_initial_query_conflict_followed_by_revocation_fails_without_model(self):
+        self.change_during_initial_query(revoke=True)
+        await self.start()
+        self.h.clock.advance(0.3)
+        await self.h.cycles()
+        fresh = self.h.turns()[-1]
+        self.assertEqual(("failed", "forbidden"), (fresh["phase"], fresh["failure"]))
+        self.assertIsNone(fresh["memory_context"])
+        self.assertEqual(2, len(self.queries))
+        self.assertEqual([], self.h.gateway.calls)
+
+    async def test_continuous_initial_conflict_uses_existing_attempts_and_horizon(self):
+        self.change_during_initial_query(repeatedly=True)
+        first = await self.start()
+        for _ in range(6):
+            self.h.clock.advance(2.1)
+            await self.h.cycles()
+        fresh = self.h.turns()[-1]
+        self.assertEqual("failed", fresh["phase"])
+        self.assertEqual(5, fresh["preparation_retries"])
+        self.assertEqual(
+            first["preparation_retry_started_at"], fresh["preparation_retry_started_at"]
+        )
+        self.assertEqual(6, len(self.queries))
+        self.assertEqual([], self.h.gateway.calls)
+
+    async def test_initial_conflict_expired_horizon_does_not_query_again(self):
+        self.change_during_initial_query(repeatedly=True)
+        await self.start()
+        self.h.clock.advance(30.1)
+        await self.h.cycles()
+        fresh = self.h.turns()[-1]
+        self.assertEqual(("failed", "timeout"), (fresh["phase"], fresh["failure"]))
+        self.assertEqual(1, len(self.queries))
+        self.assertEqual([], self.h.gateway.calls)
+
+    async def test_initial_conflict_cancelled_during_backoff_never_reselects(self):
+        self.change_during_initial_query()
+        first = await self.start()
+        await self.h.cancel(first)
+        self.h.clock.advance(1)
+        await self.h.cycles()
+        self.assertEqual("cancelled", self.h.turns()[-1]["phase"])
+        self.assertEqual(1, len(self.queries))
+        self.assertEqual([], self.h.gateway.calls)
 
     async def test_grant_revocation_reselection_cannot_use_old_material(self):
         self.change_on_verify(revoke=True)

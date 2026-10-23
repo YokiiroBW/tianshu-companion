@@ -432,9 +432,14 @@ class JsonService:
                     "timeout",
                     "result_unknown",
                 }:
-                    raise _retry_hint(
+                    failure = _retry_hint(
                         Fault(code, unknown=value.get("execution_state") == "unknown"), response
                     )
+                    # Preserve the peer's explicit read outcome for its semantic
+                    # owner. This alone does not make another HTTP error retryable.
+                    if retry_query and not_started:
+                        failure.read_execution = "not_started"
+                    raise failure
                 raise _retry_hint(Fault("dependency_unavailable"), response)
             self._report("succeeded", correlation, started, attempts)
             return value
@@ -718,7 +723,21 @@ class Memory:
             query(origin), scope, text, budget, queries=queries, known_bundle=known_bundle
         )
         self.contracts.check("memory-context-v2#query_request", request)
-        response = await self.client.call("/internal/v2/memory/context/query", request)
+        try:
+            response = await self.client.call("/internal/v2/memory/context/query", request)
+        except Fault as error:
+            # The initial two-phase selection can lose its candidate domain
+            # before producing any bundle. Only this explicit read conflict
+            # belongs to the same preparation owner as an invalid current bundle.
+            if (
+                known_bundle is None
+                and error.code == "scope_changed"
+                and not error.unknown
+                and (error.cause or {}).get("http_status") == 409
+                and getattr(error, "read_execution", None) == "not_started"
+            ):
+                error.memory_selection_invalid = True
+            raise
         self.contracts.check("memory-context-v2#query_response", response)
         return validate_response(request, response, time.time(), epoch)
 

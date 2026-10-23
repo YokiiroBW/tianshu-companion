@@ -155,6 +155,70 @@ class EvidenceProtocolTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(4, len(calls))
 
+    async def test_only_explicit_initial_query_conflict_marks_selection_for_its_owner(self):
+        fixture = example("memory-context/v2", "context-positive")
+        request = fixture["query_request"]
+        for endpoint, status, code, state, known in (
+            ("query", 409, "scope_changed", "not_started", False),
+            ("query", 409, "scope_changed", "not_started", True),
+            ("query", 409, "scope_changed", "unknown", False),
+            ("query", 409, "scope_changed", None, False),
+            ("query", 503, "scope_changed", "not_started", False),
+            ("query", 409, "version_conflict", "not_started", False),
+            ("verify", 409, "scope_changed", "not_started", False),
+            ("command", 409, "scope_changed", "not_started", False),
+        ):
+            with self.subTest(
+                endpoint=endpoint, status=status, code=code, state=state, known=known
+            ):
+                calls = []
+
+                async def handler(wire):
+                    calls.append(wire.url.path)
+                    body = dict(code=code)
+                    if state is not None:
+                        body["execution_state"] = state
+                    return httpx.Response(status, json=body)
+
+                client = JsonService(
+                    "https://synthetic.invalid", "synthetic", transport=httpx.MockTransport(handler)
+                )
+                self.addAsyncCleanup(client.close)
+                memory = Memory(self.contracts, client)
+                with self.assertRaises(Fault) as caught:
+                    if endpoint == "query":
+                        await memory.query_context(
+                            request["query"]["origin"],
+                            request["requested_scope"],
+                            "合成查询",
+                            request["budget"],
+                            known_bundle=fixture["query_response"]["bundle"] if known else None,
+                        )
+                    elif endpoint == "verify":
+                        await memory.verify_context(
+                            request["query"]["origin"],
+                            request["requested_scope"],
+                            fixture["query_response"]["bundle"],
+                        )
+                    else:
+                        await client.call("/internal/v1/identity/register", {})
+                failure = caught.exception
+                self.assertEqual(1, len(calls))
+                self.assertFalse(failure.retryable_read)
+                self.assertEqual(state == "unknown", failure.unknown)
+                self.assertEqual(
+                    endpoint == "query"
+                    and status == 409
+                    and code == "scope_changed"
+                    and state == "not_started"
+                    and not known,
+                    getattr(failure, "memory_selection_invalid", False),
+                )
+                self.assertEqual(
+                    "not_started" if endpoint != "command" and state == "not_started" else None,
+                    getattr(failure, "read_execution", None),
+                )
+
     def test_prompt_schema_resolves_published_external_refs_without_copying_rules(self):
         schema = output_schema(self.contracts)
         self.assertNotIn('"$ref"', canonical(schema))
