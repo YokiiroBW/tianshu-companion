@@ -1,5 +1,46 @@
 """Schema4 extraction is a grounded proposal, never a second factual authority."""
 
+from itertools import islice
+
+from jsonschema import Draft202012Validator, FormatChecker
+
+from .contracts import Fault, strict_json
+
+
+class ProposalStructureError(Fault):
+    """A newly generated proposal failed locally, before any Memory submission."""
+
+    def __init__(self, code, diagnostics):
+        super().__init__(code)
+        self.diagnostics = diagnostics
+
+
+def parse_proposal(contracts, raw, *, schema4=False):
+    """Validate before caching; diagnostics contain schema paths, never source values."""
+    if len(raw.encode()) > 32768:
+        raise ProposalStructureError("budget_exceeded", [dict(path=[], keyword="byte_limit")])
+    try:
+        output = strict_json(raw)
+    except ValueError:
+        raise ProposalStructureError("invalid_input", [dict(path=[], keyword="json")]) from None
+    if schema4:
+        schema = contracts.schemas["memory-extraction"]
+        validator = Draft202012Validator(
+            {"$ref": schema["$id"] + "#/$defs/output"},
+            registry=contracts.registry,
+            format_checker=FormatChecker(),
+        )
+        # Schema paths originate in the pinned contract, unlike an instance path
+        # that could contain an arbitrary attacker-controlled property name.
+        diagnostics = [
+            dict(path=list(error.absolute_schema_path)[:16], keyword=error.validator)
+            for error in islice(validator.iter_errors(output), 3)
+        ]
+        if diagnostics:
+            raise ProposalStructureError("invalid_input", diagnostics)
+    return output
+
+
 PROMPT_V4 = """Return only the JSON object {"memories": [...]} with at most 32 atomic entries.
 Use the provided output_schema exactly. Do not include statement or any other extra field.
 The numbered messages are the only evidence for new claims. Quote exact substrings using
@@ -91,24 +132,26 @@ def output_schema(contracts):
     return inline({"$ref": schema["$id"] + "#/$defs/output"}, contracts.registry.resolver())
 
 
-def messages(contracts, response, *, rejected=False):
+def messages(contracts, response, *, rejected=False, diagnostics=None):
     """Render the published schema, not a separately maintained JSON shape."""
     from .contracts import canonical
 
     system = PROMPT_V4
     if rejected:
         system += "\nThe previous proposal was explicitly rejected without committing. Recheck exact quotes, subject identity and complete target versions; do not repeat an unsupported update."
+    material = dict(
+        extraction_schema=4,
+        messages=response["content"],
+        known_facts=response["known_facts"],
+        output_schema=output_schema(contracts),
+    )
+    if diagnostics:
+        system += "\nThe previous proposal failed local structure validation before submission. Use previous_local_validation to correct its JSON/schema structure; it is not evidence for any claim."
+        material["previous_local_validation"] = diagnostics
     return [
         dict(role="system", content=system),
         dict(
             role="user",
-            content=canonical(
-                dict(
-                    extraction_schema=4,
-                    messages=response["content"],
-                    known_facts=response["known_facts"],
-                    output_schema=output_schema(contracts),
-                )
-            ),
+            content=canonical(material),
         ),
     ]

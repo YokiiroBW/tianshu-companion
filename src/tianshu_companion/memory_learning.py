@@ -7,6 +7,7 @@ import json
 from .contracts import Fault, canonical, digest, strict_json
 from .model_selection import SelectionRequest, resolve_selection
 from .memory_admission import empty_extraction_reason, extraction_review_hints
+from .memory_extraction import ProposalStructureError, parse_proposal
 from .short_context import sources_current
 from . import observability as obs
 
@@ -646,17 +647,27 @@ class MemoryLearning:
                                     core.contracts,
                                     response,
                                     rejected=bool(item.get("proposal_rejected")),
+                                    diagnostics=item.get("proposal_diagnostics"),
                                 )
                             segments, _ = await asyncio.wait_for(
                                 core.gateway.generate(generation, messages), MODEL_TIMEOUT_SECONDS
                             )
                         raw = "\n".join(segments)
                         item["stage"] = "proposal"
-                        if len(raw.encode()) > 32768:
-                            raise Fault("budget_exceeded")
-                        item["output"] = strict_json(raw)
-                        if schema4:
-                            core.contracts.check("memory-extraction#output", item["output"])
+                        try:
+                            output = parse_proposal(core.contracts, raw, schema4=schema4)
+                        except ProposalStructureError as error:
+                            # This call only parses the new model result. It has
+                            # not cached or sent a proposal; use the existing
+                            # bounded correction path, never commit recovery.
+                            item.update(
+                                output=None,
+                                proposal_rejected=True,
+                                proposal_diagnostics=error.diagnostics,
+                            )
+                            raise
+                        item["output"] = output
+                        item.pop("proposal_diagnostics", None)
                         if item["output"] == {"memories": []} and not item.get("empty_review"):
                             if hints:
                                 # Yield the background slot and durably reserve one review.
