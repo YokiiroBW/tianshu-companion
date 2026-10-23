@@ -348,14 +348,14 @@ class ExtractionNegotiationTests(unittest.IsolatedAsyncioTestCase):
             job_id="job:legacy-ack",
             extraction_schema=4,
         )
-        await h.core.memory_learning._candidate(item, None)
+        await h.core.memory_learning._candidate_request(item, None)
         saved = h.core.store.get("metadata", item["id"])
         self.assertEqual(3, saved["extraction_schema"])
         self.assertTrue(saved["extraction_negotiated"])
-        await h.core.memory_learning._candidate(saved, {"memories": []})
+        await h.core.memory_learning._candidate_request(saved, {"memories": []})
         self.assertEqual(dict(extraction_schema=3), calls[-1][2])
         old = dict(id="memory:learning:retained", job_id="job:old")
-        await h.core.memory_learning._candidate(old, {"memories": []})
+        await h.core.memory_learning._candidate_request(old, {"memories": []})
         self.assertEqual({}, calls[-1][2])
 
 

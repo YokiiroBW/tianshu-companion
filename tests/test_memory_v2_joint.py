@@ -6,6 +6,7 @@ does not call a model, production database, device, or live account.
 """
 
 import asyncio
+import copy
 import importlib.util
 import json
 import os
@@ -162,6 +163,119 @@ def test_episode_capture_during_query_ranking_returns_to_complete_preparation(sy
             turn["memory_context"] = fresh
             await verify_prepared_memory(memory, turn, [])
         finally:
+            await wire.close()
+
+    asyncio.run(run())
+
+
+def test_candidate_owner_defers_real_episode_capture_until_dialogue_boundary(sync):
+    from support import Harness
+    from test_candidate_extraction import TEXT, prepare
+    from tianshu_companion.contracts import digest
+
+    producer.setup(sync)
+    job = prepare(sync)  # A real accepted job, before its first content/capture read.
+
+    async def run():
+        memory, wire = client(sync)
+        h = Harness(silence_ms=0)
+        calls = []
+        actual = memory.process_candidate
+
+        async def process(job_id, output, **kwargs):
+            calls.append(copy.deepcopy(output))
+            return await actual(job_id, output, **kwargs)
+
+        async def empty_proposal(turn, messages):
+            return ['{"memories":[]}'], {}
+
+        memory.process_candidate = process
+        h.core.memory = memory
+        h.core.gateway.generate = empty_proposal
+        scope = sync.scope()
+        physical, admission = copy.deepcopy(sync.physicals[0]), copy.deepcopy(sync.admissions[0])
+        message = dict(
+            message_key=dict(physical["key"], revision=physical["revision"]),
+            source=admission["source"],
+        )
+        # Both sides use these same explicit synthetic admitted source facts.
+        # Core's real source-current and active-scope checks remain enabled.
+        h.core.store.put(
+            "physicals",
+            dict(
+                id=digest(message["message_key"]),
+                conversation_id=scope["conversation_id"],
+                base=digest(physical["key"]),
+                revision=physical["revision"],
+                fact=physical,
+            ),
+        )
+        h.core.store.put(
+            "admissions",
+            dict(
+                id=digest(admission["selector"]),
+                conversation_id=scope["conversation_id"],
+                fact=admission,
+            ),
+        )
+        turn = dict(
+            id="turn:joint-source",
+            scope=scope,
+            conversation_id=scope["conversation_id"],
+            role=h.core.roles[scope["actor_id"]],
+            phase="sent",
+            cancelled=False,
+            bundle=dict(messages=[message]),
+            config_version=1,
+        )
+        h.core.store.put("turns", turn)
+        active = dict(turn, id="turn:joint-active", phase="generating")
+        h.core.store.put("turns", active)
+        item = dict(
+            id="memory-learn:" + digest(job),
+            conversation_id="memory:learning",
+            job_id=job,
+            turn_id=turn["id"],
+            scope=scope,
+            output=None,
+            attempts=0,
+            proposal_failures=0,
+            recovery_failures={},
+            extraction_schema=4,
+            state="pending",
+            deadline=0,
+        )
+        h.core.store.put("metadata", item)
+        worker = h.core.memory_learning
+        try:
+            origin = sync.command()["origin"]
+            before = await memory.query_context(
+                origin, scope, "咖啡", dict(tokens=8192, bytes=8192)
+            )
+            assert before["evidence"] == []
+            await worker._work(item)
+            waiting = h.core.store.get("metadata", item["id"])
+            assert waiting["stage"] == "capture_wait" and waiting["attempts"] == 0
+            assert calls == [] and worker.admission_blocked(scope)
+            await memory.verify_context(origin, scope, before["bundle"])
+            active["phase"] = "sent"
+            h.core.store.put("turns", active)
+            await worker._work(waiting)
+            completed = h.core.store.get("metadata", item["id"])
+            assert completed["state"] == "completed" and completed["attempts"] == 1
+            assert calls == [None, {"memories": []}]
+            assert not worker.admission_blocked(scope)
+            with pytest.raises(Fault) as changed:
+                await memory.verify_context(origin, scope, before["bundle"])
+            assert changed.value.code == "scope_changed"
+            fresh = await memory.query_context(origin, scope, "咖啡", dict(tokens=8192, bytes=8192))
+            assert [row["text"] for row in fresh["evidence"] if row["kind"] == "episode"] == [TEXT]
+            assert (await worker.reconcile(job))["state"] == "completed"
+            await memory.verify_context(origin, scope, fresh["bundle"])
+            with sync.store.transaction() as db:
+                assert db.execute("SELECT count(*) FROM memory_documents").fetchone()[0] == 1
+        finally:
+            await h.core.close()
             await wire.close()
 
     asyncio.run(run())

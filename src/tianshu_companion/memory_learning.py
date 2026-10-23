@@ -16,6 +16,7 @@ MAX_ATTEMPTS = 3
 MAX_RECOVERY_ATTEMPTS = 6
 MAX_TOTAL_ATTEMPTS = 3 * MAX_RECOVERY_ATTEMPTS
 MODEL_TIMEOUT_SECONDS = 30
+MUTATION_WAIT = {"capture_wait", "commit_wait"}
 PROMPT = """Extract explicitly stated information about the source author that remains useful after
 this turn: lasting facts/preferences, organized bounded plans, and their later status updates.
 Keep statements, conditions, negations, value and keywords in the SAME language as the source.
@@ -160,12 +161,12 @@ class MemoryLearning:
         self.lock = asyncio.Lock()
         self.jobs = {}
         self.closed = False
-        self.commit_job = self.commit_scope = None
+        self.mutation_scopes = {}
 
     def admission_blocked(self, scope):
         if not self.core.automatic_memory_candidates:
             return False
-        if self.commit_scope and memory_scopes_overlap(self.commit_scope, scope):
+        if any(memory_scopes_overlap(active, scope) for active in self.mutation_scopes.values()):
             return True
         # Persisted barriers survive restart. Waiting in one room must neither
         # hold the commit lock nor prevent extraction in independent rooms.
@@ -173,23 +174,10 @@ class MemoryLearning:
             memory_scopes_overlap(json.loads(row[0]), scope)
             for row in self.core.store.db.execute(
                 "SELECT CAST(json_extract(body,'$.scope') AS TEXT) FROM metadata WHERE conversation_id=? "
-                "AND status='pending' AND json_extract(body,'$.stage')='commit_wait'",
+                "AND status='pending' AND json_extract(body,'$.stage') IN ('capture_wait','commit_wait')",
                 (QUEUE,),
             )
         )
-
-    def _commit_ready(self, item, turn):
-        if item["output"] == {"memories": []}:
-            # Memory checks the source and records a skipped receipt without a
-            # content-version change. It cannot invalidate an active dialogue.
-            if self.commit_job == item["id"]:
-                self._release_commit()
-            return True
-        self.commit_job, self.commit_scope = item["id"], turn["scope"]
-        return not self.core.has_active_dialogue(self.commit_scope)
-
-    def _release_commit(self):
-        self.commit_job = self.commit_scope = None
 
     def queue(self, item):
         receipt = item.get("receipt") or {}
@@ -288,10 +276,16 @@ class MemoryLearning:
             ).fetchone()
             if row:
                 item = json.loads(row[0])
-                if item.get("stage") == "commit_wait" and self.core.has_active_dialogue(
-                    item["scope"]
-                ):
-                    continue
+                if item.get("stage") in MUTATION_WAIT:
+                    try:
+                        self._source_turn(item)
+                    except Fault as error:
+                        self._failed(item, error.code, error)
+                        store.put("metadata", item)
+                        self.core.counted("memory.work")
+                        continue
+                    if self.core.has_active_dialogue(item["scope"]):
+                        continue
                 # Resume after the selected job rather than skipping the rest
                 # of its page. Scope ordering is independent of this fair cursor.
                 setattr(
@@ -377,8 +371,7 @@ class MemoryLearning:
             if running is not None:
                 running.cancel()
                 await asyncio.gather(running, return_exceptions=True)
-            async with self.lock:
-                return await self._reconcile(job_id, key)
+            return await self._reconcile(job_id, key)
 
     async def _reconcile(self, job_id, key):
         item = self.core.store.get("metadata", key)
@@ -388,8 +381,7 @@ class MemoryLearning:
         if not turn or not self.core._turn_allows(turn, "memory.write"):
             raise Fault("forbidden")
         self.core._check_role(turn)
-        async with asyncio.timeout(45):
-            response = await self._candidate(item, None)
+        response = await self._candidate(item, None, reconcile=True)
         if response["state"] in {"completed", "invalidated"}:
             item.update(
                 state=response["state"],
@@ -453,22 +445,49 @@ class MemoryLearning:
             self.jobs.clear()
 
     async def _commit(self, item):
-        # Only commits serialize. Provider waits, extraction and unrelated
-        # receipt reads never occupy the single write boundary.
+        # Preserve the existing single proposal-commit boundary. Candidate reads
+        # in independent scopes can still progress while another source is slow.
         async with self.lock:
-            try:
-                turn = self._source_turn(item)
-                if not self._commit_ready(item, turn):
-                    item["stage"] = "commit_wait"
+            return await self._candidate(item, item["output"])
+
+    async def _candidate(self, item, output, *, reserve_attempt=False, reconcile=False):
+        # A null lookup can capture an episode. All candidate calls therefore
+        # share the same mutation/admission owner, including explicit recovery.
+        # Waiting persists only on normal queue jobs and releases this worker.
+        try:
+            turn = self._source_turn(item)
+            mutates = output != {"memories": []}
+            if mutates and self.core.has_active_dialogue(turn["scope"]):
+                if reconcile:
+                    # No automatic generation or orphaned durable gate for
+                    # an explicit receipt-only check of a blocked job.
+                    raise Fault("queue_full")
+                waiting = (
+                    "commit_wait"
+                    if output is not None or item.get("stage") == "commit_wait"
+                    else "capture_wait"
+                )
+                if item.get("stage") != waiting:
+                    item["stage"] = waiting
                     self.core.store.put("metadata", item)
                     self.core.counted("memory.work")
-                    return None
-                item["stage"] = "commit"
+                return None
+            if mutates:
+                self.mutation_scopes[item["id"]] = turn["scope"]
+            if reserve_attempt:
+                # Only actual receipt/capture I/O spends an attempt. A
+                # restarted wait retains all prior counters and proposal.
+                item["attempts"] += 1
+            if not reconcile:
+                if output is not None:
+                    item["stage"] = "commit"
+                elif item.get("stage") not in MUTATION_WAIT:
+                    item["stage"] = "receipt"
                 self.core.store.put("metadata", item)
-                async with asyncio.timeout(45):
-                    return await self._candidate(item, item["output"])
-            finally:
-                self._release_commit()
+            async with asyncio.timeout(45):
+                return await self._candidate_request(item, output)
+        finally:
+            self.mutation_scopes.pop(item["id"], None)
 
     def _source_turn(self, item):
         core = self.core
@@ -489,7 +508,7 @@ class MemoryLearning:
         core._check_role(turn)
         return turn
 
-    async def _candidate(self, item, output):
+    async def _candidate_request(self, item, output):
         # Missing pins belong to retained pre-upgrade proposals/jobs. Never infer
         # a version from their JSON, and never regenerate an uncertain proposal.
         schema = item.get("extraction_schema", 3)
@@ -520,22 +539,14 @@ class MemoryLearning:
             item.update(state="blocked", deadline=0)
             core.store.put("metadata", item)
             return
-        if not resuming_commit:
-            item["attempts"] += 1
-            # Reserve an attempt durably before I/O; crashes must not reset the retry budget.
-            core.store.put("metadata", item)
         try:
             turn = self._source_turn(item)
-            if resuming_commit and core.has_active_dialogue(turn["scope"]):
-                return  # Waiting is not another attempt or an idle persistent write.
-            if not resuming_commit:
-                item["stage"] = "receipt"
-                core.store.put("metadata", item)
-            # commit_wait is also the durable admission barrier. Keep it during
-            # the read await; its original failure cooldown releases the barrier.
-            async with asyncio.timeout(45):
-                response = await self._candidate(item, None)
+            response = await self._candidate(item, None, reserve_attempt=not resuming_commit)
+            if response is None:
+                return
             item["stage"] = "receipt"
+            if not resuming_commit:
+                core.store.put("metadata", item)
             turn = self._source_turn(item)
             if response["state"] not in {"pending", "completed", "invalidated"}:
                 raise Fault("invalid_input")
@@ -705,8 +716,6 @@ class MemoryLearning:
             )
         except asyncio.CancelledError as error:
             failed_stage = item.get("stage")
-            if item.get("stage") == "commit_wait":
-                item["stage"] = "receipt"
             self._failed(item, "cancelled", error, failed_stage=failed_stage)
             core.store.put("metadata", item)
             raise
@@ -721,14 +730,15 @@ class MemoryLearning:
                 )
             )
             failed_stage = item.get("stage")
-            if failed_stage == "commit_wait":
-                item["stage"] = "receipt"
             self._failed(item, code, error, failed_stage=failed_stage)
         core.store.put("metadata", item)
         core.counted("memory.work")
 
     def _failed(self, item, code, error=None, *, failed_stage=None):
         stage = item.get("stage")
+        if stage in MUTATION_WAIT:
+            failed_stage = failed_stage or stage
+            item["stage"] = stage = "receipt"
         diagnostic = obs.failure_diagnostic(
             error,
             code=code,

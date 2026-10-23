@@ -102,6 +102,23 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.core = self.h.new_core()
         self.h.core.recover()
 
+    async def hold_extraction_after_capture(self):
+        """Exercise commit_wait after raw capture has already completed safely."""
+        gate, entered = asyncio.Event(), asyncio.Event()
+        original = self.h.gateway.generate
+
+        async def held(turn, messages):
+            if turn["id"].startswith("memory-generation:"):
+                entered.set()
+                await gate.wait()
+            return await original(turn, messages)
+
+        self.h.gateway.generate = held
+        await self.h.core.flush_outbox()
+        await self.h.core.memory_learning.work(wait=False)
+        await asyncio.wait_for(entered.wait(), 2)
+        return gate
+
     async def test_automatic_processing_uses_memory_model_and_separate_provider_session(self):
         await self.chat()
         outer = self
@@ -240,6 +257,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_commit_wait_allows_new_unrelated_room_to_start(self):
         await self.h.ingest(text=TEXT, group=True, channel="group:a")
         await self.h.cycles()
+        extraction_gate = await self.hold_extraction_after_capture()
         gate = asyncio.Event()
         original = self.generate
 
@@ -251,6 +269,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.gateway.generate = slow
         await self.h.ingest(text="慢回复", group=True, channel="group:a")
         await self.h.cycles()
+        extraction_gate.set()
         await self.flush()
         self.assertEqual(self.task()["stage"], "commit_wait")
         await self.h.ingest(text="同群排队", group=True, channel="group:a")
@@ -266,8 +285,142 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.h.core.memory_learning.work()
         self.assertEqual(self.task()["state"], "completed")
 
+    async def test_raw_capture_waits_without_attempt_or_model_and_survives_restart(self):
+        await self.chat()
+        self.h.gateway.gates[2] = asyncio.Event()
+        await self.h.ingest(text="同范围回复仍在生成")
+        await self.h.cycles()
+        await self.flush()
+        waiting = self.task()
+        self.assertEqual(("capture_wait", 0), (waiting["stage"], waiting["attempts"]))
+        self.assertEqual({}, waiting["recovery_failures"])
+        self.assertEqual([], self.calls)
+        self.assertEqual([], self.generated)
+        self.assertTrue(self.h.core.memory_learning.admission_blocked(waiting["scope"]))
+        for _ in range(3):
+            await self.h.core.memory_learning.work()
+        self.assertEqual(0, self.task()["attempts"])
+        await self.restart()
+        self.assertEqual(("capture_wait", 0), (self.task()["stage"], self.task()["attempts"]))
+        await self.h.core.memory_learning.work()
+        self.assertEqual(("completed", 1), (self.task()["state"], self.task()["attempts"]))
+        self.assertEqual(1, len(self.generated))
+        self.assertFalse(self.h.core.memory_learning.admission_blocked(waiting["scope"]))
+
+    async def test_capture_wait_blocks_room_followers_but_other_rooms_continue(self):
+        await self.h.ingest(text=TEXT, group=True, channel="group:a")
+        await self.h.cycles()
+        gate = asyncio.Event()
+        self.h.gateway.gates[2] = gate
+        await self.h.ingest(text="同群慢回复", group=True, channel="group:a")
+        await self.h.cycles()
+        await self.flush()
+        self.assertEqual("capture_wait", self.task()["stage"])
+        await self.h.ingest(text="同群排队", group=True, channel="group:a")
+        await self.h.ingest(text="另一群可回复", group=True, channel="group:b", account="b")
+        await self.h.cycles(100)
+        phases = {self.h.core._input_text(t): t["phase"] for t in self.h.turns()}
+        self.assertEqual("queued", phases["同群排队"])
+        self.assertEqual("sent", phases["另一群可回复"])
+        self.assertEqual([], self.calls)
+        self.assertEqual(0, self.task()["attempts"])
+        gate.set()
+        await self.h.cycles()
+        await self.h.core.memory_learning.work()
+        self.assertEqual("completed", self.task()["state"])
+        await self.h.cycles()
+        self.assertEqual("sent", self.h.turns()[2]["phase"])
+
+    async def test_invalidated_waiting_source_releases_gate_without_capture(self):
+        await self.chat()
+        self.h.gateway.gates[2] = asyncio.Event()
+        await self.h.ingest(text="同范围慢回复")
+        await self.h.cycles()
+        await self.flush()
+        waiting = self.task()
+        source = self.h.core.store.get("turns", waiting["turn_id"])
+        source["cancelled"] = True
+        self.h.core.store.put("turns", source)
+        await self.h.core.memory_learning.work()
+        self.assertEqual(
+            ("blocked", "scope_changed"), (self.task()["state"], self.task()["last_error"])
+        )
+        self.assertEqual(0, self.task()["attempts"])
+        self.assertEqual([], self.calls)
+        self.assertFalse(self.h.core.memory_learning.admission_blocked(waiting["scope"]))
+        self.assertEqual({}, self.h.core.memory_learning.mutation_scopes)
+
+    async def test_reconcile_busy_keeps_unknown_proposal_without_a_durable_gate(self):
+        await self.chat()
+        self.lose_response = True
+        await self.flush()
+        retained = self.task()
+        self.h.gateway.gates[2] = asyncio.Event()
+        await self.h.ingest(text="同范围慢回复")
+        await self.h.cycles()
+        worker = self.h.core.memory_learning
+        count = len(self.calls)
+        with self.assertRaises(Fault) as caught:
+            await worker.reconcile(retained["job_id"])
+        self.assertEqual("queue_full", caught.exception.code)
+        self.assertEqual(retained, self.task())
+        self.assertEqual(count, len(self.calls))
+        self.assertFalse(worker.admission_blocked(retained["scope"]))
+        self.assertEqual({}, worker.mutation_scopes)
+        self.h.gateway.gates[2].set()
+        await self.h.cycles()
+        self.assertEqual("completed", (await worker.reconcile(retained["job_id"]))["state"])
+        self.assertEqual(1, len(self.generated))
+        self.assertEqual(1, sum(output is not None for _, output in self.calls))
+
+    async def assert_capture_cancel_keeps_other_owner(self, *, same_room):
+        self.unique_jobs()
+        await self.h.ingest(text=TEXT, group=True, channel="group:a", account="a")
+        await self.h.cycles()
+        await self.h.ingest(
+            text=TEXT, group=True, channel="group:a" if same_room else "group:b", account="b"
+        )
+        await self.h.cycles()
+        await self.h.core.flush_outbox()
+        items = self.h.core.store.list("metadata", "memory:learning")
+        self.assertEqual(2, len(items))
+        gates = {item["job_id"]: asyncio.Event() for item in items}
+        entered = {item["job_id"]: asyncio.Event() for item in items}
+
+        async def held(job, output):
+            if output is None:
+                entered[job].set()
+                await gates[job].wait()
+            return await self.process(job, output)
+
+        self.h.memory.process_candidate = held
+        worker = self.h.core.memory_learning
+        await worker.work(wait=False)
+        for signal in entered.values():
+            await asyncio.wait_for(signal.wait(), 2)
+        self.assertEqual(set(item["id"] for item in items), set(worker.mutation_scopes))
+        first, second = items
+        worker.jobs[first["id"]].cancel()
+        await asyncio.gather(worker.jobs[first["id"]], return_exceptions=True)
+        self.assertNotIn(first["id"], worker.mutation_scopes)
+        self.assertIn(second["id"], worker.mutation_scopes)
+        self.assertTrue(worker.admission_blocked(second["scope"]))
+        self.assertEqual(same_room, worker.admission_blocked(first["scope"]))
+        self.assertEqual([], self.generated)
+        gates[second["job_id"]].set()
+        await asyncio.gather(worker.jobs[second["id"]])
+        self.assertEqual({}, worker.mutation_scopes)
+        self.assertEqual("completed", self.h.core.store.get("metadata", second["id"])["state"])
+
+    async def test_cancelling_capture_keeps_other_overlapping_scope_gate(self):
+        await self.assert_capture_cancel_keeps_other_owner(same_room=True)
+
+    async def test_cancelling_capture_releases_only_its_independent_scope(self):
+        await self.assert_capture_cancel_keeps_other_owner(same_room=False)
+
     async def test_private_commit_still_waits_for_potentially_associated_private_scope(self):
         await self.chat()
+        extraction_gate = await self.hold_extraction_after_capture()
         gate = asyncio.Event()
         original = self.generate
 
@@ -279,6 +432,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.gateway.generate = slow
         await self.h.ingest(text="另一个私聊", channel="private:c", account="c")
         await self.h.cycles()
+        extraction_gate.set()
         await self.flush()
         self.assertEqual(self.task()["stage"], "commit_wait")
         self.assertTrue(self.h.core.memory_learning.admission_blocked(self.h.turns()[-1]["scope"]))
@@ -306,6 +460,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
             return next(t["phase"] for t in self.h.turns() if self.h.core._input_text(t) == text)
 
         await self.chat()
+        extraction_gate = await self.hold_extraction_after_capture()
         generated = asyncio.Event()
         self.h.gateway.gates[2] = generated
         await self.h.ingest(text="下午泡了茉莉绿茶")
@@ -319,6 +474,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
             return response
 
         self.h.memory.process_candidate = changing_commit
+        extraction_gate.set()
         await self.flush()
         item = self.task()
         self.assertEqual(item["stage"], "commit_wait")
@@ -353,9 +509,11 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_commit_wait_survives_restart_without_regeneration_or_retry_charge(self):
         await self.chat()
+        extraction_gate = await self.hold_extraction_after_capture()
         self.h.gateway.gates[2] = asyncio.Event()
         await self.h.ingest(text="下一条消息还在生成")
         await self.h.cycles()
+        extraction_gate.set()
         await self.flush()
         proposal = copy.deepcopy(self.task()["output"])
         self.assertEqual(self.task()["stage"], "commit_wait")
@@ -369,10 +527,12 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_commit_wait_barrier_survives_slow_receipt_cancel_and_restart(self):
         await self.chat()
+        extraction_gate = await self.hold_extraction_after_capture()
         gate = asyncio.Event()
         self.h.gateway.gates[2] = gate
         await self.h.ingest(text="同范围正在回复")
         await self.h.cycles()
+        extraction_gate.set()
         await self.flush()
         waiting = self.task()
         self.assertEqual(waiting["stage"], "commit_wait")
@@ -418,11 +578,6 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_empty_proposal_finishes_while_dialogue_is_generating(self):
         await self.chat()
-        gate = asyncio.Event()
-        self.h.gateway.gates[2] = gate
-        await self.h.ingest(text="还在等这一条回复")
-        await self.h.cycles()
-        self.assertEqual(self.h.turns()[-1]["phase"], "generating")
 
         async def empty(turn, messages):
             if turn["id"].startswith("memory-generation:"):
@@ -430,6 +585,13 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
             return await self.original_generate(turn, messages)
 
         self.h.gateway.generate = empty
+        extraction_gate = await self.hold_extraction_after_capture()
+        gate = asyncio.Event()
+        self.h.gateway.gates[2] = gate
+        await self.h.ingest(text="还在等这一条回复")
+        await self.h.cycles()
+        self.assertEqual(self.h.turns()[-1]["phase"], "generating")
+        extraction_gate.set()
         await self.flush()
         self.assertEqual(self.task()["state"], "completed")
         self.assertEqual(self.task()["attempts"], 1)
@@ -1312,6 +1474,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.unique_jobs()
         await self.h.ingest(text=TEXT, group=True, channel="group:a")
         await self.h.cycles()
+        extraction_gate = await self.hold_extraction_after_capture()
         gate = asyncio.Event()
         original = self.generate
 
@@ -1323,6 +1486,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.gateway.generate = slow
         await self.h.ingest(text="慢回复", group=True, channel="group:a")
         await self.h.cycles()
+        extraction_gate.set()
         await self.flush()
         first = self.task()
         self.assertEqual(first["stage"], "commit_wait")
