@@ -1,6 +1,6 @@
 import pytest
 
-from tianshu_companion.memory_admission import empty_extraction_reason, mixed_stable_hints
+from tianshu_companion.memory_admission import empty_extraction_reason, extraction_review_hints
 
 
 @pytest.mark.parametrize(
@@ -73,7 +73,9 @@ def test_every_message_must_be_proven_empty():
     ],
 )
 def test_mixed_stable_review_preserves_exact_source_clause(text, quote):
-    assert mixed_stable_hints([dict(index=7, text=text)]) == [dict(source_index=7, quote=quote)]
+    assert extraction_review_hints([dict(index=7, text=text)]) == [
+        dict(source_index=7, quote=quote)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -90,4 +92,58 @@ def test_mixed_stable_review_preserves_exact_source_clause(text, quote):
     ],
 )
 def test_no_empty_review_for_transient_question_quotation_or_hypothesis(text):
-    assert mixed_stable_hints([dict(index=0, text=text)]) == []
+    assert extraction_review_hints([dict(index=0, text=text)]) == []
+
+
+def test_plan_update_hint_has_only_current_source_and_the_known_key():
+    text = "我还是想去，几点出发我也没想好。"
+    plan = dict(key="event.visit.plan", state="current", superseded=False, value="周日下午去书屋")
+    assert extraction_review_hints([dict(index=3, text=text)], [plan]) == [
+        dict(source_index=3, quote=text, known_plan_key="event.visit.plan")
+    ]
+    assert "书屋" not in str(extraction_review_hints([dict(index=3, text=text)], [plan]))
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
+        [],
+        [dict(key="identity.name", state="current")],
+        [dict(key="event.visit.plan", state="historical")],
+        [dict(key="event.visit.plan", state="current", superseded=True)],
+        [dict(key="event.visit.plan", state="current", valid_to="2026-01-01T00:00:00Z")],
+        [dict(key="event.visit.plan", state="current", entity=dict(id="entity:x"))],
+        [
+            dict(key="event.visit.plan", state="current"),
+            dict(key="event.meeting.plan", state="current"),
+        ],
+        [dict(key="event.visit.plan.departure", state="current")],
+        [
+            dict(key="event.visit.plan", state="current"),
+            dict(key="event.visit.plan.departure", state="current"),
+        ],
+        [
+            dict(key="event.visit.plan", state="current"),
+            dict(key="event.meeting", state="current", entity=dict(id="entity:other")),
+        ],
+    ],
+)
+def test_unresolved_ended_multiple_or_implicit_entity_plans_do_not_trigger_review(facts):
+    text = "我还是想去，几点出发我也没想好。"
+    assert extraction_review_hints([dict(index=0, text=text)], facts) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "你说我能去吗？",
+        "如果我能去，几点出发还没定。",
+        "朋友说我能去。",
+        "我现在去倒垃圾，几点出发还没想好。",
+        "谢谢，晚安。",
+        "I can swim.",
+    ],
+)
+def test_known_plan_does_not_turn_a_question_report_or_chore_into_update(text):
+    plan = dict(key="event.visit.plan", state="current", superseded=False)
+    assert extraction_review_hints([dict(index=0, text=text)], [plan]) == []

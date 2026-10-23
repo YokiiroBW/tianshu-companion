@@ -174,6 +174,47 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.generated), 2)
         self.assertEqual(self.calls[-1][1], {"memories": []})
 
+    async def test_identifiable_plan_update_is_hinted_initially_and_reviews_at_most_once(self):
+        await self.chat()
+        self.source_text = "我还是想去，几点出发我也没想好。"
+        process = self.process
+
+        async def with_plan(job, output):
+            response = await process(job, output)
+            if response["state"] == "pending":
+                response["known_facts"] = [
+                    dict(
+                        key="event.visit.plan",
+                        value="周日下午去书屋",
+                        state="current",
+                        superseded=False,
+                        entity=None,
+                    )
+                ]
+            return response
+
+        async def empty(turn, messages):
+            self.generated.append(copy.deepcopy(turn))
+            self.extraction_messages.append(copy.deepcopy(messages))
+            return ['{"memories":[]}'], {}
+
+        self.h.memory.process_candidate = with_plan
+        self.h.gateway.generate = empty
+        await self.flush()
+        payload = json.loads(self.extraction_messages[0][-1]["content"])
+        self.assertEqual(
+            payload["source_hints"],
+            [dict(source_index=0, quote=self.source_text, known_plan_key="event.visit.plan")],
+        )
+        self.assertEqual(self.task()["stage"], "empty_review")
+        self.assertFalse(any(output is not None for _, output in self.calls))
+        await self.flush()
+        await self.flush()
+        self.assertEqual(len(self.generated), 2)
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.calls[-1][1], {"memories": []})
+        self.assertEqual(self.generated[1]["generation_budget"]["reasoning_effort"], "low")
+
     async def test_group_commit_does_not_wait_for_unrelated_group_or_private_generation(self):
         await self.h.ingest(text=TEXT, group=True, channel="group:a")
         await self.h.cycles()

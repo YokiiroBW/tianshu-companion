@@ -46,6 +46,44 @@ def media_reply():
     ), data
 
 
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_receipt_lookup_is_exact_indexed_and_preserves_unreleased_barrier(tmp_path, backend):
+    settings = None
+    if backend == "postgresql":
+        url = os.environ.get("TS233_POSTGRES_URL")
+        if not url:
+            pytest.skip("TS233_POSTGRES_URL is required for isolated real PostgreSQL")
+        settings = {
+            "storage_backends": {"postgresql_url": url, "namespace": "q20_" + uuid.uuid4().hex}
+        }
+    store = Store(tmp_path / "receipt.sqlite", settings=settings)
+    try:
+        target = dict(
+            id="input:target", receipt=dict(receipt_id="receipt:target"), response_released=False
+        )
+        with store.transaction():
+            for i in range(1000):
+                store.put("inbox", dict(id=f"old:{i}", receipt=dict(receipt_id=f"old-receipt:{i}")))
+            store.put("inbox", target)
+        self_head = store.source_head()
+        assert store.receipt_input("receipt:target") == target
+        assert store.receipt_input("receipt:missing") is None
+        assert store.source_head() == self_head
+        if backend == "sqlite":
+            steps = []
+            store.db.set_progress_handler(lambda: steps.append(1) or 0, 1)
+            assert store.receipt_input("receipt:target") == target
+            store.db.set_progress_handler(None, 0)
+            assert len(steps) < 40, "Receipt lookup must not scan historical inbox rows"
+        else:
+            sql = store.db.native(
+                "SELECT statement FROM companion_indexes WHERE name='inbox_receipt'"
+            ).fetchone()[0]
+            assert "{receipt,receipt_id}" in sql
+    finally:
+        store.close()
+
+
 def test_large_payload_recovery_and_missing_file_refuses_content(tmp_path):
     path = tmp_path / "main.sqlite"
     reply, data = media_reply()

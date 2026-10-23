@@ -285,6 +285,67 @@ class RuntimeFixTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "index definition mismatch"):
                 Store(path)
 
+    async def test_receipt_index_upgrade_has_pre_ddl_backup_and_rejects_wrong_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "receipts.db"
+            row = dict(id="input:kept", receipt=dict(receipt_id="receipt:kept"))
+            store = Store(path)
+            store.put("inbox", row)
+            head = store.source_head()
+            store.close()
+            with closing(sqlite3.connect(path, isolation_level=None)) as db:
+                db.execute("DROP INDEX inbox_receipt")
+            store = Store(path)
+            self.assertEqual(row, store.receipt_input("receipt:kept"))
+            self.assertEqual(head, store.source_head())
+            store.close()
+            backups = list(Path(tmp).glob("*.pre-work-index-*.bak"))
+            self.assertEqual(len(backups), 1)
+            with closing(sqlite3.connect(backups[0])) as db:
+                self.assertIsNone(
+                    db.execute("SELECT 1 FROM sqlite_master WHERE name='inbox_receipt'").fetchone()
+                )
+                self.assertEqual(1, db.execute("SELECT COUNT(*) FROM inbox").fetchone()[0])
+            Store(path).close()
+            self.assertEqual(backups, list(Path(tmp).glob("*.pre-work-index-*.bak")))
+            with closing(sqlite3.connect(path, isolation_level=None)) as db:
+                db.execute("DROP INDEX inbox_receipt")
+                db.execute("CREATE INDEX inbox_receipt ON inbox(id)")
+            with self.assertRaisesRegex(RuntimeError, "index definition mismatch: inbox_receipt"):
+                Store(path)
+
+    async def test_receipt_index_backup_failure_happens_before_any_ddl(self):
+        from tianshu_companion import work_index
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "receipts.db"
+            Store(path).close()
+            with closing(sqlite3.connect(path, isolation_level=None)) as db:
+                db.execute("DROP INDEX inbox_receipt")
+            statements = []
+            connect, prepare = sqlite3.connect, work_index.prepare
+
+            def without_backup(target, *args, **kwargs):
+                if str(target).endswith(".bak"):
+                    raise OSError("Synthetic unavailable backup")
+                return connect(target, *args, **kwargs)
+
+            def traced(connection, *args, **kwargs):
+                connection.set_trace_callback(statements.append)
+                return prepare(connection, *args, **kwargs)
+
+            with (
+                patch("tianshu_companion.work_index.sqlite3.connect", without_backup),
+                patch("tianshu_companion.work_index.prepare", traced),
+                self.assertRaises(OSError),
+            ):
+                Store(path)
+            self.assertFalse(any("CREATE " in sql.upper() for sql in statements), statements)
+            with closing(connect(path)) as db:
+                self.assertIsNone(
+                    db.execute("SELECT 1 FROM sqlite_master WHERE name='inbox_receipt'").fetchone()
+                )
+
     async def test_work_pages_are_fair_and_do_not_walk_completed_history(self):
         store = Store(":memory:")
         try:

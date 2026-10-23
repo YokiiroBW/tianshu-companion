@@ -808,7 +808,8 @@ class Store:
 
     def receipt_input(self, receipt_id):
         row = self.db.execute(
-            "SELECT body FROM inbox WHERE json_extract(body,'$.receipt.receipt_id')=?",
+            "SELECT body FROM inbox INDEXED BY inbox_receipt "
+            "WHERE json_extract(body,'$.receipt.receipt_id')=? LIMIT 1",
             (receipt_id,),
         ).fetchone()
         return json.loads(row[0]) if row else None

@@ -64,10 +64,10 @@ class HttpsSourceTests(unittest.TestCase):
             channel = dict(
                 namespace="qq",
                 binding_id="qq-fixture",
-                channel_conversation_id="fixture:group",
+                channel_conversation_id="group:9900298",
                 thread_id=None,
             )
-            author = dict(namespace="qq", immutable_account_id="synthetic-only")
+            author = dict(namespace="qq", immutable_account_id="990029800001")
             physical = dict(
                 message_key=dict(channel=channel, message_id="p:tls", revision=1),
                 author=author,
@@ -101,7 +101,11 @@ class HttpsSourceTests(unittest.TestCase):
                     role = (
                         "platform"
                         if self.path
-                        in ("/internal/v1/source-access/read", "/internal/v1/origins/resolve")
+                        in (
+                            "/internal/v1/source-access/read",
+                            "/internal/v1/origins/resolve",
+                            "/internal/v1/qq-admin/check",
+                        )
                         else "memory"
                     )
                     if self.headers.get("Authorization") != "Bearer " + tokens[role]:
@@ -150,6 +154,16 @@ class HttpsSourceTests(unittest.TestCase):
                                 actor_contexts=contexts,
                                 audience="group",
                             )
+                    elif self.path == "/internal/v1/qq-admin/check":
+                        assert body["assertion_ref"] in state["contexts"]
+                        assert body["actor_id"] in {"actor:a", "actor:b"}
+                        response = dict(
+                            schema_version=1,
+                            request_id=body["request_id"],
+                            version=1,
+                            is_admin=False,
+                            capabilities=[],
+                        )
                     elif self.path.endswith("/identity/resolve"):
                         assert body["query"]["origin"]["assertion_ref"].startswith("origin:actor:")
                         response = dict(
@@ -286,6 +300,7 @@ class HttpsSourceTests(unittest.TestCase):
                     for name in ("platform", "memory", "gateway", "nonebot")
                 },
             )
+            config["services"]["qq_admin"] = dict(config["services"]["platform"])
             (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
             env = {
                 **os.environ,

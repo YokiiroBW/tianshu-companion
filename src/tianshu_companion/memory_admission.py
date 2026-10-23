@@ -43,22 +43,63 @@ TEMPORARY_CLAUSE = re.compile(
     r"临时|待会.{0,8}(?:拿|收|放)|\b(?:right now|for a minute)\b",
     re.I,
 )
-NON_ASSERTION = re.compile(
+REPORTED_OR_HYPOTHETICAL = re.compile(
     r"[?？《》「」『』\"“”‘’]|如果|假如|要是|比如|例如|据说|听说|他说|她说|朋友说|同事说|[说讲](?:他|她|它)|"
-    r"可能|也许|大概|不一定|是否|是不是|\b(?:if|might|perhaps|said)\b",
+    r"\b(?:if|said|suppose)\b",
+    re.I,
+)
+NON_ASSERTION = re.compile(
+    REPORTED_OR_HYPOTHETICAL.pattern + r"|可能|也许|大概|不一定|是否|是不是|\b(?:might|perhaps)\b",
+    re.I,
+)
+PLAN_UPDATE = re.compile(
+    r"我(?:也|还|还是|现在|已经)?(?:(?:想|打算|准备|决定|能|可以|不能|不想).{0,12}(?:去|参加|到|来)|不去|不参加)|"
+    r"(?:出发|到场|到达|碰面|集合|入口|几点|时间).{0,12}(?:未定|没定|没想好|未确定|还不确定)|"
+    r"\bI (?:can|cannot|still want to) (?:go|come|attend|join)\b|"
+    r"\bdeparture .{0,16}(?:undecided|not decided)\b",
     re.I,
 )
 
 
-def mixed_stable_hints(content):
-    """Exact source hints for a bounded empty-proposal review, never stored facts.
+def extraction_review_hints(content, known_facts=()):
+    """Exact source hints for one bounded review, never accepted facts.
 
-    Review only a stable assertion alongside a temporary action. Attribution and
-    validity still belong to Memory, including after a successful model review.
+    A stable assertion alongside a temporary action, or an elliptical update to
+    one current open-ended non-entity plan, may merit review. Attribution and
+    validity stay with Memory; no hint proves an event link or becomes a fact.
     """
+    events = [
+        fact
+        for fact in known_facts
+        if fact.get("key", "").startswith("event.")
+        and fact.get("state") == "current"
+        and not fact.get("superseded")
+    ]
+    # Count every current event before narrowing: another entity's event or an
+    # existing subproperty must not disappear and make a reference look unique.
+    plan = events[0] if len(events) == 1 else None
+    if plan is not None and (
+        not plan["key"].endswith(".plan")
+        or plan.get("valid_to") is not None
+        or plan.get("entity") is not None
+    ):
+        plan = None
     hints = []
     for message in content:
         text = message["text"]
+        if (
+            plan is not None
+            and PLAN_UPDATE.search(text)
+            and not REPORTED_OR_HYPOTHETICAL.search(text)
+            and not TEMPORARY_CLAUSE.search(text)
+        ):
+            hints.append(
+                dict(
+                    source_index=message["index"],
+                    quote=text.strip(),
+                    known_plan_key=plan["key"],
+                )
+            )
         if NON_ASSERTION.search(text):
             continue
         clauses = [c.strip() for c in re.split(r"[，,。.!！;；\n]", text) if c.strip()]

@@ -10,6 +10,20 @@ from tianshu_companion.core import ACTIVE
 
 
 class CoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ingest_ack_uses_exact_receipt_without_loading_history_and_is_idempotent(self):
+        from unittest.mock import patch
+
+        request = self.h.request(text="这一条先等接收完成")
+        receipt = await self.h.core.ingest("nonebot", request)
+        receipt_id = receipt["receipt_id"]
+        with patch.object(self.h.core.store, "list", side_effect=AssertionError("Full table read")):
+            await self.h.core.acknowledge_ingest(receipt_id)
+            changes = self.h.core.store.db.total_changes
+            await self.h.core.acknowledge_ingest(receipt_id)
+            await self.h.core.acknowledge_ingest("receipt:missing")
+        self.assertEqual(changes, self.h.core.store.db.total_changes)
+        self.assertTrue(self.h.core.store.receipt_input(receipt_id)["response_released"])
+
     async def test_scheduler_counts_phases_and_overlaps_without_loading_turn_payloads(self):
         from unittest.mock import patch
 

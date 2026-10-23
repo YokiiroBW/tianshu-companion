@@ -366,6 +366,48 @@ class ContextCheckpointTests(unittest.IsolatedAsyncioTestCase):
         await self.h.core._preflight(current)
         self.assertEqual(calls.count(first["origin"]), 2)
 
+    async def test_preparation_overlaps_independent_recent_groups_and_preserves_order(self):
+        first, second, current = await self.turns(3)
+        entered, release = asyncio.Event(), asyncio.Event()
+        source_refs = {first["origin"]["assertion_ref"], second["origin"]["assertion_ref"]}
+        observed = set()
+        active, peak = 0, 0
+        resolve = self.h.origins.resolve
+
+        async def gated(service, envelope, now):
+            nonlocal active, peak
+            source_ref = envelope["origin"]["assertion_ref"]
+            if source_ref not in source_refs:
+                return await resolve(service, envelope, now)
+            observed.add(source_ref)
+            active += 1
+            peak = max(peak, active)
+            if observed == source_refs:
+                entered.set()
+            try:
+                await release.wait()
+                return await resolve(service, envelope, now)
+            finally:
+                active -= 1
+
+        self.h.origins.resolve = gated
+        job = asyncio.create_task(self.h.core._prepare_context(current, []))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            self.assertEqual(peak, 2)
+            release.set()
+            context, *_ = await job
+            self.assertEqual(
+                [group["turn_id"] for group in context.data["recent_dialogue"]],
+                [first["id"], second["id"]],
+            )
+            self.assertEqual(active, 0)
+        finally:
+            release.set()
+            if not job.done():
+                job.cancel()
+                await asyncio.gather(job, return_exceptions=True)
+
     async def test_prepare_transient_full_candidate_failure_reopens_for_raw_input(self):
         self.h.memory.input_history = self.h.memory.history
         previous, current = await self.turns(2)
