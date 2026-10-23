@@ -167,6 +167,34 @@ class EvidenceProtocolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ExtractionNegotiationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_memory_write_stays_unknown_when_receipt_read_fails(self):
+        request = example("memory-context/v2", "context-forget-positive")["forget_request"]
+        for path in ("/internal/v1/memory/context/propose", "/internal/v2/memory/context/forget"):
+            for failure in ("unavailable", "timeout"):
+                with self.subTest(path=path, failure=failure):
+                    writes = []
+
+                    async def handler(wire):
+                        if wire.url.path == path:
+                            writes.append(wire)
+                            raise httpx.ReadTimeout("synthetic lost write acknowledgement")
+                        self.assertEqual("/internal/v1/memory/context/receipt", wire.url.path)
+                        if failure == "timeout":
+                            raise httpx.ReadTimeout("synthetic unavailable receipt")
+                        return httpx.Response(503, json=dict(code="dependency_unavailable"))
+
+                    client = JsonService(
+                        "https://synthetic.invalid",
+                        "synthetic-token",
+                        transport=httpx.MockTransport(handler),
+                    )
+                    self.addAsyncCleanup(client.close)
+                    memory = Memory(contracts(), client)
+                    with self.assertRaises(Fault) as uncertain:
+                        await memory._memory_write(request, path)
+                    self.assertTrue(uncertain.exception.unknown)
+                    self.assertEqual(1, len(writes))
+
     async def test_episode_forget_malformed_commit_receipt_remains_unknown(self):
         async def handler(request):
             self.assertEqual("/internal/v2/memory/context/forget", request.url.path)
@@ -428,6 +456,33 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
             await self.h.core.role_actions.memory_propose(turn, "tool:forget", value)
         self.assertTrue(uncertain.exception.unknown)
         turn["memory_context"]["evidence"] = []
+        queries = []
+        original_query = self.h.memory.query_context
+
+        async def current_query(*args):
+            queries.append(args)
+            result = await original_query(*args)
+            result["evidence"] = []
+            return result
+
+        async def unavailable_lookup(*args):
+            raise Fault("dependency_unavailable")
+
+        self.h.memory.query_context = current_query
+        self.h.memory.receipt = unavailable_lookup
+        with self.assertRaises(Fault) as uncertain:
+            await self.h.core.role_actions.memory_propose(turn, "tool:forget", value)
+        self.assertTrue(uncertain.exception.unknown)
+        self.assertEqual([], queries)
+        self.h.memory.scope_version += 1
+        original_verify = self.h.memory.verify_context
+
+        async def current_verify(origin, scope, bundle, checks=()):
+            if bundle["scope_version"] != self.h.memory.scope_version:
+                raise Fault("scope_changed")
+            await original_verify(origin, scope, bundle, checks)
+
+        self.h.memory.verify_context = current_verify
 
         async def lookup(origin, scope, operation):
             self.assertEqual(operation, submitted[0]["command"]["idempotency_key"])
@@ -437,13 +492,48 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
         recovered = await self.h.core.role_actions.memory_propose(turn, "tool:forget", value)
         self.assertEqual("tombstoned", recovered["state"])
         self.assertEqual((1, 1), (len(issued), len(submitted)))
-        with self.assertRaises(Fault) as changed:
-            await self.h.core.role_actions.memory_propose(
-                turn,
-                "tool:forget",
-                dict(value, target=dict(episode_ref="episode:changed", episode_version=1)),
-            )
-        self.assertEqual("idempotency_conflict", changed.exception.code)
+        fresh = self.h.core.store.get("turns", turn["id"])
+        self.assertEqual([], fresh["memory_context"]["evidence"])
+        self.assertEqual(
+            self.h.memory.scope_version, fresh["memory_context"]["bundle"]["scope_version"]
+        )
+        self.assertEqual(1, len(queries))
+        await self.h.core._prepare_context(fresh, [])
+        await self.h.core._preflight(fresh)
+        self.assertTrue(self.verifications)
+        self.assertEqual(
+            recovered, await self.h.core.role_actions.memory_propose(turn, "tool:forget", value)
+        )
+        self.assertEqual(2, len(queries))
+        for changed_value in (
+            dict(value, target=dict(episode_ref="episode:changed", episode_version=1)),
+            dict(
+                value,
+                kind="no_op",
+                target=dict(
+                    category="evidence",
+                    field_key=None,
+                    item_key=None,
+                    record_id=None,
+                    expected_version=None,
+                ),
+            ),
+            dict(
+                value,
+                kind="upsert",
+                target=dict(
+                    category="evidence",
+                    field_key="cup",
+                    item_key=None,
+                    record_id=None,
+                    expected_version=None,
+                ),
+            ),
+        ):
+            with self.assertRaises(Fault) as changed:
+                await self.h.core.role_actions.memory_propose(turn, "tool:forget", changed_value)
+            self.assertEqual("idempotency_conflict", changed.exception.code)
+        self.assertEqual((1, 1, 2), (len(issued), len(submitted), len(queries)))
 
     async def test_recent_human_context_coexists_with_long_term_episode_and_checks_batch(self):
         for text in ("我们的旅行先保留计划", "后来提到的行程是什么？"):

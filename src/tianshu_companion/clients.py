@@ -831,11 +831,16 @@ class Memory:
         except Fault as error:
             if not error.unknown:
                 raise
-            response = await self.receipt(
-                request["command"]["origin"],
-                request["scope"],
-                request["command"]["idempotency_key"],
-            )
+            try:
+                response = await self.receipt(
+                    request["command"]["origin"],
+                    request["scope"],
+                    request["command"]["idempotency_key"],
+                )
+            except Fault as lookup_error:
+                # Failure to read a receipt says nothing about the submitted
+                # write. Keep its operation available for later recovery.
+                raise Fault(lookup_error.code, unknown=True, cause=lookup_error.cause) from None
             if response is None:
                 raise Fault("result_unknown", unknown=True) from None
         try:

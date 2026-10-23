@@ -497,6 +497,22 @@ class RoleActions:
                 raise Fault("invalid_input")
             unit["sources"] = sources
         target = value["target"]
+        operation_id = "memory-op:" + digest([turn["id"], tool_id])
+        key = "memory-action:" + digest(operation_id)
+        proposal = dict(
+            command=command(turn["origin"], operation_id, self.core.clock()),
+            scope=turn["scope"],
+            batch_ref=None,
+            item_id="item:" + digest([turn["id"], tool_id]),
+            kind=value["kind"],
+            target=target,
+            **({} if episode_forget else {"units": units}),
+            evidence_refs=sources if value["kind"] != "no_op" else [],
+            proof_ref=None,
+        )
+        prior = self.core.store.get("metadata", key)
+        if prior:
+            return await self._recover_memory_action(turn, proposal, prior)
         if value["kind"] in {"correct", "forget"}:
             recalled = next(
                 (
@@ -510,25 +526,6 @@ class RoleActions:
                 "version", recalled.get("record_version", recalled.get("revision"))
             ) != target.get("expected_version"):
                 raise Fault("not_found")
-        operation_id = "memory-op:" + digest([turn["id"], tool_id])
-        key = "memory-action:" + digest(operation_id)
-        prior = self.core.store.get("metadata", key)
-        if prior:
-            if episode_forget and (
-                prior["proposal"]["kind"] != value["kind"]
-                or prior["proposal"]["target"] != target
-                or prior["proposal"]["scope"] != turn["scope"]
-                or prior["proposal"]["evidence_refs"] != sources
-            ):
-                raise Fault("idempotency_conflict")
-            if prior.get("receipt"):
-                return prior["receipt"]
-            receipt = await self.core.memory.receipt(turn["origin"], turn["scope"], operation_id)
-            if receipt is None:
-                raise Fault("result_unknown", unknown=True)
-            prior.update(state=receipt["state"], receipt=receipt)
-            self.core.store.put("metadata", prior)
-            return receipt
         if episode_forget:
             recalled = next(
                 (
@@ -544,17 +541,6 @@ class RoleActions:
             )
             if recalled is None:
                 raise Fault("not_found")
-        proposal = dict(
-            command=command(turn["origin"], operation_id, self.core.clock()),
-            scope=turn["scope"],
-            batch_ref=None,
-            item_id="item:" + digest([turn["id"], tool_id]),
-            kind=value["kind"],
-            target=target,
-            **({} if episode_forget else {"units": units}),
-            evidence_refs=sources if value["kind"] != "no_op" else [],
-            proof_ref=None,
-        )
         if revision:
             physical = self.core.store.get("physicals", digest(latest["message_key"]))
             issuer = self.core.origins.issuers.get(turn["service"])
@@ -607,10 +593,9 @@ class RoleActions:
             else "memory-context#proposal_request",
             proposal,
         )
-        key = "memory-action:" + digest(operation_id)
         old = self.core.store.get("metadata", key)
-        if old and old.get("receipt"):
-            return old["receipt"]
+        if old:
+            return await self._recover_memory_action(turn, proposal, old)
         self.core.store.put(
             "metadata",
             dict(
@@ -636,6 +621,32 @@ class RoleActions:
                 receipt=receipt,
             ),
         )
+        await self._refresh_memory_context(turn, proposal, receipt)
+        return receipt
+
+    async def _recover_memory_action(self, turn, proposal, prior):
+        def semantic(value):
+            return {key: item for key, item in value.items() if key not in {"command", "proof_ref"}}
+
+        if semantic(prior["proposal"]) != semantic(proposal):
+            raise Fault("idempotency_conflict")
+        receipt = prior.get("receipt")
+        if receipt is None:
+            try:
+                receipt = await self.core.memory.receipt(
+                    turn["origin"], turn["scope"], prior["operation_id"]
+                )
+            except Fault as error:
+                raise Fault(error.code, unknown=True, cause=error.cause) from None
+            if receipt is None:
+                raise Fault("result_unknown", unknown=True)
+            prior.update(state=receipt["state"], receipt=receipt)
+            self.core.store.put("metadata", prior)
+        await self._refresh_memory_context(turn, prior["proposal"], receipt)
+        return receipt
+
+    async def _refresh_memory_context(self, turn, proposal, receipt):
+        """Every known mutation outcome replaces stale evidence before Core reassembles it."""
         if receipt["state"] in {"committed", "corrected", "tombstoned"}:
             memory_context = None
             if hasattr(self.core.memory, "query_context"):
@@ -675,8 +686,8 @@ class RoleActions:
                         "input_history_snapshot"
                     ]
                 self.core._save_turn(fresh)
-                if target.get("record_id") and value["kind"] in {"correct", "forget"}:
+                target = proposal["target"]
+                if target.get("record_id") and proposal["kind"] in {"correct", "forget"}:
                     self.core.life.concerns.invalidate(
                         "memory", target["record_id"], target["expected_version"]
                     )
-        return receipt
