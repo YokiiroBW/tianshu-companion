@@ -45,6 +45,7 @@ from .writing import Writing
 from .runtime_capabilities import candidates_enabled
 from .model_selection import verify_lease
 from .model_slots import ModelSlots
+from .preparation_retry import read_retry, recovery_deadline, retry_preparation
 from .qq_identity import (
     SOURCE_INSTRUCTION,
     material_provenance,
@@ -915,6 +916,7 @@ class Core(Delivery):
         if turn["phase"] in TERMINAL:
             return "too_late"
         turn.update(cancelled=True, failure=reason, stream_open=False)
+        self.store.delete("metadata", "delivery-reconcile:" + turn["id"])
         for reply in self._replies(turn):
             if reply["state"] == "pending":
                 reply["state"] = "cancelled"
@@ -1084,6 +1086,19 @@ class Core(Delivery):
                 if conv.get("source_quarantined"):
                     continue
                 cid = conv["conversation_id"]
+                expired = set()
+                for turn_id, retry_at in candidate["retry"]:
+                    recovery = candidate["recovery"].get(turn_id)
+                    if (
+                        recovery is not None
+                        and turn_id not in self.jobs
+                        and retry_at <= self.clock()
+                        and self.clock()
+                        >= recovery_deadline(recovery[0], source_deadline=recovery[1])
+                        and self._expire_preparation_retry(turn_id)
+                    ):
+                        expired.add(turn_id)
+                        candidate["active"] -= 1
                 queued = candidate["queued"][: max(0, 2 - candidate["active"])]
                 for turn_id in queued:
                     if not self._preparation_available(phases):
@@ -1145,7 +1160,8 @@ class Core(Delivery):
                     )
                 for turn_id, retry_at in candidate["retry"]:
                     if (
-                        turn_id not in self.jobs
+                        turn_id not in expired
+                        and turn_id not in self.jobs
                         and retry_at <= self.clock()
                         and self._preparation_available(phases)
                     ):
@@ -1163,7 +1179,10 @@ class Core(Delivery):
                         self.jobs[turn_id] = asyncio.create_task(self._process(turn_id))
                         phases[turn_id] = turn["phase"]
                         self._work_cursor = cid
-                if candidate["deliver"] and cid not in self.send_jobs:
+                if (
+                    candidate["deliver"]
+                    or any(at <= self.clock() for at in candidate["reconcile"].values())
+                ) and cid not in self.send_jobs:
                     self.send_jobs[cid] = asyncio.create_task(self._deliver(cid))
                 waiting = ("direct", cid)
                 if (
@@ -1200,6 +1219,35 @@ class Core(Delivery):
             phases = self.store.turn_phases(self.jobs)
         preparing = sum(phases.get(key) != "generating" for key in self.jobs)
         return preparing < self.preparation_slots
+
+    def _expire_preparation_retry(self, turn_id):
+        """Finish an unowned, expired recovery before worker admission can delay it."""
+        turn = self.store.get("turns", turn_id)
+        if (
+            turn is None
+            or turn_id in self.jobs
+            or turn["cancelled"]
+            or turn["phase"] not in {"preparing", "waiting_dependency"}
+            or turn["model_calls"]
+            or turn.get("expression_id")
+            or turn.get("native_execution")
+            or not turn.get("preparation_retries")
+            or turn.get("preparation_retry_started_at") is None
+            or turn["retry_at"] > self.clock()
+        ):
+            return False
+        current = self.store.conversation(turn["conversation_id"])
+        if current is None or current.get("source_quarantined"):
+            return False
+        if self.clock() < recovery_deadline(
+            turn["preparation_retry_started_at"], source_deadline=turn["source_deadline"]
+        ):
+            return False
+        failure = Fault("timeout", cause=dict(category="timeout", operation="query"))
+        self._record_turn_failure(turn, failure, "preparation")
+        turn["failure"] = failure.code
+        self._finish(turn, "failed", "failed")
+        return True
 
     def _pin_role(self, actor):
         """Snapshot the persona at the turn preparation boundary.
@@ -1326,7 +1374,7 @@ class Core(Delivery):
             # The recovery window bounds work as well as the next retry time.
             # Normal preparation before its first pressure failure consumes none
             # of it. The timer is disabled at the existing model boundary.
-            remaining = max(0, recovery_started + 30 - self.clock())
+            remaining = max(0, recovery_deadline(recovery_started) - self.clock())
             try:
                 async with asyncio.timeout(remaining) as recovery_timeout:
                     await self._process_turn(turn_id, preparation_timeout=recovery_timeout)
@@ -1369,7 +1417,7 @@ class Core(Delivery):
 
     def _preparation_expired(self, turn, timeout):
         return timeout is not None and (
-            self.clock() >= turn["preparation_retry_started_at"] + 30
+            self.clock() >= recovery_deadline(turn["preparation_retry_started_at"])
             or asyncio.get_running_loop().time() >= timeout.when()
         )
 
@@ -1672,8 +1720,6 @@ class Core(Delivery):
                 self._record_turn_failure(
                     turn, error, "preparation" if not turn["model_calls"] else "generation"
                 )
-                from .preparation_retry import retry_preparation
-
                 if retry_preparation(turn, error, self.clock()):
                     self._save_turn(turn)
                     return
@@ -2309,8 +2355,6 @@ class Core(Delivery):
         )
 
     async def _preflight(self, turn):
-        from .preparation_retry import read_retry
-
         # Before generation the durable preparation owner handles recovery.
         # During streaming this await retains the same model and pending text;
         # only authority reads repeat, each in a fresh checkpoint.

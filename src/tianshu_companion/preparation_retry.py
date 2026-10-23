@@ -3,6 +3,16 @@
 from .contracts import Fault
 
 
+def recovery_deadline(started_at, *, source_deadline=None):
+    """Recovery horizon, optionally bounded by a source lease before another read.
+
+    A running preparation can renew its source with fresh proof; callers that
+    own that work keep the recovery horizon rather than pinning its old lease.
+    """
+    deadline = started_at + 30
+    return min(deadline, source_deadline) if source_deadline is not None else deadline
+
+
 def read_retry(state, error, now, source_deadline):
     """One bounded policy for a logical preparation or delivery authority read.
 
@@ -19,7 +29,7 @@ def read_retry(state, error, now, source_deadline):
         return None
     attempts = state.get("attempts", 0)
     started = state.get("started_at", now)
-    deadline = min(source_deadline, started + 30)
+    deadline = recovery_deadline(started, source_deadline=source_deadline)
     delay = max(min(2, 0.2 * 2**attempts), getattr(error, "retry_after_seconds", None) or 0)
     if attempts >= 5 or now + delay >= deadline:
         return None

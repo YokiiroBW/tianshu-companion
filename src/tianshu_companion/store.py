@@ -597,7 +597,16 @@ class Store:
         """
         conversation_ids = list(dict.fromkeys(conversation_ids))
         result = {
-            cid: dict(conversation=None, active=0, queued=[], retry=[], deliver=False, direct=False)
+            cid: dict(
+                conversation=None,
+                active=0,
+                queued=[],
+                retry=[],
+                recovery={},
+                reconcile={},
+                deliver=False,
+                direct=False,
+            )
             for cid in conversation_ids
         }
         for offset in range(0, len(conversation_ids), 256):
@@ -608,12 +617,26 @@ class Store:
                 batch,
             ):
                 result[cid]["conversation"] = json.loads(body)
-            for key, cid, phase, retry_at in self.db.execute(
-                "SELECT id,conversation_id,status,CASE WHEN status IN ('preparing','waiting_dependency') "
-                "THEN json_extract(body,'$.retry_at') END FROM turns INDEXED BY turns_work "
-                "WHERE status IN ('queued','preparing','generating','waiting_dependency',"
+            for (
+                key,
+                cid,
+                phase,
+                retry_at,
+                recovery_started,
+                source_deadline,
+                reconcile_at,
+            ) in self.db.execute(
+                "SELECT t.id,t.conversation_id,t.status,CASE WHEN t.status IN ('preparing','waiting_dependency') "
+                "THEN json_extract(t.body,'$.retry_at') END,"
+                "CASE WHEN t.status IN ('preparing','waiting_dependency') "
+                "THEN CAST(json_extract(t.body,'$.preparation_retry_started_at') AS REAL) END,"
+                "CASE WHEN t.status IN ('preparing','waiting_dependency') "
+                "THEN CAST(json_extract(t.body,'$.source_deadline') AS REAL) END,coalesce(m.deadline,0) "
+                "FROM turns t INDEXED BY turns_work LEFT JOIN metadata m "
+                "ON m.id='delivery-reconcile:'||t.id "
+                "WHERE t.status IN ('queued','preparing','generating','waiting_dependency',"
                 "'ready_to_send','sending','reconciling') "
-                f"AND conversation_id IN ({placeholders}) ORDER BY conversation_id,position,id",
+                f"AND t.conversation_id IN ({placeholders}) ORDER BY t.conversation_id,t.position,t.id",
                 batch,
             ):
                 candidate = result[cid]
@@ -624,14 +647,20 @@ class Store:
                     candidate["active"] += 1
                 if phase in {"preparing", "waiting_dependency"}:
                     candidate["retry"].append((key, retry_at))
-                if phase in {"ready_to_send", "sending", "reconciling"}:
+                    if recovery_started is not None and source_deadline is not None:
+                        candidate["recovery"][key] = (recovery_started, source_deadline)
+                if phase in {"ready_to_send", "sending"}:
                     candidate["deliver"] = True
-            for (cid,) in self.db.execute(
-                "SELECT DISTINCT conversation_id FROM replies INDEXED BY replies_unknown "
-                f"WHERE status='unknown' AND conversation_id IN ({placeholders})",
+                elif phase == "reconciling":
+                    candidate["reconcile"][key] = reconcile_at
+            for cid, turn_id, reconcile_at in self.db.execute(
+                "SELECT DISTINCT r.conversation_id,json_extract(r.body,'$.turn_id'),coalesce(m.deadline,0) "
+                "FROM replies r INDEXED BY replies_unknown LEFT JOIN metadata m "
+                "ON m.id='delivery-reconcile:'||CAST(json_extract(r.body,'$.turn_id') AS TEXT) "
+                f"WHERE r.status='unknown' AND r.conversation_id IN ({placeholders})",
                 batch,
             ):
-                result[cid]["deliver"] = True
+                result[cid]["reconcile"][turn_id] = reconcile_at
             for (cid,) in self.db.execute(
                 "SELECT DISTINCT conversation_id FROM direct_requests INDEXED BY direct_waiting_band "
                 "WHERE status IN ('completed','failed') "

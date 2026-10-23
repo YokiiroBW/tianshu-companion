@@ -405,6 +405,60 @@ def test_real_postgres_core_restart_retains_unknown_without_resend(tmp_path, pg_
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "mode", ["expired", "source", "waiting_dependency", "not_expired", "live", "renewed"]
+)
+def test_real_postgres_durable_recovery_slot_independent_expiry(tmp_path, pg_settings, mode):
+    async def run():
+        from test_tick_batch import expired_recovery_case
+
+        from tianshu_companion.core import Core
+
+        h = Harness(silence_ms=0)
+        await h.core.close()
+        h.core = Core(
+            Store(tmp_path / "recovery.sqlite", settings=pg_settings),
+            h.contracts,
+            h.origins,
+            h.memory,
+            h.gateway,
+            h.sender,
+            **h.options,
+        )
+        try:
+            await expired_recovery_case(h, mode)
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("query_failure", [False, True])
+def test_real_postgres_reconciliation_cadence_is_bookkeeping(tmp_path, pg_settings, query_failure):
+    async def run():
+        from test_delivery_v2 import reconciliation_cadence_case
+
+        from tianshu_companion.core import Core
+
+        h = Harness(silence_ms=0)
+        await h.core.close()
+        h.core = Core(
+            Store(tmp_path / "cadence.sqlite", settings=pg_settings),
+            h.contracts,
+            h.origins,
+            h.memory,
+            h.gateway,
+            h.sender,
+            **h.options,
+        )
+        try:
+            await reconciliation_cadence_case(h, query_failure=query_failure)
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
 def test_real_postgres_nonebot_journal_migrates_claims_and_event_order(tmp_path, pg_settings):
     from tianshu_nonebot.journal import Conflict, Journal
 

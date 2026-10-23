@@ -7,6 +7,8 @@ from unittest.mock import patch
 import pytest
 
 from support import Harness
+from tianshu_companion.contracts import Fault
+from tianshu_companion.preparation_retry import retry_preparation
 from tianshu_companion.store import Store
 from tianshu_companion.storage_postgres import translate
 
@@ -54,9 +56,19 @@ def test_work_candidates_match_current_states_and_direct_waiting_predicate():
                         phase=phase,
                         sequence=index + 1,
                         retry_at=12,
+                        **(
+                            dict(preparation_retry_started_at=10, source_deadline=100)
+                            if index == 2
+                            else {}
+                        ),
                     ),
                 )
-            store.put("replies", dict(id="late", conversation_id="room:001", state="unknown"))
+            store.put(
+                "replies",
+                dict(
+                    id="late", conversation_id="room:001", turn_id="unknown-turn", state="unknown"
+                ),
+            )
             for index, (state, reply_state, reason) in enumerate(
                 [
                     ("completed", "ready_to_deliver", "outbound_band_busy"),
@@ -85,8 +97,10 @@ def test_work_candidates_match_current_states_and_direct_waiting_predicate():
             assert mixed["active"] == 3
             assert mixed["queued"] == ["queued:0", "mixed:0"]
             assert mixed["retry"] == [("mixed:2", 12), ("mixed:3", 12)]
+            assert mixed["recovery"] == {"mixed:2": (10, 100)}
             assert mixed["deliver"]
-            assert candidates["room:001"]["deliver"]
+            assert not candidates["room:001"]["deliver"]
+            assert candidates["room:001"]["reconcile"] == {"unknown-turn": 0}
             assert not candidates["room:002"]["deliver"]
             for index in range(5):
                 cid = f"direct:{index}"
@@ -201,6 +215,163 @@ def test_retry_hint_rechecks_the_current_retry_time():
     asyncio.run(run())
 
 
+def mark_recovering(h, turn, *, source_seconds=3600):
+    turn.update(
+        phase="preparing",
+        config_version=h.core.config_version,
+        role=h.core.roles["actor:a"],
+        scope_version=h.memory.scope_version,
+        source_deadline=h.clock() + source_seconds,
+    )
+    failure = Fault("dependency_unavailable", retryable_read=True)
+    h.core._record_turn_failure(turn, failure, "preparation")
+    assert retry_preparation(turn, failure, h.clock())
+    h.core._save_turn(turn)
+
+
+async def expired_recovery_case(h, mode):
+    """Same scheduling and transaction case on SQLite and optional native PG."""
+    await h.ingest(text="synthetic pending recovery")
+    turn = h.turns()[0]
+    mark_recovering(h, turn, source_seconds=5 if mode == "source" else 3600)
+    if mode == "waiting_dependency":
+        turn["phase"] = "waiting_dependency"
+        h.core._save_turn(turn)
+    h.clock.advance(6 if mode in {"source", "not_expired"} else 31)
+    occupy_preparation(h)
+    if mode == "live":
+        h.core.jobs[turn["id"]] = asyncio.create_task(asyncio.Event().wait())
+    original = h.core.store.work_candidates
+
+    def hints(ids):
+        result = original(ids)
+        fresh = h.core.store.get("turns", turn["id"])
+        if mode == "cancelled":
+            fresh["cancelled"] = True
+        elif mode == "terminal":
+            fresh["phase"] = "sent"
+        elif mode == "renewed":
+            fresh["preparation_retry_started_at"] = h.clock()
+            fresh["retry_at"] = h.clock() + 1
+        elif mode == "retry_later":
+            fresh["retry_at"] = h.clock() + 1
+        elif mode == "no_identity":
+            fresh.pop("preparation_retry_started_at")
+        elif mode == "model":
+            fresh["model_calls"] = 1
+        elif mode == "expression":
+            fresh["expression_id"] = "synthetic-expression"
+        elif mode == "quarantine":
+            conv = h.core.store.conversation(turn["conversation_id"])
+            conv["source_quarantined"] = True
+            h.core.store.put("conversations", conv)
+        if fresh != turn:
+            h.core._save_turn(fresh)
+        return result
+
+    with patch.object(h.core.store, "work_candidates", hints):
+        await h.core.tick()
+    fresh = h.core.store.get("turns", turn["id"])
+    if mode in {"expired", "source", "waiting_dependency"}:
+        assert fresh["phase"] == "failed" and fresh["failure"] == "timeout"
+        assert fresh["model_calls"] == 0 and turn["id"] not in h.core.jobs
+        assert fresh["failure_count"] == 2
+        assert fresh["last_failure"]["stage"] == "preparation"
+        assert fresh["last_failure"]["attempt"] == 2
+        assert fresh["last_failure"]["category"] == "timeout"
+        assert fresh["last_failure"]["operation"] == "query"
+        assert "peer" not in fresh["last_failure"]
+        assert len(h.core.store.list("outbox", turn["conversation_id"])) == 1
+        version = fresh["version"]
+        await h.core.tick()
+        assert h.core.store.get("turns", turn["id"])["version"] == version
+    else:
+        assert fresh["phase"] == ("sent" if mode == "terminal" else "preparing")
+        assert fresh["failure_count"] == 1
+        assert not h.core.store.list("outbox", turn["conversation_id"])
+    assert not h.gateway.calls and not h.sender.calls
+    assert all(not job.done() for job in h.core.jobs.values())
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "expired",
+        "source",
+        "waiting_dependency",
+        "not_expired",
+        "live",
+        "cancelled",
+        "terminal",
+        "renewed",
+        "retry_later",
+        "no_identity",
+        "model",
+        "expression",
+        "quarantine",
+    ],
+)
+def test_durable_recovery_expires_before_preparation_slot_admission(mode):
+    async def run():
+        h = Harness(silence_ms=0)
+        try:
+            await expired_recovery_case(h, mode)
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+def test_expired_recoveries_release_conversation_positions_for_the_next_turn():
+    async def run():
+        h = Harness(silence_ms=0)
+        h.gateway.segments = ["synthetic following reply"]
+        try:
+            for index in range(3):
+                await h.ingest(text=f"synthetic turn {index}")
+            first, second, following = h.turns()
+            for turn in (first, second):
+                mark_recovering(h, turn)
+            h.clock.advance(31)
+            await h.cycles(60)
+            first, second, following = [
+                h.core.store.get("turns", turn["id"]) for turn in (first, second, following)
+            ]
+            assert first["phase"] == second["phase"] == "failed"
+            assert first["failure"] == second["failure"] == "timeout"
+            assert following["phase"] == "sent"
+            assert len(h.gateway.calls) == len(h.sender.calls) == 1
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+def test_saturated_recovery_hints_do_not_load_unexpired_turn_payloads():
+    async def run():
+        h = Harness(silence_ms=0)
+        try:
+            await h.ingest(text="synthetic unexpired recovery")
+            turn = h.turns()[0]
+            mark_recovering(h, turn)
+            h.clock.advance(5)
+            occupy_preparation(h)
+            original = h.core.store.get
+
+            def get(table, key):
+                assert table != "turns", "Unexpired saturated recovery must use scalar hints"
+                return original(table, key)
+
+            with patch.object(h.core.store, "get", get):
+                await h.core.tick()
+            assert h.core.store.get("turns", turn["id"])["phase"] == "preparing"
+            assert not h.gateway.calls and not h.sender.calls
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("closed", [False, True])
 def test_unknown_recovery_progresses_with_queued_work_and_all_preparation_slots_busy(closed):
     async def run():
@@ -221,6 +392,7 @@ def test_unknown_recovery_progresses_with_queued_work_and_all_preparation_slots_
             occupy_preparation(h)
             request = h.sender.calls[0]
             h.sender.answers[request["reply_id"]] = h.sender.receipt(request)
+            h.clock.advance(5 if closed else 0.25)
             await h.cycles(5)
             assert h.core.store.get("replies", request["reply_id"])["state"] == "sent"
             assert h.core.store.get("turns", first["id"])["phase"] == (
@@ -267,7 +439,7 @@ def test_batch_queries_keep_postgres_translation_and_partial_index_predicates():
         store.work_turn_count("room:000", ["preparing", "generating"])
         native = [translate(sql) for sql in statements]
         assert not any("INDEXED BY" in sql or "json_extract" in sql for sql in native)
-        retry = next(sql for sql in native if "CASE WHEN status IN" in sql)
+        retry = next(sql for sql in native if "CASE WHEN t.status IN" in sql)
         assert "double precision" in retry
         assert "status IN ('queued','preparing','generating','waiting_dependency'," in retry
         direct = next(sql for sql in native if "FROM direct_requests" in sql)

@@ -9,6 +9,10 @@ from . import observability as obs
 TERMINAL = {"sent", "failed", "cancelled", "observed", "closed_unknown"}
 
 
+def _receipt_semantic(value):
+    return {k: v for k, v in value.items() if k not in {"request_id", "observed_at"}}
+
+
 class Delivery:
     def expression_sender(self, turn):
         sender = self._sender_for(turn)
@@ -133,12 +137,25 @@ class Delivery:
             self._save_turn(turn)
         try:
             receipt = await sender.send_expression(request)
-        except Exception:
+        except Exception as error:
             with self.store.transaction():
                 reply = self.store.get("replies", segment_id)
                 reply.update(state="unknown", unknown_since=self.clock())
                 self.store.put("replies", reply)
-            raise Fault("result_unknown", unknown=True) from None
+            diagnostic = obs.failure_diagnostic(
+                error, code="result_unknown", attempt=1, stage="delivery", observed_at=self.clock()
+            )
+            failure = Fault(
+                "result_unknown",
+                unknown=True,
+                cause={
+                    key: diagnostic[key]
+                    for key in ("category", "peer", "operation", "http_status", "exception_type")
+                    if key in diagnostic
+                },
+            )
+            failure.companion_failure_stage = "delivery"
+            raise failure from None
         self.record_expression(turn_id, receipt)
 
     def record_contact(
@@ -181,9 +198,6 @@ class Delivery:
                 raise Fault("invalid_input")
             previous = turn.get("expression_receipt")
 
-            def semantic(value):
-                return {k: v for k, v in value.items() if k not in {"request_id", "observed_at"}}
-
             terminal_transition = (
                 turn["phase"] not in TERMINAL
                 and not turn.get("stream_open")
@@ -192,10 +206,15 @@ class Delivery:
                     s["state"] not in {"queued", "sending", "unknown"} for s in receipt["segments"]
                 )
             )
-            if previous and semantic(previous) == semantic(receipt) and not terminal_transition:
+            if (
+                previous
+                and _receipt_semantic(previous) == _receipt_semantic(receipt)
+                and not terminal_transition
+            ):
                 # Poll time/request correlation is not a new source fact. Repeated
                 # pending receipts must not invalidate every reader's Core barrier.
                 return
+            self.store.delete("metadata", "delivery-reconcile:" + turn_id)
             for segment in receipt["segments"]:
                 reply = self.store.get("replies", segment["reply_id"])
                 if (
@@ -524,9 +543,12 @@ class Delivery:
                 if reply["receipt"] != receipt:
                     raise Fault("idempotency_conflict")
                 return
-            if reply["receipt"] == receipt:
+            if reply["receipt"] and _receipt_semantic(reply["receipt"]) == _receipt_semantic(
+                receipt
+            ):
                 return
             turn = self.store.get("turns", reply["turn_id"])
+            self.store.delete("metadata", "delivery-reconcile:" + turn["id"])
             if receipt["state"] == "sent":
                 self.record_contact(
                     "legacy:" + turn["id"],
@@ -605,6 +627,98 @@ class Delivery:
         )
 
     async def _reconcile(self, turn):
+        deadline = self._reconciliation_deadline(turn)
+        if deadline is not None and self.clock() >= deadline:
+            self._close_reconciliation_if_due(turn["id"])
+        schedule = self.store.get("metadata", "delivery-reconcile:" + turn["id"])
+        if schedule and schedule["deadline"] > self.clock():
+            return
+        try:
+            remaining = None if deadline is None else deadline - self.clock()
+            if remaining is not None and remaining > 0:
+                async with asyncio.timeout(remaining) as unknown_timeout:
+                    await self._reconcile_once(turn, unknown_timeout=unknown_timeout)
+            else:
+                await self._reconcile_once(turn)
+        except TimeoutError:
+            pass  # Read closure is unknown; no send or generation is repeated.
+        finally:
+            self._close_reconciliation_if_due(turn["id"])
+            self._defer_reconciliation(turn["id"])
+
+    def _reconciliation_deadline(self, turn, replies=None):
+        if turn["phase"] in TERMINAL:
+            return None
+        if turn.get("expression_id"):
+            receipt = turn.get("expression_receipt")
+            if receipt and not any(s["state"] == "unknown" for s in receipt["segments"]):
+                return None  # Confirmed queue progress keeps its existing lifecycle.
+            starts = [turn.get("expression_started_at", self.clock())]
+        else:
+            replies = self._replies(turn) if replies is None else replies
+            starts = [
+                r["unknown_since"]
+                for r in replies
+                if r["state"] == "unknown" and r.get("unknown_since") is not None
+            ]
+        return min(starts) + self.policy.delivery_reconcile_timeout_ms / 1000 if starts else None
+
+    def _close_reconciliation_if_due(self, turn_id):
+        with self.store.transaction():
+            turn = self.store.get("turns", turn_id)
+            if turn is None or turn["phase"] in TERMINAL:
+                return
+            deadline = self._reconciliation_deadline(turn)
+            if deadline is None or self.clock() < deadline:
+                return
+            receipt = turn.get("expression_receipt")
+            partial = receipt and any(s["channel_message_ids"] for s in receipt["segments"])
+            self._finish(turn, "closed_unknown", "partial" if partial else "unknown")
+
+    def _defer_reconciliation(self, turn_id):
+        # Cadence is bookkeeping, not a source fact or a new work queue. Only
+        # existing pending replies/expressions can cause another owner pass.
+        key = "delivery-reconcile:" + turn_id
+        with self.store.transaction():
+            turn = self.store.get("turns", turn_id)
+            if turn is None:
+                return
+            replies = self._replies(turn)
+            unknown = [r for r in replies if r["state"] == "unknown"]
+            receipt = turn.get("expression_receipt")
+            pending = (
+                bool(unknown)
+                or turn.get("expression_id")
+                and (
+                    receipt is None
+                    or not receipt["final"]
+                    or any(
+                        s["state"] in {"queued", "sending", "unknown"} for s in receipt["segments"]
+                    )
+                )
+            )
+            if not pending:
+                self.store.delete("metadata", key)
+                return
+            previous = self.store.get("metadata", key)
+            attempts = (previous or {}).get("attempts", 0) + 1
+            now = self.clock()
+            deadline = now + min(5.0, 0.25 * 2 ** min(attempts - 1, 5))
+            terminal_deadline = self._reconciliation_deadline(turn, replies)
+            if terminal_deadline is not None:
+                deadline = min(deadline, terminal_deadline)
+            self.store.put(
+                "metadata",
+                dict(
+                    id=key,
+                    conversation_id=turn["conversation_id"],
+                    state="scheduled",
+                    deadline=deadline,
+                    attempts=attempts,
+                ),
+            )
+
+    async def _reconcile_once(self, turn, *, unknown_timeout=None):
         if turn.get("expression_id"):
             sender = self.expression_sender(turn)
             if sender:
@@ -616,6 +730,15 @@ class Delivery:
                     if receipt:
                         self.record_expression(turn["id"], receipt)
                         if (
+                            unknown_timeout is not None
+                            and self._reconciliation_deadline(self.store.get("turns", turn["id"]))
+                            is None
+                        ):
+                            # The bounded unknown lookup obtained actual queue
+                            # progress. Its old horizon must not cancel the
+                            # existing finalize lifecycle that follows.
+                            unknown_timeout.reschedule(None)
+                        if (
                             not receipt["final"]
                             and not turn.get("stream_open")
                             and not turn["cancelled"]
@@ -623,24 +746,6 @@ class Delivery:
                             await self.finalize_stream(turn["id"])
                 except (Fault, OSError):
                     pass
-                if (
-                    self.clock()
-                    >= turn.get("expression_started_at", self.clock())
-                    + self.policy.delivery_reconcile_timeout_ms / 1000
-                ):
-                    fresh = self.store.get("turns", turn["id"])
-                    receipt = fresh.get("expression_receipt")
-                    if fresh["phase"] not in TERMINAL and (
-                        not receipt
-                        or any(segment["state"] == "unknown" for segment in receipt["segments"])
-                    ):
-                        with self.store.transaction():
-                            partial = receipt and any(
-                                segment["channel_message_ids"] for segment in receipt["segments"]
-                            )
-                            self._finish(
-                                fresh, "closed_unknown", "partial" if partial else "unknown"
-                            )
             return
         for reply in self._replies(turn):
             if reply["state"] != "unknown":
@@ -653,12 +758,3 @@ class Delivery:
                     self.record_receipt(reply["id"], receipt)
             except (Fault, TimeoutError, OSError):
                 pass
-            current = self.store.get("replies", reply["id"])
-            if (
-                current["state"] == "unknown"
-                and self.clock()
-                >= current["unknown_since"] + self.policy.delivery_reconcile_timeout_ms / 1000
-            ):
-                with self.store.transaction():
-                    fresh = self.store.get("turns", turn["id"])
-                    self._finish(fresh, "closed_unknown", "unknown")
