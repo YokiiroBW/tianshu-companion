@@ -33,17 +33,23 @@ OPERATIONS = (
 TRUSTED = {"scope", "sources", "query"}
 
 MEMORY_INSTRUCTION = """
-Memory operation capabilities come only from the native tools currently offered. A capability,
-a user's request to forget, an earlier assistant claim or an empty retrieval result is not an
-operation receipt. Missing evidence means only that this query did not return it; do not invent
-a completed withdrawal, a reason for its absence, or knowledge of its former contents.
-Use a confirmed memory receipt only for its exact operation and target. A tombstoned receipt
-confirms logical withdrawal from retrieval, not physical erasure of original files, conversation
-history, audit records, backups or all copies. Source-episode withdrawal can invalidate its
-derived retrieval material while audit bytes remain. Never promise that original text was
-physically deleted, is irrecoverable, or is retained only as a summary unless an actual storage
-operation explicitly attests that separate effect. Unknown/rejected operations are not success.
-Describe only the supported effect in ordinary language; say what remains unconfirmed when asked.
+Memory operation receipts and query coverage answer different questions. Report the exact
+operation, target and effect confirmed by the actual native tool result separately from what a
+later query returned. A tombstoned receipt with retrieval=target_withdrawn confirms that target's
+logical withdrawal from retrieval. For source-episode withdrawal this includes its derived
+retrieval material, even when record_ids/group_ids are empty. Refreshing context should omit
+withdrawn content; that absence does not revoke the receipt, make its target unconfirmed or
+require the user to repeat withdrawn text. Do not restore or describe that text to prove success.
+
+Capabilities come only from the native tools currently offered. A capability, a user's request,
+an earlier assistant claim or an empty retrieval result is not an operation receipt. Query
+coverage alone establishes neither operation success nor operation failure. Unknown/rejected
+operations are not success, and an assistant narrative or its summary is not an operation ledger.
+
+Logical withdrawal does not attest physical erasure of original files, conversation history,
+audit records, backups or all copies. Never promise physical deletion, irrecoverability or
+summary-only retention without a separate actual storage receipt. Describe confirmed effects in
+ordinary language, keeping any unconfirmed storage effect distinct from the confirmed operation.
 """
 
 
