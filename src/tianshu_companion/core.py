@@ -2056,7 +2056,16 @@ class Core(Delivery):
             return
         await verify_checks(
             checks,
-            lambda check, checkpoint: self._verify_context_check(turn, check, checkpoint),
+            lambda check, checkpoint: self._verify_context_check(
+                turn,
+                check,
+                checkpoint,
+                read_budget=(
+                    clients.JsonService.QUERY_BUDGET_SECONDS
+                    if check["version_domain"] in {TEXT_DOMAIN, TEXT_INPUT_DOMAIN, PROFILE_DOMAIN}
+                    else 0
+                ),
+            ),
             verified=verified,
             checkpoint=checkpoint,
         )
@@ -2265,7 +2274,24 @@ class Core(Delivery):
     async def _prepare_context(self, turn, dependencies):
         from .context_checks import read_parallel
 
-        await self._refresh_preparation_origin(turn)
+        reserve_snapshots = (
+            turn.get("memory_context") is None
+            and self._turn_allows(turn, "memory.read")
+            and hasattr(self.memory, "history")
+        )
+        await self._refresh_preparation_origin(
+            turn, read_budget=clients.JsonService.QUERY_BUDGET_SECONDS if reserve_snapshots else 0
+        )
+        if (
+            not reserve_snapshots
+            and turn.get("memory_context") is None
+            and self._turn_allows(turn, "memory.read")
+            and hasattr(self.memory, "history")
+        ):
+            # A newly granted live capability still needs the actual read's headroom.
+            await self._refresh_preparation_origin(
+                turn, read_budget=clients.JsonService.QUERY_BUDGET_SECONDS
+            )
         if turn.get("memory_context") is not None:
             bundle = turn["memory_context"]["bundle"]
             turn["history_snapshot"] = bundle["history_snapshot"]

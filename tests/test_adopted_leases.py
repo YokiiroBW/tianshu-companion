@@ -322,6 +322,130 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([current["origin"], current["origin"]], self.renewals)
         self.assertEqual(1, len(self.verifications))
 
+    async def test_prepare_catalog_renews_before_proof_and_survives_another_bounded_reader(self):
+        from tianshu_companion.clients import JsonService
+
+        previous, current = await self.prepare()
+        self.lease(previous, 30)
+        self.lease(current, 120)
+        old = previous["source_deadline"]
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = self.h.memory.prepare_context
+        proved = []
+
+        async def prepare(*args):
+            result = await original(*args)
+            lease = self.h.core.store.get("turns", previous["id"])["source_deadline"]
+            proved.append(lease)
+            self.assertGreater(lease, old)
+            self.assertIn((previous["id"], lease), self.authorizations)
+            entered.set()
+            await release.wait()
+            return result
+
+        self.h.memory.prepare_context = prepare
+        task = asyncio.create_task(self.h.core._prepare_context(current, []))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            self.h.clock.advance(1)
+            other = self.h.core.store.get("turns", previous["id"])
+            await asyncio.create_task(
+                self.h.core.continue_delivery_origin(
+                    other, read_budget=JsonService.QUERY_BUDGET_SECONDS
+                )
+            )
+            self.assertEqual(proved[0], other["source_deadline"])
+            release.set()
+            context, _, checks, *_ = await task
+            self.assertTrue(context.data["recent_dialogue"])
+            self.assertTrue(any(c["source_turn_id"] == previous["id"] for c in checks))
+            self.assertEqual(
+                [proved[0]],
+                [deadline for key, deadline in self.authorizations if key == previous["id"]],
+            )
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_v2_local_snapshot_keeps_default_then_recent_reserves_its_actual_read(self):
+        previous, current = await self.prepare()
+        self.lease(previous, 120)
+        self.lease(current, 32)
+        old = current["source_deadline"]
+        refresh = self.h.core._refresh_preparation_origin
+        transitions = []
+
+        async def refreshed(turn, **kwargs):
+            before = self.h.core.store.get("turns", turn["id"])["source_deadline"]
+            result = await refresh(turn, **kwargs)
+            transitions.append((before, turn["source_deadline"]))
+            return result
+
+        self.h.core._refresh_preparation_origin = refreshed
+        prepare = self.h.memory.prepare_context
+
+        async def bounded(*args):
+            self.assertGreater(current["source_deadline"], old)
+            self.h.clock.advance(14)
+            result = await prepare(*args)
+            self.assertGreater(current["source_deadline"], self.h.clock() + 20)
+            return result
+
+        self.h.memory.prepare_context = bounded
+        await self.h.core._prepare_context(current, [])
+        self.assertEqual((old, old), transitions[0])
+        self.assertEqual(old, transitions[1][0])
+        self.assertGreater(transitions[1][1], old)
+
+    async def test_profile_batch_reserves_main_lease_before_its_bounded_read(self):
+        from tianshu_companion.context import TurnContext
+        from tianshu_companion.context_preparation import profiles
+
+        _, current = await self.prepare()
+        self.lease(current, 32)
+        old = current["source_deadline"]
+        original = self.h.memory.profiles_batch
+        calls = []
+
+        async def bounded(*args):
+            calls.append(current["source_deadline"])
+            self.assertGreater(current["source_deadline"], old)
+            self.h.clock.advance(14)
+            result = await original(*args)
+            self.assertGreater(current["source_deadline"], self.h.clock() + 20)
+            return result
+
+        self.h.memory.profiles_batch = bounded
+        context = TurnContext(current["preparation"], [], [], memory=current["memory_context"])
+        await profiles(self.h.core, current, context, [])
+        self.assertEqual([current["source_deadline"]], calls)
+
+    async def test_midrange_catalog_renewal_unknown_still_aborts_the_entire_preparation(self):
+        previous, current = await self.prepare()
+        self.lease(previous, 32)
+        self.lease(current, 120)
+        context = self.h.core.sender.expression_context
+        calls = []
+
+        async def unknown(source, scope, channel):
+            if source["origin"] == previous["origin"]:
+                raise Fault("result_unknown", unknown=True)
+            return await context(source, scope, channel)
+
+        async def prepare(*args):
+            calls.append(args)
+            return {}
+
+        self.h.core.sender.expression_context = unknown
+        self.h.memory.prepare_context = prepare
+        with self.assertRaises(Fault) as caught:
+            await self.h.core._prepare_context(current, [])
+        self.assertTrue(caught.exception.unknown)
+        self.assertTrue(caught.exception.context_renewal_failure)
+        self.assertFalse(calls)
+
     async def test_read_budget_is_not_a_guarantee_after_unbounded_other_checks(self):
         previous, current = await self.prepare()
         self.lease(previous, 120)

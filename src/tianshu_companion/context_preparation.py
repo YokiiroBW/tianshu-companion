@@ -139,7 +139,11 @@ async def _v2_variants(core, turn, checks, batches):
             memory_checks = {}
             try:
                 lease = await core._verify_context_check(
-                    turn, check, checkpoint, memory_checks=memory_checks
+                    turn,
+                    check,
+                    checkpoint,
+                    memory_checks=memory_checks,
+                    read_budget=JsonService.QUERY_BUDGET_SECONDS,
                 )
             except Fault as error:
                 if (
@@ -234,7 +238,7 @@ async def recent(core, turn, context, checks):
         batches, metadata["reply_dependency_omissions"] = bound_recent_provenance(
             core.store, batches, checks
         )
-        await core._refresh_preparation_origin(turn)
+        await core._refresh_preparation_origin(turn, read_budget=JsonService.QUERY_BUDGET_SECONDS)
         prepared = await _v2_variants(core, turn, checks, batches)
         accepted = []
         for variants in prepared:
@@ -323,7 +327,7 @@ async def profiles(core, turn, context, accepted):
         if allowance <= 0:
             break
         batch = targets[offset : offset + 4]
-        await core._refresh_preparation_origin(turn)
+        await core._refresh_preparation_origin(turn, read_budget=JsonService.QUERY_BUDGET_SECONDS)
         budget = dict(tokens=allowance, bytes=allowance)
         if turn.get("memory_context") is not None:
             requests = [

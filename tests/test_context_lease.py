@@ -415,3 +415,153 @@ def test_group_history_renews_original_human_lease_and_revocation_still_denies()
             await h.core.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("domain", ["text", "relationship"])
+def test_legacy_check_reserves_only_the_actual_memory_read_budget(domain):
+    async def run():
+        from tianshu_companion.relationships.contract import DOMAIN, SCHEMA_HASH
+
+        h = Harness(silence_ms=0)
+        try:
+            for account, text in [("1001", "周末约在公园门口"), ("1002", "后来再问安排")]:
+                await h.ingest(account=account, channel="group:123", group=True, text=text)
+                await h.cycles()
+            previous, current = h.turns()
+            previous["source_deadline"] = h.clock() + 32
+            h.core.store.put("turns", previous)
+            h.origins.values[previous["origin"]["assertion_ref"]]["expires_at"] = utc(
+                previous["source_deadline"]
+            )
+            old = previous["source_deadline"]
+            calls = lease_sender(h)
+            history, observed = h.memory.history, []
+
+            async def bounded(*args, **kwargs):
+                deadline = h.core.store.get("turns", previous["id"])["source_deadline"]
+                observed.append(deadline)
+                assert deadline > old
+                h.clock.advance(14)
+                result = await history(*args, **kwargs)
+                assert deadline > h.clock() + 20
+                return result
+
+            h.memory.history = bounded
+            check = scope_check(previous)
+            if domain == "relationship":
+                check.update(
+                    version_domain=DOMAIN,
+                    schema_hash=SCHEMA_HASH,
+                    relationship_view="unavailable",
+                    relationship_version=None,
+                    checked_at=None,
+                )
+            await h.core._verify_checks(current, [check])
+            if domain == "text":
+                assert len(calls) == len(observed) == 1
+            else:
+                assert not calls and not observed
+                assert h.core.store.get("turns", previous["id"])["source_deadline"] == old
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_initial_snapshot_reserves_its_own_bounded_read():
+    async def run():
+        h = Harness(silence_ms=0)
+        try:
+            turn = await preparing_turn(h)
+            turn["preparation"] = await h.memory.select(
+                turn["origin"], turn["scope"], "合成待办", dict(tokens=0, bytes=0)
+            )
+            turn["source_deadline"] = h.clock() + 32
+            h.core.store.put("turns", turn)
+            h.origins.values[turn["origin"]["assertion_ref"]]["expires_at"] = utc(
+                turn["source_deadline"]
+            )
+            old = turn["source_deadline"]
+            calls = lease_sender(h)
+            history, observed = h.memory.history, []
+
+            async def bounded(*args, **kwargs):
+                observed.append(turn["source_deadline"])
+                assert turn["source_deadline"] > old
+                h.clock.advance(14)
+                result = await history(*args, **kwargs)
+                assert turn["source_deadline"] > h.clock() + 20
+                return result
+
+            h.memory.history = bounded
+            await h.core._prepare_context(turn, [])
+            assert len(calls) == len(observed) == 1
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("allowed_before", [True, False], ids=["revoked", "granted"])
+def test_legacy_snapshot_rechecks_live_read_capability_after_renewal(allowed_before):
+    async def run():
+        from types import SimpleNamespace
+
+        from test_delivery_v2 import NativeQueue
+
+        h = Harness(silence_ms=0)
+        task = None
+        try:
+            turn = await preparing_turn(h)
+            turn["preparation"] = await h.memory.select(
+                turn["origin"], turn["scope"], "合成待办", dict(tokens=0, bytes=0)
+            )
+            turn["source_deadline"] = h.clock() + 19
+            h.core.store.put("turns", turn)
+            h.origins.values[turn["origin"]["assertion_ref"]]["expires_at"] = utc(
+                turn["source_deadline"]
+            )
+            allowed = allowed_before
+            h.core.role_runtime = SimpleNamespace(
+                allowed=lambda actor, capability: capability != "memory.read" or allowed
+            )
+            entered, release = asyncio.Event(), asyncio.Event()
+            queue, renewals = NativeQueue(h.clock), []
+
+            async def context(source, scope, channel):
+                renewals.append(h.clock())
+                if len(renewals) == 1:
+                    entered.set()
+                    await release.wait()
+                expiry = utc(h.clock() + (32 if len(renewals) == 1 else 60))
+                h.origins.values[source["origin"]["assertion_ref"]]["expires_at"] = expiry
+                return dict(
+                    origin=source["origin"], scope=scope, channel=channel, expires_at=expiry
+                )
+
+            queue.expression_context = context
+            h.core.sender = queue
+            reads = []
+            history = h.memory.history
+
+            async def snapshot(*args, **kwargs):
+                reads.append(turn["source_deadline"])
+                assert turn["source_deadline"] > h.clock() + 35
+                return await history(*args, **kwargs)
+
+            h.memory.history = h.memory.input_history = snapshot
+            task = asyncio.create_task(h.core._prepare_context(turn, []))
+            await asyncio.wait_for(entered.wait(), 1)
+            allowed = not allowed_before
+            assert h.core._turn_allows(turn, "dialogue")
+            release.set()
+            await task
+            assert len(reads) == (0 if allowed_before else 2)
+            assert len(renewals) == (1 if allowed_before else 2)
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await h.core.close()
+
+    asyncio.run(run())
