@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from test_source_sync import SourceHarness
-from tianshu_companion.clients import uid, utc
+from tianshu_companion.clients import epoch, uid, utc
 from tianshu_companion.contracts import Fault, digest
 from tianshu_companion.source_sync import selector
 
@@ -59,6 +59,10 @@ class SourceFactsBatchTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temp.cleanup)
         self.h = SourceHarness(Path(temp.name) / "source-lease.sqlite")
         turn = (await self.completed_turns())[0]
+        # Persisting a longer lease is required at the real renewal boundary;
+        # a healthy conservative deadline now intentionally stays unchanged.
+        turn["source_deadline"] = epoch(utc(self.h.clock() + 19))
+        self.h.core.store.put("turns", turn)
         query = self.query(turns=[turn["id"]])
         before = self.read(query)
         deadline = turn["source_deadline"] + 600

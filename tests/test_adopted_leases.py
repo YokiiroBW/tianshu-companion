@@ -222,5 +222,64 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(caught.exception.retryable_read)
         self.assertTrue(changed)
 
+    async def concurrent_continuation(self, operation, *, near=False):
+        previous, current = await self.prepare()
+        self.lease(previous, 21 if near else 60)
+        deadline = previous["source_deadline"]
+        entered, release = asyncio.Event(), asyncio.Event()
+        name = "prepare_context" if operation == "prepare" else "verify_context"
+        original = getattr(self.h.memory, name)
+
+        async def blocked(*args):
+            result = await original(*args)
+            entered.set()
+            await release.wait()
+            return result
+
+        setattr(self.h.memory, name, blocked)
+        read = (
+            self.h.core._prepare_context(current, [])
+            if operation == "prepare"
+            else self.h.core._preflight_once(current)
+        )
+        task = asyncio.create_task(read)
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            self.h.clock.advance(2 if near else 1)
+            # A different live turn/checkpoint continues this human's source
+            # while the successful Memory read is still in flight.
+            await asyncio.create_task(self.h.core.continue_delivery_origin(previous))
+            release.set()
+            if near:
+                with self.assertRaises(Fault) as caught:
+                    await task
+                self.assertTrue(caught.exception.retryable_read)
+                self.assertGreater(previous["source_deadline"], deadline)
+            else:
+                await task
+                self.assertEqual(deadline, previous["source_deadline"])
+            self.assertIn(previous["origin"], self.renewals)
+            self.assertEqual(
+                previous["source_deadline"],
+                self.h.core.store.get("turns", previous["id"])["source_deadline"],
+            )
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_healthy_other_checkpoint_does_not_invalidate_successful_prepare(self):
+        await self.concurrent_continuation("prepare")
+
+    async def test_healthy_other_checkpoint_does_not_invalidate_successful_verify(self):
+        await self.concurrent_continuation("verify")
+
+    async def test_real_near_expiry_renewal_still_invalidates_old_prepare_proof(self):
+        await self.concurrent_continuation("prepare", near=True)
+
+    async def test_real_near_expiry_renewal_still_invalidates_old_verify_proof(self):
+        await self.concurrent_continuation("verify", near=True)
+
 
 del CoreEvidenceTests

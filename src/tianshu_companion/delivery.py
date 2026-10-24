@@ -43,20 +43,31 @@ class Delivery:
             or current["channel"] != turn["bundle"]["collection_key"]["channel"]
         ):
             raise Fault("scope_changed")
-        # This is a freshly verified lease from the existing delivery authority, not
-        # a local extension of the admission deadline. Persist it for retry/restart.
+        # Every checkpoint still reads the actual delivery authority. A longer
+        # remote lease need not change our healthy conservative proof deadline:
+        # doing so would invalidate other turns reading this same human source.
         deadline = epoch(current["expires_at"])
-        if deadline <= self.clock():
+        now = self.clock()
+        if deadline <= now:
             raise Fault("forbidden")
         with self.store.transaction():
             fresh = self.store.get("turns", turn["id"])
-            if fresh and deadline > fresh["source_deadline"]:
-                fresh["source_deadline"] = deadline
-                if fresh.get("bootstrap_mapping") and fresh["bootstrap_until"] <= self.clock():
-                    fresh["bootstrap_until"] = min(deadline, self.clock() + 5)
+            durable = fresh["source_deadline"] if fresh else turn["source_deadline"]
+            # Re-read after the await: another checkpoint may already have
+            # renewed this source. Never overwrite it with the caller's old copy
+            # or keep a deadline beyond a shorter actual authority response.
+            adopted = deadline if durable <= now + 20 else min(durable, deadline)
+            if fresh and adopted != durable:
+                fresh["source_deadline"] = adopted
+                if (
+                    adopted > durable
+                    and fresh.get("bootstrap_mapping")
+                    and fresh["bootstrap_until"] <= now
+                ):
+                    fresh["bootstrap_until"] = min(adopted, now + 5)
                 # Lease bookkeeping does not revise the turn's source/event version.
                 self.store.put("turns", fresh)
-        turn["source_deadline"] = max(turn["source_deadline"], deadline)
+        turn["source_deadline"] = adopted
 
     async def stream_segment(self, turn_id, text="", content_refs=None):
         turn = self.store.get("turns", turn_id)

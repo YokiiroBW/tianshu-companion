@@ -4,7 +4,7 @@ import copy
 import pytest
 
 from support import Harness
-from tianshu_companion.clients import utc
+from tianshu_companion.clients import epoch, utc
 from tianshu_companion.context import scope_check
 from tianshu_companion.contracts import Fault
 
@@ -17,11 +17,172 @@ async def preparing_turn(h):
         phase="preparing",
         config_version=h.core.config_version,
         bootstrap_until=h.clock() + 5,
-        source_deadline=h.clock() + 60,
+        source_deadline=epoch(utc(h.clock() + 60)),
     )
     h.origins.values[turn["origin"]["assertion_ref"]]["expires_at"] = utc(turn["source_deadline"])
     h.core.store.put("turns", turn)
     return turn
+
+
+def lease_sender(h, *, duration=60):
+    from test_delivery_v2 import NativeQueue
+
+    queue, calls = NativeQueue(h.clock), []
+
+    async def context(source, scope, channel):
+        calls.append(h.clock())
+        expiry = utc(h.clock() + duration)
+        h.origins.values[source["origin"]["assertion_ref"]]["expires_at"] = expiry
+        return dict(origin=source["origin"], scope=scope, channel=channel, expires_at=expiry)
+
+    queue.expression_context = context
+    h.core.sender = queue
+    return calls
+
+
+def test_healthy_continuation_keeps_deadline_version_and_bootstrap_window():
+    async def run():
+        h = Harness(silence_ms=0)
+        try:
+            turn = await preparing_turn(h)
+            turn.update(bootstrap_mapping=True, bootstrap_until=h.clock() - 1)
+            h.core.store.put("turns", turn)
+            original = copy.deepcopy(turn)
+            calls = lease_sender(h)
+            for _ in range(2):
+                h.clock.advance(1)
+                await h.core.continue_delivery_origin(turn)
+            assert len(calls) == 2
+            assert turn == original
+            assert h.core.store.get("turns", turn["id"]) == original
+            assert (
+                epoch(h.origins.values[turn["origin"]["assertion_ref"]]["expires_at"])
+                > turn["source_deadline"]
+            )
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+def test_near_expiry_continuation_adopts_real_deadline_and_preserves_bootstrap_bound():
+    async def run():
+        h = Harness(silence_ms=0)
+        try:
+            turn = await preparing_turn(h)
+            turn.update(
+                source_deadline=h.clock() + 19,
+                bootstrap_mapping=True,
+                bootstrap_until=h.clock() - 1,
+            )
+            h.core.store.put("turns", turn)
+            calls = lease_sender(h)
+            now = h.clock()
+            await h.core.continue_delivery_origin(turn)
+            assert turn["source_deadline"] == epoch(utc(now + 60))
+            fresh = h.core.store.get("turns", turn["id"])
+            assert fresh["bootstrap_until"] == now + 5
+            h.clock.advance(1)
+            await h.core.continue_delivery_origin(fresh)
+            assert len(calls) == 2
+            assert fresh["source_deadline"] == epoch(utc(now + 60))
+            assert h.core.store.get("turns", turn["id"])["bootstrap_until"] == now + 5
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+def test_overlapping_continuations_reload_the_already_adopted_durable_deadline():
+    async def run():
+        from test_delivery_v2 import NativeQueue
+
+        h = Harness(silence_ms=0)
+        task = None
+        try:
+            first = await preparing_turn(h)
+            first["source_deadline"] = h.clock() + 19
+            h.core.store.put("turns", first)
+            second = copy.deepcopy(first)
+            entered, release = asyncio.Event(), asyncio.Event()
+            calls = 0
+
+            async def context(source, scope, channel):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    entered.set()
+                    await release.wait()
+                return dict(
+                    origin=source["origin"],
+                    scope=scope,
+                    channel=channel,
+                    expires_at=utc(h.clock() + 60),
+                )
+
+            queue = NativeQueue(h.clock)
+            queue.expression_context = context
+            h.core.sender = queue
+            task = asyncio.create_task(h.core.continue_delivery_origin(first))
+            await asyncio.wait_for(entered.wait(), 1)
+            await h.core.continue_delivery_origin(second)
+            adopted = second["source_deadline"]
+            h.clock.advance(1)
+            release.set()
+            await task
+            assert calls == 2
+            assert first["source_deadline"] == adopted
+            assert h.core.store.get("turns", first["id"])["source_deadline"] == adopted
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+def test_shorter_fresh_authority_expiry_remains_a_conservative_deadline():
+    async def run():
+        h = Harness(silence_ms=0)
+        try:
+            turn = await preparing_turn(h)
+            calls = lease_sender(h, duration=30)
+            await h.core.continue_delivery_origin(turn)
+            assert calls == [h.clock()]
+            assert turn["source_deadline"] == epoch(utc(h.clock() + 30))
+            assert h.core.store.get("turns", turn["id"])["source_deadline"] == epoch(
+                utc(h.clock() + 30)
+            )
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+def test_adopted_near_expiry_deadline_survives_store_restart(tmp_path):
+    async def run():
+        from tianshu_companion.store import Store
+
+        path = tmp_path / "companion.db"
+        h = Harness(path, silence_ms=0)
+        try:
+            turn = await preparing_turn(h)
+            turn["source_deadline"] = h.clock() + 19
+            h.core.store.put("turns", turn)
+            calls = lease_sender(h)
+            await h.core.continue_delivery_origin(turn)
+            expected = turn["source_deadline"]
+        finally:
+            await h.core.close()
+        reopened = Store(path)
+        try:
+            assert reopened.get("turns", turn["id"])["source_deadline"] == expected
+            assert len(calls) == 1
+        finally:
+            reopened.close()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("query_seconds", [0, 45])
