@@ -644,7 +644,7 @@ def test_real_raw_source_proof_survives_unrelated_foreign_history_withdrawal(syn
 def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
     from support import Harness
     from test_memory_context import ProofIssuer
-    from tianshu_companion.clients import utc
+    from tianshu_companion.clients import epoch, utc
     from tianshu_companion.context import scope_check
     from tianshu_companion.context_preparation import _v2_variants
     from tianshu_companion.contracts import digest
@@ -755,6 +755,7 @@ def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
                 expires_at=utc(h.clock() + 3600),
                 revoked=False,
             )
+            origin_deadline = epoch(h.origins.values[origin["assertion_ref"]]["expires_at"])
 
             def seed(source, content):
                 messages = []
@@ -801,7 +802,7 @@ def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
                     scope=scope,
                     binding_version=binding,
                     scope_version=1,
-                    source_deadline=h.clock() + 3600,
+                    source_deadline=origin_deadline,
                     bundle=dict(
                         collection_id="collection:" + digest(source["turn_id"]),
                         collection_revision=source["input_revision"],
@@ -839,7 +840,9 @@ def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
                 origin=origin,
                 service="nonebot",
                 scope=scope,
-                bundle=dict(collection_key=dict(channel=channel)),
+                binding_version=binding,
+                source_deadline=origin_deadline,
+                bundle=dict(collection_key=dict(channel=channel, author=sync.account)),
                 memory_context=fresh,
             )
             assert (
