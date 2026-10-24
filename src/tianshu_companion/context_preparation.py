@@ -13,7 +13,7 @@ from .context import (
     profile_targets,
     recent_checks,
 )
-from .context_checks import VerificationCheckpoint, dependency_changed, read_parallel, verify_checks
+from .context_checks import VerificationCheckpoint, read_parallel, verify_checks
 from .context_relevance import input_only
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 from .delivery import SOURCE_RENEWAL_MARGIN_SECONDS
@@ -23,17 +23,14 @@ from .preparation_retry import verify_prepared_memory
 
 def _lease(core, turn, check):
     identity = check.get("source_turn_id")
-    if identity:
-        previous = core.store.get("turns", identity)
-        if previous is None:
-            raise dependency_changed()
-        return previous["source_deadline"]
-    if check["origin"] == turn["origin"]:
-        current = core.store.get("turns", turn["id"])
-        if current is None:
-            raise dependency_changed()
-        return current["source_deadline"]
-    return None
+    if not identity:
+        if check["origin"] != turn["origin"]:
+            return None
+        identity = turn["id"]
+    source = core._context_source(dict(check, source_turn_id=identity))
+    if identity == turn["id"]:
+        core._check_preparation_origin(turn, source)
+    return source["source_deadline"]
 
 
 def _checkpoint_changed():
@@ -42,10 +39,18 @@ def _checkpoint_changed():
     return Fault("dependency_unavailable", retryable_read=True)
 
 
-def _needs_coordination(core, turn, check, captured, *, read_budget):
+def _proof_lease(core, turn, check, captured):
     lease = _lease(core, turn, check)
-    return lease != captured or (
-        lease is not None and lease <= core.clock() + SOURCE_RENEWAL_MARGIN_SECONDS + read_budget
+    if (lease is None) != (captured is None) or (lease is not None and lease < captured):
+        raise _checkpoint_changed()
+    # A same-source extension does not revise this checkpoint's deadline.
+    return captured
+
+
+def _needs_coordination(core, turn, check, captured, *, read_budget):
+    _proof_lease(core, turn, check, captured)
+    return captured is not None and (
+        captured <= core.clock() + SOURCE_RENEWAL_MARGIN_SECONDS + read_budget
     )
 
 
@@ -57,20 +62,13 @@ class AdoptedChecks:
     checks: dict = field(default_factory=dict)
     leases: dict = field(default_factory=dict)
 
-    async def collect(self, core, turn, checks, checkpoint, *, read_budget=0):
-        async def attest(check, point):
-            self.leases[digest(check)] = await core._verify_context_check(
-                turn, check, point, memory_checks=self.checks, read_budget=read_budget
-            )
-
+    def add(self, checks):
         checks = merge_checks(checks)
         self.catalog.update((digest(check), check) for check in checks)
-        await verify_checks(checks, attest, checkpoint=checkpoint)
 
     async def verify(self, core, turn, checkpoint):
-        # Other main/QQ/book/local reads finish before this phase. Their waits
-        # may have consumed an early source's renewal margin, or another caller
-        # may have renewed it. Never attach an old authorization to a new lease.
+        # QQ/book reads finish first. This phase alone attests adopted authority,
+        # including non-Memory relationship checks, before the complete barrier.
         read_budget = JsonService.QUERY_BUDGET_SECONDS
         await core._refresh_preparation_origin(turn, read_budget=read_budget, checkpoint=checkpoint)
         main = dict(
@@ -81,27 +79,26 @@ class AdoptedChecks:
             binding_version=turn["binding_version"],
         )
         main_lease = _lease(core, turn, main)
-        await core._authorize_context(main, checkpoint, main_lease)
 
-        pending = [
-            check
-            for identity, check in self.catalog.items()
-            if _needs_coordination(
-                core, turn, check, self.leases[identity], read_budget=read_budget
+        async def attest(check, point):
+            self.leases[digest(check)] = await core._verify_context_check(
+                turn, check, point, memory_checks=self.checks, read_budget=read_budget
             )
-        ]
-        # One coordination pass, never a new retry loop. Changed deadlines use
-        # new checkpoint keys, so each renewal gets its own authority proof.
-        await self.collect(core, turn, pending, checkpoint, read_budget=read_budget)
+
+        await read_parallel(
+            [
+                lambda: core._authorize_context(main, checkpoint, main_lease),
+                lambda: verify_checks(self.catalog.values(), attest, checkpoint=checkpoint),
+            ]
+        )
 
         def current(*, margin):
-            if _lease(core, turn, main) != main_lease or main_lease <= core.clock() + margin:
+            lease = _proof_lease(core, turn, main, main_lease)
+            if lease <= core.clock() + margin:
                 raise _checkpoint_changed()
             for identity, check in self.catalog.items():
-                lease = _lease(core, turn, check)
-                if lease != self.leases[identity] or (
-                    lease is not None and lease <= core.clock() + margin
-                ):
+                lease = _proof_lease(core, turn, check, self.leases[identity])
+                if lease is not None and lease <= core.clock() + margin:
                     raise _checkpoint_changed()
 
         current(margin=SOURCE_RENEWAL_MARGIN_SECONDS)
@@ -109,7 +106,7 @@ class AdoptedChecks:
             core.memory, turn, [self.checks[key] for key in sorted(self.checks)]
         )
         # The 20-second margin governs early renewal, not publication. A proof
-        # returned before its unchanged durable deadline is still valid.
+        # returned before its original captured deadline is still valid.
         current(margin=0)
 
 
@@ -232,10 +229,7 @@ async def _v2_variants(core, turn, checks, batches):
                 # Rejected/unavailable Memory dependencies cannot be adopted;
                 # their lease must neither extend nor invalidate valid material.
                 continue
-            lease = _lease(core, turn, check)
-            if lease != leases[identity]:
-                # A concurrent renewal invalidates this checkpoint, not selection.
-                raise Fault("dependency_unavailable", retryable_read=True)
+            lease = _proof_lease(core, turn, check, leases[identity])
             if lease is not None and lease <= core.clock():
                 raise Fault("forbidden")
         return [

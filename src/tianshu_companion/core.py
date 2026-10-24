@@ -2047,7 +2047,7 @@ class Core(Delivery):
             deferred = adopted is not None
             adopted = adopted if deferred else AdoptedChecks()
             try:
-                await adopted.collect(self, turn, checks, checkpoint)
+                adopted.add(checks)
                 if not deferred:
                     await adopted.verify(self, turn, checkpoint)
             finally:
@@ -2089,6 +2089,22 @@ class Core(Delivery):
         if binding != check["binding_version"]:
             raise dependency_changed()
 
+    def _context_source(self, check):
+        from .context_checks import dependency_changed
+
+        previous = self.store.get("turns", check["source_turn_id"])
+        if (
+            previous is None
+            or previous["origin"] != check["origin"]
+            or previous["scope"] != check["scope"]
+            or previous["service"] != check["service"]
+            or previous["binding_version"] != check["binding_version"]
+            or previous["bundle"]["collection_key"]["channel"] != check["channel"]
+            or not sources_current(self.store, previous)
+        ):
+            raise dependency_changed()
+        return previous
+
     async def _verify_context_check(
         self, turn, check, checkpoint, *, memory_checks=None, read_budget=0
     ):
@@ -2106,22 +2122,7 @@ class Core(Delivery):
         source_turn_id = check.get("source_turn_id")
         lease_deadline = turn["source_deadline"] if check["origin"] == turn["origin"] else None
         if source_turn_id:
-
-            def source():
-                previous = self.store.get("turns", source_turn_id)
-                if (
-                    previous is None
-                    or previous["origin"] != check["origin"]
-                    or previous["scope"] != scope
-                    or previous["service"] != check["service"]
-                    or previous["binding_version"] != check["binding_version"]
-                    or previous["bundle"]["collection_key"]["channel"] != check["channel"]
-                    or not sources_current(self.store, previous)
-                ):
-                    raise dependency_changed()
-                return previous
-
-            previous = source()
+            previous = self._context_source(check)
             # Renew the original human's lease once, including parallel domain checks.
             if (
                 previous["source_deadline"]
@@ -2139,7 +2140,7 @@ class Core(Delivery):
                     raise
                 # Parallel domain checks may have joined another caller's lease
                 # continuation; use the durable deadline, not this caller's copy.
-                previous = source()
+                previous = self._context_source(check)
             # A long preparation can outlive a renewed source lease. The next
             # lease must not reuse the authority or history proof of the old one.
             lease_deadline = previous["source_deadline"]
@@ -2223,21 +2224,24 @@ class Core(Delivery):
             raise Fault("invalid_input")
         return lease_deadline
 
+    def _check_preparation_origin(self, turn, fresh):
+        if (
+            fresh is None
+            or fresh["cancelled"]
+            or fresh["scope"]["actor_id"] not in self.roles
+            or any(fresh[key] != turn[key] for key in ("origin", "scope", "binding_version"))
+            or fresh["bundle"]["collection_key"]["channel"]
+            != turn["bundle"]["collection_key"]["channel"]
+            or not self._turn_allows(fresh, "dialogue")
+        ):
+            raise Fault("scope_changed")
+        self._check_role(fresh)
+        self._check_input_versions(fresh)
+
     async def _refresh_preparation_origin(self, turn, *, read_budget=0, checkpoint=None):
         def current():
             fresh = self.store.get("turns", turn["id"])
-            if (
-                fresh is None
-                or fresh["cancelled"]
-                or fresh["scope"]["actor_id"] not in self.roles
-                or any(fresh[key] != turn[key] for key in ("origin", "scope", "binding_version"))
-                or fresh["bundle"]["collection_key"]["channel"]
-                != turn["bundle"]["collection_key"]["channel"]
-                or not self._turn_allows(fresh, "dialogue")
-            ):
-                raise Fault("scope_changed")
-            self._check_role(fresh)
-            self._check_input_versions(fresh)
+            self._check_preparation_origin(turn, fresh)
             turn["source_deadline"] = fresh["source_deadline"]
 
         current()
@@ -2454,7 +2458,7 @@ class Core(Delivery):
 
             await read_parallel(
                 [
-                    authorize,
+                    *([authorize] if adopted is None else []),
                     lambda: checkpoint.once(
                         ["qq_admin", turn["id"]], lambda: self._check_qq_admin(turn)
                     ),

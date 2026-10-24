@@ -391,20 +391,42 @@ class CorePreparationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await job
 
-    async def test_renewal_during_batch_does_not_extend_old_authority(self):
+    async def test_pure_extension_during_batch_preserves_original_authority_bound(self):
         previous, current = await self.turns()
+        old = self.h.clock() + 60
+        for expires in (False, True):
+            with self.subTest(captured_expires=expires):
+                fresh = self.h.core.store.get("turns", previous["id"])
+                fresh["source_deadline"] = old
+                self.h.core.store.put("turns", fresh)
+                self.h.origins.values[previous["origin"]["assertion_ref"]]["expires_at"] = utc(old)
+                calls = []
 
-        async def prepare(origin, scope, bundle, checks, required):
-            fresh = self.h.core.store.get("turns", previous["id"])
-            fresh["source_deadline"] += 10
-            self.h.core._save_turn(fresh)
-            return {c["check_id"]: "valid" for c in checks}
+                async def prepare(origin, scope, bundle, checks, required):
+                    calls.append(checks)
+                    fresh = self.h.core.store.get("turns", previous["id"])
+                    fresh["source_deadline"] = old + 10
+                    self.h.core.store.put("turns", fresh)
+                    self.h.origins.values[previous["origin"]["assertion_ref"]]["expires_at"] = utc(
+                        old + 10
+                    )
+                    if expires:
+                        self.h.clock.advance(61)
+                    return {c["check_id"]: "valid" for c in checks}
 
-        self.h.memory.prepare_context = prepare
-        with self.assertRaises(Fault) as caught:
-            await self.h.core._prepare_context(current, [])
-        self.assertTrue(caught.exception.retryable_read)
-        self.assertFalse(getattr(caught.exception, "memory_selection_invalid", False))
+                self.h.memory.prepare_context = prepare
+                if expires:
+                    with self.assertRaises(Fault) as caught:
+                        await self.h.core._prepare_context(current, [])
+                    self.assertEqual("forbidden", caught.exception.code)
+                    self.assertLessEqual(old, self.h.clock())
+                else:
+                    context, *_ = await self.h.core._prepare_context(current, [])
+                    self.assertTrue(context.data["recent_dialogue"])
+                self.assertEqual(1, len(calls))
+                durable = self.h.core.store.get("turns", previous["id"])["source_deadline"]
+                self.assertGreater(durable, old)
+                self.assertGreater(durable, self.h.clock())
 
     async def test_local_source_withdrawal_rejects_full_and_input_variants(self):
         previous, current = await self.turns()
