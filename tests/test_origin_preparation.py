@@ -165,7 +165,7 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_unproved_check_excludes_same_origin_with_another_valid_lease(self):
         previous, current = await self.turns()
         clone = dict(copy.deepcopy(previous), id="turn:another-lease")
-        clone["source_deadline"] += 10
+        clone["source_deadline"] = self.h.clock() + 36
         self.h.core._save_turn(clone)
         ref, reads = previous["origin"]["assertion_ref"], []
 
@@ -173,6 +173,10 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
             if key != ref:
                 return "valid"
             reads.append(key)
+            if len(reads) == 2:
+                # The apparently valid sibling enters the coordination margin,
+                # but an unavailable check already excluded their whole origin.
+                self.h.clock.advance(2)
             return "403" if len(reads) == 1 else "valid"
 
         self.origins(mode)
@@ -185,6 +189,25 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
             result = await _v2_variants(self.h.core, current, [], batches)
         self.assertEqual(2, len(reads))
         self.assertEqual([[], []], result)
+
+    async def test_initial_rejected_check_is_not_retried_by_prepare_coordination(self):
+        previous, current = await self.turns()
+        previous["source_deadline"] = self.h.clock() + 10
+        self.h.core._save_turn(previous)
+        rejected = dict(scope_check(previous), binding_version=previous["binding_version"] + 1)
+        verify, calls = self.h.core._verify_context_check, []
+
+        async def checked(*args, **kwargs):
+            calls.append(args[1])
+            return await verify(*args, **kwargs)
+
+        self.h.core._verify_context_check = checked
+        with patch("tianshu_companion.context_preparation.recent_checks", return_value=[rejected]):
+            result = await _v2_variants(
+                self.h.core, current, [], [[dict(turn_id=previous["id"], replies=[])]]
+            )
+        self.assertEqual([[]], result)
+        self.assertEqual([rejected], calls)
 
     async def test_reply_only_unproved_origin_keeps_only_independent_input_projection(self):
         old, previous, current = await self.turns(3)

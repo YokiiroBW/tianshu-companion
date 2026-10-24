@@ -42,6 +42,13 @@ def _checkpoint_changed():
     return Fault("dependency_unavailable", retryable_read=True)
 
 
+def _needs_coordination(core, turn, check, captured, *, read_budget):
+    lease = _lease(core, turn, check)
+    return lease != captured or (
+        lease is not None and lease <= core.clock() + SOURCE_RENEWAL_MARGIN_SECONDS + read_budget
+    )
+
+
 @dataclass
 class AdoptedChecks:
     """Local authority proofs awaiting one final, complete Memory barrier."""
@@ -65,7 +72,6 @@ class AdoptedChecks:
         # may have consumed an early source's renewal margin, or another caller
         # may have renewed it. Never attach an old authorization to a new lease.
         read_budget = JsonService.QUERY_BUDGET_SECONDS
-        margin = SOURCE_RENEWAL_MARGIN_SECONDS + read_budget
         await core._refresh_preparation_origin(turn, read_budget=read_budget, checkpoint=checkpoint)
         main = dict(
             service=turn["service"],
@@ -80,9 +86,9 @@ class AdoptedChecks:
         pending = [
             check
             for identity, check in self.catalog.items()
-            if (lease := _lease(core, turn, check)) != self.leases[identity]
-            or lease is not None
-            and lease <= core.clock() + margin
+            if _needs_coordination(
+                core, turn, check, self.leases[identity], read_budget=read_budget
+            )
         ]
         # One coordination pass, never a new retry loop. Changed deadlines use
         # new checkpoint keys, so each renewal gets its own authority proof.
@@ -170,6 +176,34 @@ async def _v2_variants(core, turn, checks, batches):
         unavailable_origins = {
             origins[identity] for identity, status, _, _ in results if status == "unavailable"
         }
+        # Authority awaits can cross another turn's renewal boundary. Coordinate
+        # only still-valid sources once, before spending the complete Memory read.
+        # Reuse attest so required/global faults and whole-origin exclusions keep
+        # their existing ownership; a later renewal still fails the post-read guard.
+        pending = [
+            (identity, catalog[identity])
+            for identity, status, _, lease in results
+            if status == "valid"
+            and origins[identity] not in unavailable_origins
+            and _needs_coordination(
+                core,
+                turn,
+                catalog[identity],
+                lease,
+                read_budget=JsonService.QUERY_BUDGET_SECONDS,
+            )
+        ]
+        if pending:
+            coordinated = await read_parallel(
+                [lambda identity=i, check=c: attest(identity, check) for i, c in pending]
+            )
+            replacements = {value[0]: value for value in coordinated}
+            results = [replacements.get(value[0], value) for value in results]
+            unavailable_origins.update(
+                origins[identity]
+                for identity, status, _, _ in coordinated
+                if status == "unavailable"
+            )
         local, memory, links, required_memory, leases = {}, {}, {}, set(), {}
         for identity, valid, values, lease in results:
             if origins[identity] in unavailable_origins:

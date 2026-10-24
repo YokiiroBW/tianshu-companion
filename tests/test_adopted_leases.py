@@ -205,6 +205,7 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_renewal_during_authorization_cannot_label_a_new_lease_as_the_old_proof(self):
         previous, current = await self.prepare()
+        old = previous["source_deadline"]
         original = self.h.origins.resolve
         changed = False
 
@@ -217,10 +218,181 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
             return result
 
         self.h.origins.resolve = resolve
+        await self.h.core._prepare_context(current, [])
+        self.assertTrue(changed)
+        self.assertEqual(
+            [old, previous["source_deadline"]],
+            [deadline for key, deadline in self.authorizations if key == previous["id"]],
+        )
+
+    async def catalog_coordination(self, *, concurrent=False, failure=None):
+        from tianshu_companion.clients import JsonService
+        from tianshu_companion.context_preparation import _v2_variants
+        from tianshu_companion.contracts import digest
+        from tianshu_companion.short_context import select_recent
+
+        previous, current = await self.prepare()
+        self.lease(previous, 40)
+        self.lease(current, 120)
+        old = previous["source_deadline"]
+        selected, _ = select_recent(
+            self.h.core.store, current, self.h.core.short_context_policy, self.h.clock()
+        )
+        required = [scope_check(previous)]
+        ready, release = asyncio.Event(), asyncio.Event()
+        verify = self.h.core._verify_context_check
+        initial, active = 0, 0
+
+        async def checked(turn, check, checkpoint, **kwargs):
+            nonlocal initial, active
+            active += 1
+            try:
+                lease = await verify(turn, check, checkpoint, **kwargs)
+                if check.get("source_turn_id") == previous["id"] and initial < 2:
+                    initial += 1
+                    if initial == 2:
+                        ready.set()
+                        await release.wait()
+                return lease
+            finally:
+                active -= 1
+
+        self.h.core._verify_context_check = checked
+        prepare = self.h.memory.prepare_context
+        calls = []
+
+        async def prepared(origin, scope, bundle, checks, required_ids):
+            fresh = self.h.core.store.get("turns", previous["id"])
+            self.assertGreater(fresh["source_deadline"], old)
+            self.assertIn((previous["id"], fresh["source_deadline"]), self.authorizations)
+            self.assertEqual({"history", "input_history"}, {c["kind"] for c in checks})
+            self.assertEqual(2, len(checks))
+            self.assertEqual(["check:" + digest(required[0])], required_ids)
+            calls.append(copy.deepcopy(checks))
+            return await prepare(origin, scope, bundle, checks, required_ids)
+
+        self.h.memory.prepare_context = prepared
+        task = asyncio.create_task(_v2_variants(self.h.core, current, required, [selected]))
+        try:
+            await asyncio.wait_for(ready.wait(), 1)
+            self.assertFalse(calls)
+            self.h.clock.advance(6)
+            if concurrent:
+                other = self.h.core.store.get("turns", previous["id"])
+                await asyncio.create_task(
+                    self.h.core.continue_delivery_origin(
+                        other, read_budget=JsonService.QUERY_BUDGET_SECONDS
+                    )
+                )
+                self.assertGreater(other["source_deadline"], old)
+            if failure == "binding":
+                identity = self.h.memory.identity
+
+                async def changed_identity(origin, *args):
+                    person, binding = await identity(origin, *args)
+                    return person, binding + (origin == previous["origin"])
+
+                self.h.memory.identity = changed_identity
+            elif failure is not None:
+                context = self.h.core.sender.expression_context
+
+                async def failed_context(source, scope, channel):
+                    if source["origin"] == previous["origin"]:
+                        if failure == "cancelled":
+                            raise asyncio.CancelledError()
+                        error = Fault(
+                            "result_unknown" if failure == "unknown" else "forbidden",
+                            unknown=failure == "unknown",
+                        )
+                        error.origin_read_unavailable = True
+                        raise error
+                    return await context(source, scope, channel)
+
+                self.h.core.sender.expression_context = failed_context
+            release.set()
+            if failure is not None:
+                with self.assertRaises(
+                    asyncio.CancelledError if failure == "cancelled" else Fault
+                ) as caught:
+                    await task
+                if failure not in {"binding", "cancelled"}:
+                    self.assertTrue(caught.exception.context_renewal_failure)
+                    self.assertEqual(failure == "unknown", caught.exception.unknown)
+                self.assertFalse(calls)
+            else:
+                variants = await task
+                self.assertEqual(2, len(variants[0]))
+                self.assertEqual(1, len(calls))
+                fresh = self.h.core.store.get("turns", previous["id"])
+                self.assertEqual(
+                    [old, fresh["source_deadline"]],
+                    [deadline for key, deadline in self.authorizations if key == previous["id"]],
+                )
+                self.assertEqual([previous["origin"]], self.renewals)
+            self.assertEqual(0, active)
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_prepare_coordinates_source_renewed_by_another_turn_before_its_memory_read(self):
+        await self.catalog_coordination(concurrent=True)
+
+    async def test_prepare_coordinates_sources_that_cross_the_existing_margin_during_attestation(
+        self,
+    ):
+        await self.catalog_coordination()
+
+    async def test_prepare_coordination_renewal_unknown_cannot_become_optional(self):
+        await self.catalog_coordination(failure="unknown")
+
+    async def test_prepare_coordination_renewal_denial_cannot_become_optional(self):
+        await self.catalog_coordination(failure="forbidden")
+
+    async def test_prepare_coordination_cancellation_drains_authority_tasks(self):
+        await self.catalog_coordination(failure="cancelled")
+
+    async def test_prepare_coordination_rechecks_required_binding(self):
+        await self.catalog_coordination(failure="binding")
+
+    async def test_prepare_coordination_is_one_pass_and_later_authority_change_still_rejects(self):
+        from collections import Counter
+
+        from tianshu_companion.contracts import digest
+
+        previous, current = await self.prepare()
+        original = self.h.origins.resolve
+        verify = self.h.core._verify_context_check
+        changes, calls, attempts = [], [], []
+
+        async def checked(turn, check, checkpoint, **kwargs):
+            attempts.append(digest(check))
+            return await verify(turn, check, checkpoint, **kwargs)
+
+        async def changing(service, envelope, now):
+            result = await original(service, envelope, now)
+            if envelope["origin"] == previous["origin"]:
+                changes.append(now)
+                self.lease(previous, 120 + 60 * len(changes))
+            return result
+
+        async def prepared(origin, scope, bundle, checks, required):
+            calls.append(checks)
+            return {check["check_id"]: "valid" for check in checks}
+
+        self.h.origins.resolve = changing
+        self.h.core._verify_context_check = checked
+        self.h.memory.prepare_context = prepared
         with self.assertRaises(Fault) as caught:
             await self.h.core._prepare_context(current, [])
         self.assertTrue(caught.exception.retryable_read)
-        self.assertTrue(changed)
+        # Two catalog checks, each attempted initially and once in coordination.
+        # Every completed authorize deliberately changes the full lease key, so
+        # these four distinct authority proofs cannot share one result per phase.
+        self.assertEqual([2, 2], sorted(Counter(attempts).values()))
+        self.assertEqual(4, len(changes))
+        self.assertEqual(1, len(calls))
 
     async def concurrent_continuation(self, operation, *, near=False):
         previous, current = await self.prepare()
