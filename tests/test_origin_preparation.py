@@ -184,7 +184,7 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
         checks = {t["id"]: [scope_check(t)] for t in (previous, clone)}
         with patch(
             "tianshu_companion.context_preparation.recent_checks",
-            side_effect=lambda store, candidate: checks[candidate[0]["turn_id"]],
+            side_effect=lambda store, candidate, **kwargs: checks[candidate[0]["turn_id"]],
         ):
             result = await _v2_variants(self.h.core, current, [], batches)
         self.assertEqual(2, len(reads))

@@ -1,5 +1,7 @@
 """Whole-turn context accounting and bounded provenance; no identity inference."""
 
+import copy
+
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 
 TEXT_DOMAIN = "text-dialogue/v1"
@@ -47,9 +49,11 @@ class TurnContext:
         return True
 
 
-def scope_check(turn, *, input_only=False):
-    input_only = input_only and turn.get("input_history_snapshot") is not None
-    return dict(
+def scope_check(turn, *, input_only=False, raw_input=None):
+    input_only = input_only and (
+        raw_input is not None or turn.get("input_history_snapshot") is not None
+    )
+    check = dict(
         version_domain=TEXT_INPUT_DOMAIN if input_only else TEXT_DOMAIN,
         source_turn_id=turn["id"],
         origin=turn["origin"],
@@ -65,6 +69,23 @@ def scope_check(turn, *, input_only=False):
         if turn.get("preparation") and "association_version" in turn["preparation"]
         else None,
     )
+    if input_only and raw_input is not None:
+        # This projection carries only these original human inputs. Its old
+        # query's history/association set is not a version of their raw text.
+        # Bind the actual selected material, not a later reread of the turn.
+        check.update(
+            scope=dict(
+                turn["scope"], actor_id=raw_input["actor_id"], person_id=raw_input["person_id"]
+            ),
+            input_author=raw_input["author"],
+            collection_id=raw_input["collection_id"],
+            input_revision=raw_input["input_revision"],
+            input_sources=[m["source"] for m in raw_input["messages"]],
+        )
+        for key in ("scope_version", "history_snapshot", "memory_snapshot"):
+            del check[key]
+        return copy.deepcopy(check)
+    return check
 
 
 def profile_check(turn, target, text, selection, response):
@@ -94,14 +115,15 @@ def inherited_checks(previous):
     )
 
 
-def recent_checks(store, candidate):
+def recent_checks(store, candidate, *, exact_inputs=False):
     checks = []
     for member in candidate:
         previous = store.get("turns", member["turn_id"])
+        input_projection = not member["replies"] or (member.get("input_only") and not exact_inputs)
         checks = merge_checks(
             checks,
-            [scope_check(previous, input_only=True)]
-            if member.get("input_only") or not member["replies"]
+            [scope_check(previous, input_only=True, raw_input=member if exact_inputs else None)]
+            if input_projection
             else inherited_checks(previous),
         )
     return checks

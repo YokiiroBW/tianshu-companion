@@ -582,6 +582,65 @@ def test_real_producer_lost_commit_ack_recovers_same_typed_job_once(sync):
     asyncio.run(run())
 
 
+def test_real_raw_source_proof_survives_unrelated_foreign_history_withdrawal(sync):
+    from test_group_context import owner
+
+    if sync.scope()["audience"] != "group":
+        pytest.skip("Foreign group-history domain requires the group audience")
+    producer.setup(sync)
+    other = owner(sync)
+    text = "我把随身杯放在桌上。"
+    job, _ = producer.candidate(sync, text, serial=1)
+    producer.commit(sync, job, text)
+    original = copy.deepcopy(sync.turns[-1])
+    foreign_text = "我喜欢乌龙茶。"
+    foreign, _ = producer.candidate(sync, foreign_text, serial=2, actor=other)
+    producer.commit(sync, foreign, foreign_text, producer.fact("乌龙茶"))
+    foreign_physical = sync.physicals[-1]
+    captured = dict(
+        id=original["turn_id"],
+        scope=original["scope"],
+        bundle=dict(collection_revision=original["input_revision"]),
+    )
+    sources = copy.deepcopy(original["input_sources"])
+
+    async def run():
+        memory, wire = client(sync)
+        try:
+            origin, scope = sync.command()["origin"], sync.scope()
+            selected = await memory.query_context(
+                origin, scope, "群里谁喜欢乌龙茶", dict(tokens=8192, bytes=8192)
+            )
+            old = selected["bundle"]["input_history_snapshot"]
+            assert sync.scope(other) in [entry["scope"] for entry in old["history_checks"]]
+            assert await memory.check_sources(captured, sources) > 0
+
+            # Withdraw only the other owner's original source. Its old complete
+            # history is no longer a proof, while this human's raw input is.
+            foreign_physical.update(
+                state="withdrawn",
+                kind="retract",
+                revision=2,
+                physical_receipt_id="physical:foreign-withdrawn",
+                content_digest="c" * 64,
+            )
+            sync.core_head["sequence"] += 1
+            with pytest.raises(Fault):
+                await memory.input_history(origin, scope, known=old)
+            assert await memory.check_sources(captured, sources) > 0
+            assert sources == original["input_sources"]
+            fresh = await memory.query_context(
+                origin, scope, "随身杯放在哪里", dict(tokens=8192, bytes=8192)
+            )
+            assert await memory.prepare_context(origin, scope, fresh["bundle"], [], []) == {}
+            # These are independently real source-sync and bundle proofs, not
+            # a fabricated fifth wire kind or a single common database snapshot.
+        finally:
+            await wire.close()
+
+    asyncio.run(run())
+
+
 def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
     from test_memory_context import ProofIssuer
     from tianshu_memory.memory_reindex import MemoryReindexer
@@ -590,6 +649,13 @@ def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
     text = "明天去松林随身带雨伞。" * 30
     job, _ = producer.candidate(sync, text)
     producer.commit(sync, job, text)
+    original = copy.deepcopy(sync.turns[-1])
+    captured = dict(
+        id=original["turn_id"],
+        scope=original["scope"],
+        bundle=dict(collection_revision=original["input_revision"]),
+    )
+    sources = copy.deepcopy(original["input_sources"])
 
     async def run():
         memory, wire = client(sync)
@@ -600,6 +666,7 @@ def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
             )
             episode = next(row for row in read["evidence"] if row["kind"] == "episode")
             target_source = read["bundle"]["source_dependencies"][0]["source_key"]
+            assert await memory.check_sources(captured, sources) > 0
             request_text = "忘掉之前关于松林的原话。"
             request_job, _ = producer.candidate(sync, request_text, serial=2)
             producer.commit(sync, request_job, request_text)
@@ -643,6 +710,20 @@ def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
                 assert db.execute("SELECT count(*) FROM records").fetchone()[0] == 0
             with pytest.raises(Fault):
                 await memory.verify_context(origin, scope, read["bundle"])
+            # Memory's already committed source suppression must reject raw
+            # reuse even though the original Core physical is still active.
+            assert any(
+                physical["state"] == "active"
+                and physical["key"]
+                == {
+                    key: value
+                    for key, value in sources[0]["message_key"].items()
+                    if key != "revision"
+                }
+                for physical in sync.physicals
+            )
+            with pytest.raises(Fault):
+                await memory.check_sources(captured, sources)
         finally:
             await wire.close()
 

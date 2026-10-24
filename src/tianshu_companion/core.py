@@ -2101,6 +2101,17 @@ class Core(Delivery):
             or previous["binding_version"] != check["binding_version"]
             or previous["bundle"]["collection_key"]["channel"] != check["channel"]
             or not sources_current(self.store, previous)
+            or (
+                "input_sources" in check
+                and (
+                    check["version_domain"] != TEXT_INPUT_DOMAIN
+                    or check.get("input_author") != previous["bundle"]["collection_key"]["author"]
+                    or check.get("collection_id") != previous["bundle"]["collection_id"]
+                    or check.get("input_revision") != previous["bundle"]["collection_revision"]
+                    or check["input_sources"]
+                    != [message["source"] for message in previous["bundle"]["messages"]]
+                )
+            )
         ):
             raise dependency_changed()
         return previous
@@ -2145,6 +2156,17 @@ class Core(Delivery):
             # lease must not reuse the authority or history proof of the old one.
             lease_deadline = previous["source_deadline"]
         await self._authorize_context(check, checkpoint, lease_deadline)
+        if check["version_domain"] == TEXT_INPUT_DOMAIN and "input_sources" in check:
+            # This is a real Memory read in this checkpoint, not a local guard
+            # or an input_history request with a weakened old snapshot. The
+            # original author proof and captured lease still bound this RPC.
+            previous = self._context_source(check)
+            await checkpoint.once(
+                ["input_sources", check, lease_deadline],
+                lambda: self.memory.check_sources(previous, check["input_sources"]),
+            )
+            self._context_source(check)
+            return lease_deadline
         if memory_checks is not None:
             from .memory_context import legacy_check
 

@@ -120,7 +120,7 @@ async def _v2_variants(core, turn, checks, batches):
             variants.append([input_only(member) for member in batch])
         planned = []
         for candidate in variants:
-            inherited = recent_checks(core.store, candidate)
+            inherited = recent_checks(core.store, candidate, exact_inputs=True)
             members = []
             for check in inherited:
                 identity = digest(check)
@@ -213,6 +213,9 @@ async def _v2_variants(core, turn, checks, batches):
                 if identity in required:
                     required_memory.add(key)
         ordered = [memory[key] for key in sorted(memory)]
+        # Exact raw inputs were really checked through source-sync/check above.
+        # AND those independent RPC proofs with the complete legacy catalog;
+        # an empty legacy set is not a raw-source proof or a common snapshot.
         outcomes = await core.memory.prepare_context(
             turn["origin"],
             turn["scope"],
@@ -222,6 +225,22 @@ async def _v2_variants(core, turn, checks, batches):
         )
         if set(outcomes) != set(memory):
             raise Fault("invalid_input")
+        unavailable_origins.update(
+            origins[identity]
+            for identity, values in links.items()
+            if any(outcomes[key] == "unavailable" for key in values)
+        )
+        if unavailable_origins & required_origins:
+            # A raw-only required proof is absent from the legacy wire list,
+            # but retains the complete catalog's required-origin priority.
+            raise Fault(
+                "dependency_unavailable",
+                retryable_read=True,
+                cause=dict(category="fault", peer="memory", operation="query", http_status=200),
+            )
+        for identity in catalog:
+            if origins[identity] in unavailable_origins:
+                local[identity] = "unavailable"
         for identity, check in catalog.items():
             if local[identity] != "valid" or any(
                 outcomes[key] != "valid" for key in links[identity]

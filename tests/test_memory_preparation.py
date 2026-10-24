@@ -349,7 +349,12 @@ class CorePreparationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_catalog_selects_input_variant_and_preserves_mandatory(self):
         previous, current = await self.turns()
-        calls = []
+        calls, sources = [], []
+        original = self.h.memory.check_sources
+
+        async def source_check(turn, selected):
+            sources.append((turn["id"], copy.deepcopy(selected)))
+            return await original(turn, selected)
 
         async def prepare(origin, scope, bundle, checks, required):
             calls.append((copy.deepcopy(checks), list(required)))
@@ -358,9 +363,13 @@ class CorePreparationTests(unittest.IsolatedAsyncioTestCase):
             }
 
         self.h.memory.prepare_context = prepare
+        self.h.memory.check_sources = source_check
         context, *_ = await self.h.core._prepare_context(current, [])
         self.assertEqual(1, len(calls))
-        self.assertEqual({"history", "input_history"}, {c["kind"] for c in calls[0][0]})
+        self.assertEqual({"history"}, {c["kind"] for c in calls[0][0]})
+        self.assertEqual(
+            [(previous["id"], [m["source"] for m in previous["bundle"]["messages"]])], sources
+        )
         self.assertTrue(context.data["recent_dialogue"][0]["input_only"])
         self.assertFalse(context.data["recent_dialogue"][0]["replies"])
 

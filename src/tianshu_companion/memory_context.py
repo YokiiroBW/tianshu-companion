@@ -276,6 +276,10 @@ def legacy_check(check, header):
     """Serialize the original check semantics; local source/binding checks remain in Core."""
     scope = check["scope"]
     domain = check["version_domain"]
+    if domain == "text-input/v1" and "input_sources" in check:
+        # Core explicitly awaits source-sync/check with this exact payload.
+        # It remains in Core's full catalog/AND, not this legacy four-kind wire.
+        return None
     if domain == PROFILE_DOMAIN:
         kind = "profile"
         request = dict(

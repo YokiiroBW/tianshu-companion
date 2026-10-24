@@ -626,14 +626,28 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.h.core._verify_context_check = checked
         prepare = self.h.memory.prepare_context
-        calls = []
+        calls, raw_proofs = [], []
+        source_check = self.h.memory.check_sources
+
+        async def checked_sources(source, sources):
+            raw_proofs.append((source["source_deadline"], copy.deepcopy(sources)))
+            return await source_check(source, sources)
+
+        self.h.memory.check_sources = checked_sources
 
         async def prepared(origin, scope, bundle, checks, required_ids):
             fresh = self.h.core.store.get("turns", previous["id"])
             self.assertGreater(fresh["source_deadline"], old)
             self.assertIn((previous["id"], fresh["source_deadline"]), self.authorizations)
-            self.assertEqual({"history", "input_history"}, {c["kind"] for c in checks})
-            self.assertEqual(2, len(checks))
+            self.assertEqual({"history"}, {c["kind"] for c in checks})
+            self.assertEqual(1, len(checks))
+            self.assertEqual([old, fresh["source_deadline"]], [cap for cap, _ in raw_proofs])
+            self.assertTrue(
+                all(
+                    sources == [message["source"] for message in previous["bundle"]["messages"]]
+                    for _, sources in raw_proofs
+                )
+            )
             self.assertEqual(["check:" + digest(required[0])], required_ids)
             calls.append(copy.deepcopy(checks))
             return await prepare(origin, scope, bundle, checks, required_ids)
