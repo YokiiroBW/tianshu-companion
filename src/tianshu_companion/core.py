@@ -2161,10 +2161,18 @@ class Core(Delivery):
             # or an input_history request with a weakened old snapshot. The
             # original author proof and captured lease still bound this RPC.
             previous = self._context_source(check)
-            await checkpoint.once(
-                ["input_sources", check, lease_deadline],
-                lambda: self.memory.check_sources(previous, check["input_sources"]),
-            )
+            try:
+                await checkpoint.once(
+                    ["input_sources", check, lease_deadline],
+                    lambda: self.memory.check_sources(previous, check["input_sources"]),
+                )
+            except Fault as error:
+                if error.unknown or not getattr(error, "source_invalid", False):
+                    raise
+                failure = dependency_changed()
+                failure.source_invalid = True
+                failure.cause = error.cause
+                raise failure from None
             self._context_source(check)
             return lease_deadline
         if memory_checks is not None:

@@ -2,11 +2,14 @@
 
 import asyncio
 import copy
+import json
 import unittest
 
+import httpx
+
 from test_memory_v2 import CoreEvidenceTests
-from tianshu_companion.clients import epoch, utc
-from tianshu_companion.context import recent_checks, scope_check
+from tianshu_companion.clients import JsonService, Memory, epoch, utc
+from tianshu_companion.context import profile_check, recent_checks, scope_check
 from tianshu_companion.context_preparation import _v2_variants
 from tianshu_companion.context_relevance import input_only
 from tianshu_companion.contracts import Fault, digest
@@ -75,6 +78,218 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         physical = self.h.core.store.get("physicals", key)
         physical["fact"]["state"] = "retracted"
         self.h.core.store.put("physicals", physical)
+
+    def source_client(self, handler):
+        def respond(incoming):
+            self.assertEqual("/internal/v1/memory/source-sync/check", incoming.url.path)
+            return handler(json.loads(incoming.content))
+
+        wire = JsonService(
+            "https://synthetic-memory.invalid",
+            "synthetic-only",
+            label="memory",
+            transport=httpx.MockTransport(respond),
+        )
+        self.addAsyncCleanup(wire.close)
+        return Memory(self.h.contracts, wire)
+
+    def source_response(self, request, *, invalid=False):
+        if invalid:
+            return httpx.Response(409, json=Fault("version_conflict").wire(request["request_id"]))
+        return httpx.Response(
+            200,
+            json=dict(
+                schema_version=1,
+                request_id=request["request_id"],
+                request_digest=digest(request),
+                scope=request["scope"],
+                version_domain="text-dialogue/v1",
+                scope_version=1,
+                checked_at=utc(self.h.clock()),
+            ),
+        )
+
+    async def test_source_invalid_requires_bound_complete_common_error_response(self):
+        previous, _ = await self.turns()
+        sources = [m["source"] for m in previous["bundle"]["messages"]]
+        cases = [
+            ("confirmed", 409, {}, None),
+            ("wrong_request", 409, dict(request_id="req:other"), None),
+            ("wrong_schema", 409, dict(schema_version=2), None),
+            ("missing_field", 409, {}, "schema_version"),
+            ("extra_field", 409, dict(peer_detail="untrusted"), None),
+            ("unknown", 409, dict(execution_state="unknown"), None),
+            ("retryable", 409, dict(retryable=True), None),
+            ("wrong_code", 409, dict(code="scope_changed"), None),
+            ("permission", 403, dict(code="forbidden"), None),
+            ("barrier", 503, dict(code="dependency_unavailable", retryable=True), None),
+            ("wrong_status", 400, {}, None),
+            ("malformed_json", 409, {}, None),
+            ("encoded_body", 409, {}, None),
+            ("partial_body", 409, {}, None),
+        ]
+        for name, status, changes, missing in cases:
+            with self.subTest(case=name):
+
+                def response(request):
+                    value = Fault("version_conflict").wire(request["request_id"])
+                    value.update(changes)
+                    if missing:
+                        del value[missing]
+                    if name == "malformed_json":
+                        return httpx.Response(status, content=b'{"code":"version_conflict"')
+                    if name == "encoded_body":
+                        return httpx.Response(
+                            status,
+                            headers={"Content-Encoding": "gzip"},
+                            stream=httpx.ByteStream(json.dumps(value).encode()),
+                        )
+                    if name == "partial_body":
+
+                        class Partial(httpx.AsyncByteStream):
+                            async def __aiter__(self):
+                                yield json.dumps(value).encode()
+                                raise httpx.ReadError("synthetic incomplete response")
+
+                        return httpx.Response(status, stream=Partial())
+                    return httpx.Response(status, json=value)
+
+                memory = self.source_client(response)
+                with self.assertRaises(Fault) as caught:
+                    await memory.check_sources(previous, sources)
+                self.assertEqual(
+                    name == "confirmed", getattr(caught.exception, "source_invalid", False)
+                )
+                self.assertEqual(status, caught.exception.cause["http_status"])
+                if name == "confirmed":
+                    # Non-context callers still receive their original409 Fault.
+                    self.assertEqual("version_conflict", caught.exception.code)
+                    self.assertFalse(caught.exception.unknown)
+                    self.assertFalse(caught.exception.retryable_read)
+
+    async def test_confirmed_memory_negative_excludes_whole_linked_raw_batch_only(self):
+        first, second, current = await self.turns(3)
+        groups = self.groups(current)
+        calls = []
+
+        def response(request):
+            calls.append(request["turn_id"])
+            return self.source_response(request, invalid=request["turn_id"] == first["id"])
+
+        self.h.memory.check_sources = self.source_client(response).check_sources
+        # The profile's independent dependencies remain valid, even though it
+        # shares the raw source's author origin. A negative source is not an
+        # origin authorization failure and must not block this required read.
+        required = profile_check(
+            first,
+            dict(kind="person", person_id=first["scope"]["person_id"]),
+            "当前画像",
+            ["interest"],
+            dict(scope_version=self.h.memory.profile_version),
+        )
+        batch = [input_only(groups[t["id"]]) for t in (first, second)]
+        result = await _v2_variants(self.h.core, current, [required], [batch])
+        self.assertEqual([[]], result)
+        self.assertCountEqual([first["id"], second["id"]], calls)
+        self.assertEqual("profile", self.verifications[-1][0]["kind"])
+        self.assertEqual(first["origin"], required["origin"])
+        self.assertEqual(first["id"], self.h.core._context_source(self.raw(first))["id"])
+        # The healthy raw source still succeeds on its own; no negative cache,
+        # Core physical withdrawal or whole-origin exclusion was installed.
+        result = await _v2_variants(self.h.core, current, [required], [[batch[1]]])
+        self.assertEqual([second["id"]], [g["turn_id"] for g in result[0][0][0]])
+
+    async def test_confirmed_negative_remains_fault_for_required_main_and_adopted_raw(self):
+        previous, current = await self.turns()
+        self.h.memory.check_sources = self.source_client(
+            lambda request: self.source_response(request, invalid=True)
+        ).check_sources
+        for stage in ("required", "main", "adopted"):
+            with self.subTest(stage=stage):
+                check = self.raw(current if stage == "main" else previous)
+                with self.assertRaises(Fault) as caught:
+                    if stage == "adopted":
+                        self.adopt(current, [check])
+                        await self.h.core._preflight_once(current)
+                    else:
+                        await _v2_variants(self.h.core, current, [check], [])
+                self.assertTrue(caught.exception.context_dependency_invalid)
+                self.assertEqual("scope_changed", caught.exception.code)
+                self.assertEqual(409, caught.exception.cause["http_status"])
+                self.assertFalse(caught.exception.unknown)
+
+    async def test_unproved_source_errors_still_fail_optional_preparation(self):
+        previous, current = await self.turns()
+        group = input_only(self.groups(current)[previous["id"]])
+        for changes, status in (
+            (dict(request_id="req:wrong"), 409),
+            (dict(execution_state="unknown"), 409),
+            (dict(code="forbidden"), 403),
+            (dict(code="dependency_unavailable", retryable=True), 503),
+        ):
+            with self.subTest(changes=changes, status=status):
+
+                def response(request):
+                    value = Fault("version_conflict").wire(request["request_id"])
+                    value.update(changes)
+                    return httpx.Response(status, json=value)
+
+                self.h.memory.check_sources = self.source_client(response).check_sources
+                with self.assertRaises(Fault) as caught:
+                    await _v2_variants(self.h.core, current, [], [[group]])
+                self.assertFalse(getattr(caught.exception, "context_dependency_invalid", False))
+
+    async def test_forget_tool_refresh_and_next_turn_omit_still_locally_active_raw(self):
+        await self.h.ingest(text="这段原始输入稍后会被检索遗忘。")
+        await self.h.cycles()
+        previous = self.h.turns()[-1]
+        current, value, _, submitted, _ = await CoreEvidenceTests.episode_forget(self)
+        forgotten, calls = False, []
+        original_forget = self.h.memory.forget_episode
+        original_query = self.h.memory.query_context
+
+        async def forget(request):
+            nonlocal forgotten
+            result = await original_forget(request)
+            forgotten = True
+            return result
+
+        async def query(*args):
+            result = await original_query(*args)
+            if forgotten:
+                result["evidence"] = []
+                result["query_results"] = []
+            return result
+
+        def response(request):
+            calls.append(request["turn_id"])
+            return self.source_response(
+                request, invalid=forgotten and request["turn_id"] == previous["id"]
+            )
+
+        async def prepare(origin, scope, bundle, checks, required):
+            # Synthetic Memory ports mirror the known negative for the old
+            # complete-reply alternative as well as the real raw error port.
+            return {c["check_id"]: "rejected" for c in checks}
+
+        self.h.memory.forget_episode = forget
+        self.h.memory.query_context = query
+        self.h.memory.prepare_context = prepare
+        self.h.memory.check_sources = self.source_client(response).check_sources
+        receipt = await self.h.core.role_actions.memory_propose(current, "tool:forget-raw", value)
+        self.assertEqual("tombstoned", receipt["state"])
+        self.assertEqual(1, len(submitted))
+        refreshed = self.h.core.store.get("turns", current["id"])
+        context, *_ = await self.h.core._prepare_context(refreshed, [])
+        self.assertEqual([], context.data["recent_dialogue"])
+        self.assertIn(previous["id"], calls)
+        self.assertEqual(previous["id"], self.h.core._context_source(self.raw(previous))["id"])
+        await self.h.ingest(text="继续一个不依赖那段原话的问题。")
+        await self.h.cycles()
+        self.assertEqual("sent", self.h.turns()[-1]["phase"])
+        prompt = json.loads(self.h.gateway.calls[-1][1][1]["content"])
+        self.assertNotIn(previous["id"], [g["turn_id"] for g in prompt["recent_dialogue"]])
+        self.assertEqual(previous["id"], self.h.core._context_source(self.raw(previous))["id"])
 
     async def test_linked_raw_batch_survives_unrelated_old_history_without_splitting(self):
         *previous, current = await self.turns(4)

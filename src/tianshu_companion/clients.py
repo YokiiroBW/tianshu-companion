@@ -288,10 +288,14 @@ class JsonService:
                 ),
             ) from None
 
-    async def call(self, path, body=None, headers=None, *, uncertain_write=False):
+    async def call(
+        self, path, body=None, headers=None, *, uncertain_write=False, error_response=None
+    ):
         retry_query = self._is_query(path, body)
         if not retry_query:
-            return await self._call_once(path, body, headers, uncertain_write=uncertain_write)
+            return await self._call_once(
+                path, body, headers, uncertain_write=uncertain_write, error_response=error_response
+            )
         headers = dict(headers or {})
         headers.setdefault(
             obs.CORRELATION_HEADER, obs.current_correlation_id() or obs.new_correlation_id()
@@ -308,7 +312,11 @@ class JsonService:
                         await asyncio.sleep(self.query_not_before - time.monotonic())
                     started = True
                     return await self._call_once(
-                        path, body, headers, uncertain_write=uncertain_write
+                        path,
+                        body,
+                        headers,
+                        uncertain_write=uncertain_write,
+                        error_response=error_response,
                     )
         except TimeoutError as error:
             failure = Fault(
@@ -359,7 +367,9 @@ class JsonService:
             and re.fullmatch(r"/internal/v1/model-requests/model:[0-9a-f]{32}", path) is not None
         )
 
-    async def _call_once(self, path, body=None, headers=None, *, uncertain_write=False):
+    async def _call_once(
+        self, path, body=None, headers=None, *, uncertain_write=False, error_response=None
+    ):
         if not self.url or not self.token:
             raise Fault("dependency_unavailable")
         retry_query = self._is_query(path, body)
@@ -381,6 +391,7 @@ class JsonService:
         sent, not_started = False, False
         response = None
         body_complete = False
+        value = None
         LOG_PORT.emit(
             "peer.call.started",
             "started",
@@ -474,6 +485,11 @@ class JsonService:
             )
             if isinstance(error, Fault):
                 error.cause = cause
+                if error_response is not None and body_complete and response.status_code >= 300:
+                    # The semantic client owns schema/request binding. Inspect the
+                    # bounded complete body here; never attach peer text to faults
+                    # or logs, and never classify transport/partial responses.
+                    error_response(response.status_code, value, error)
                 if (
                     path == "/internal/v1/origins/resolve"
                     and body_complete
@@ -694,7 +710,31 @@ class Memory:
             sources=sources,
         )
         self.contracts.check("shared#check_request", request)
-        response = await self.client.call("/internal/v1/memory/source-sync/check", request)
+
+        def source_error(status, value, error):
+            if status != 409 or error.unknown:
+                return
+            try:
+                self.contracts.check("common#error", value)
+            except Fault:
+                return
+            if (
+                value["request_id"] == request["request_id"]
+                and value["code"] == "version_conflict"
+                and value["execution_state"] == "not_started"
+                and value["retryable"] is False
+                and error.code == "version_conflict"
+            ):
+                # This endpoint's sole409 is _source_rows' exact source
+                # inactive/revision/payload mismatch. The original Fault is
+                # unchanged for repair/outbox and all non-context callers.
+                # not_started is an envelope label, not a claim that its
+                # source barrier did no work before proving the negative.
+                error.source_invalid = True
+
+        response = await self.client.call(
+            "/internal/v1/memory/source-sync/check", request, error_response=source_error
+        )
         self.contracts.check("shared#check_response", response)
         if (
             response["request_id"] != request["request_id"]

@@ -642,7 +642,12 @@ def test_real_raw_source_proof_survives_unrelated_foreign_history_withdrawal(syn
 
 
 def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
+    from support import Harness
     from test_memory_context import ProofIssuer
+    from tianshu_companion.clients import utc
+    from tianshu_companion.context import scope_check
+    from tianshu_companion.context_preparation import _v2_variants
+    from tianshu_companion.contracts import digest
     from tianshu_memory.memory_reindex import MemoryReindexer
 
     producer.setup(sync)
@@ -659,6 +664,7 @@ def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
 
     async def run():
         memory, wire = client(sync)
+        h = Harness(silence_ms=0)
         try:
             origin, scope = sync.command()["origin"], sync.scope()
             read = await memory.query_context(
@@ -722,9 +728,138 @@ def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
                 }
                 for physical in sync.physicals
             )
-            with pytest.raises(Fault):
+            with pytest.raises(Fault) as negative:
                 await memory.check_sources(captured, sources)
+            assert negative.value.code == "version_conflict"
+            assert negative.value.source_invalid and not negative.value.unknown
+            assert negative.value.cause["http_status"] == 409
+
+            # The real producer's known negative must also be usable by the
+            # consumer's actual catalog planner. As in the existing candidate
+            # owner joint, seed the same admitted facts on both sides rather
+            # than bypassing Core's real sources_current/_context_source guard.
+            h.core.memory = memory
+            _, binding = await memory.identity(origin, sync.account, h.clock())
+            channel = sources[0]["message_key"]["channel"]
+            h.core.bindings[channel["binding_id"]] = dict(
+                service="nonebot",
+                namespace=channel["namespace"],
+                audience=scope["audience"],
+                actor_ids=[scope["actor_id"]],
+            )
+            h.origins.values[origin["assertion_ref"]] = dict(
+                authenticated_service="nonebot",
+                verified_account=sync.account,
+                verified_channel=channel,
+                allowed_scope=scope,
+                expires_at=utc(h.clock() + 3600),
+                revoked=False,
+            )
+
+            def seed(source, content):
+                messages = []
+                for value in source["input_sources"]:
+                    physical = next(
+                        row
+                        for row in sync.physicals
+                        if dict(row["key"], revision=row["revision"]) == value["message_key"]
+                    )
+                    admission = next(row for row in sync.admissions if row["source"] == value)
+                    message = dict(
+                        message_key=value["message_key"],
+                        source=value,
+                        author=sync.account,
+                        person_id=scope["person_id"],
+                        parts=[dict(kind="text", text=content)],
+                    )
+                    messages.append(message)
+                    h.core.store.put(
+                        "physicals",
+                        dict(
+                            id=digest(message["message_key"]),
+                            conversation_id=scope["conversation_id"],
+                            base=digest(physical["key"]),
+                            revision=physical["revision"],
+                            fact=physical,
+                        ),
+                    )
+                    h.core.store.put(
+                        "admissions",
+                        dict(
+                            id=digest(admission["selector"]),
+                            conversation_id=scope["conversation_id"],
+                            fact=admission,
+                        ),
+                    )
+                previous = dict(
+                    id=source["turn_id"],
+                    conversation_id=scope["conversation_id"],
+                    phase="sent",
+                    cancelled=False,
+                    service="nonebot",
+                    origin=origin,
+                    scope=scope,
+                    binding_version=binding,
+                    scope_version=1,
+                    source_deadline=h.clock() + 3600,
+                    bundle=dict(
+                        collection_id="collection:" + digest(source["turn_id"]),
+                        collection_revision=source["input_revision"],
+                        collection_key=dict(channel=channel, author=sync.account),
+                        messages=messages,
+                    ),
+                )
+                h.core.store.put("turns", previous)
+                group = dict(
+                    turn_id=previous["id"],
+                    actor_id=scope["actor_id"],
+                    person_id=scope["person_id"],
+                    author=sync.account,
+                    collection_id=previous["bundle"]["collection_id"],
+                    input_revision=source["input_revision"],
+                    messages=messages,
+                    input_only=True,
+                    replies=[],
+                )
+                return previous, group
+
+            forgotten, old_group = seed(original, text)
+            healthy, good_group = seed(sync.turns[-1], request_text)
+            forgotten["history_snapshot"] = read["bundle"]["history_snapshot"]
+            h.core.store.put("turns", forgotten)
+            old_group.update(
+                input_only=False,
+                replies=[dict(reply_id="reply:synthetic-old", text="合成已确认回复。")],
+            )
+            fresh = await memory.query_context(
+                origin, scope, "继续一个不依赖旧原话的问题", dict(tokens=8192, bytes=8192)
+            )
+            current = dict(
+                id="turn:joint-fresh-viewer",
+                origin=origin,
+                service="nonebot",
+                scope=scope,
+                bundle=dict(collection_key=dict(channel=channel)),
+                memory_context=fresh,
+            )
+            assert (
+                h.core._context_source(
+                    scope_check(forgotten, input_only=True, raw_input=old_group)
+                )["id"]
+                == forgotten["id"]
+            )
+            assert await _v2_variants(h.core, current, [], [[old_group, good_group]]) == [[]]
+            # Excluding the whole linked batch never leaves its healthy member
+            # behind. That member can independently appear in a later batch.
+            usable = await _v2_variants(h.core, current, [], [[good_group]])
+            assert [g["turn_id"] for g in usable[0][0][0]] == [healthy["id"]]
+            required = scope_check(forgotten, input_only=True, raw_input=old_group)
+            with pytest.raises(Fault) as required_negative:
+                await _v2_variants(h.core, current, [required], [])
+            assert required_negative.value.context_dependency_invalid
+            assert required_negative.value.cause["http_status"] == 409
         finally:
+            await h.core.close()
             await wire.close()
 
     asyncio.run(run())
