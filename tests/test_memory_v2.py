@@ -599,6 +599,58 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("idempotency_conflict", changed.exception.code)
         self.assertEqual((1, 1, 2), (len(issued), len(submitted), len(queries)))
 
+    async def test_model_forget_effect_keeps_the_exact_receipt_and_does_not_claim_erasure(self):
+        turn, value, issued, submitted, receipt = await self.episode_forget()
+        result, attachments = await self.h.core.role_actions.execute_domain(
+            turn["id"],
+            dict(
+                id="tool:withdraw",
+                function=dict(name="memory_propose", arguments=canonical(value)),
+            ),
+        )
+        self.assertEqual([], attachments)
+        self.assertEqual("tombstoned", result["state"])
+        self.assertEqual(
+            dict(
+                operation="forget_episode",
+                target=value["target"],
+                receipt_state="tombstoned",
+                retrieval="target_withdrawn",
+                physical_erasure="not_attested",
+                audit_retention="may_remain",
+            ),
+            result["effect"],
+        )
+        stored = self.h.core.store.get(
+            "metadata", "memory-action:" + digest(submitted[0]["command"]["idempotency_key"])
+        )
+        self.assertEqual(receipt(submitted[0]), stored["receipt"])
+        self.assertNotIn("effect", stored["receipt"])
+        result["effect"]["target"]["episode_ref"] = "episode:changed"
+        self.assertEqual(value["target"], stored["proposal"]["target"])
+        self.assertEqual((1, 1), (len(issued), len(submitted)))
+
+    async def test_rejected_model_forget_effect_does_not_invent_withdrawal(self):
+        turn, value, issued, submitted, receipt = await self.episode_forget()
+
+        async def rejected(request):
+            submitted.append(copy.deepcopy(request))
+            return dict(receipt(request), state="rejected", error_code="invalid_input")
+
+        self.h.memory.forget_episode = rejected
+        result, attachments = await self.h.core.role_actions.execute_domain(
+            turn["id"],
+            dict(
+                id="tool:withdraw",
+                function=dict(name="memory_propose", arguments=canonical(value)),
+            ),
+        )
+        self.assertEqual([], attachments)
+        self.assertEqual("rejected", result["state"])
+        self.assertEqual("not_attested", result["effect"]["retrieval"])
+        self.assertEqual("not_attested", result["effect"]["physical_erasure"])
+        self.assertEqual((1, 1), (len(issued), len(submitted)))
+
     async def test_recent_human_context_coexists_with_long_term_episode_and_checks_batch(self):
         for text in ("我们的旅行先保留计划", "后来提到的行程是什么？"):
             await self.h.ingest(text=text)

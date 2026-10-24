@@ -32,6 +32,35 @@ OPERATIONS = (
 )
 TRUSTED = {"scope", "sources", "query"}
 
+MEMORY_INSTRUCTION = """
+Memory operation capabilities come only from the native tools currently offered. A capability,
+a user's request to forget, an earlier assistant claim or an empty retrieval result is not an
+operation receipt. Missing evidence means only that this query did not return it; do not invent
+a completed withdrawal, a reason for its absence, or knowledge of its former contents.
+Use a confirmed memory receipt only for its exact operation and target. A tombstoned receipt
+confirms logical withdrawal from retrieval, not physical erasure of original files, conversation
+history, audit records, backups or all copies. Source-episode withdrawal can invalidate its
+derived retrieval material while audit bytes remain. Never promise that original text was
+physically deleted, is irrecoverable, or is retained only as a summary unless an actual storage
+operation explicitly attests that separate effect. Unknown/rejected operations are not success.
+Describe only the supported effect in ordinary language; say what remains unconfirmed when asked.
+"""
+
+
+def memory_effect(kind, target, receipt):
+    """Model-facing effect of a known receipt, without expanding its storage claim."""
+    state = receipt["state"]
+    return dict(
+        operation=kind,
+        target=copy.deepcopy(target),
+        receipt_state=state,
+        retrieval="target_withdrawn"
+        if state == "tombstoned" and kind in {"forget", "forget_episode"}
+        else "not_attested",
+        physical_erasure="not_attested",
+        audit_retention="may_remain",
+    )
+
 
 class RoleActions:
     def __init__(self, core):
@@ -180,7 +209,7 @@ class RoleActions:
                     type="function",
                     function=dict(
                         name="memory_propose",
-                        description="Propose a sourced current user memory, correction or forgetting. Use real latest user input only. Correct/forget targets a recalled record/version; forget_episode targets an exact recalled episode_ref/version with units=[], forgetting its entire original source and derived memory. Report actual committed/corrected/tombstoned receipt, never claim rejected/unknown succeeded.",
+                        description="Propose a sourced current user memory, correction or retrieval withdrawal. Use real latest user input only. Correct/forget targets a recalled record/version; forget_episode targets an exact recalled episode_ref/version with units=[], withdrawing its source and derived material from retrieval. These operations do not attest physical erasure of original text, logs, audit records or backups. Report only the actual receipt's target/effect; rejected/unknown is not success.",
                         parameters=dict(
                             type="object",
                             properties=dict(
@@ -239,7 +268,11 @@ class RoleActions:
                 state=fresh["expression_receipt"]["state"], expression_id=fresh["expression_id"]
             ), []
         if name == "memory_propose":
-            return await self.memory_propose(turn, tool["id"], supplied), []
+            receipt = await self.memory_propose(turn, tool["id"], supplied)
+            return dict(
+                receipt,
+                effect=memory_effect(supplied["kind"], supplied["target"], receipt),
+            ), []
         operation = next(
             (item for item in OPERATIONS if name == "life_" + item.replace(".", "_")), None
         )

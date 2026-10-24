@@ -1,7 +1,7 @@
 """Whole-group preparation planning; Memory attests checks, Core chooses context."""
 
 import copy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 from .clients import query
 from .context import (
@@ -13,10 +13,11 @@ from .context import (
     profile_targets,
     recent_checks,
 )
-from .context_checks import VerificationCheckpoint, dependency_changed, read_parallel
+from .context_checks import VerificationCheckpoint, dependency_changed, read_parallel, verify_checks
 from .context_relevance import input_only
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 from .short_context import select_recent
+from .preparation_retry import verify_prepared_memory
 
 
 def _lease(core, turn, check):
@@ -27,8 +28,80 @@ def _lease(core, turn, check):
             raise dependency_changed()
         return previous["source_deadline"]
     if check["origin"] == turn["origin"]:
-        return turn["source_deadline"]
+        current = core.store.get("turns", turn["id"])
+        if current is None:
+            raise dependency_changed()
+        return current["source_deadline"]
     return None
+
+
+def _checkpoint_changed():
+    # The adopted set stays intact. Only its pure-read checkpoint may restart
+    # through the existing bounded preparation/preflight recovery policy.
+    return Fault("dependency_unavailable", retryable_read=True)
+
+
+@dataclass
+class AdoptedChecks:
+    """Local authority proofs awaiting one final, complete Memory barrier."""
+
+    catalog: dict = field(default_factory=dict)
+    checks: dict = field(default_factory=dict)
+    leases: dict = field(default_factory=dict)
+
+    async def collect(self, core, turn, checks, checkpoint):
+        async def attest(check, point):
+            self.leases[digest(check)] = await core._verify_context_check(
+                turn, check, point, memory_checks=self.checks
+            )
+
+        checks = merge_checks(checks)
+        self.catalog.update((digest(check), check) for check in checks)
+        await verify_checks(checks, attest, checkpoint=checkpoint)
+
+    async def verify(self, core, turn, checkpoint):
+        # Other main/QQ/book/local reads finish before this phase. Their waits
+        # may have consumed an early source's renewal margin, or another caller
+        # may have renewed it. Never attach an old authorization to a new lease.
+        await core._refresh_preparation_origin(turn)
+        main = dict(
+            service=turn["service"],
+            origin=turn["origin"],
+            channel=turn["bundle"]["collection_key"]["channel"],
+            scope=turn["scope"],
+            binding_version=turn["binding_version"],
+        )
+        main_lease = _lease(core, turn, main)
+        await core._authorize_context(main, checkpoint, main_lease)
+
+        pending = [
+            check
+            for identity, check in self.catalog.items()
+            if (lease := _lease(core, turn, check)) != self.leases[identity]
+            or lease is not None
+            and lease <= core.clock() + 20
+        ]
+        # One coordination pass, never a new retry loop. Changed deadlines use
+        # new checkpoint keys, so each renewal gets its own authority proof.
+        await self.collect(core, turn, pending, checkpoint)
+
+        def current(*, margin):
+            if _lease(core, turn, main) != main_lease or main_lease <= core.clock() + margin:
+                raise _checkpoint_changed()
+            for identity, check in self.catalog.items():
+                lease = _lease(core, turn, check)
+                if lease != self.leases[identity] or (
+                    lease is not None and lease <= core.clock() + margin
+                ):
+                    raise _checkpoint_changed()
+
+        current(margin=20)
+        await verify_prepared_memory(
+            core.memory, turn, [self.checks[key] for key in sorted(self.checks)]
+        )
+        # The 20-second margin governs early renewal, not publication. A proof
+        # returned before its unchanged durable deadline is still valid.
+        current(margin=0)
 
 
 async def _v2_variants(core, turn, checks, batches):
@@ -62,7 +135,7 @@ async def _v2_variants(core, turn, checks, batches):
         async def attest(identity, check):
             memory_checks = {}
             try:
-                await core._verify_context_check(
+                lease = await core._verify_context_check(
                     turn, check, checkpoint, memory_checks=memory_checks
                 )
             except Fault as error:
@@ -82,7 +155,7 @@ async def _v2_variants(core, turn, checks, batches):
                 ):
                     return identity, "unavailable", {}, None
                 raise
-            return identity, "valid", memory_checks, _lease(core, turn, check)
+            return identity, "valid", memory_checks, lease
 
         results = await read_parallel(
             [lambda identity=i, check=c: attest(identity, check) for i, c in catalog.items()]

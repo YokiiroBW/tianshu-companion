@@ -53,6 +53,10 @@ entity/event use id=null and a stable type. For every entity/event, including a 
 the identifying mention must appear verbatim in that entry's selected evidence quote.
 Reuse a known id only for the same unambiguous subject. Never invent IDs,
 merge similarly named people/objects, or attribute another person's statement to this author.
+Keep the object as subject when its name, material, location, possession or status changes.
+The author who owns or moves it is not a substitute object subject; a destination belongs in
+the location value, not as a new object subject. A place is a subject only for a claim about
+that place itself. Preserve the known object's type and exact identity across these updates.
 If a reference cannot be resolved, do not guess: the source episode remains available.
 
 Each fact contains subject, predicate, value, modality, cardinality, operation, target_refs,
@@ -73,6 +77,9 @@ Subject/predicate/modality form independent default slots: assert introduces a s
 add adds a set member. Neither automatically retires other modalities or other set members.
 Do not encode modality again in predicate suffixes. A plan, ability or passage of time proves
 neither actual completion nor noncompletion; separate attendance, departure and arrival properties.
+Buying, holding, cancelling or returning a ticket establishes the ticket/booking state, not
+attendance at its event. A cancelled arrangement does not prove that someone attended or left.
+An immediate intention is still planned until the source explicitly reports its execution.
 
 replace/confirm/retract require complete exact current target_refs from known_facts, with the
 same authorized owner/scope, subject, predicate, reality and cardinality. Only explicit replace
@@ -98,6 +105,8 @@ state current/historical describes the asserted fact, separately from modality. 
 are null, and valid_time preserves the actual wording (use 未说明有效时间 if absent). Source sent_at
 is observation time, not an event date, local calendar, start of a name, or proof of completion.
 Each new non-null bound requires explicit date/time evidence with a known local calendar reference.
+Null canonical date bounds must remain unknown when rendered into any proposed unit; do not
+replace them with the observation date, an invented starting day, or a claim of permanence.
 Do not copy the date from another event in the same sentence. Conditions and denials remain scoped
 to the exact property and person. An empty memories array is valid when no atomic fact is supported.
 """

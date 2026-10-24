@@ -45,7 +45,6 @@ from .preparation_retry import (
     read_retry,
     recovery_deadline,
     retry_preparation,
-    verify_prepared_memory,
 )
 from .qq_identity import (
     SOURCE_INSTRUCTION,
@@ -1574,7 +1573,6 @@ class Core(Delivery):
                 return
             self._check_role(turn)
             self._check_input_versions(turn)
-            await self.continue_delivery_origin(turn)
             # Preparation already has its own bounded worker admission. Do not
             # occupy provider capacity while loading and checking local context.
             turn = self.store.get("turns", turn_id)
@@ -1755,10 +1753,13 @@ class Core(Delivery):
 
     async def _respond_native(self, turn, messages, *, provenance=None):
         """Native tools continue the same actor dialogue after actual domain receipts."""
+        from .role_actions import MEMORY_INSTRUCTION
+
         native = hasattr(self.gateway, "complete")
         instruction = self.skills.instructions(turn) if native else ""
         instruction += self.memory_learning.dialogue_context(turn)
         instruction += SOURCE_INSTRUCTION
+        instruction += MEMORY_INSTRUCTION
         if messages and messages[0]["role"] == "system":
             system = provenance[0] if provenance is not None else messages[0]["content"]
             system += "\n" + instruction
@@ -2037,24 +2038,18 @@ class Core(Delivery):
             if not sources_current(self.store, previous):
                 raise Fault("scope_changed")
 
-    async def _verify_checks(self, turn, checks, *, verified=None, checkpoint=None):
+    async def _verify_checks(self, turn, checks, *, verified=None, checkpoint=None, adopted=None):
         if turn.get("memory_context") is not None:
+            from .context_preparation import AdoptedChecks
+
             owns_checkpoint = checkpoint is None
             checkpoint = checkpoint or VerificationCheckpoint()
-            memory_checks = {}
+            deferred = adopted is not None
+            adopted = adopted if deferred else AdoptedChecks()
             try:
-                await verify_checks(
-                    checks,
-                    lambda check, point: self._verify_context_check(
-                        turn, check, point, memory_checks=memory_checks
-                    ),
-                    checkpoint=checkpoint,
-                )
-                ordered = [memory_checks[key] for key in sorted(memory_checks)]
-                # Each complete set gets a fresh barrier. A source lease may
-                # have been renewed while preparing another group; signatures
-                # alone must not reuse an earlier Memory proof of that lease.
-                await verify_prepared_memory(self.memory, turn, ordered)
+                await adopted.collect(self, turn, checks, checkpoint)
+                if not deferred:
+                    await adopted.verify(self, turn, checkpoint)
             finally:
                 if owns_checkpoint:
                     await checkpoint.close()
@@ -2065,6 +2060,25 @@ class Core(Delivery):
             verified=verified,
             checkpoint=checkpoint,
         )
+
+    async def _authorize_context(self, check, checkpoint, lease_deadline):
+        from .context_checks import dependency_changed
+
+        _, _, binding = await checkpoint.once(
+            [
+                "authorize",
+                {k: check[k] for k in ("service", "origin", "channel", "scope", "binding_version")},
+                lease_deadline,
+            ],
+            lambda: self._authorize(
+                check["service"],
+                command(check["origin"], uid("check"), self.clock()),
+                check["channel"],
+                scope=check["scope"],
+            ),
+        )
+        if binding != check["binding_version"]:
+            raise dependency_changed()
 
     async def _verify_context_check(self, turn, check, checkpoint, *, memory_checks=None):
         from .context_checks import dependency_changed
@@ -2115,28 +2129,14 @@ class Core(Delivery):
             # A long preparation can outlive a renewed source lease. The next
             # lease must not reuse the authority or history proof of the old one.
             lease_deadline = previous["source_deadline"]
-        _, _, binding = await checkpoint.once(
-            [
-                "authorize",
-                {k: check[k] for k in ("service", "origin", "channel", "scope")},
-                lease_deadline,
-            ],
-            lambda: self._authorize(
-                check["service"],
-                command(check["origin"], uid("check"), self.clock()),
-                check["channel"],
-                scope=scope,
-            ),
-        )
-        if binding != check["binding_version"]:
-            raise dependency_changed()
+        await self._authorize_context(check, checkpoint, lease_deadline)
         if memory_checks is not None:
             from .memory_context import legacy_check
 
             memory_check = legacy_check(check, query(check["origin"]))
             if memory_check is not None:
                 memory_checks[memory_check["check_id"]] = memory_check
-                return
+                return lease_deadline
         if check["version_domain"] == PROFILE_DOMAIN:
             await checkpoint.once(
                 [
@@ -2207,6 +2207,7 @@ class Core(Delivery):
             )
         else:
             raise Fault("invalid_input")
+        return lease_deadline
 
     async def _refresh_preparation_origin(self, turn):
         def current():
@@ -2381,32 +2382,25 @@ class Core(Delivery):
         self._check_input_versions(turn)
         await self.continue_delivery_origin(turn)
         from .context_checks import read_parallel
+        from .context_preparation import AdoptedChecks
 
         # A fresh checkpoint at each model/send boundary. Independent peer
         # checks overlap; exact authority reads share only this checkpoint.
         async with VerificationCheckpoint() as checkpoint:
+            adopted = AdoptedChecks() if turn.get("memory_context") is not None else None
 
             async def authorize():
-                _, _, binding = await checkpoint.once(
-                    [
-                        "authorize",
-                        dict(
-                            service=turn["service"],
-                            origin=turn["origin"],
-                            channel=turn["bundle"]["collection_key"]["channel"],
-                            scope=turn["scope"],
-                        ),
-                        turn["source_deadline"],
-                    ],
-                    lambda: self._authorize(
-                        turn["service"],
-                        command(turn["origin"], uid("check"), self.clock()),
-                        turn["bundle"]["collection_key"]["channel"],
+                await self._authorize_context(
+                    dict(
+                        service=turn["service"],
+                        origin=turn["origin"],
+                        channel=turn["bundle"]["collection_key"]["channel"],
                         scope=turn["scope"],
+                        binding_version=turn["binding_version"],
                     ),
+                    checkpoint,
+                    turn["source_deadline"],
                 )
-                if binding != turn["binding_version"]:
-                    raise Fault("scope_changed")
 
             await read_parallel(
                 [
@@ -2444,12 +2438,15 @@ class Core(Delivery):
                             turn.get("context_checks", []), turn.get("profile_checks", [])
                         ),
                         checkpoint=checkpoint,
+                        adopted=adopted,
                     ),
                     lambda: checkpoint.once(
                         ["book_reading", turn["id"]], lambda: self.book_reading.verify(turn)
                     ),
                 ]
             )
+            if adopted is not None:
+                await adopted.verify(self, turn, checkpoint)
         self._check_input_versions(turn)
 
     async def _check_qq_admin(self, turn):
