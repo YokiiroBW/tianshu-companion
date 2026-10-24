@@ -160,6 +160,35 @@ def test_shorter_fresh_authority_expiry_remains_a_conservative_deadline():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("remaining,adopts", [(35, True), (36, False)])
+def test_only_declared_next_read_budget_advances_the_renewal_boundary(remaining, adopts):
+    async def run():
+        from tianshu_companion.clients import JsonService
+
+        h = Harness(silence_ms=0)
+        try:
+            turn = await preparing_turn(h)
+            turn["source_deadline"] = h.clock() + remaining
+            h.core.store.put("turns", turn)
+            old = turn["source_deadline"]
+            calls = lease_sender(h)
+            await h.core.continue_delivery_origin(turn)
+            assert turn["source_deadline"] == old
+            await h.core.continue_delivery_origin(
+                turn, read_budget=JsonService.QUERY_BUDGET_SECONDS
+            )
+            actual = epoch(h.origins.values[turn["origin"]["assertion_ref"]]["expires_at"])
+            assert turn["source_deadline"] == (actual if adopts else old)
+            assert len(calls) == 2
+            assert (
+                h.core.store.get("turns", turn["id"])["source_deadline"] == turn["source_deadline"]
+            )
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
 def test_adopted_near_expiry_deadline_survives_store_restart(tmp_path):
     async def run():
         from tianshu_companion.store import Store

@@ -3,7 +3,7 @@
 import copy
 from dataclasses import dataclass, field, replace
 
-from .clients import query
+from .clients import JsonService, query
 from .context import (
     TEXT_DOMAIN,
     TEXT_INPUT_DOMAIN,
@@ -16,6 +16,7 @@ from .context import (
 from .context_checks import VerificationCheckpoint, dependency_changed, read_parallel, verify_checks
 from .context_relevance import input_only
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
+from .delivery import SOURCE_RENEWAL_MARGIN_SECONDS
 from .short_context import select_recent
 from .preparation_retry import verify_prepared_memory
 
@@ -49,10 +50,10 @@ class AdoptedChecks:
     checks: dict = field(default_factory=dict)
     leases: dict = field(default_factory=dict)
 
-    async def collect(self, core, turn, checks, checkpoint):
+    async def collect(self, core, turn, checks, checkpoint, *, read_budget=0):
         async def attest(check, point):
             self.leases[digest(check)] = await core._verify_context_check(
-                turn, check, point, memory_checks=self.checks
+                turn, check, point, memory_checks=self.checks, read_budget=read_budget
             )
 
         checks = merge_checks(checks)
@@ -63,7 +64,9 @@ class AdoptedChecks:
         # Other main/QQ/book/local reads finish before this phase. Their waits
         # may have consumed an early source's renewal margin, or another caller
         # may have renewed it. Never attach an old authorization to a new lease.
-        await core._refresh_preparation_origin(turn)
+        read_budget = JsonService.QUERY_BUDGET_SECONDS
+        margin = SOURCE_RENEWAL_MARGIN_SECONDS + read_budget
+        await core._refresh_preparation_origin(turn, read_budget=read_budget, checkpoint=checkpoint)
         main = dict(
             service=turn["service"],
             origin=turn["origin"],
@@ -79,11 +82,11 @@ class AdoptedChecks:
             for identity, check in self.catalog.items()
             if (lease := _lease(core, turn, check)) != self.leases[identity]
             or lease is not None
-            and lease <= core.clock() + 20
+            and lease <= core.clock() + margin
         ]
         # One coordination pass, never a new retry loop. Changed deadlines use
         # new checkpoint keys, so each renewal gets its own authority proof.
-        await self.collect(core, turn, pending, checkpoint)
+        await self.collect(core, turn, pending, checkpoint, read_budget=read_budget)
 
         def current(*, margin):
             if _lease(core, turn, main) != main_lease or main_lease <= core.clock() + margin:
@@ -95,7 +98,7 @@ class AdoptedChecks:
                 ):
                     raise _checkpoint_changed()
 
-        current(margin=20)
+        current(margin=SOURCE_RENEWAL_MARGIN_SECONDS)
         await verify_prepared_memory(
             core.memory, turn, [self.checks[key] for key in sorted(self.checks)]
         )

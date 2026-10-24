@@ -231,10 +231,10 @@ class ContextCheckpointTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         original = self.h.core.continue_delivery_origin
 
-        async def renew(turn):
+        async def renew(turn, **kwargs):
             calls.append(turn["id"])
             await asyncio.sleep(0)
-            return await original(turn)
+            return await original(turn, **kwargs)
 
         self.h.core.continue_delivery_origin = renew
         await self.h.core._verify_checks(previous, [text, profile])

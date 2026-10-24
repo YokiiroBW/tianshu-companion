@@ -55,7 +55,7 @@ from .qq_identity import (
     validate_channel,
 )
 
-from .delivery import Delivery, TERMINAL
+from .delivery import Delivery, SOURCE_RENEWAL_MARGIN_SECONDS, TERMINAL
 from .book_reading import BookReading, INSTRUCTION as BOOK_READING_INSTRUCTION
 
 ACTIVE = {
@@ -2080,7 +2080,9 @@ class Core(Delivery):
         if binding != check["binding_version"]:
             raise dependency_changed()
 
-    async def _verify_context_check(self, turn, check, checkpoint, *, memory_checks=None):
+    async def _verify_context_check(
+        self, turn, check, checkpoint, *, memory_checks=None, read_budget=0
+    ):
         from .context_checks import dependency_changed
 
         scope = check["scope"]
@@ -2112,11 +2114,14 @@ class Core(Delivery):
 
             previous = source()
             # Renew the original human's lease once, including parallel domain checks.
-            if previous["source_deadline"] <= self.clock() + 20:
+            if (
+                previous["source_deadline"]
+                <= self.clock() + SOURCE_RENEWAL_MARGIN_SECONDS + read_budget
+            ):
                 try:
                     await checkpoint.once(
                         ["renew", source_turn_id, previous["source_deadline"]],
-                        lambda: self.continue_delivery_origin(previous),
+                        lambda: self.continue_delivery_origin(previous, read_budget=read_budget),
                     )
                 except Fault as error:
                     # Renewal is a control boundary, never optional pure-read
@@ -2209,7 +2214,7 @@ class Core(Delivery):
             raise Fault("invalid_input")
         return lease_deadline
 
-    async def _refresh_preparation_origin(self, turn):
+    async def _refresh_preparation_origin(self, turn, *, read_budget=0, checkpoint=None):
         def current():
             fresh = self.store.get("turns", turn["id"])
             if (
@@ -2227,19 +2232,34 @@ class Core(Delivery):
             turn["source_deadline"] = fresh["source_deadline"]
 
         current()
-        if turn["source_deadline"] > self.clock() + 20:
+        if turn["source_deadline"] > self.clock() + SOURCE_RENEWAL_MARGIN_SECONDS + read_budget:
             return False
-        await self.continue_delivery_origin(turn)
+        await self.continue_delivery_origin(turn, read_budget=read_budget)
         current()
-        _, _, binding = await self._authorize(
-            turn["service"],
-            command(turn["origin"], uid("check"), self.clock()),
-            turn["bundle"]["collection_key"]["channel"],
-            scope=turn["scope"],
-        )
+        if checkpoint is None:
+            _, _, binding = await self._authorize(
+                turn["service"],
+                command(turn["origin"], uid("check"), self.clock()),
+                turn["bundle"]["collection_key"]["channel"],
+                scope=turn["scope"],
+            )
+            if binding != turn["binding_version"]:
+                raise Fault("scope_changed")
+        else:
+            # The final adopted phase owns this exact authority key as well.
+            # Joining it avoids a second identity read for the same renewed lease.
+            await self._authorize_context(
+                dict(
+                    service=turn["service"],
+                    origin=turn["origin"],
+                    channel=turn["bundle"]["collection_key"]["channel"],
+                    scope=turn["scope"],
+                    binding_version=turn["binding_version"],
+                ),
+                checkpoint,
+                turn["source_deadline"],
+            )
         current()
-        if binding != turn["binding_version"]:
-            raise Fault("scope_changed")
         return True
 
     async def _prepare_context(self, turn, dependencies):
@@ -2380,7 +2400,11 @@ class Core(Delivery):
         ):
             raise Fault("scope_changed")
         self._check_input_versions(turn)
-        await self.continue_delivery_origin(turn)
+        # This checkpoint still needs its bounded authority reads before the
+        # final 20-second admission check. Reserve their existing budget early.
+        await self.continue_delivery_origin(
+            turn, read_budget=clients.JsonService.QUERY_BUDGET_SECONDS
+        )
         from .context_checks import read_parallel
         from .context_preparation import AdoptedChecks
 

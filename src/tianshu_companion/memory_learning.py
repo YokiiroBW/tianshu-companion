@@ -444,50 +444,46 @@ class MemoryLearning:
             await asyncio.gather(*self.jobs.values(), return_exceptions=True)
             self.jobs.clear()
 
-    async def _commit(self, item):
-        # Preserve the existing single proposal-commit boundary. Candidate reads
-        # in independent scopes can still progress while another source is slow.
-        async with self.lock:
-            return await self._candidate(item, item["output"])
-
     async def _candidate(self, item, output, *, reserve_attempt=False, reconcile=False):
         # A null lookup can capture an episode. All candidate calls therefore
         # share the same mutation/admission owner, including explicit recovery.
-        # Waiting persists only on normal queue jobs and releases this worker.
-        try:
-            turn = self._source_turn(item)
-            mutates = output != {"memories": []}
-            if mutates and self.core.has_active_dialogue(turn["scope"]):
-                if reconcile:
-                    # No automatic generation or orphaned durable gate for
-                    # an explicit receipt-only check of a blocked job.
-                    raise Fault("queue_full")
-                waiting = (
-                    "commit_wait"
-                    if output is not None or item.get("stage") == "commit_wait"
-                    else "capture_wait"
-                )
-                if item.get("stage") != waiting:
-                    item["stage"] = waiting
-                    self.core.store.put("metadata", item)
-                    self.core.counted("memory.work")
-                return None
-            if mutates:
-                self.mutation_scopes[item["id"]] = turn["scope"]
-            if reserve_attempt:
-                # Only actual receipt/capture I/O spends an attempt. A
-                # restarted wait retains all prior counters and proposal.
-                item["attempts"] += 1
-            if not reconcile:
-                if output is not None:
-                    item["stage"] = "commit"
-                elif item.get("stage") not in MUTATION_WAIT:
-                    item["stage"] = "receipt"
-                self.core.store.put("metadata", item)
-            async with asyncio.timeout(45):
-                return await self._candidate_request(item, output)
-        finally:
-            self.mutation_scopes.pop(item["id"], None)
+        # Serial source I/O leaves the shared peer read slots available to live
+        # dialogue. Models remain outside this lock; waiting spends no attempt
+        # and creates no new mutation gate. The existing budget includes waiting.
+        async with asyncio.timeout(45):
+            async with self.lock:
+                try:
+                    turn = self._source_turn(item)
+                    mutates = output != {"memories": []}
+                    if mutates and self.core.has_active_dialogue(turn["scope"]):
+                        if reconcile:
+                            # Explicit receipt recovery neither regenerates nor
+                            # installs an orphaned durable admission gate.
+                            raise Fault("queue_full")
+                        waiting = (
+                            "commit_wait"
+                            if output is not None or item.get("stage") == "commit_wait"
+                            else "capture_wait"
+                        )
+                        if item.get("stage") != waiting:
+                            item["stage"] = waiting
+                            self.core.store.put("metadata", item)
+                            self.core.counted("memory.work")
+                        return None
+                    if mutates:
+                        self.mutation_scopes[item["id"]] = turn["scope"]
+                    if reserve_attempt:
+                        # Only actual receipt/capture I/O spends an attempt.
+                        item["attempts"] += 1
+                    if not reconcile:
+                        if output is not None:
+                            item["stage"] = "commit"
+                        elif item.get("stage") not in MUTATION_WAIT:
+                            item["stage"] = "receipt"
+                        self.core.store.put("metadata", item)
+                    return await self._candidate_request(item, output)
+                finally:
+                    self.mutation_scopes.pop(item["id"], None)
 
     def _source_turn(self, item):
         core = self.core
@@ -541,6 +537,11 @@ class MemoryLearning:
             return
         try:
             turn = self._source_turn(item)
+            if item.get("stage") == "proposal":
+                # A previous proposal failure is not a new model attempt.
+                # Recovery first reads Memory, retaining any parsed output.
+                item["stage"] = "commit" if item["output"] is not None else "receipt"
+                core.store.put("metadata", item)
             response = await self._candidate(item, None, reserve_attempt=not resuming_commit)
             if response is None:
                 return
@@ -693,8 +694,9 @@ class MemoryLearning:
                     # read its receipt first. Only a valid Memory-owned pending
                     # response permits the same job/exact output retry: Memory's
                     # atomic job ledger consumes it once, including a lost ack.
+                    item["stage"] = "commit"
                     core.store.put("metadata", item)
-                response = await self._commit(item)
+                response = await self._candidate(item, item["output"])
                 if response is None:
                     return
                 if response["state"] == "rejected":

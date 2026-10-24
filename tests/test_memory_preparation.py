@@ -465,7 +465,7 @@ class CorePreparationTests(unittest.IsolatedAsyncioTestCase):
         previous["source_deadline"] = self.h.clock() + 10
         self.h.core._save_turn(previous)
 
-        async def unavailable(turn):
+        async def unavailable(turn, **kwargs):
             error = Fault("dependency_unavailable", retryable_read=True)
             error.optional_read_unavailable = True
             raise error

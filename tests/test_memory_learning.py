@@ -396,12 +396,14 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.memory.process_candidate = held
         worker = self.h.core.memory_learning
         await worker.work(wait=False)
-        for signal in entered.values():
-            await asyncio.wait_for(signal.wait(), 2)
-        self.assertEqual(set(item["id"] for item in items), set(worker.mutation_scopes))
         first, second = items
+        await asyncio.wait_for(entered[first["job_id"]].wait(), 2)
+        self.assertFalse(entered[second["job_id"]].is_set())
+        self.assertEqual({first["id"]}, set(worker.mutation_scopes))
+        self.assertEqual(0, self.h.core.store.get("metadata", second["id"])["attempts"])
         worker.jobs[first["id"]].cancel()
         await asyncio.gather(worker.jobs[first["id"]], return_exceptions=True)
+        await asyncio.wait_for(entered[second["job_id"]].wait(), 2)
         self.assertNotIn(first["id"], worker.mutation_scopes)
         self.assertIn(second["id"], worker.mutation_scopes)
         self.assertTrue(worker.admission_blocked(second["scope"]))
@@ -412,10 +414,10 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({}, worker.mutation_scopes)
         self.assertEqual("completed", self.h.core.store.get("metadata", second["id"])["state"])
 
-    async def test_cancelling_capture_keeps_other_overlapping_scope_gate(self):
+    async def test_cancelled_capture_releases_io_to_next_overlapping_scope(self):
         await self.assert_capture_cancel_keeps_other_owner(same_room=True)
 
-    async def test_cancelling_capture_releases_only_its_independent_scope(self):
+    async def test_cancelled_capture_releases_io_to_next_independent_scope(self):
         await self.assert_capture_cancel_keeps_other_owner(same_room=False)
 
     async def test_private_commit_still_waits_for_potentially_associated_private_scope(self):
@@ -1389,7 +1391,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.generated, [])
         self.assertEqual(self.calls, [])
 
-    async def test_slow_receipt_does_not_hold_other_rooms_or_get_claimed_twice(self):
+    async def test_slow_receipt_serializes_candidate_io_without_holding_other_room_dialogue(self):
         self.unique_jobs()
         await self.chat()
         first_turn = self.h.turns()[0]["id"]
@@ -1417,13 +1419,243 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(entered.wait(), 2)
         for _ in range(60):
             await asyncio.sleep(0)
-        self.assertEqual(self.h.core.store.get("metadata", second["id"])["state"], "completed")
+        waiting = self.h.core.store.get("metadata", second["id"])
+        self.assertEqual(("pending", 0), (waiting["state"], waiting["attempts"]))
+        self.assertNotIn(second["id"], worker.mutation_scopes)
         self.assertEqual(self.h.core.store.get("metadata", first["id"])["state"], "pending")
         await worker.work(wait=False)
         self.assertEqual(len(reads), 1)
+        await self.h.ingest(text="独立群仍能对话", group=True, channel="group:live", account="c")
+        await self.h.cycles()
+        self.assertEqual("sent", self.h.turns()[-1]["phase"])
         gate.set()
-        await worker.work()
+        await asyncio.gather(*worker.jobs.values())
         self.assertEqual(self.h.core.store.get("metadata", first["id"])["state"], "completed")
+        self.assertEqual(self.h.core.store.get("metadata", second["id"])["state"], "completed")
+
+    async def test_candidate_lock_wait_has_no_new_admission_gate_attempt_or_io(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        item = self.task()
+        worker = self.h.core.memory_learning
+        async with worker.lock:
+            task = asyncio.create_task(worker._candidate(item, None, reserve_attempt=True))
+            await asyncio.sleep(0)
+            self.assertEqual(0, item["attempts"])
+            self.assertEqual([], self.calls)
+            self.assertEqual({}, worker.mutation_scopes)
+            self.assertFalse(worker.admission_blocked(item["scope"]))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(0, self.task()["attempts"])
+        self.assertFalse(worker.lock.locked())
+        await worker._candidate(item, None, reserve_attempt=True)
+        self.assertEqual(1, item["attempts"])
+        self.assertEqual(1, len(self.calls))
+
+    async def test_candidate_existing_timeout_also_bounds_lock_wait(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        item = self.task()
+        worker = self.h.core.memory_learning
+        timeout = asyncio.timeout
+
+        def budget(seconds):
+            self.assertEqual(45, seconds)
+            return timeout(0.02)
+
+        async with worker.lock:
+            with patch("tianshu_companion.memory_learning.asyncio.timeout", side_effect=budget):
+                with self.assertRaises(TimeoutError):
+                    await worker._candidate(item, None, reserve_attempt=True)
+        self.assertEqual(0, item["attempts"])
+        self.assertEqual([], self.calls)
+        self.assertEqual({}, worker.mutation_scopes)
+        self.assertFalse(worker.lock.locked())
+
+    async def assert_candidate_source_rechecked_after_lock_wait(self, change):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        item = self.task()
+        worker = self.h.core.memory_learning
+        async with worker.lock:
+            task = asyncio.create_task(worker._candidate(item, None, reserve_attempt=True))
+            await asyncio.sleep(0)
+            turn = self.h.core.store.get("turns", item["turn_id"])
+            if change == "role":
+                del self.h.core.roles[turn["scope"]["actor_id"]]
+            else:
+                if change == "cancelled":
+                    turn["cancelled"] = True
+                else:
+                    turn["scope"]["person_id"] = "person:changed"
+                self.h.core.store.put("turns", turn)
+        with self.assertRaises(Fault) as caught:
+            await task
+        self.assertEqual(
+            "forbidden" if change == "role" else "scope_changed", caught.exception.code
+        )
+        self.assertEqual(0, item["attempts"])
+        self.assertEqual([], self.calls)
+        self.assertEqual({}, worker.mutation_scopes)
+        self.assertFalse(worker.lock.locked())
+
+    async def test_candidate_source_is_rechecked_after_lock_wait(self):
+        await self.assert_candidate_source_rechecked_after_lock_wait("cancelled")
+
+    async def test_candidate_role_is_rechecked_after_lock_wait(self):
+        await self.assert_candidate_source_rechecked_after_lock_wait("role")
+
+    async def test_candidate_scope_is_rechecked_after_lock_wait(self):
+        await self.assert_candidate_source_rechecked_after_lock_wait("scope")
+
+    async def test_candidate_lock_timeout_retains_unknown_proposal_for_receipt_recovery(self):
+        await self.chat()
+        self.lose_response = True
+        await self.flush()
+        item = self.task()
+        proposal, attempts = copy.deepcopy(item["output"]), item["attempts"]
+        calls = len(self.calls)
+        self.h.clock.advance(10)
+        worker = self.h.core.memory_learning
+        timeout = asyncio.timeout
+
+        def budget(seconds):
+            self.assertEqual(45, seconds)
+            return timeout(0.02)
+
+        async with worker.lock:
+            with patch("tianshu_companion.memory_learning.asyncio.timeout", side_effect=budget):
+                await worker._work(item)
+        retained = self.task()
+        self.assertEqual(proposal, retained["output"])
+        self.assertEqual(attempts, retained["attempts"])
+        self.assertEqual(calls, len(self.calls))
+        self.assertFalse(retained["last_failure"]["unknown"])
+        self.assertEqual({}, worker.mutation_scopes)
+        self.h.clock.advance(10)
+        await self.flush()
+        self.assertEqual("completed", self.task()["state"])
+        self.assertEqual(1, len(self.generated))
+        self.assertEqual(1, sum(output is not None for _, output in self.calls))
+
+    async def test_first_parsed_proposal_lock_timeout_is_temporary_and_restart_reads_receipt_first(
+        self,
+    ):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        worker = self.h.core.memory_learning
+        entered, release = asyncio.Event(), asyncio.Event()
+        generate = self.generate
+
+        async def held(turn, messages):
+            result = await generate(turn, messages)
+            entered.set()
+            await release.wait()
+            return result
+
+        self.h.gateway.generate = held
+        await worker.work(wait=False)
+        await asyncio.wait_for(entered.wait(), 2)
+        timeout = asyncio.timeout
+
+        def budget(seconds):
+            self.assertEqual(45, seconds)
+            return timeout(0.02)
+
+        async with worker.lock:
+            with patch("tianshu_companion.memory_learning.asyncio.timeout", side_effect=budget):
+                release.set()
+                await asyncio.gather(*worker.jobs.values())
+        item = self.task()
+        proposal = copy.deepcopy(item["output"])
+        self.assertIsNotNone(proposal)
+        self.assertEqual("commit", item["stage"])
+        self.assertEqual((1, 0), (item["attempts"], item["proposal_failures"]))
+        self.assertEqual({"temporary": 1}, item["recovery_failures"])
+        self.assertFalse(item["last_failure"]["unknown"])
+        self.assertEqual([None], [output for _, output in self.calls])
+        self.assertEqual({}, worker.mutation_scopes)
+        await self.restart()
+        self.h.clock.advance(10)
+        await self.flush()
+        self.assertEqual("completed", self.task()["state"])
+        self.assertEqual(1, len(self.generated))
+        self.assertEqual([None, None, proposal], [output for _, output in self.calls])
+
+    async def assert_proposal_recovery_lock_wait_is_not_another_proposal_failure(self, failure):
+        await self.chat()
+        generate = self.h.gateway.generate
+        if failure == "rejected":
+            self.reject = True
+        else:
+
+            async def malformed(turn, messages):
+                await generate(turn, messages)
+                return ["not JSON"], {}
+
+            self.h.gateway.generate = malformed
+        await self.flush()
+        self.h.gateway.generate = generate
+        item = self.task()
+        self.assertEqual(
+            ("proposal", None, 1), (item["stage"], item["output"], item["proposal_failures"])
+        )
+        calls, attempts = len(self.calls), item["attempts"]
+        self.h.clock.advance(10)
+        worker = self.h.core.memory_learning
+        timeout = asyncio.timeout
+
+        def budget(seconds):
+            self.assertEqual(45, seconds)
+            return timeout(0.02)
+
+        async with worker.lock:
+            with patch("tianshu_companion.memory_learning.asyncio.timeout", side_effect=budget):
+                await worker._work(item)
+        retained = self.task()
+        self.assertEqual(
+            ("receipt", None, 1),
+            (retained["stage"], retained["output"], retained["proposal_failures"]),
+        )
+        self.assertEqual(attempts, retained["attempts"])
+        self.assertEqual(1, retained["recovery_failures"]["receipt"])
+        self.assertEqual(calls, len(self.calls))
+        self.assertEqual(1, len(self.generated))
+        self.assertEqual({}, worker.mutation_scopes)
+        await self.restart()
+        self.h.clock.advance(10)
+        await self.flush()
+        self.assertEqual("completed", self.task()["state"])
+        self.assertEqual(1, self.task()["proposal_failures"])
+        self.assertEqual(2, len(self.generated))
+        self.assertEqual(None, self.calls[calls][1])
+
+    async def test_rejected_proposal_recovery_lock_timeout_does_not_spend_proposal_budget(self):
+        await self.assert_proposal_recovery_lock_wait_is_not_another_proposal_failure("rejected")
+
+    async def test_parse_failure_recovery_lock_timeout_does_not_spend_proposal_budget(self):
+        await self.assert_proposal_recovery_lock_wait_is_not_another_proposal_failure("parse")
+
+    async def test_candidate_active_dialogue_is_rechecked_after_lock_wait(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        item = self.task()
+        worker = self.h.core.memory_learning
+        async with worker.lock:
+            task = asyncio.create_task(worker._candidate(item, None, reserve_attempt=True))
+            await asyncio.sleep(0)
+            self.h.gateway.gates[2] = asyncio.Event()
+            await self.h.ingest(text="候选等锁期间开始的新对话")
+            await self.h.cycles()
+            self.assertEqual("generating", self.h.turns()[-1]["phase"])
+        self.assertIsNone(await task)
+        self.assertEqual("capture_wait", self.task()["stage"])
+        self.assertEqual(0, self.task()["attempts"])
+        self.assertEqual([], self.calls)
+        self.assertEqual({}, worker.mutation_scopes)
+        self.assertFalse(worker.lock.locked())
 
     async def test_background_models_overlap_but_same_scope_correction_keeps_order(self):
         from tianshu_companion.model_slots import ModelSlots

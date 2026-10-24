@@ -92,7 +92,7 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.h.memory.verify_context = barrier
         await self.h.core._preflight_once(current)
-        self.assertEqual([current["origin"], previous["origin"]], self.renewals)
+        self.assertEqual([current["origin"], current["origin"], previous["origin"]], self.renewals)
         self.assertEqual(1, len(self.verifications))
         source_proofs = [deadline for key, deadline in self.authorizations if key == previous["id"]]
         self.assertEqual(2, len(source_proofs))
@@ -224,7 +224,7 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def concurrent_continuation(self, operation, *, near=False):
         previous, current = await self.prepare()
-        self.lease(previous, 21 if near else 60)
+        self.lease(previous, 36 if near else 60)
         deadline = previous["source_deadline"]
         entered, release = asyncio.Event(), asyncio.Event()
         name = "prepare_context" if operation == "prepare" else "verify_context"
@@ -245,7 +245,7 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(read)
         try:
             await asyncio.wait_for(entered.wait(), 1)
-            self.h.clock.advance(2 if near else 1)
+            self.h.clock.advance(17 if near else 1)
             # A different live turn/checkpoint continues this human's source
             # while the successful Memory read is still in flight.
             await asyncio.create_task(self.h.core.continue_delivery_origin(previous))
@@ -280,6 +280,70 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_near_expiry_renewal_still_invalidates_old_verify_proof(self):
         await self.concurrent_continuation("verify", near=True)
+
+    async def test_preflight_reserves_existing_read_budget_before_local_checks(self):
+        previous, current = await self.prepare()
+        self.lease(previous, 120)
+        self.lease(current, 32)
+        old = current["source_deadline"]
+        self.wait_after_source(previous, lambda: self.h.clock.advance(14))
+        await self.h.core._preflight_once(current)
+        self.assertGreater(current["source_deadline"], old)
+        self.assertEqual([current["origin"]], self.renewals)
+        self.assertEqual(1, len(self.verifications))
+        self.assertEqual(
+            [current["source_deadline"]],
+            [deadline for key, deadline in self.authorizations if key == current["id"]],
+        )
+
+    async def test_final_source_coordination_reserves_budget_and_reproves_exact_new_lease(self):
+        previous, current = await self.prepare()
+        self.lease(previous, 40)
+        old = previous["source_deadline"]
+        self.wait_after_source(previous, lambda: self.h.clock.advance(10))
+        await self.h.core._preflight_once(current)
+        fresh = self.h.core.store.get("turns", previous["id"])
+        self.assertGreater(fresh["source_deadline"], old)
+        self.assertEqual(
+            [old, fresh["source_deadline"]],
+            [deadline for key, deadline in self.authorizations if key == previous["id"]],
+        )
+        self.assertEqual([current["origin"], previous["origin"]], self.renewals)
+        self.assertEqual(1, len(self.verifications))
+
+    async def test_final_main_refresh_joins_its_exact_checkpoint_authorization(self):
+        previous, current = await self.prepare()
+        self.lease(previous, 120)
+        self.wait_after_source(previous, lambda: self.h.clock.advance(30))
+        await self.h.core._preflight_once(current)
+        proofs = [deadline for key, deadline in self.authorizations if key == current["id"]]
+        self.assertEqual(2, len(proofs))
+        self.assertGreater(proofs[1], proofs[0])
+        self.assertEqual([current["origin"], current["origin"]], self.renewals)
+        self.assertEqual(1, len(self.verifications))
+
+    async def test_read_budget_is_not_a_guarantee_after_unbounded_other_checks(self):
+        previous, current = await self.prepare()
+        self.lease(previous, 120)
+        self.lease(current, 32)
+        self.wait_after_source(previous, lambda: self.h.clock.advance(61))
+        context = self.h.core.sender.expression_context
+
+        async def unchanged(source, scope, channel):
+            # The port cannot supply a fresh grant after the first continuation.
+            if self.renewals:
+                return dict(
+                    origin=source["origin"],
+                    scope=scope,
+                    channel=channel,
+                    expires_at=utc(current["source_deadline"]),
+                )
+            return await context(source, scope, channel)
+
+        self.h.core.sender.expression_context = unchanged
+        with self.assertRaises(Fault):
+            await self.h.core._preflight_once(current)
+        self.assertEqual([], self.verifications)
 
 
 del CoreEvidenceTests

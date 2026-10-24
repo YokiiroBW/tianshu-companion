@@ -7,6 +7,7 @@ from .contracts import Fault, digest
 from . import observability as obs
 
 TERMINAL = {"sent", "failed", "cancelled", "observed", "closed_unknown"}
+SOURCE_RENEWAL_MARGIN_SECONDS = 20
 
 
 def _receipt_semantic(value):
@@ -29,7 +30,7 @@ class Delivery:
             sources=self.life.concerns.captured_sources(turn),
         )
 
-    async def continue_delivery_origin(self, turn):
+    async def continue_delivery_origin(self, turn, *, read_budget=0):
         sender = self.expression_sender(turn)
         context = getattr(sender, "expression_context", None)
         if context is None:
@@ -56,7 +57,8 @@ class Delivery:
             # Re-read after the await: another checkpoint may already have
             # renewed this source. Never overwrite it with the caller's old copy
             # or keep a deadline beyond a shorter actual authority response.
-            adopted = deadline if durable <= now + 20 else min(durable, deadline)
+            margin = SOURCE_RENEWAL_MARGIN_SECONDS + read_budget
+            adopted = deadline if durable <= now + margin else min(durable, deadline)
             if fresh and adopted != durable:
                 fresh["source_deadline"] = adopted
                 if (
