@@ -3,7 +3,7 @@
 import copy
 from dataclasses import dataclass, field, replace
 
-from .clients import JsonService, query
+from .clients import JsonService
 from .context import (
     TEXT_DOMAIN,
     TEXT_INPUT_DOMAIN,
@@ -111,23 +111,55 @@ class AdoptedChecks:
 
 
 async def _v2_variants(core, turn, checks, batches):
+    # Select complete units locally first. Do not attest raw alternatives that
+    # will never be used, or turn origin unavailability into another source read.
+    prepared, unavailable_origins = await _prepare_candidates(core, turn, checks, batches)
+    candidates, positions = [], []
+    fallback = False
+    for position, (candidate, _, status) in enumerate(prepared):
+        if status != "valid":
+            if not any(member["replies"] for member in candidate):
+                continue
+            candidate = [input_only(member) for member in candidate]
+            raw_checks = recent_checks(core.store, candidate, exact_inputs=True)
+            if any(
+                canonical([check["service"], check["origin"]]) in unavailable_origins
+                for check in raw_checks
+            ):
+                # A reply can depend on an unavailable foreign origin without
+                # invalidating its author's raw input. Never reread an origin
+                # that remains in the actual input projection's closure.
+                continue
+            fallback = True
+        candidates.append(candidate)
+        positions.append(position)
+    if not fallback:
+        return [
+            [(candidate, inherited)] if status == "valid" else []
+            for candidate, inherited, status in prepared
+        ]
+    # One existing input-only fallback, with the complete actually proposed set
+    # checked together again. Earlier full proofs never outlive this later phase.
+    final = [[] for _ in batches]
+    prepared, _ = await _prepare_candidates(core, turn, checks, candidates)
+    for position, (candidate, inherited, status) in zip(positions, prepared, strict=True):
+        if status == "valid":
+            final[position] = [(candidate, inherited)]
+    return final
+
+
+async def _prepare_candidates(core, turn, checks, batches):
     plans = []
     catalog = {digest(check): copy.deepcopy(check) for check in merge_checks(checks)}
     required = set(catalog)
-    for batch in batches:
-        variants = [batch]
-        if any(member["replies"] for member in batch):
-            variants.append([input_only(member) for member in batch])
-        planned = []
-        for candidate in variants:
-            inherited = recent_checks(core.store, candidate, exact_inputs=True)
-            members = []
-            for check in inherited:
-                identity = digest(check)
-                catalog.setdefault(identity, copy.deepcopy(check))
-                members.append(identity)
-            planned.append((candidate, inherited, members))
-        plans.append(planned)
+    for candidate in batches:
+        inherited = recent_checks(core.store, candidate, exact_inputs=True)
+        members = []
+        for check in inherited:
+            identity = digest(check)
+            catalog.setdefault(identity, copy.deepcopy(check))
+            members.append(identity)
+        plans.append((candidate, inherited, members))
 
     origins = {
         identity: canonical([check["service"], check["origin"]])
@@ -251,18 +283,27 @@ async def _v2_variants(core, turn, checks, batches):
             lease = _proof_lease(core, turn, check, leases[identity])
             if lease is not None and lease <= core.clock():
                 raise Fault("forbidden")
-        return [
-            [
-                (candidate, inherited)
-                for candidate, inherited, members in variants
-                if all(
-                    local[identity] == "valid"
-                    and all(outcomes[key] == "valid" for key in links[identity])
+        prepared = [
+            (
+                candidate,
+                inherited,
+                "unavailable"
+                if any(
+                    local[identity] == "unavailable"
+                    or any(outcomes[key] == "unavailable" for key in links[identity])
                     for identity in members
                 )
-            ]
-            for variants in plans
+                else "rejected"
+                if any(
+                    local[identity] != "valid"
+                    or any(outcomes[key] != "valid" for key in links[identity])
+                    for identity in members
+                )
+                else "valid",
+            )
+            for candidate, inherited, members in plans
         ]
+        return prepared, unavailable_origins
 
 
 async def recent(core, turn, context, checks):
@@ -366,6 +407,10 @@ async def _legacy_recent(core, turn, context, checks, batches):
 
 
 async def profiles(core, turn, context, accepted):
+    if turn.get("memory_context") is not None:
+        # Contextual portraits already use the selected v2 facts budget. The
+        # explicit legacy profile port remains available for its real callers.
+        return []
     text = core._input_text(turn) or "media"
     targets = profile_targets(turn, accepted) if core._turn_allows(turn, "memory.read") else []
     checks = []
@@ -376,29 +421,14 @@ async def profiles(core, turn, context, accepted):
         batch = targets[offset : offset + 4]
         await core._refresh_preparation_origin(turn, read_budget=JsonService.QUERY_BUDGET_SECONDS)
         budget = dict(tokens=allowance, bytes=allowance)
-        if turn.get("memory_context") is not None:
-            requests = [
-                dict(
-                    query=query(turn["origin"]),
-                    requester_scope=turn["scope"],
-                    target=target,
-                    query_text=text,
-                    selection=selection,
-                    known_scope_version=None,
-                    budget=budget,
+        responses = await read_parallel(
+            [
+                lambda target=target, selection=selection: core.memory.profiles(
+                    turn["origin"], turn["scope"], target, text, selection, budget
                 )
                 for target, selection in batch
             ]
-            responses = await core.memory.profiles_batch(turn["origin"], turn["scope"], requests)
-        else:
-            responses = await read_parallel(
-                [
-                    lambda target=target, selection=selection: core.memory.profiles(
-                        turn["origin"], turn["scope"], target, text, selection, budget
-                    )
-                    for target, selection in batch
-                ]
-            )
+        )
         for (target, selection), response in zip(batch, responses, strict=True):
             if response["selected_units"] and context.append(
                 "profiles",

@@ -149,7 +149,9 @@ class Core(Delivery):
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
         self.book_reading = BookReading(origins, clock)
         from .memory_learning import MemoryLearning
+        from .summary_windows import SummaryWindows
 
+        self.summary_windows = SummaryWindows(self)
         self.memory_learning = MemoryLearning(self)
         self.knowledge_client = knowledge_client or getattr(memory, "client", None)
         # The injected runtime-event port. It records what already happened and decides
@@ -1448,7 +1450,11 @@ class Core(Delivery):
                         from .memory_context import selection as project_selection
 
                         memory_context = await self.memory.query_context(
-                            turn["origin"], turn["scope"], text or "media", budget
+                            turn["origin"],
+                            turn["scope"],
+                            text or "media",
+                            budget,
+                            retrieval_mode="context",
                         )
                         selection = project_selection(memory_context)
                     else:
@@ -1932,7 +1938,9 @@ class Core(Delivery):
                 )
                 messages.extend(attachments)
                 fresh = self.store.get("turns", turn["id"])
-                if call["function"]["name"] == "memory_propose":
+                if call["function"]["name"] == "memory_propose" or (
+                    call["function"]["name"] == "memory_recall" and result["state"] == "completed"
+                ):
                     prompt = json.loads(messages[1]["content"])
                     prompt.update(
                         evidence=fresh["preparation"]["selected_units"],

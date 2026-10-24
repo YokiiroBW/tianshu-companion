@@ -38,6 +38,21 @@ def read_capabilities(core):
                 is not None
                 for state in ("pending", "completed", "invalidated", "blocked")
             },
+            "consolidation_receipts": {
+                label: core.store.db.execute(
+                    "SELECT 1 FROM metadata WHERE conversation_id=? "
+                    "AND json_extract(body,'$.extraction_schema')=5 "
+                    f"AND json_extract(body,'{path}')=? LIMIT 1",
+                    ("memory:learning", value),
+                ).fetchone()
+                is not None
+                for label, path, value in (
+                    ("experience_saved", "$.experience_state", "saved"),
+                    ("summary_committed", "$.summary_state", "committed"),
+                    ("summary_skipped", "$.summary_state", "skipped"),
+                    ("portrait_pending", "$.portrait_state", "pending"),
+                )
+            },
             "memory_write_verification": "not_verified",
         },
         "chat_audit": {"enabled": False, "state": "not_integrated"},

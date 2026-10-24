@@ -357,6 +357,11 @@ class JsonService:
                         set(body) == {"job_id", "output", "supported_extraction_schemas"}
                         and body["supported_extraction_schemas"] in ([3], [4], [3, 4])
                     )
+                    or (
+                        set(body)
+                        == {"job_id", "job_ids", "output", "supported_extraction_schemas", "window"}
+                        and body["supported_extraction_schemas"] == [5]
+                    )
                 )
                 and isinstance(body["job_id"], str)
                 and bool(body["job_id"])
@@ -669,7 +674,7 @@ class Origins:
 
 
 class Memory:
-    extraction_schema = 4
+    extraction_schema = 5
 
     def __init__(self, contracts, client):
         self.contracts, self.client = contracts, client
@@ -819,11 +824,27 @@ class Memory:
                 raise Fault("forbidden")
         return response
 
-    async def query_context(self, origin, scope, text, budget, *, queries=None, known_bundle=None):
+    async def query_context(
+        self,
+        origin,
+        scope,
+        text,
+        budget,
+        *,
+        queries=None,
+        known_bundle=None,
+        retrieval_mode="factual",
+    ):
         from .memory_context import query_request, validate_response
 
         request = query_request(
-            query(origin), scope, text, budget, queries=queries, known_bundle=known_bundle
+            query(origin),
+            scope,
+            text,
+            budget,
+            queries=queries,
+            known_bundle=known_bundle,
+            retrieval_mode=retrieval_mode,
         )
         self.contracts.check("memory-context-v2#query_request", request)
         try:
@@ -871,6 +892,13 @@ class Memory:
                 or epoch(current["valid_until"]) <= time.time()
             ):
                 raise Fault("scope_changed")
+            if current.get("retrieval_mode", "factual") != bundle.get("retrieval_mode", "factual"):
+                raise Fault("invalid_input")
+            if bundle.get("retrieval_mode") == "context":
+                from .memory_context import bundle_identity
+
+                if bundle_identity(current) != bundle_identity(bundle):
+                    raise Fault("scope_changed")
             if any(
                 current[key] != bundle[key]
                 for key in (
@@ -1092,12 +1120,78 @@ class Memory:
             raise Fault("invalid_input", unknown=True)
         return value
 
-    async def process_candidate(self, job_id, output, *, extraction_schema=None):
+    async def process_candidate(
+        self, job_id, output, *, extraction_schema=None, job_ids=None, window=None, batch_ref=None
+    ):
         if extraction_schema is not None and (
-            type(extraction_schema) is not int or extraction_schema not in (3, 4)
+            type(extraction_schema) is not int or extraction_schema not in (3, 4, 5)
         ):
             raise Fault("invalid_input")
         request = dict(job_id=job_id, output=output)
+        if extraction_schema == 5:
+            mutates = output is not None or window is not None
+            request["job_ids"] = list(job_ids or [job_id])
+            if output is None:
+                request.update(supported_extraction_schemas=[5], window=window)
+            else:
+                request.update(extraction_schema=5, batch_ref=batch_ref)
+            self.contracts.check("memory-extraction#process_request", request)
+            if len(canonical(request).encode()) > 262144:
+                raise Fault("budget_exceeded")
+            response = await self.client.call(
+                "/internal/v1/memory/candidates/process",
+                request,
+                # A new window can capture episodes/claim a batch even before
+                # model output exists. Receipt-only lookups create no batch.
+                uncertain_write=mutates,
+            )
+            try:
+                self.contracts.check("memory-extraction#process_response", response)
+            except Fault:
+                raise Fault("invalid_input", unknown=mutates) from None
+            if response["extraction_schema"] != 5 or job_id not in response["job_ids"]:
+                raise Fault("invalid_input", unknown=mutates)
+            if response["job_ids"] != request["job_ids"]:
+                raise Fault("invalid_input", unknown=mutates)
+            if batch_ref is not None and response.get("batch_ref", batch_ref) != batch_ref:
+                raise Fault("invalid_input", unknown=mutates)
+            if response["state"] == "completed":
+                result = response["result"]
+                if (
+                    result["covered_job_ids"] != response["job_ids"]
+                    or result["cursor"]["job_ids"] != response["job_ids"]
+                ):
+                    raise Fault("invalid_input", unknown=mutates)
+                if (
+                    window is not None
+                    and result["cursor"]["window_id"] != window["manifest"]["window_id"]
+                ):
+                    raise Fault("invalid_input", unknown=mutates)
+            if (
+                response["state"] == "pending"
+                and window is not None
+                and response["window_id"] != window["manifest"]["window_id"]
+            ):
+                raise Fault("invalid_input", unknown=mutates)
+            if response["state"] == "context_changed":
+                if (
+                    output is not None
+                    or window is None
+                    or response["window_id"] != window["manifest"]["window_id"]
+                ):
+                    raise Fault("invalid_input", unknown=mutates)
+                members = {member["member_id"]: member for member in window["manifest"]["members"]}
+                invalid = response["invalid_context_member_ids"]
+                if len(set(invalid)) != len(invalid) or any(
+                    identity not in members or members[identity]["purpose"] != "context"
+                    for identity in invalid
+                ):
+                    raise Fault("invalid_input", unknown=mutates)
+            if response["state"] == "unclaimed" and (
+                output is not None or window is not None or batch_ref is not None
+            ):
+                raise Fault("invalid_input", unknown=mutates)
+            return response
         if extraction_schema is not None:
             if output is None:
                 request["supported_extraction_schemas"] = [3, 4] if extraction_schema == 4 else [3]

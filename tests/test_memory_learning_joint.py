@@ -14,7 +14,7 @@ web = pytest.importorskip("aiohttp.web")
 TEXT = "第一支钢笔用蓝黑墨水"
 
 
-class MemoryLearningJoint(SourceChain):
+class ConsolidationJointBase(SourceChain):
     silence_ms = 0
 
     def make_platform_app(self):
@@ -67,8 +67,9 @@ class MemoryLearningJoint(SourceChain):
     async def start_asgi(self, app, owner, sock):
         if owner == "memory":
             self.memory.store.migrate_context(self.directory / "backups/context.sqlite")
-            self.memory.contracts.load_context()
             self.memory.store.migrate_facts(self.directory / "backups/facts.sqlite")
+            self.memory.contracts.load_context()
+            self.memory.store.migrate_memory(self.directory / "backups/consolidation.sqlite")
         return await super().start_asgi(app, owner, sock)
 
     async def start_core(self):
@@ -91,36 +92,75 @@ class MemoryLearningJoint(SourceChain):
                 ),
             )
 
+    @staticmethod
+    def model_material(body):
+        return json.loads(body["messages"][-1]["content"])
+
+    def consolidation_requests(self):
+        return [
+            body
+            for body in self.model_requests
+            if self.model_material(body).get("extraction_schema") == 5
+        ]
+
+    async def submit_and_learn(self, text, key):
+        before = {item["id"] for item in self.core.store.list("metadata", "memory:learning")}
+        await self.submit(self.physical(text, key))
+
+        def completed():
+            return [
+                item
+                for item in self.core.store.list("metadata", "memory:learning")
+                if item["id"] not in before and item["state"] == "completed"
+            ]
+
+        await self.eventually(completed, timeout=30)
+        result = completed()[0]
+        self.assertEqual(5, result["extraction_schema"])
+        self.assertEqual("saved", result["receipt"]["experience_state"])
+        return result
+
+    async def recall(self, text, intent="current"):
+        turn = self.core.store.list("turns")[-1]
+        return await self.core.memory.query_context(
+            turn["origin"],
+            turn["scope"],
+            text,
+            dict(tokens=8192, bytes=8192),
+            queries=[
+                dict(
+                    query_id="joint",
+                    text=text,
+                    kinds=["facts", "episodes"],
+                    intent=intent,
+                    time_filter=None,
+                )
+            ],
+        )
+
+    def summary_output(self, material):
+        summary = "\n".join(
+            row["text"]
+            for row in material["conversation"]
+            if row["role"] == "user" and row["purpose"] == "new"
+        )
+        portrait = None
+        if material["portrait_input"] is not None:
+            portrait = "\n".join(
+                [
+                    *(row["text"] for row in material["portrait_input"]["summaries"]),
+                    summary,
+                ]
+            )
+        return dict(summary=summary, portrait=portrait, importance="normal")
+
     async def record_model(self, request):
         body = await request.json()
         self.model_requests.append(body)
-        extraction = body["messages"][0]["content"].startswith("Extract only durable facts")
+        content = self.model_material(body)
+        extraction = content.get("extraction_schema") == 5
         if extraction:
-            content = json.loads(body["messages"][-1]["content"])
-            self.assertEqual(content["extraction_schema"], 3)
-            memories = (
-                [
-                    dict(
-                        statement=TEXT,
-                        conditions=[],
-                        negations=[],
-                        valid_time="current",
-                        evidence=[dict(source_index=0, quote=TEXT)],
-                        fact=dict(
-                            key="pen.ink",
-                            value="蓝黑墨水",
-                            state="current",
-                            valid_from=None,
-                            valid_to=None,
-                            keywords=["钢笔", "墨水"],
-                            entity=dict(id=None, kind="pen", mention="第一支钢笔"),
-                        ),
-                    )
-                ]
-                if TEXT in content["messages"][0]["text"]
-                else []
-            )
-            text = json.dumps({"memories": memories}, ensure_ascii=False)
+            text = json.dumps(self.summary_output(content), ensure_ascii=False)
         else:
             text = "收到。"
         if body.get("stream"):
@@ -157,23 +197,13 @@ class MemoryLearningJoint(SourceChain):
             )
         )
 
+
+class MemoryLearningJoint(ConsolidationJointBase):
     async def test_chat_extract_persist_restart_and_recall_without_trigger_words(self):
-        await self.submit(self.physical(TEXT, "learn-one"))
-        await self.eventually(
-            lambda: any(
-                item["state"] == "completed"
-                for item in self.core.store.list("metadata", "memory:learning")
-            ),
-            timeout=30,
-        )
-        tasks = self.core.store.list("metadata", "memory:learning")
-        self.assertEqual(tasks[0]["receipt"]["state"], "committed")
-        extraction_count = sum(
-            body["messages"][0]["content"].startswith("Extract only durable facts")
-            for body in self.model_requests
-        )
-        self.assertEqual(extraction_count, 1)
-        # Discard short adjacency so the next model prompt can only get this fact from Memory.
+        result = await self.submit_and_learn(TEXT, "learn-one")
+        self.assertEqual("committed", result["receipt"]["summary_state"])
+        self.assertEqual(1, len(self.consolidation_requests()))
+        # Discard adjacency so this supplied account must come from Memory.
         from tianshu_companion.short_context import ShortContextPolicy
 
         await self.restart_core()
@@ -182,7 +212,7 @@ class MemoryLearningJoint(SourceChain):
 
         def recalled():
             for body in self.model_requests:
-                if body["messages"][0]["content"].startswith("Extract only durable facts"):
+                if self.model_material(body).get("extraction_schema") == 5:
                     continue
                 content = json.loads(body["messages"][1]["content"])
                 if any(unit["statement"] == TEXT for unit in content.get("evidence", [])):
@@ -193,14 +223,7 @@ class MemoryLearningJoint(SourceChain):
         self.assertTrue(recalled())
 
     async def test_automatic_learning_preserves_recent_dialogue_after_restart(self):
-        await self.submit(self.physical(TEXT, "context-first"))
-        await self.eventually(
-            lambda: any(
-                item["state"] == "completed"
-                for item in self.core.store.list("metadata", "memory:learning")
-            ),
-            timeout=30,
-        )
+        await self.submit_and_learn(TEXT, "context-first")
         await self.eventually(
             lambda: any(turn["phase"] == "sent" for turn in self.core.store.list("turns")),
             timeout=30,
@@ -215,7 +238,7 @@ class MemoryLearningJoint(SourceChain):
             return [
                 body
                 for body in self.model_requests[count:]
-                if not body["messages"][0]["content"].startswith("Extract only durable facts")
+                if self.model_material(body).get("extraction_schema") != 5
             ]
 
         await self.eventually(followup, timeout=30)

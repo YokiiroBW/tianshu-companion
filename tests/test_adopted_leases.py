@@ -213,9 +213,10 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
         await self.h.core._prepare_context(current, [])
         self.assertTrue(changed)
         self.assertEqual(
-            [old, previous["source_deadline"]],
+            [old],
             [deadline for key, deadline in self.authorizations if key == previous["id"]],
         )
+        self.assertGreater(previous["source_deadline"], old)
 
     async def test_next_checkpoint_reauthorizes_the_extended_source_with_a_new_key(self):
         previous, current = await self.prepare()
@@ -615,11 +616,10 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
             active += 1
             try:
                 lease = await verify(turn, check, checkpoint, **kwargs)
-                if check.get("source_turn_id") == previous["id"] and initial < 2:
+                if check.get("source_turn_id") == previous["id"] and initial == 0:
                     initial += 1
-                    if initial == 2:
-                        ready.set()
-                        await release.wait()
+                    ready.set()
+                    await release.wait()
                 return lease
             finally:
                 active -= 1
@@ -641,13 +641,7 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn((previous["id"], fresh["source_deadline"]), self.authorizations)
             self.assertEqual({"history"}, {c["kind"] for c in checks})
             self.assertEqual(1, len(checks))
-            self.assertEqual([old, fresh["source_deadline"]], [cap for cap, _ in raw_proofs])
-            self.assertTrue(
-                all(
-                    sources == [message["source"] for message in previous["bundle"]["messages"]]
-                    for _, sources in raw_proofs
-                )
-            )
+            self.assertEqual([], raw_proofs)
             self.assertEqual(["check:" + digest(required[0])], required_ids)
             calls.append(copy.deepcopy(checks))
             return await prepare(origin, scope, bundle, checks, required_ids)
@@ -702,7 +696,7 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(calls)
             else:
                 variants = await task
-                self.assertEqual(2, len(variants[0]))
+                self.assertEqual(1, len(variants[0]))
                 self.assertEqual(1, len(calls))
                 fresh = self.h.core.store.get("turns", previous["id"])
                 self.assertEqual(
@@ -752,7 +746,7 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
         async def checked(turn, check, checkpoint, **kwargs):
             attempts.append(digest(check))
             result = await verify(turn, check, checkpoint, **kwargs)
-            if len(attempts) == 2:
+            if len(attempts) == 1:
                 ready.set()
                 await release.wait()
             return result
@@ -777,7 +771,7 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual([2, 2], sorted(Counter(attempts).values()))
+        self.assertEqual([2], sorted(Counter(attempts).values()))
         self.assertEqual(2, len(self.authorizations))
         self.assertEqual(1, len(calls))
 
@@ -954,7 +948,7 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old, transitions[1][0])
         self.assertGreater(transitions[1][1], old)
 
-    async def test_profile_batch_reserves_main_lease_before_its_bounded_read(self):
+    async def test_v2_daily_profiles_neither_fanout_nor_renew_an_unused_read(self):
         from tianshu_companion.context import TurnContext
         from tianshu_companion.context_preparation import profiles
 
@@ -975,7 +969,9 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.h.memory.profiles_batch = bounded
         context = TurnContext(current["preparation"], [], [], memory=current["memory_context"])
         await profiles(self.h.core, current, context, [])
-        self.assertEqual([current["source_deadline"]], calls)
+        self.assertEqual([], calls)
+        self.assertEqual(old, current["source_deadline"])
+        self.assertEqual([], context.data["profiles"])
 
     async def test_midrange_catalog_renewal_unknown_still_aborts_the_entire_preparation(self):
         previous, current = await self.prepare()

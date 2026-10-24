@@ -772,7 +772,8 @@ def create_app(core=None, tokens=None, life_readers=None):
             content = bytearray()
             async for chunk in request.stream():
                 content.extend(chunk)
-                if len(content) > 1_000_000:
+                limit = 262144 if operation == "summary-window-check" else 1_000_000
+                if len(content) > limit:
                     raise Fault("invalid_input")
             try:
                 body = strict_json(content)
@@ -810,6 +811,8 @@ def create_app(core=None, tokens=None, life_readers=None):
                 return await core.web_snapshot(service, body)
             if operation == "facts":
                 return core.source_facts(service, body)
+            if operation == "summary-window-check":
+                return core.summary_windows.check(service, body)
             if operation == "ingest-receipt":
                 from .ingress_receipts import read
 
@@ -920,6 +923,10 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v1/source-facts/read")
     async def source_facts(request: Request):
         return await dispatch(request, "facts")
+
+    @app.post("/internal/v1/memory/consolidation/window/check")
+    async def summary_window_check(request: Request):
+        return await dispatch(request, "summary-window-check")
 
     @app.post("/internal/v1/conversation/direct-command")
     async def direct_command(request: Request):

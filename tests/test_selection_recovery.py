@@ -18,11 +18,11 @@ class SelectionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.denied = False
         original = self.h.memory.query_context
 
-        async def query(*args):
+        async def query(*args, **kwargs):
             self.queries.append(args)
             if self.denied:
                 raise Fault("forbidden")
-            result = await original(*args)
+            result = await original(*args, **kwargs)
             result["bundle"]["test_candidate_revision"] = self.version
             result["evidence"][0]["text"] = f"第{self.version}版可见原话"
             return result
@@ -56,13 +56,13 @@ class SelectionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         memory = Memory(evidence.contracts(), wire)
         original = self.h.memory.query_context
 
-        async def query(*args):
+        async def query(*args, **kwargs):
             if not self.queries or repeatedly:
                 self.queries.append(args)
                 self.denied = revoke
                 self.version += 1
-                await memory.query_context(*args)
-            return await original(*args)
+                await memory.query_context(*args, **kwargs)
+            return await original(*args, **kwargs)
 
         self.h.memory.query_context = query
 

@@ -5,10 +5,10 @@ import time
 
 from .clients import epoch, query
 from .contracts import Fault, canonical
+from .memory_context import bundle_identity
 
 
 BODY_LIMIT = 262144
-FRESH_FIELDS = {"verified_at", "valid_until", "owner_heads", "source_revision"}
 
 
 def _identity(request, response):
@@ -31,9 +31,7 @@ def _fresh(response):
 
 def _bundle(before, response):
     current = response["bundle"]
-    if {k: v for k, v in current.items() if k not in FRESH_FIELDS} != {
-        k: v for k, v in before.items() if k not in FRESH_FIELDS
-    }:
+    if bundle_identity(current) != bundle_identity(before):
         raise Fault("invalid_input")
     if epoch(current["valid_until"]) < epoch(response["valid_until"]):
         raise Fault("invalid_input")

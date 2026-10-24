@@ -58,6 +58,16 @@ def install(registry):
     life.update({"life.read": "life_read", "life.send_content": "life_send_content"})
     registry.register(
         definition(
+            "memory.recall",
+            "记忆检索",
+            "检索当前可见的经历与画像，或查阅自然淡出的有源历史资料。",
+            "memory",
+            ["memory.recall"],
+        ),
+        NativeSkill("memory", {"memory.recall": "memory_recall"}, "memory.read"),
+    )
+    registry.register(
+        definition(
             "life.manage",
             "生活、阅读与写作",
             "管理角色生活事项，阅读真实原件和创作内容。",

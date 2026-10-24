@@ -347,7 +347,7 @@ class CorePreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(t["phase"] == "sent" for t in self.h.turns()))
         return self.h.turns()
 
-    async def test_one_catalog_selects_input_variant_and_preserves_mandatory(self):
+    async def test_full_rejection_then_input_proof_preserves_mandatory(self):
         previous, current = await self.turns()
         calls, sources = [], []
         original = self.h.memory.check_sources
@@ -365,8 +365,9 @@ class CorePreparationTests(unittest.IsolatedAsyncioTestCase):
         self.h.memory.prepare_context = prepare
         self.h.memory.check_sources = source_check
         context, *_ = await self.h.core._prepare_context(current, [])
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertEqual({"history"}, {c["kind"] for c in calls[0][0]})
+        self.assertEqual(([], []), calls[1])
         self.assertEqual(
             [(previous["id"], [m["source"] for m in previous["bundle"]["messages"]])], sources
         )

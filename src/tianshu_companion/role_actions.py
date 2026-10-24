@@ -194,6 +194,27 @@ class RoleActions:
                     ),
                 )
             )
+        if self.core._turn_allows(turn, "memory.read") and hasattr(
+            self.core.memory, "query_context"
+        ):
+            tools.append(
+                dict(
+                    type="function",
+                    function=dict(
+                        name="memory_recall",
+                        description="Retrieve sourced Memory context for this conversation. current recalls ordinary available material; history or mixed can include naturally faded experiences, but never forgotten or unauthorized sources. Results are relevant context, not exhaustive history, proof of absence or unique identity. This does not search the separate Chat archive.",
+                        parameters=dict(
+                            type="object",
+                            properties=dict(
+                                query=dict(type="string", minLength=1, maxLength=4000),
+                                intent=dict(enum=["current", "history", "mixed"]),
+                            ),
+                            required=["query", "intent"],
+                            additionalProperties=False,
+                        ),
+                    ),
+                )
+            )
         if self.core._turn_allows(turn, "memory.write"):
             memory_schema = self.core.contracts.schemas["memory-context"]
             proposal = self._expand(memory_schema["$defs"]["proposal_request"], memory_schema)
@@ -273,6 +294,8 @@ class RoleActions:
                 receipt,
                 effect=memory_effect(supplied["kind"], supplied["target"], receipt),
             ), []
+        if name == "memory_recall":
+            return await self.memory_recall(turn, supplied), []
         operation = next(
             (item for item in OPERATIONS if name == "life_" + item.replace(".", "_")), None
         )
@@ -678,18 +701,63 @@ class RoleActions:
         await self._refresh_memory_context(turn, prior["proposal"], receipt)
         return receipt
 
-    async def _refresh_memory_context(self, turn, proposal, receipt):
-        """Every known mutation outcome replaces stale evidence before Core reassembles it."""
-        if receipt["state"] in {"committed", "corrected", "tombstoned"}:
+    async def memory_recall(self, turn, value):
+        if not self.core._turn_allows(turn, "memory.read"):
+            raise Fault("forbidden")
+        if (
+            set(value) != {"query", "intent"}
+            or not isinstance(value["query"], str)
+            or not value["query"].strip()
+            or len(value["query"]) > 4000
+            or not isinstance(value["intent"], str)
+            or value["intent"] not in {"current", "history", "mixed"}
+        ):
+            raise Fault("invalid_input")
+        if not hasattr(self.core.memory, "query_context"):
+            raise Fault("dependency_unavailable")
+        response = await self._refresh_memory_context(
+            turn, text=value["query"], intent=value["intent"]
+        )
+        from .memory_context import prompt_material
+
+        return dict(
+            state="completed",
+            source="memory",
+            intent=value["intent"],
+            material=prompt_material(response),
+            omissions=response["omissions"],
+            chat_archive="not_integrated",
+        )
+
+    async def _refresh_memory_context(
+        self, turn, proposal=None, receipt=None, *, text=None, intent=None
+    ):
+        """Adopt a successful read or known mutation through the same context owner."""
+        if receipt is None or receipt["state"] in {"committed", "corrected", "tombstoned"}:
             memory_context = None
             if hasattr(self.core.memory, "query_context"):
                 from .memory_context import selection
 
+                queries = (
+                    None
+                    if intent is None
+                    else [
+                        dict(
+                            query_id="recall",
+                            text=text,
+                            kinds=["facts", "episodes"],
+                            intent=intent,
+                            time_filter=None,
+                        )
+                    ]
+                )
                 memory_context = await self.core.memory.query_context(
                     turn["origin"],
                     turn["scope"],
-                    self.core._input_text(turn),
+                    self.core._input_text(turn) if text is None else text,
                     dict(tokens=8192, bytes=8192),
+                    queries=queries,
+                    retrieval_mode="context",
                 )
                 current = selection(memory_context)
             else:
@@ -701,6 +769,11 @@ class RoleActions:
                 )
             with self.core.store.transaction():
                 fresh = self.core.store.get("turns", turn["id"])
+                if intent is not None:
+                    self.core._check_role(fresh)
+                    self.core._check_input_versions(fresh)
+                    if not self.core._turn_allows(fresh, "memory.read"):
+                        raise Fault("forbidden")
                 fresh.update(
                     preparation=current,
                     scope_version=current["scope_version"],
@@ -719,8 +792,9 @@ class RoleActions:
                         "input_history_snapshot"
                     ]
                 self.core._save_turn(fresh)
-                target = proposal["target"]
+                target = proposal["target"] if proposal is not None else {}
                 if target.get("record_id") and proposal["kind"] in {"correct", "forget"}:
                     self.core.life.concerns.invalidate(
                         "memory", target["record_id"], target["expected_version"]
                     )
+            return memory_context

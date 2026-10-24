@@ -5,6 +5,20 @@ import hashlib
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 
 SELECTION = ["identity", "style", "relationship", "current_items", "evidence"]
+FRESH_FIELDS = {"verified_at", "valid_until", "owner_heads", "source_revision"}
+
+
+def bundle_identity(bundle):
+    fresh = FRESH_FIELDS
+    if bundle.get("retrieval_mode", "factual") == "context":
+        fresh = fresh | {
+            "scope_version",
+            "association_version",
+            "scope_checks",
+            "history_snapshot",
+            "input_history_snapshot",
+        }
+    return {key: value for key, value in bundle.items() if key not in fresh}
 
 
 def group_context_owners(scope, checks):
@@ -27,8 +41,32 @@ def group_context_owners(scope, checks):
     return people
 
 
-def query_request(header, scope, text, budget, *, queries=None, known_bundle=None):
-    return dict(
+def _authorized_owner(scope, owner, allowed, include_associated, *, contextual=False):
+    if canonical(owner) not in allowed or owner["actor_id"] != scope["actor_id"]:
+        raise Fault("forbidden")
+    if scope["audience"] == "group":
+        if any(owner[key] != scope[key] for key in ("audience", "conversation_id")):
+            raise Fault("forbidden")
+    else:
+        if not include_associated and owner != scope:
+            raise Fault("forbidden")
+        if contextual and owner != scope:
+            if (
+                scope["audience"] != "self_private"
+                or owner["audience"] != "self_private"
+                or allowed[canonical(owner)]["association_id"] is None
+            ):
+                raise Fault("forbidden")
+        elif owner["person_id"] != scope["person_id"]:
+            raise Fault("forbidden")
+
+
+def query_request(
+    header, scope, text, budget, *, queries=None, known_bundle=None, retrieval_mode="factual"
+):
+    if retrieval_mode not in {"context", "factual"}:
+        raise Fault("invalid_input")
+    request = dict(
         schema_version=2,
         query=header,
         requested_scope=scope,
@@ -39,7 +77,7 @@ def query_request(header, scope, text, budget, *, queries=None, known_bundle=Non
                 query_id="current",
                 text=text,
                 kinds=["facts", "episodes"],
-                intent="mixed",
+                intent="current",
                 time_filter=None,
             )
         ],
@@ -49,6 +87,9 @@ def query_request(header, scope, text, budget, *, queries=None, known_bundle=Non
         limits=dict(facts=8, episodes=8),
         known_bundle=known_bundle,
     )
+    if retrieval_mode != "factual":
+        request["retrieval_mode"] = retrieval_mode
+    return request
 
 
 def validate_response(request, response, now, epoch):
@@ -63,6 +104,8 @@ def validate_response(request, response, now, epoch):
         for key in ("queries", "selection", "include_associated", "budget", "limits")
     ):
         raise Fault("scope_changed")
+    if bundle.get("retrieval_mode", "factual") != request.get("retrieval_mode", "factual"):
+        raise Fault("invalid_input")
     if epoch(bundle["valid_until"]) <= now:
         raise Fault("scope_changed")
     ids = [entry["evidence_id"] for entry in evidence]
@@ -87,7 +130,7 @@ def validate_response(request, response, now, epoch):
     episodes = [row for row in evidence if row["kind"] == "episode"]
     if len(facts) > request["limits"]["facts"] or len(episodes) > request["limits"]["episodes"]:
         raise Fault("budget_exceeded")
-    allowed = {canonical(row["scope"]) for row in bundle["scope_checks"]}
+    allowed = {canonical(row["scope"]): row for row in bundle["scope_checks"]}
     if (
         bundle["scope_checks"][0]["scope"] != scope
         or bundle["scope_checks"][0]["scope_version"] != bundle["scope_version"]
@@ -100,17 +143,14 @@ def validate_response(request, response, now, epoch):
         raise Fault("invalid_input")
     for row in evidence:
         owner = row["owner_scope"]
-        if canonical(owner) not in allowed or owner["person_id"] != row["subject_person_id"]:
-            raise Fault("forbidden")
-        if scope["audience"] == "group" and any(
-            owner[k] != scope[k] for k in ("actor_id", "audience", "conversation_id")
-        ):
-            raise Fault("forbidden")
-        if owner["actor_id"] != scope["actor_id"]:
-            raise Fault("forbidden")
-        if scope["audience"] != "group" and owner["person_id"] != scope["person_id"]:
-            raise Fault("forbidden")
-        if scope["audience"] != "group" and not request["include_associated"] and owner != scope:
+        _authorized_owner(
+            scope,
+            owner,
+            allowed,
+            request["include_associated"],
+            contextual=row["kind"] in {"summary", "portrait"},
+        )
+        if owner["person_id"] != row["subject_person_id"]:
             raise Fault("forbidden")
     by_record = {row["unit"]["record_id"]: row for row in facts}
     if len(by_record) != len(facts):
@@ -118,16 +158,26 @@ def validate_response(request, response, now, epoch):
     covered = set()
     for dependency in bundle["group_dependencies"]:
         group = dependency["group"]
-        if any(
-            key not in sources or sources[key]["owner_scope"] != dependency["owner_scope"]
-            for key in dependency["source_dependency_ids"]
-        ):
-            raise Fault("invalid_input")
         members = set(group["record_ids"])
         if members != {r["record_id"] for r in dependency["records"]} or not members.issubset(
             by_record
         ):
             raise Fault("invalid_input")
+        contextual = all(
+            by_record[identity]["kind"] in {"summary", "portrait"} for identity in members
+        )
+        for key in dependency["source_dependency_ids"]:
+            if key not in sources:
+                raise Fault("invalid_input")
+            owner = sources[key]["owner_scope"]
+            if contextual:
+                # Contextual records retain every actual author leaf. Their
+                # owner is not the author of all the quoted conversation.
+                _authorized_owner(
+                    scope, owner, allowed, request["include_associated"], contextual=True
+                )
+            elif owner != dependency["owner_scope"]:
+                raise Fault("invalid_input")
         for record in dependency["records"]:
             row = by_record[record["record_id"]]
             unit = row["unit"]
@@ -155,6 +205,16 @@ def validate_response(request, response, now, epoch):
         raise Fault("invalid_input")
     for result, constraint in zip(response["query_results"], bundle["selection_constraints"]):
         if result["status"] != constraint["result_status"]:
+            raise Fault("invalid_input")
+        if request.get("retrieval_mode") == "context" and (
+            result["status"] != "incomplete"
+            or "context_only" not in response["omissions"]
+            or "context_only" not in result["omissions"]
+            or result["coverage"]["candidate_complete"]
+            or constraint["candidate_domain_complete"]
+            or constraint["proof_kinds"] != ["positive_sources"]
+            or constraint["owner_resolution"] != dict(mode="unresolved", targets=[])
+        ):
             raise Fault("invalid_input")
         if result["status"] == "no_match" and (
             result["evidence_ids"]
@@ -266,6 +326,12 @@ def prompt_material(response):
                 )
             }
             state["record_id"] = row["unit"]["record_id"]
+            if row["kind"] in {"summary", "portrait"}:
+                state.update(
+                    interpretation=row["unit"]["statement"],
+                    importance=row["importance"],
+                    expires_at=row["expires_at"],
+                )
             if "fact" in row:
                 state["fact"] = row["fact"]
             states.append(state)

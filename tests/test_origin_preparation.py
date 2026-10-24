@@ -214,11 +214,43 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
         previous["context_checks"] = [scope_check(old)]
         self.h.core._save_turn(previous)
         ref = old["origin"]["assertion_ref"]
-        self.origins(lambda key: "403" if key == ref else "valid")
-        context, *_ = await self.h.core._prepare_context(current, [])
-        self.assertEqual([previous["id"]], [g["turn_id"] for g in context.data["recent_dialogue"]])
-        self.assertTrue(context.data["recent_dialogue"][0]["input_only"])
-        self.assertEqual([], context.data["recent_dialogue"][0]["replies"])
+        original_prepare = self.h.memory.prepare_context
+        original_sources = self.h.memory.check_sources
+        for boundary in ("origin", "memory"):
+            with self.subTest(boundary=boundary):
+                reads, raw, preparations = [], [], []
+
+                def mode(key):
+                    reads.append(key)
+                    return "403" if boundary == "origin" and key == ref else "valid"
+
+                async def prepare(origin, scope, bundle, checks, required):
+                    preparations.append(copy.deepcopy(checks))
+                    result = await original_prepare(origin, scope, bundle, checks, required)
+                    if boundary == "memory":
+                        for check in checks:
+                            if check["request"]["query"]["origin"] == old["origin"]:
+                                result[check["check_id"]] = "unavailable"
+                    return result
+
+                async def sources(source, values):
+                    raw.append(source["id"])
+                    return await original_sources(source, values)
+
+                self.origins(mode)
+                self.h.memory.prepare_context = prepare
+                self.h.memory.check_sources = sources
+                context, _, checks, *_ = await self.h.core._prepare_context(current, [])
+                self.assertEqual(
+                    [previous["id"]], [g["turn_id"] for g in context.data["recent_dialogue"]]
+                )
+                self.assertTrue(context.data["recent_dialogue"][0]["input_only"])
+                self.assertEqual([], context.data["recent_dialogue"][0]["replies"])
+                self.assertEqual([previous["id"]], raw)
+                self.assertEqual(1, reads.count(ref))
+                self.assertEqual(2, len(preparations))
+                self.assertEqual([], preparations[1])
+                self.assertTrue(all(check["origin"] != old["origin"] for check in checks))
 
     async def test_identity_read_cannot_borrow_origin_transport_marker(self):
         previous, current = await self.turns()

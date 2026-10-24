@@ -1395,13 +1395,10 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.unique_jobs()
         await self.chat()
         first_turn = self.h.turns()[0]["id"]
-        await self.h.ingest(text=TEXT, group=True, channel="group:independent", account="b")
-        await self.h.cycles()
         await self.h.core.flush_outbox()
         worker = self.h.core.memory_learning
         tasks = self.h.core.store.list("metadata", "memory:learning")
         first = next(job for job in tasks if job["turn_id"] == first_turn)
-        second = next(job for job in tasks if job["turn_id"] != first_turn)
         gate = asyncio.Event()
         entered = asyncio.Event()
         original = self.process
@@ -1417,6 +1414,15 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.memory.process_candidate = slow
         await worker.work(wait=False)
         await asyncio.wait_for(entered.wait(), 2)
+        # Different scopes may share sequence1; their hashed queue IDs do not
+        # promise creation order. Establish the held capture before adding its
+        # independent contender, then exercise the same shared candidate lock.
+        await self.h.ingest(text=TEXT, group=True, channel="group:independent", account="b")
+        await self.h.cycles()
+        await self.h.core.flush_outbox()
+        tasks = self.h.core.store.list("metadata", "memory:learning")
+        second = next(job for job in tasks if job["turn_id"] != first_turn)
+        await worker.work(wait=False)
         for _ in range(60):
             await asyncio.sleep(0)
         waiting = self.h.core.store.get("metadata", second["id"])

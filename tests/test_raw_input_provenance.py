@@ -254,8 +254,8 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
             forgotten = True
             return result
 
-        async def query(*args):
-            result = await original_query(*args)
+        async def query(*args, **kwargs):
+            result = await original_query(*args, **kwargs)
             if forgotten:
                 result["evidence"] = []
                 result["query_results"] = []
@@ -323,8 +323,9 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(g["input_only"] and not g["replies"] for g in adopted))
         self.assertEqual(3, len(self.source_calls))
         self.assertTrue(all("input_sources" in check for check in checks))
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertTrue(calls[0])
+        self.assertEqual([], calls[1])
         self.assertNotIn("input_history", {check["kind"] for check in calls[0]})
         self.assertEqual(old_snapshots, [source["input_history_snapshot"] for source in previous])
 
@@ -487,13 +488,16 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
 
                 self.h.memory.prepare_context = prepare
                 variants = await _v2_variants(self.h.core, current, [], [[group]])
-                self.assertEqual(1, len(self.source_calls))
-                self.assertEqual(1, len(calls))
                 self.assertEqual({"history"}, {check["kind"] for check in calls[0]})
                 self.assertGreater(previous["source_deadline"], self.h.clock() + 35)
                 if status == "unavailable":
+                    self.assertEqual([], self.source_calls)
+                    self.assertEqual(1, len(calls))
                     self.assertEqual([[]], variants)
                 else:
+                    self.assertEqual(1, len(self.source_calls))
+                    self.assertEqual(2, len(calls))
+                    self.assertEqual([], calls[1])
                     self.assertEqual(1, len(variants[0]))
                     selected, checks = variants[0][0]
                     self.assertEqual([previous["id"]], [group["turn_id"] for group in selected])

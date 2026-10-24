@@ -88,6 +88,10 @@ class FakeOrigins:
 
 
 class FakeMemory:
+    # These long-standing scenarios exercise retained protocol3 jobs. New
+    # consolidation tests explicitly use schema5 and its real envelope.
+    extraction_schema = 3
+
     def __init__(self, clock):
         self.clock, self.accounts = clock, {}
         self.selections, self.commits = [], []

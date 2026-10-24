@@ -366,10 +366,29 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.h = Harness(silence_ms=0)
         self.addAsyncCleanup(self.h.core.close)
         self.verifications = []
+        self.context_queries = []
         self.invalid = False
         old_select, history = self.h.memory.select, self.h.memory.history
 
-        async def query_context(origin, scope, text, budget):
+        async def query_context(
+            origin,
+            scope,
+            text,
+            budget,
+            *,
+            queries=None,
+            known_bundle=None,
+            retrieval_mode="factual",
+        ):
+            self.context_queries.append(
+                dict(
+                    origin=copy.deepcopy(origin),
+                    scope=copy.deepcopy(scope),
+                    text=text,
+                    queries=copy.deepcopy(queries),
+                    retrieval_mode=retrieval_mode,
+                )
+            )
             old = await old_select(origin, scope, text, budget)
             snapshot = await history(origin, scope)
             source = dict(
@@ -395,13 +414,14 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 evidence=[episode],
                 query_results=[
                     dict(
-                        query_id="current",
-                        status="matched",
+                        query_id="current" if queries is None else queries[0]["query_id"],
+                        status="incomplete" if retrieval_mode == "context" else "matched",
                         evidence_ids=["evidence:old"],
-                        omissions=[],
+                        omissions=["context_only"] if retrieval_mode == "context" else [],
                     )
                 ],
                 bundle=dict(
+                    **({"retrieval_mode": retrieval_mode} if retrieval_mode == "context" else {}),
                     **{
                         key: old[key]
                         for key in (
@@ -417,7 +437,7 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
                     input_history_snapshot=snapshot,
                 ),
                 budget_used=dict(bytes=500, tokens=500),
-                omissions=[],
+                omissions=["context_only"] if retrieval_mode == "context" else [],
             )
 
         async def verify_context(origin, scope, bundle, checks=()):
@@ -523,9 +543,9 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
         queries = []
         original_query = self.h.memory.query_context
 
-        async def current_query(*args):
+        async def current_query(*args, **kwargs):
             queries.append(args)
-            result = await original_query(*args)
+            result = await original_query(*args, **kwargs)
             result["evidence"] = []
             return result
 

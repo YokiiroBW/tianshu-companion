@@ -283,6 +283,8 @@ def test_aggregate_contract_limit_rolls_back_source_catalog(monkeypatch):
         h = Harness(silence_ms=0)
         try:
             catalog = h.core.skills
+            builtin_count = len(catalog.result("actor:a")["skills"])
+            assert "memory.recall" in {s["id"] for s in catalog.result("actor:a")["skills"]}
             await manage(h, "source.configure", source())
             entries = [
                 definition(
@@ -320,7 +322,7 @@ def test_aggregate_contract_limit_rolls_back_source_catalog(monkeypatch):
             with pytest.raises(Fault, match="invalid_input"):
                 await manage(h, "source.refresh", dict(source_id="source:two"))
             assert catalog.actor("actor:a") == before
-            assert len(catalog.result("actor:a")["skills"]) == 99
+            assert len(catalog.result("actor:a")["skills"]) == builtin_count + len(entries)
         finally:
             await h.core.close()
 
