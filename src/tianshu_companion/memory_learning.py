@@ -404,12 +404,31 @@ class MemoryLearning:
         core._check_role(turn)
         return turn
 
+    def _summary_subject(self, item):
+        # Metadata scope is the job's original owner; a frozen window must
+        # agree with it. Receipt-only recovery need not create a new window.
+        scope = item.get("scope")
+        if scope is None:
+            scope = self._source_turn(item)["scope"]
+        if item.get("window") is not None and item["window"]["manifest"]["scope"] != scope:
+            raise Fault("scope_changed")
+        return scope["person_id"]
+
     async def _candidate_request(self, item, output):
         # Missing pins belong to retained pre-upgrade proposals/jobs. Never infer
         # a version from their JSON, and never regenerate an uncertain proposal.
         schema = item.get("extraction_schema", 3)
         if schema == 5:
-            return await self.core.memory.process_candidate(
+            from .memory_summaries import check_response_subject
+
+            subject = self._summary_subject(item)
+            if (
+                output is not None
+                and "subject_person_id" in output
+                and output["subject_person_id"] != subject
+            ):
+                raise Fault("invalid_input")
+            response = await self.core.memory.process_candidate(
                 item["job_id"],
                 output,
                 extraction_schema=5,
@@ -418,7 +437,15 @@ class MemoryLearning:
                 if item.get("batch_ref") or item.get("capture_uncertain")
                 else item.get("window"),
                 batch_ref=item.get("batch_ref"),
+                subject_person_id=subject,
             )
+            check_response_subject(
+                response,
+                subject,
+                unknown=output is not None
+                or not (item.get("batch_ref") or item.get("capture_uncertain")),
+            )
+            return response
         if schema == 4 or item.get("extraction_negotiated"):
             response = await self.core.memory.process_candidate(
                 item["job_id"], output, extraction_schema=schema
@@ -467,6 +494,9 @@ class MemoryLearning:
             raise Fault("scope_changed")
 
     def _finish_summary(self, item, response):
+        from .memory_summaries import check_response_subject
+
+        check_response_subject(response, self._summary_subject(item), unknown=True)
         receipt = response["result"]
         if response["job_ids"] != [item["job_id"]]:
             raise Fault("invalid_input", unknown=True)
@@ -600,7 +630,11 @@ class MemoryLearning:
                     MODEL_TIMEOUT_SECONDS,
                 )
             item["stage"] = "proposal"
-            item["output"] = parse(self.core.contracts, "\n".join(segments))
+            item["output"] = parse(
+                self.core.contracts,
+                "\n".join(segments),
+                subject_person_id=self._summary_subject(item),
+            )
             item["stage"] = "commit"
             self.core.store.put("metadata", item)
         self._source_turn(item)

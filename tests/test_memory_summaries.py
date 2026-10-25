@@ -94,6 +94,105 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("valid", self.check(window)["state"])
         self.assertEqual([first["id"]], [row["turn_id"] for row in window["manifest"]["new_turns"]])
 
+    async def test_model_subject_distinguishes_owner_history_from_other_speakers(self):
+        await self.chat("我准备去拿书", group=True, channel="group:subjects")
+        owner = await self.chat("我已经退了包裹", account="b", group=True, channel="group:subjects")
+        last = await self.chat(
+            "他说的时间是哪儿的时间？", account="b", group=True, channel="group:subjects"
+        )
+        self.allow_empty_memory_provenance()
+        window = self.h.core.summary_windows.read([last["id"]])
+        human = next(
+            member
+            for member in window["manifest"]["members"]
+            if member["turn_id"] == owner["id"] and member["role"] == "user"
+        )
+        text = next(
+            row["text"] for row in window["members"] if row["member_id"] == human["member_id"]
+        )
+        portrait = dict(
+            subject_person_id=last["scope"]["person_id"],
+            expected_revision=0,
+            summary_refs=[dict(record_id="record:owner", record_version=1)],
+            summaries=[
+                dict(
+                    record_id="record:owner",
+                    record_version=1,
+                    subject_person_id=last["scope"]["person_id"],
+                    subject_material=[
+                        {
+                            **{key: human[key] for key in ("member_id", "speaker", "observed_at")},
+                            "text": text,
+                        }
+                    ],
+                )
+            ],
+            current_text="",
+        )
+        material = json.loads(messages(self.h.contracts, window, portrait)[1]["content"])
+        self.assertEqual(last["scope"], {key: material["subject"][key] for key in last["scope"]})
+        self.assertEqual(last["bundle"]["collection_key"]["author"], material["subject"]["account"])
+        self.assertTrue(material["subject"]["new_member_ids"])
+        for member in material["conversation"]:
+            expected = (
+                "subject"
+                if member["role"] == "user"
+                and member["speaker"]["person_id"] == last["scope"]["person_id"]
+                else "context"
+            )
+            self.assertEqual(expected, member["relation_to_subject"])
+        earlier_owner = next(
+            row for row in material["conversation"] if row["member_id"] == human["member_id"]
+        )
+        self.assertEqual(
+            ("context", "subject"), (earlier_owner["purpose"], earlier_owner["relation_to_subject"])
+        )
+        self.assertEqual(
+            [text],
+            [row["text"] for row in material["portrait_input"]["summaries"][0]["subject_material"]],
+        )
+        self.assertNotIn("text", material["portrait_input"]["summaries"][0])
+        for level in ("portrait", "summary", "member", "refs", "size"):
+            with self.subTest(level=level):
+                wrong = copy.deepcopy(portrait)
+                if level == "portrait":
+                    wrong["subject_person_id"] = "person:other"
+                elif level == "summary":
+                    wrong["summaries"][0]["subject_person_id"] = "person:other"
+                elif level == "member":
+                    wrong["summaries"][0]["subject_material"][0]["speaker"]["person_id"] = (
+                        "person:other"
+                    )
+                elif level == "refs":
+                    wrong["summary_refs"][0]["record_id"] = "record:other"
+                else:
+                    raw = wrong["summaries"][0]["subject_material"][0]
+                    raw["text"] = "甲" * 3001
+                    wrong["summaries"][0]["subject_material"].append(
+                        dict(raw, member_id="input:more")
+                    )
+                with self.assertRaises(Fault):
+                    messages(self.h.contracts, window, wrong)
+
+    async def test_window_check_reuses_reconstruction_only_inside_one_call(self):
+        await self.chat()
+        last = await self.chat("补充一句")
+        self.allow_empty_memory_provenance()
+        windows = self.h.core.summary_windows
+        window = windows.read([last["id"]])
+        count = len({member["turn_id"] for member in window["manifest"]["members"]})
+        with (
+            patch.object(windows, "_current", wraps=windows._current) as current,
+            patch.object(windows, "_members", wraps=windows._members) as members,
+        ):
+            self.assertEqual("valid", self.check(window)["state"])
+            self.assertEqual((count, count), (current.call_count, members.call_count))
+            reply = self.h.core.store.turn_replies(last["id"])[0]
+            reply["text"] += " 篡改正文"
+            self.h.core.store.put("replies", reply)
+            self.assertEqual("invalid", self.check(window)["state"])
+            self.assertEqual((2 * count, 2 * count), (current.call_count, members.call_count))
+
     async def test_original_edit_or_binding_change_cannot_validate_old_text(self):
         first = await self.chat()
         window = self.h.core.summary_windows.read([first["id"]])
@@ -423,6 +522,7 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
         ids = request["job_ids"]
         self.assertEqual([job], ids)
         window = self.windows[job]
+        subject = window["manifest"]["scope"]["person_id"]
         if output is None:
             return dict(
                 state="pending",
@@ -430,9 +530,11 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
                 batch_ref="batch:one",
                 job_ids=ids,
                 window_id=window["manifest"]["window_id"],
+                subject_person_id=subject,
                 portrait_input=None,
             )
         result = dict(
+            subject_person_id=subject,
             state="committed" if output["summary"] else "skipped",
             record_ids=["record:summary"],
             group_ids=["group:summary"],
@@ -463,7 +565,16 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
         if not turn["id"].startswith("memory-generation:"):
             return await self.original_generate(turn, material)
         self.generated.append(copy.deepcopy(material))
-        return [canonical(dict(summary="对方谈到周六的想法，后来仍有待决定。", portrait=None))], {}
+        subject = json.loads(material[1]["content"])["subject"]["person_id"]
+        return [
+            canonical(
+                dict(
+                    subject_person_id=subject,
+                    summary="对方谈到周六的想法，后来仍有待决定。",
+                    portrait=None,
+                )
+            )
+        ], {}
 
     async def test_scope_queue_keeps_per_job_receipts_and_real_conversation_context(self):
         await self.chat("我周六想去看看")
@@ -542,6 +653,126 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["experience_saved"])
         self.assertTrue(status["portrait_pending"])
 
+    async def test_wrong_model_subject_cannot_submit_another_persons_portrait(self):
+        await self.chat()
+
+        async def wrong(turn, material):
+            self.generated.append(copy.deepcopy(material))
+            return [
+                canonical(
+                    dict(
+                        subject_person_id="person:other",
+                        summary="别人的经历",
+                        portrait="别人的画像",
+                    )
+                )
+            ], {}
+
+        self.h.gateway.generate = wrong
+        await self.flush()
+        first = self.tasks()[0]
+        self.assertEqual(("proposal", 1), (first["stage"], first["proposal_failures"]))
+        self.assertTrue(all(call["output"] is None for call in self.calls))
+        frozen = copy.deepcopy(first["window"])
+        self.h.gateway.generate = self.generate
+        self.h.clock.advance(10)
+        await self.flush()
+        final = self.tasks()[0]
+        self.assertEqual("completed", final["state"])
+        self.assertEqual(frozen, final["window"])
+        self.assertEqual(2, len(self.generated))
+        self.assertEqual(final["scope"]["person_id"], final["receipt"]["subject_person_id"])
+
+    async def test_pending_subject_mismatch_never_reaches_the_model(self):
+        await self.chat()
+
+        async def wrong(job, output, **request):
+            response = await self.process(job, output, **request)
+            response["subject_person_id"] = "person:other"
+            return response
+
+        self.h.memory.process_candidate = wrong
+        await self.flush()
+        self.assertEqual([], self.generated)
+        self.assertEqual("pending", self.tasks()[0]["state"])
+        self.assertTrue(self.tasks()[0]["capture_uncertain"])
+        frozen = copy.deepcopy(self.tasks()[0]["window"])
+        self.h.memory.process_candidate = self.process
+        self.h.clock.advance(10)
+        await self.flush()
+        self.assertEqual("completed", self.tasks()[0]["state"])
+        self.assertEqual(frozen, self.tasks()[0]["window"])
+        self.assertEqual(1, len(self.generated))
+
+    async def test_wrong_receipt_subject_keeps_output_for_exact_receipt_recovery(self):
+        await self.chat()
+
+        async def wrong(job, output, **request):
+            response = await self.process(job, output, **request)
+            if response["state"] == "completed":
+                response["result"]["subject_person_id"] = "person:other"
+            return response
+
+        self.h.memory.process_candidate = wrong
+        await self.flush()
+        original = self.tasks()[0]
+        self.assertEqual("pending", original["state"])
+        self.assertIsNotNone(original["output"])
+        self.assertEqual(1, len(self.generated))
+        self.h.memory.process_candidate = self.process
+        self.h.clock.advance(10)
+        await self.flush()
+        final = self.tasks()[0]
+        self.assertEqual("completed", final["state"])
+        self.assertEqual(original["window"], final["window"])
+        self.assertIsNone(self.calls[-1]["output"])
+        self.assertEqual(final["scope"]["person_id"], final["receipt"]["subject_person_id"])
+        self.assertEqual(1, len(self.generated))
+
+    async def test_retained_unbound_job_invalidates_without_rewriting_its_proposal(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        item = self.tasks()[0]
+        learner = self.h.core.memory_learning
+        learner._capture_window(item)
+        old_output = dict(summary="旧的多人叙述", portrait="旧画像")
+        item.update(batch_ref="batch:legacy", output=copy.deepcopy(old_output), stage="commit")
+        self.h.core.store.put("metadata", item)
+        seen = []
+
+        async def invalidated(job, output, **request):
+            seen.append(dict(output=copy.deepcopy(output), **request))
+            return dict(state="invalidated", extraction_schema=5, job_ids=[job], result=None)
+
+        self.h.memory.process_candidate = invalidated
+        await learner._work(item)
+        final = self.tasks()[0]
+        self.assertEqual("invalidated", final["state"])
+        self.assertEqual(item["window"], final["window"])
+        self.assertEqual([None], [call["output"] for call in seen])
+        self.assertEqual([None], [call["window"] for call in seen])
+        self.assertEqual(dict(summary="旧的多人叙述", portrait="旧画像"), old_output)
+        self.assertEqual([], self.generated)
+
+    async def test_receipt_reconcile_before_capture_keeps_the_job_without_a_new_window(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        item = self.tasks()[0]
+        seen = []
+
+        async def unclaimed(job, output, **request):
+            seen.append(dict(output=output, **request))
+            return dict(state="unclaimed", extraction_schema=5, job_ids=[job])
+
+        self.h.memory.process_candidate = unclaimed
+        response = await self.h.core.memory_learning.reconcile(item["job_id"])
+        self.assertEqual("unclaimed", response["state"])
+        self.assertIsNone(self.tasks()[0].get("window"))
+        self.assertEqual(item["scope"]["person_id"], seen[0]["subject_person_id"])
+        self.assertIsNone(seen[0]["window"])
+        self.assertIsNone(seen[0]["output"])
+        self.assertEqual([], self.generated)
+
     async def test_empty_summary_is_single_call_without_lexical_rereview(self):
         await self.chat("嗯，知道了")
 
@@ -549,7 +780,8 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
             if not turn["id"].startswith("memory-generation:"):
                 return await self.original_generate(turn, material)
             self.generated.append(material)
-            return ['{"summary":"","portrait":null}'], {}
+            subject = json.loads(material[1]["content"])["subject"]["person_id"]
+            return [canonical(dict(subject_person_id=subject, summary="", portrait=None))], {}
 
         self.h.gateway.generate = empty
         with patch(
@@ -996,15 +1228,21 @@ class SummaryProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(5, Memory.extraction_schema)
         self.assertEqual(
             "normal",
-            parse(self.contracts, '{"summary":"记下一段经历","portrait":null}')["importance"],
+            parse(
+                self.contracts,
+                '{"subject_person_id":"person:a","summary":"记下一段经历","portrait":null}',
+                subject_person_id="person:a",
+            )["importance"],
         )
         for raw in (
-            '{"summary":"x","portrait":null,"owner":"person:fake"}',
+            '{"subject_person_id":"person:a","summary":"x","portrait":null,"owner":"person:fake"}',
             '{"memories":[]}',
-            '{"summary":"x","portrait":null,"importance":"forever"}',
+            '{"subject_person_id":"person:a","summary":"x","portrait":null,"importance":"forever"}',
+            '{"subject_person_id":"person:other","summary":"x","portrait":null}',
+            '{"summary":"x","portrait":null}',
         ):
             with self.subTest(raw=raw), self.assertRaises(Fault):
-                parse(self.contracts, raw)
+                parse(self.contracts, raw, subject_person_id="person:a")
 
     async def test_null_batch_lookup_is_read_classification_but_output_is_write(self):
         request = dict(
@@ -1067,6 +1305,7 @@ class SummaryProtocolTests(unittest.IsolatedAsyncioTestCase):
             batch_ref="batch:one",
             job_ids=["job:one"],
             window_id="a" * 64,
+            subject_person_id="person:a",
             portrait_input=None,
         )
         supplied = pending
@@ -1080,9 +1319,70 @@ class SummaryProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(wire.close)
         memory = Memory(self.contracts, wire)
         actual = await memory.process_candidate(
-            "job:one", None, extraction_schema=5, job_ids=["job:one"], window=None
+            "job:one",
+            None,
+            extraction_schema=5,
+            job_ids=["job:one"],
+            window=None,
+            subject_person_id="person:a",
         )
         self.assertEqual(pending, actual)
+        basis = dict(
+            subject_person_id="person:a",
+            expected_revision=0,
+            current_text="",
+            summary_refs=[dict(record_id="record:one", record_version=1)],
+            summaries=[
+                dict(
+                    record_id="record:one",
+                    record_version=1,
+                    subject_person_id="person:a",
+                    subject_material=[
+                        dict(
+                            member_id="input:owner",
+                            speaker=dict(
+                                kind="person",
+                                person_id="person:a",
+                                account=dict(namespace="qq", immutable_account_id="a"),
+                            ),
+                            observed_at="2026-10-25T00:00:00Z",
+                            text="我还没有决定。",
+                        )
+                    ],
+                )
+            ],
+        )
+        for level in ("pending", "portrait", "summary", "member", "refs", "size"):
+            with self.subTest(level=level):
+                supplied = dict(pending, portrait_input=copy.deepcopy(basis))
+                if level == "pending":
+                    supplied["subject_person_id"] = "person:other"
+                elif level == "portrait":
+                    supplied["portrait_input"]["subject_person_id"] = "person:other"
+                elif level == "summary":
+                    supplied["portrait_input"]["summaries"][0]["subject_person_id"] = "person:other"
+                elif level == "member":
+                    supplied["portrait_input"]["summaries"][0]["subject_material"][0]["speaker"][
+                        "person_id"
+                    ] = "person:other"
+                elif level == "refs":
+                    supplied["portrait_input"]["summary_refs"][0]["record_version"] = 2
+                else:
+                    raw = supplied["portrait_input"]["summaries"][0]["subject_material"][0]
+                    raw["text"] = "甲" * 3001
+                    supplied["portrait_input"]["summaries"][0]["subject_material"].append(
+                        dict(raw, member_id="input:more")
+                    )
+                with self.assertRaises(Fault) as caught:
+                    await memory.process_candidate(
+                        "job:one",
+                        None,
+                        extraction_schema=5,
+                        job_ids=["job:one"],
+                        window=None,
+                        subject_person_id="person:a",
+                    )
+                self.assertFalse(caught.exception.unknown)
         supplied = dict(pending, job_ids=["job:other"])
         with self.assertRaises(Fault) as caught:
             await memory.process_candidate(
@@ -1099,6 +1399,67 @@ class SummaryProtocolTests(unittest.IsolatedAsyncioTestCase):
                 batch_ref="batch:one",
             )
         self.assertTrue(caught.exception.unknown)
+
+    async def test_client_replays_a_legacy_proposal_without_adding_a_subject_to_it(self):
+        output = dict(summary="保留的旧经历", portrait=None, importance="normal")
+        original = copy.deepcopy(output)
+        seen = []
+        result = dict(
+            state="committed",
+            subject_person_id="person:a",
+            record_ids=["record:summary"],
+            group_ids=["group:summary"],
+            experience_state="saved",
+            summary_state="committed",
+            summary_record_refs=[dict(record_id="record:summary", record_version=1)],
+            portrait=dict(state="not_requested", record_refs=[]),
+            covered_job_ids=["job:one"],
+            cursor=dict(window_id="a" * 64, job_ids=["job:one"]),
+        )
+
+        async def handler(request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json=dict(
+                    state="completed",
+                    extraction_schema=5,
+                    batch_ref="batch:legacy",
+                    job_ids=["job:one"],
+                    result=result,
+                ),
+            )
+
+        wire = JsonService(
+            "https://synthetic.invalid", "synthetic", transport=httpx.MockTransport(handler)
+        )
+        self.addAsyncCleanup(wire.close)
+        memory = Memory(self.contracts, wire)
+        receipt = await memory.process_candidate(
+            "job:one",
+            output,
+            extraction_schema=5,
+            job_ids=["job:one"],
+            batch_ref="batch:legacy",
+            subject_person_id="person:a",
+        )
+        self.assertEqual("completed", receipt["state"])
+        self.assertEqual(original, seen[0]["output"])
+        self.assertEqual(original, output)
+        self.assertNotIn("subject_person_id", seen[0])
+        result["subject_person_id"] = "person:other"
+        for supplied_output in (output, None):
+            with self.subTest(write=supplied_output is not None):
+                with self.assertRaises(Fault) as caught:
+                    await memory.process_candidate(
+                        "job:one",
+                        supplied_output,
+                        extraction_schema=5,
+                        job_ids=["job:one"],
+                        batch_ref="batch:legacy",
+                        subject_person_id="person:a",
+                    )
+                self.assertEqual(supplied_output is not None, caught.exception.unknown)
 
     async def test_unclaimed_is_only_a_bound_receipt_lookup_not_a_new_capture_response(self):
         supplied = dict(state="unclaimed", extraction_schema=5, job_ids=["job:one"])

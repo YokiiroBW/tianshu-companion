@@ -1121,7 +1121,15 @@ class Memory:
         return value
 
     async def process_candidate(
-        self, job_id, output, *, extraction_schema=None, job_ids=None, window=None, batch_ref=None
+        self,
+        job_id,
+        output,
+        *,
+        extraction_schema=None,
+        job_ids=None,
+        window=None,
+        batch_ref=None,
+        subject_person_id=None,
     ):
         if extraction_schema is not None and (
             type(extraction_schema) is not int or extraction_schema not in (3, 4, 5)
@@ -1129,6 +1137,26 @@ class Memory:
             raise Fault("invalid_input")
         request = dict(job_id=job_id, output=output)
         if extraction_schema == 5:
+            from .memory_summaries import check_response_subject
+
+            if window is not None:
+                owner = window["manifest"]["scope"]["person_id"]
+                if subject_person_id is not None and subject_person_id != owner:
+                    raise Fault("invalid_input")
+                subject_person_id = owner
+            if output is not None:
+                owner = output.get("subject_person_id")
+                if (
+                    owner is not None
+                    and subject_person_id is not None
+                    and owner != subject_person_id
+                ):
+                    raise Fault("invalid_input")
+                if owner is not None:
+                    subject_person_id = owner
+                # An exact retained, unbound proposal can only replay its old
+                # ledger in Memory. Never add a subject to that frozen output;
+                # normal new model output uses the required subject schema.
             mutates = output is not None or window is not None
             request["job_ids"] = list(job_ids or [job_id])
             if output is None:
@@ -1153,6 +1181,11 @@ class Memory:
                 raise Fault("invalid_input", unknown=mutates)
             if response["job_ids"] != request["job_ids"]:
                 raise Fault("invalid_input", unknown=mutates)
+            owner = subject_person_id
+            if owner is None and response["state"] == "pending":
+                owner = response["subject_person_id"]
+            if owner is not None:
+                check_response_subject(response, owner, unknown=mutates)
             if batch_ref is not None and response.get("batch_ref", batch_ref) != batch_ref:
                 raise Fault("invalid_input", unknown=mutates)
             if response["state"] == "completed":

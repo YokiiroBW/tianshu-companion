@@ -455,8 +455,27 @@ class SummaryWindows:
         new = [turns[key] for key in new_ids]
         if any(turn is None for turn in new):
             raise Fault("scope_changed")
+        # This synchronous owner check has one fixed manifest/turn set. Reuse
+        # reconstruction only inside this call, not across an await or a later
+        # window check. A multi-segment BOT reply otherwise repeats the same
+        # recursive dependency and sent-reply reads for every member.
+        validated, captured_members = set(), {}
+
+        def current(turn):
+            if turn is None or turn["id"] not in validated:
+                self._current(turn, manifest["scope"], manifest["channel"])
+                validated.add(turn["id"])
+
+        def members(turn):
+            identity = turn["id"]
+            if identity not in captured_members:
+                captured_members[identity] = self._members(
+                    turn, "new" if identity in new_ids else "context", turns=turns
+                )
+            return captured_members[identity]
+
         for entry, turn in zip(manifest["new_turns"], new, strict=True):
-            self._current(turn, manifest["scope"], manifest["channel"])
+            current(turn)
             if (
                 turn["scope"] != manifest["scope"]
                 or entry["input_revision"] != turn["bundle"]["collection_revision"]
@@ -473,7 +492,7 @@ class SummaryWindows:
         for member in manifest["members"]:
             turn = turns[member["turn_id"]]
             try:
-                self._current(turn, manifest["scope"], manifest["channel"])
+                current(turn)
                 if member["purpose"] != (
                     "new"
                     if member["role"] == "user" and member["turn_id"] in new_ids
@@ -481,11 +500,7 @@ class SummaryWindows:
                 ):
                     raise Fault("invalid_input")
                 actual = next(
-                    (
-                        pair
-                        for pair in self._members(turn, member["purpose"], turns=turns)
-                        if pair[0]["member_id"] == member["member_id"]
-                    ),
+                    (pair for pair in members(turn) if pair[0]["member_id"] == member["member_id"]),
                     None,
                 )
                 expected = actual[0] if actual else None
@@ -503,11 +518,7 @@ class SummaryWindows:
                 for member in manifest["members"]
                 if member["turn_id"] == turn["id"] and member["role"] == "user"
             ]
-            expected = [
-                member
-                for member, _ in self._members(turn, "new", turns=turns)
-                if member["role"] == "user"
-            ]
+            expected = [member for member, _ in members(turn) if member["role"] == "user"]
             if expected != present:
                 invalid.extend(member["member_id"] for member in present)
                 if not present:
@@ -520,11 +531,8 @@ class SummaryWindows:
             ]
             if not assistants or turns[identity] is None:
                 continue
-            purpose = "new" if identity in new_ids else "context"
             expected_inputs = [
-                member
-                for member, _ in self._members(turns[identity], purpose, turns=turns)
-                if member["role"] == "user"
+                member for member, _ in members(turns[identity]) if member["role"] == "user"
             ]
             actual_inputs = [
                 member

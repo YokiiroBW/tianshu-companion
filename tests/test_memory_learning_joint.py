@@ -148,11 +148,20 @@ class ConsolidationJointBase(SourceChain):
         if material["portrait_input"] is not None:
             portrait = "\n".join(
                 [
-                    *(row["text"] for row in material["portrait_input"]["summaries"]),
+                    *(
+                        member["text"]
+                        for row in material["portrait_input"]["summaries"]
+                        for member in row["subject_material"]
+                    ),
                     summary,
                 ]
             )
-        return dict(summary=summary, portrait=portrait, importance="normal")
+        return dict(
+            subject_person_id=material["subject"]["person_id"],
+            summary=summary,
+            portrait=portrait,
+            importance="normal",
+        )
 
     async def record_model(self, request):
         body = await request.json()
