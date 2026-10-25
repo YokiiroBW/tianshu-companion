@@ -922,6 +922,78 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_empty_optional_portrait_commits_summary_with_or_without_portrait_input(self):
+        basis = None
+
+        async def process(job, output, **request):
+            response = await self.process(job, output, **request)
+            if response["state"] == "pending":
+                response["portrait_input"] = copy.deepcopy(basis)
+            return response
+
+        async def generate(turn, material):
+            if not turn["id"].startswith("memory-generation:"):
+                return await self.original_generate(turn, material)
+            self.generated.append(copy.deepcopy(material))
+            subject = json.loads(material[1]["content"])["subject"]["person_id"]
+            return [
+                canonical(
+                    dict(subject_person_id=subject, summary="保留这段非空经历。", portrait="")
+                )
+            ], {}
+
+        self.h.memory.process_candidate = process
+        self.h.gateway.generate = generate
+        for index, text in enumerate(("我周六想去看看", "后来仍没有决定")):
+            with self.subTest(has_portrait_input=basis is not None):
+                prior_jobs = set(self.receipts)
+                await self.chat(text)
+                await self.flush()
+                job = next(job for job in self.receipts if job not in prior_jobs)
+                task = next(row for row in self.tasks() if row["job_id"] == job)
+                self.assertEqual(
+                    ("completed", "committed", 0),
+                    (task["state"], task["summary_state"], task["proposal_failures"]),
+                )
+                self.assertEqual(index + 1, len(self.generated))
+                material = json.loads(self.generated[-1][1]["content"])
+                self.assertEqual(basis, material["portrait_input"])
+                submitted = [
+                    call["output"]
+                    for call in self.calls
+                    if call["job_id"] == job and call["output"] is not None
+                ]
+                self.assertEqual(1, len(submitted))
+                self.assertEqual("保留这段非空经历。", submitted[0]["summary"])
+                self.assertIsNone(submitted[0]["portrait"])
+                window = self.windows[job]
+                human = next(
+                    member
+                    for member in window["manifest"]["members"]
+                    if member["role"] == "user" and member["purpose"] == "new"
+                )
+                basis = dict(
+                    subject_person_id=window["manifest"]["scope"]["person_id"],
+                    expected_revision=0,
+                    current_text="",
+                    summary_refs=task["receipt"]["summary_record_refs"],
+                    summaries=[
+                        dict(
+                            **task["receipt"]["summary_record_refs"][0],
+                            subject_person_id=window["manifest"]["scope"]["person_id"],
+                            subject_material=[
+                                dict(
+                                    **{
+                                        key: human[key]
+                                        for key in ("member_id", "speaker", "observed_at")
+                                    },
+                                    text=text,
+                                )
+                            ],
+                        )
+                    ],
+                )
+
     async def test_parse_failure_then_lock_wait_does_not_spend_another_proposal(self):
         await self.chat()
 
@@ -1366,6 +1438,38 @@ class SummaryProtocolTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(raw=raw), self.assertRaises(Fault):
                 parse(self.contracts, raw, subject_person_id="person:a")
+
+    async def test_empty_optional_portrait_normalizes_only_the_exact_empty_string(self):
+        output = dict(subject_person_id="person:a", summary="非空经历摘要", importance="high")
+        for portrait in ("", None, "人物归纳", " "):
+            with self.subTest(portrait=portrait):
+                expected = dict(output, portrait=None if portrait == "" else portrait)
+                self.assertEqual(
+                    expected,
+                    parse(
+                        self.contracts,
+                        canonical(dict(output, portrait=portrait)),
+                        subject_person_id="person:a",
+                    ),
+                )
+        for value in (
+            output,
+            [dict(output, portrait="")],
+            dict(output, portrait=[]),
+            dict(output, portrait={}),
+            dict(output, portrait=False),
+            dict(output, portrait=0),
+            dict(output, portrait="", subject_person_id="person:other"),
+        ):
+            with self.subTest(invalid=value), self.assertRaises(Fault):
+                parse(self.contracts, canonical(value), subject_person_id="person:a")
+        with self.assertRaises(Fault) as over_budget:
+            parse(
+                self.contracts,
+                canonical(dict(output, portrait="", summary="字" * 23000)),
+                subject_person_id="person:a",
+            )
+        self.assertEqual("budget_exceeded", over_budget.exception.code)
 
     async def test_null_batch_lookup_is_read_classification_but_output_is_write(self):
         request = dict(

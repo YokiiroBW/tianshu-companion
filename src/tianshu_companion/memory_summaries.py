@@ -170,6 +170,8 @@ def parse(contracts, raw, *, subject_person_id):
         raise ProposalStructureError("budget_exceeded", [dict(path=[], keyword="byte_limit")])
     try:
         output = strict_json(raw)
+        if isinstance(output, dict) and output.get("portrait") == "":
+            output["portrait"] = None
         contracts.check("memory-extraction#summary_output", output)
         if output["subject_person_id"] != subject_person_id:
             raise Fault("invalid_input")
