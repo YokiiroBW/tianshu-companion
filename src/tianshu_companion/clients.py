@@ -362,6 +362,10 @@ class JsonService:
                         == {"job_id", "job_ids", "output", "supported_extraction_schemas", "window"}
                         and body["supported_extraction_schemas"] == [5]
                     )
+                    or (
+                        set(body) == {"extraction_schema", "job_id", "batch_ref", "output"}
+                        and body["extraction_schema"] == 6
+                    )
                 )
                 and isinstance(body["job_id"], str)
                 and bool(body["job_id"])
@@ -674,7 +678,7 @@ class Origins:
 
 
 class Memory:
-    extraction_schema = 5
+    extraction_schema = 6
 
     def __init__(self, contracts, client):
         self.contracts, self.client = contracts, client
@@ -1116,6 +1120,103 @@ class Memory:
             raise Fault("invalid_input", unknown=True)
         return value
 
+    async def accept_materials(self, request):
+        """Accept source material without creating a per-turn model job."""
+        self.contracts.check("memory-extraction#segment_material_request", request)
+        if len(canonical(request).encode("utf-8")) > 262144:
+            raise Fault("budget_exceeded")
+        value = await self.client.call(
+            "/internal/v1/memory/candidates/materials", request, uncertain_write=True
+        )
+        try:
+            if not isinstance(value, dict):
+                raise Fault("invalid_input")
+            if value.get("candidate_job_ref") is not None and "event" in request:
+                # A retained pre-schema6 event can only return its original
+                # acceptance receipt. It is never converted into new material.
+                self.contracts.check("identity-memory#consume_receipt", value)
+                event = request["event"]
+                if (
+                    value["event_id"] != event["event_id"]
+                    or value["turn_id"] != event["aggregate_id"]
+                    or value["input_revision"] != event["input_revision"]
+                ):
+                    raise Fault("invalid_input")
+            else:
+                self.contracts.check("memory-extraction#segment_material_response", value)
+                if value["candidate_job_ref"] is not None:
+                    raise Fault("invalid_input")
+                refs = [material["material_ref"] for material in value["materials"]]
+                if len(set(refs)) != len(refs):
+                    raise Fault("invalid_input")
+                if "event" in request:
+                    scope = request["event"]["scope"]
+                    expected = {
+                        key: scope[key] for key in ("actor_id", "audience", "conversation_id")
+                    }
+                    if any(
+                        material["frame"] != expected or material["person_id"] != scope["person_id"]
+                        for material in value["materials"]
+                    ):
+                        raise Fault("invalid_input")
+        except (Fault, KeyError, TypeError):
+            raise Fault("invalid_input", unknown=True) from None
+        return value
+
+    async def create_segment(self, request):
+        self.contracts.check("memory-extraction#segment_seal_request", request)
+        if len(canonical(request).encode("utf-8")) > 262144:
+            raise Fault("budget_exceeded")
+        response = await self.client.call(
+            "/internal/v1/memory/candidates/segments", request, uncertain_write=True
+        )
+        try:
+            self.contracts.check("memory-extraction#segment_seal_response", response)
+            if (
+                response["segment_id"] != request["segment_id"]
+                or response["candidate_job_ref"] != response["job_id"]
+            ):
+                raise Fault("invalid_input")
+        except (Fault, KeyError, TypeError):
+            raise Fault("invalid_input", unknown=True) from None
+        return response
+
+    async def _process_segment(self, job_id, batch_ref, output):
+        request = dict(extraction_schema=6, job_id=job_id, batch_ref=batch_ref, output=output)
+        self.contracts.check(
+            "memory-extraction#segment_read_request"
+            if output is None
+            else "memory-extraction#segment_submit_request",
+            request,
+        )
+        if len(canonical(request).encode("utf-8")) > 262144:
+            raise Fault("budget_exceeded")
+        response = await self.client.call(
+            "/internal/v1/memory/candidates/process", request, uncertain_write=output is not None
+        )
+        try:
+            definitions = {
+                "pending": "segment_pending_response",
+                "completed": "segment_receipt",
+                "invalidated": "segment_invalidated_response",
+            }
+            if not isinstance(response, dict):
+                raise Fault("invalid_input")
+            if response.get("state") not in definitions:
+                raise Fault("invalid_input")
+            self.contracts.check("memory-extraction#" + definitions[response["state"]], response)
+            if response["job_id"] != job_id or response["extraction_schema"] != 6:
+                raise Fault("invalid_input")
+            if batch_ref is not None and response["batch_ref"] != batch_ref:
+                raise Fault("invalid_input")
+            if response["state"] == "pending":
+                from .memory_summaries import check_segment_window
+
+                check_segment_window(self.contracts, response["segment_window"])
+        except (Fault, KeyError, TypeError):
+            raise Fault("invalid_input", unknown=output is not None) from None
+        return response
+
     async def process_candidate(
         self,
         job_id,
@@ -1127,6 +1228,8 @@ class Memory:
         batch_ref=None,
         subject_person_id=None,
     ):
+        if type(extraction_schema) is int and extraction_schema == 6:
+            return await self._process_segment(job_id, batch_ref, output)
         if extraction_schema is not None and (
             type(extraction_schema) is not int or extraction_schema not in (3, 4, 5)
         ):

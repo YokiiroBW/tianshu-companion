@@ -224,6 +224,28 @@ class HttpsSourceTests(unittest.TestCase):
                             scope_version=3,
                             checked_at=utc(),
                         )
+                    elif self.path == "/internal/v1/memory/candidates/materials":
+                        contract.check("memory-extraction#segment_material_front_request", body)
+                        event = body["event"]
+                        state["commits"].append(event)
+                        response = dict(
+                            schema_version=1,
+                            candidate_job_ref=None,
+                            materials=[
+                                dict(
+                                    material_ref="material:" + digest([event["scope"], source]),
+                                    frame={
+                                        key: event["scope"][key]
+                                        for key in ("actor_id", "audience", "conversation_id")
+                                    },
+                                    person_id=event["scope"]["person_id"],
+                                    text_bytes=len(physical["parts"][0]["text"].encode("utf-8")),
+                                    member_count=1,
+                                    source_key=digest([event["scope"]["actor_id"], source]),
+                                )
+                                for source in event["sources"]
+                            ],
+                        )
                     elif self.path == "/internal/v1/memory/turn-commits":
                         contract.check("conversation#committed_event", body)
                         state["commits"].append(body)

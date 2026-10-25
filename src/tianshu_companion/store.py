@@ -12,6 +12,8 @@ from .life_read_index import create_page_index, prepare_page_index
 from . import work_index
 from .payload_files import PayloadFiles
 
+CHANNEL_ALIAS_PREFIX = "source-channel-alias:"
+
 
 def _exact_scope_filter(scope):
     keys = ("actor_id", "person_id", "audience", "conversation_id")
@@ -442,6 +444,16 @@ class Store:
     def get(self, table, key):
         assert table in TABLES
         row = self.db.execute(f"SELECT body FROM {table} WHERE id=?", (key,)).fetchone()
+        if row is None and table == "conversations":
+            alias = self.get("metadata", CHANNEL_ALIAS_PREFIX + key)
+            if alias is not None:
+                # One hop to a real row, never another alias or a second set of
+                # ingest/turn/send counters. All original callers get its ID.
+                row = self.db.execute(
+                    "SELECT body FROM conversations WHERE id=?", (alias["conversation_key"],)
+                ).fetchone()
+                if row is None:
+                    raise ValueError("Missing canonical conversation")
         return self.payloads.restore(table, json.loads(row[0])) if row else None
 
     def get_many(self, table, keys):
@@ -456,6 +468,29 @@ class Store:
                 f"SELECT id,body FROM {table} WHERE id IN ({placeholders})", batch
             ):
                 result[row[0]] = self.payloads.restore(table, json.loads(row[1]))
+        if table == "conversations":
+            missing = [key for key in keys if key not in result]
+            aliases = self.get_many("metadata", [CHANNEL_ALIAS_PREFIX + key for key in missing])
+            owners = list(dict.fromkeys(row["conversation_key"] for row in aliases.values()))
+            canonical_rows = {}
+            for offset in range(0, len(owners), 256):
+                batch = owners[offset : offset + 256]
+                for row in self.db.execute(
+                    "SELECT id,body FROM conversations WHERE id IN ("
+                    + ",".join("?" for _ in batch)
+                    + ")",
+                    batch,
+                ):
+                    canonical_rows[row[0]] = self.payloads.restore(table, json.loads(row[1]))
+            for key in missing:
+                alias = aliases.get(CHANNEL_ALIAS_PREFIX + key)
+                if alias is not None:
+                    owner = canonical_rows.get(alias["conversation_key"])
+                    if owner is None:
+                        raise ValueError("Missing canonical conversation")
+                    # Preserve requested keys: source-facts groups selectors by
+                    # their actual source channel, not the canonical row ID.
+                    result[key] = owner
         return result
 
     def turn_phases(self, keys):

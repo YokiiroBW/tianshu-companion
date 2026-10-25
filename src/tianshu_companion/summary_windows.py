@@ -6,7 +6,7 @@ import hashlib
 from .clients import utc
 from .contracts import Fault, canonical, digest
 from .short_context import sources_current
-from .source_sync import ensure_channel, selector
+from .source_sync import ensure_channel, link_learning_channel, selector
 
 
 MAX_NEW_TURNS = 1
@@ -240,8 +240,14 @@ class SummaryWindows:
             )
         return values
 
-    def read(self, new_turn_ids, *, max_bytes=MAX_REQUEST_BYTES):
-        """Capture complete new inputs and bounded same-scope human history."""
+    def read(self, new_turn_ids, *, max_bytes=MAX_REQUEST_BYTES, include_dialogue=False):
+        """Capture full new human inputs and bounded owner-proved context.
+
+        Retained singleton jobs keep their original owner-only default. New
+        segments explicitly request shared same-group dialogue; private context
+        remains exact-scope. Optional sent replies require their existing full
+        provenance and never replace a new human member.
+        """
         if not 1 <= len(new_turn_ids) <= MAX_NEW_TURNS or len(set(new_turn_ids)) != len(
             new_turn_ids
         ):
@@ -259,7 +265,10 @@ class SummaryWindows:
                 raise Fault("scope_changed")
             self._current(turn, scope, channel)
         recent = self.store.recent_turns(
-            anchor["conversation_id"], anchor["sequence"] + 1, MAX_TURNS + 1, scope=scope
+            anchor["conversation_id"],
+            anchor["sequence"] + 1,
+            MAX_TURNS + 1,
+            scope=None if include_dialogue and scope["audience"] == "group" else scope,
         )
         selected = {turn["id"]: turn for turn in fresh}
         omitted = len(recent) > MAX_TURNS
@@ -277,7 +286,9 @@ class SummaryWindows:
                     raise
                 omitted = True
                 continue
-            if self.core._event_reality(turn) != self.core._event_reality(anchor):
+            if not include_dialogue and self.core._event_reality(turn) != self.core._event_reality(
+                anchor
+            ):
                 omitted = True
                 continue
             selected[turn["id"]] = turn
@@ -301,11 +312,40 @@ class SummaryWindows:
             groups[turn["id"]] = members
             count, size = count + len(members), size + added
 
+        def replies():
+            """Rebuild optional BOT text only against the humans actually kept."""
+            nonlocal omitted
+            if not include_dialogue:
+                return {}
+            turns = {identity: selected[identity] for identity in groups}
+            result, used, text_size = {}, count, size
+            for turn in ordered:
+                if turn["id"] not in turns:
+                    continue
+                extra = [
+                    pair
+                    for pair in self._members(
+                        turn, "new" if turn["id"] in new_turn_ids else "context", turns=turns
+                    )
+                    if pair[0]["role"] == "assistant"
+                ]
+                if not extra and turn.get("delivery_state") == "sent":
+                    omitted = True
+                added = sum(len(text.encode("utf-8")) for _, text in extra)
+                if used + len(extra) <= MAX_MEMBERS and text_size + added <= MAX_TEXT_BYTES:
+                    result[turn["id"]] = extra
+                    used, text_size = used + len(extra), text_size + added
+                else:
+                    omitted = True
+            return result
+
+        reply_groups = replies()
+
         def package():
             pairs = [
                 pair
                 for turn in sorted(selected.values(), key=lambda turn: turn["sequence"])
-                for pair in groups.get(turn["id"], [])
+                for pair in groups.get(turn["id"], []) + reply_groups.get(turn["id"], [])
             ]
             manifest = dict(
                 schema_version=1,
@@ -338,6 +378,13 @@ class SummaryWindows:
             )
             if older is not None:
                 del groups[older]
+                count = sum(len(values) for values in groups.values())
+                size = sum(
+                    len(text.encode("utf-8")) for values in groups.values() for _, text in values
+                )
+                reply_groups = replies()
+            elif reply_groups:
+                reply_groups = {}
             else:
                 raise Fault("budget_exceeded")
             omitted = True
@@ -406,9 +453,71 @@ class SummaryWindows:
         self.core.contracts.check("memory-extraction#summary_window", result)
         return result
 
+    def learning_frame(self, service, request):
+        """Prove Core's channel identity, not observation or reply permission.
+
+        The authenticated Memory owner obtains the current observation actor
+        and channel from Platform. Core alone assigns the conversation ID; no
+        source admission, person, turn or dialogue capability is created here.
+        """
+        if service not in {"memory", "platform"}:
+            raise Fault("forbidden")
+        self.core.contracts.check("memory-extraction#segment_frame_request", request)
+        actor, channel = request["actor_id"], request["channel"]
+        if actor not in self.core.roles or (
+            service == "memory" and not self.core._role_allows(actor, "memory.write")
+        ):
+            raise Fault("forbidden")
+        binding = self.core.bindings.get(channel["binding_id"])
+        if binding is not None:
+            if binding["namespace"] != channel["namespace"] or actor not in binding["actor_ids"]:
+                raise Fault("forbidden")
+            audience = binding["audience"]
+        elif channel["namespace"] == "qq" and channel["channel_conversation_id"].startswith(
+            ("group:", "private:")
+        ):
+            audience = (
+                "group"
+                if channel["channel_conversation_id"].startswith("group:")
+                else "self_private"
+            )
+        else:
+            raise Fault("forbidden")
+        delivery = request["delivery_channel"]
+        if delivery is not None and any(
+            channel[key] != delivery[key]
+            for key in ("namespace", "channel_conversation_id", "thread_id")
+        ):
+            raise Fault("forbidden")
+        if delivery is not None and delivery["binding_id"] in self.core.bindings:
+            current_binding = self.core.bindings[delivery["binding_id"]]
+            if (
+                current_binding["namespace"] != delivery["namespace"]
+                or current_binding["audience"] != audience
+                or actor not in current_binding["actor_ids"]
+            ):
+                raise Fault("forbidden")
+        with self.store.transaction():
+            current = link_learning_channel(
+                self.store, channel, delivery, conversation_id=request["conversation_id"]
+            )
+            response = dict(
+                schema_version=1,
+                valid=True,
+                frame=dict(
+                    actor_id=actor, audience=audience, conversation_id=current["conversation_id"]
+                ),
+                channel=copy.deepcopy(channel),
+                delivery_channel=copy.deepcopy(delivery),
+            )
+            self.core.contracts.check("memory-extraction#segment_frame_response", response)
+            return response
+
     def check(self, service, request):
         if service != "memory":
             raise Fault("forbidden")
+        if isinstance(request, dict) and "manifest" not in request:
+            return self.learning_frame(service, request)
         self.core.contracts.check("memory-extraction#summary_window_check_request", request)
         manifest = request["manifest"]
         if manifest["window_id"] != digest(

@@ -5,6 +5,7 @@ import copy
 from .clients import epoch, uid, utc
 from .contracts import Fault, canonical, digest
 from .model_selection import SelectionRequest, resolve_selection, verify_lease
+from .store import CHANNEL_ALIAS_PREFIX
 
 INPUT_FIELDS = (
     "message_key",
@@ -128,6 +129,55 @@ def ensure_channel(store, channel, *, known=None):
     if conv and conv.get("source_quarantined"):
         raise Fault("dependency_unavailable")
     return conv
+
+
+def allocate_channel(store, channel, *, conversation_id=None):
+    """Allocate only the channel identity, without an admission or reply scope."""
+    with store.transaction():
+        conv = ensure_channel(store, channel)
+        if conv is None:
+            conv = dict(
+                id=digest(channel),
+                conversation_id=conversation_id or uid("conv"),
+                channel=copy.deepcopy(channel),
+                ingest_sequence=0,
+                turn_sequence=0,
+            )
+            store.put("conversations", conv)
+        return conv
+
+
+def link_learning_channel(store, channel, delivery_channel, *, conversation_id=None):
+    """Bind a Memory/Platform-proven read alias to one existing counter owner.
+
+    The caller owns the authenticated same-actor physical-frame proof. This
+    grants no reply ability and never merges two real conversations. A later
+    host revision can add a delivery alias without replacing old source keys.
+    """
+    with store.transaction():
+        channels = [channel] if delivery_channel is None else [channel, delivery_channel]
+        current = [ensure_channel(store, value) for value in channels]
+        owners = {row["id"]: row for row in current if row is not None}
+        if len(owners) > 1:
+            raise Fault("scope_changed")
+        owner = next(iter(owners.values()), None)
+        if conversation_id is not None and (
+            owner is None or owner["conversation_id"] != conversation_id
+        ):
+            raise Fault("scope_changed")
+        if owner is None:
+            owner = allocate_channel(store, delivery_channel or channel)
+        for value, existing in zip(channels, current):
+            key = digest(value)
+            if existing is None and key != owner["id"]:
+                store.put(
+                    "metadata",
+                    dict(
+                        id=CHANNEL_ALIAS_PREFIX + key,
+                        conversation_key=owner["id"],
+                    ),
+                )
+        return owner
 
 
 def migrate_legacy(store):
@@ -743,13 +793,7 @@ async def _ingest(core, service, request, defer=False, *, legacy=False):
             raise Fault("timeout")
         if epoch(authority["expires_at"]) <= now:
             raise Fault("forbidden")
-        conv = ensure_channel(store, channel) or dict(
-            id=digest(channel),
-            conversation_id=candidate_cid,
-            channel=channel,
-            ingest_sequence=0,
-            turn_sequence=0,
-        )
+        conv = allocate_channel(store, channel, conversation_id=candidate_cid)
         cid = conv["conversation_id"]
         if reservations and cid != candidate_cid:
             error = Fault("dependency_unavailable")

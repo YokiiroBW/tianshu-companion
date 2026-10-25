@@ -534,6 +534,7 @@ def build_runtime(config):
                 config["database_path"] + ".observations.sqlite",
                 core.memory.client,
                 storage_runtime=storage,
+                on_archived=core.memory_learning.observation_archived,
             )
         for spec in (routing or {}).get("commands", []):
             core.direct.register_command(**spec)
@@ -870,6 +871,10 @@ def create_app(core=None, tokens=None, life_readers=None):
                 if not hasattr(core, "bot_bindings"):
                     raise Fault("dependency_unavailable")
                 return core.bot_bindings.status(service, body)
+            if operation == "bot-learning-frame":
+                if service != "platform":
+                    raise Fault("forbidden")
+                return core.summary_windows.learning_frame(service, body)
             if operation == "observation-ingest":
                 if not hasattr(core, "observations"):
                     raise Fault("dependency_unavailable")
@@ -907,6 +912,10 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v1/bot-bindings/status")
     async def bot_binding_status(request: Request):
         return await dispatch(request, "bot-binding-status")
+
+    @app.post("/internal/v1/bot-bindings/learning-frame")
+    async def bot_learning_frame(request: Request):
+        return await dispatch(request, "bot-learning-frame")
 
     @app.post("/internal/v2/observations/ingest")
     async def observation_ingest(request: Request):

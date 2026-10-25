@@ -120,10 +120,14 @@ def validate(request):
 
 
 class Observations:
-    def __init__(self, path, memory_client, *, storage_runtime=None):
+    def __init__(self, path, memory_client, *, storage_runtime=None, on_archived=None):
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.memory = memory_client
+        # The existing learning owner accepts the durable archive handoff. It
+        # runs before the local transfer is marked archived, so a crash retries
+        # the same source instead of losing the handoff between databases.
+        self.on_archived = on_archived
         self.database = None
         if storage_runtime is not None:
             from .observation_postgres import prepare
@@ -239,6 +243,8 @@ class Observations:
                     or response.get("archive_state") != "archived"
                 ):
                     raise Fault("dependency_unavailable")
+                if self.on_archived is not None:
+                    await self.on_archived(json.loads(row["payload"]), response)
                 with closing(self._db()) as db, db:
                     db.execute(
                         "UPDATE inbox SET archive_state='archived',error_code=NULL,"

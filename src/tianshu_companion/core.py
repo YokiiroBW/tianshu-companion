@@ -2609,11 +2609,45 @@ class Core(Delivery):
                             outcome = "cancelled"
                         else:
                             self.contracts.check("conversation#committed_event", item["event"])
+                            contextual = getattr(
+                                self.memory, "extraction_schema", 5
+                            ) == 6 and hasattr(self.memory, "accept_materials")
+                            if contextual and "material_request" not in item:
+                                windows = []
+                                try:
+                                    windows = [
+                                        self.summary_windows.read(
+                                            [turn["id"]], include_dialogue=True
+                                        )
+                                    ]
+                                except Fault as error:
+                                    # Context is optional; the actual new event's
+                                    # complete sources still go to Memory and are
+                                    # independently proved, never silently trimmed.
+                                    if error.code not in {
+                                        "scope_changed",
+                                        "forbidden",
+                                        "not_found",
+                                        "budget_exceeded",
+                                    }:
+                                        raise
+                                request = dict(
+                                    schema_version=1,
+                                    event=copy.deepcopy(item["event"]),
+                                    context_windows=windows,
+                                )
+                                if len(canonical(request).encode("utf-8")) > 262144:
+                                    request["context_windows"] = []
+                                item["material_request"] = request
                             item["state"] = "submitting"
                             item["attempts"] = attempts
                             self.store.put("outbox", item)
                             try:
-                                receipt = await self.memory.commit(item["event"])
+                                receipt = await (
+                                    self.memory.accept_materials(item["material_request"])
+                                    if contextual
+                                    else self.memory.commit(item["event"])
+                                )
                             except BaseException:
                                 # Cancellation or an unclassified adapter failure is also
                                 # uncertain. Persist it before propagating to the worker.

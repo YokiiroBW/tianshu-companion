@@ -135,7 +135,7 @@ to the exact property and person. An empty memories array is valid when no atomi
 """
 
 
-def output_schema(contracts):
+def output_schema(contracts, definition="output"):
     """Resolve the published schema for a model that cannot access our Registry."""
     schema = contracts.schemas["memory-extraction"]
 
@@ -161,7 +161,7 @@ def output_schema(contracts):
             if key not in {"$id", "$schema", "$defs"}
         }
 
-    return inline({"$ref": schema["$id"] + "#/$defs/output"}, contracts.registry.resolver())
+    return inline({"$ref": schema["$id"] + "#/$defs/" + definition}, contracts.registry.resolver())
 
 
 def messages(contracts, response, *, rejected=False, diagnostics=None):

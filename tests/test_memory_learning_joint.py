@@ -16,6 +16,7 @@ TEXT = "第一支钢笔用蓝黑墨水"
 
 class ConsolidationJointBase(SourceChain):
     silence_ms = 0
+    learning_schema = 5
 
     def make_platform_app(self):
         from services.platform.server import create_app
@@ -74,6 +75,9 @@ class ConsolidationJointBase(SourceChain):
 
     async def start_core(self):
         await super().start_core()
+        # The original singleton scenarios remain real retained-protocol tests;
+        # schema6 joint subclasses explicitly select the new segment producer.
+        self.core.memory.extraction_schema = self.learning_schema
         # The synthetic web channel uses this fixture's delivery recorder.
         self.core.web_sender = self.core.sender
         for skill in ("life.manage", "memory.propose"):

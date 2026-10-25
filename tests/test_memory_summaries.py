@@ -1562,8 +1562,8 @@ class SummaryProtocolTests(unittest.IsolatedAsyncioTestCase):
                             owner["person_id"], actual["evidence"][0]["subject_person_id"]
                         )
 
-    async def test_default_schema5_and_structural_output_keep_interpretation_only(self):
-        self.assertEqual(5, Memory.extraction_schema)
+    async def test_default_schema6_and_retained_schema5_output_keep_interpretation_only(self):
+        self.assertEqual(6, Memory.extraction_schema)
         self.assertEqual(
             "normal",
             parse(
