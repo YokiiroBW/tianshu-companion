@@ -2411,7 +2411,12 @@ class Core(Delivery):
         while True:
             try:
                 if recovery:
-                    remaining = min(recovery["deadline"], turn["source_deadline"]) - self.clock()
+                    # A renewable grant bounds its proof, not this owner's
+                    # lifetime. The next checkpoint must obtain fresh authority.
+                    bound = self._source_recovery_bound(turn)
+                    remaining = (
+                        recovery["deadline"] if bound is None else min(recovery["deadline"], bound)
+                    ) - self.clock()
                     if remaining <= 0:
                         raise Fault("timeout")
                     async with asyncio.timeout(remaining) as deadline:
@@ -2439,7 +2444,7 @@ class Core(Delivery):
                         raise
                     self._record_turn_failure(fresh, error, "preflight")
                     self._save_turn(fresh)
-                delay = read_retry(recovery, error, self.clock(), turn["source_deadline"])
+                delay = read_retry(recovery, error, self.clock(), self._source_recovery_bound(turn))
                 if delay is None:
                     raise
                 retry_at = time.monotonic() + delay
@@ -2449,7 +2454,8 @@ class Core(Delivery):
                         raise Fault("scope_changed") from None
                     self._check_input_versions(fresh)
                     self._check_role(fresh)
-                    if self.clock() >= turn["source_deadline"]:
+                    bound = self._source_recovery_bound(fresh)
+                    if bound is not None and self.clock() >= bound:
                         raise Fault("forbidden") from None
                     remaining = retry_at - time.monotonic()
                     if remaining <= 0:

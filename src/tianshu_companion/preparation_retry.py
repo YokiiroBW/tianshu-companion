@@ -4,10 +4,11 @@ from .contracts import Fault
 
 
 def recovery_deadline(started_at, *, source_deadline=None):
-    """Recovery horizon, optionally bounded by a source lease before another read.
+    """Recovery horizon, optionally bounded by a nonrenewable source grant.
 
-    A running preparation can renew its source with fresh proof; callers that
-    own that work keep the recovery horizon rather than pinning its old lease.
+    A live owner with a continuation port passes no grant bound: its next
+    checkpoint must obtain fresh authority, rather than extending an old proof.
+    Durable preparation callers keep their existing source-bound policy.
     """
     deadline = started_at + 30
     return min(deadline, source_deadline) if source_deadline is not None else deadline
@@ -19,6 +20,8 @@ def read_retry(state, error, now, source_deadline, *, selection_changed=False):
     Transport performs no semantic replay. The durable preparation owner and
     the live delivery checkpoint use this policy at mutually exclusive model
     boundaries; neither can replay a model, tool command or send.
+    ``source_deadline=None`` permits a fresh continuation attempt within the
+    same thirty-second window; it is not a source-validity assertion.
     """
     if (
         not isinstance(error, Fault)

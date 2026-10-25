@@ -30,6 +30,19 @@ class Delivery:
             sources=self.life.concerns.captured_sources(turn),
         )
 
+    def _source_recovery_bound(self, turn):
+        """A nonrenewable grant also bounds its live read-recovery owner.
+
+        An existing continuation port permits the next fresh checkpoint to try
+        renewing a grant, even after its old deadline. It does not authorize
+        that attempt or extend any captured proof; the port and checkpoint
+        still enforce the actual entry expiry, permissions and source state.
+        """
+        sender = self.expression_sender(turn)
+        if getattr(sender, "expression_context", None) is None:
+            return turn["source_deadline"]
+        return None
+
     async def continue_delivery_origin(self, turn, *, read_budget=0):
         sender = self.expression_sender(turn)
         context = getattr(sender, "expression_context", None)

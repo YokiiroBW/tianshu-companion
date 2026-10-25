@@ -1020,5 +1020,140 @@ class AdoptedLeaseTests(unittest.IsolatedAsyncioTestCase):
             await self.h.core._preflight_once(current)
         self.assertEqual([], self.verifications)
 
+    async def live_turn(self):
+        previous, current = await self.prepare()
+        self.lease(current, 60)
+        current.update(phase="generating", model_calls=1)
+        self.h.core._save_turn(current)
+        return previous, current
+
+    async def test_live_recovery_renews_and_reauthorizes_without_inheriting_the_old_main_cap(self):
+        _, current = await self.live_turn()
+        old = current["source_deadline"]
+        verify = self.h.memory.verify_context
+        attempts = []
+        model_calls = len(self.h.gateway.calls)
+
+        async def barrier(*args):
+            attempts.append(copy.deepcopy(args[-1]))
+            if len(attempts) == 1:
+                self.h.clock.advance(41)
+                raise Fault("dependency_unavailable", retryable_read=True)
+            self.h.clock.advance(21)
+            self.assertLess(old, self.h.clock())
+            self.assertLess(self.h.clock(), current["source_deadline"])
+            return await verify(*args)
+
+        self.h.memory.verify_context = barrier
+        await self.h.core._preflight(current)
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(
+            [old, current["source_deadline"]],
+            [deadline for key, deadline in self.authorizations if key == current["id"]],
+        )
+        self.assertEqual(
+            [(c["check_id"], c["kind"]) for c in attempts[0]],
+            [(c["check_id"], c["kind"]) for c in attempts[1]],
+        )
+        self.assertTrue(
+            {c["request"]["query"]["request_id"] for c in attempts[0]}.isdisjoint(
+                c["request"]["query"]["request_id"] for c in attempts[1]
+            )
+        )
+        self.assertEqual(1, len(self.verifications))
+        self.assertEqual(model_calls, len(self.h.gateway.calls))
+        self.assertEqual([], self.h.core.sender.requests)
+
+    async def test_renewable_live_recovery_still_ends_at_its_original_thirty_second_horizon(self):
+        _, current = await self.live_turn()
+        verify = self.h.memory.verify_context
+        attempts = []
+
+        async def barrier(*args):
+            attempts.append(True)
+            if len(attempts) == 1:
+                self.h.clock.advance(41)
+                raise Fault("dependency_unavailable", retryable_read=True)
+            self.h.clock.advance(31)
+            self.assertLess(self.h.clock(), current["source_deadline"])
+            return await verify(*args)
+
+        self.h.memory.verify_context = barrier
+        with self.assertRaises(Fault) as caught:
+            await self.h.core._preflight(current)
+        self.assertEqual("timeout", caught.exception.code)
+        self.assertEqual("preflight", caught.exception.companion_failure_stage)
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(1, len(self.verifications))
+        self.assertEqual([], self.h.core.sender.requests)
+
+    async def test_live_recovery_without_a_continuation_port_keeps_the_hard_grant_bound(self):
+        _, current = await self.live_turn()
+        del self.h.core.sender.expression_context
+        failure = Fault("dependency_unavailable", retryable_read=True)
+        attempts = []
+
+        async def barrier(*args):
+            attempts.append(True)
+            self.h.clock.advance(59.9)
+            raise failure
+
+        self.h.memory.verify_context = barrier
+        with self.assertRaises(Fault) as caught:
+            await self.h.core._preflight(current)
+        self.assertIs(failure, caught.exception)
+        self.assertGreater(current["source_deadline"], self.h.clock())
+        self.assertEqual(1, len(attempts))
+        self.assertEqual([], self.h.core.sender.requests)
+
+    async def live_continuation_failure(self, mode):
+        _, current = await self.live_turn()
+        continuation = self.h.core.sender.expression_context
+        attempts, continuations = [], []
+        failure = Fault(
+            "result_unknown" if mode == "unknown" else "forbidden",
+            unknown=mode == "unknown",
+            cause=dict(
+                category="fault",
+                peer="platform",
+                operation="command",
+                http_status=503 if mode == "unknown" else 403,
+            ),
+        )
+
+        async def context(*args):
+            continuations.append(True)
+            if attempts:
+                if mode == "cancelled":
+                    raise asyncio.CancelledError()
+                raise failure
+            return await continuation(*args)
+
+        async def barrier(*args):
+            attempts.append(True)
+            self.h.clock.advance(61)
+            self.assertLess(current["source_deadline"], self.h.clock())
+            raise Fault("dependency_unavailable", retryable_read=True)
+
+        self.h.core.sender.expression_context = context
+        self.h.memory.verify_context = barrier
+        with self.assertRaises(asyncio.CancelledError if mode == "cancelled" else Fault) as caught:
+            await self.h.core._preflight(current)
+        if mode != "cancelled":
+            self.assertIs(failure, caught.exception)
+            self.assertEqual(mode == "unknown", caught.exception.unknown)
+        self.assertEqual(1, len(attempts))
+        self.assertEqual(2, len(continuations))
+        self.assertEqual([], self.h.core.sender.requests)
+
+    async def test_entry_hard_expiry_denial_still_aborts_live_read_recovery(self):
+        await self.live_continuation_failure("forbidden")
+
+    async def test_unknown_live_continuation_is_not_retried_or_treated_as_authority(self):
+        await self.live_continuation_failure("unknown")
+
+    async def test_cancelled_live_continuation_stops_without_another_memory_barrier(self):
+        await self.live_continuation_failure("cancelled")
+
 
 del CoreEvidenceTests

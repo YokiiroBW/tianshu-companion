@@ -119,16 +119,20 @@ class CongestionTests(unittest.IsolatedAsyncioTestCase):
             Fault("queue_full", cause={"operation": "query", "http_status": 429}),
         ):
             self.assertIsNone(read_retry({}, error, 100, 200))
-        state = {}
         error = Fault("queue_full", retryable_read=True)
         error.retry_after_seconds = 6
-        self.assertEqual(read_retry(state, error, 100, 200), 6)
-        self.assertEqual(read_retry(state, error, 107, 200), 6)
-        self.assertIsNone(read_retry(state, error, 125, 200))
-        state = {}
-        for attempt in range(5):
-            self.assertIsNotNone(read_retry(state, Fault("queue_full"), 100 + attempt, 200))
-        self.assertIsNone(read_retry(state, Fault("queue_full"), 105, 200))
+        for source_bound in (200, None):
+            with self.subTest(source_bound=source_bound):
+                state = {}
+                self.assertEqual(read_retry(state, error, 100, source_bound), 6)
+                self.assertEqual(read_retry(state, error, 107, source_bound), 6)
+                self.assertIsNone(read_retry(state, error, 125, source_bound))
+                state = {}
+                for attempt in range(5):
+                    self.assertIsNotNone(
+                        read_retry(state, Fault("queue_full"), 100 + attempt, source_bound)
+                    )
+                self.assertIsNone(read_retry(state, Fault("queue_full"), 105, source_bound))
 
     async def test_prepare_recovery_window_bounds_running_reads(self):
         from test_delivery_v2 import source_turn
