@@ -20,6 +20,7 @@ from tianshu_companion.contracts import Fault
 
 
 SELECT = "/internal/v1/memory/select"
+IDENTITY = "/internal/v1/identity/resolve"
 QUERIES = [
     ("/internal/v1/origins/resolve", {}),
     ("/internal/v1/identity/resolve", {}),
@@ -54,6 +55,269 @@ class QueryTransportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addAsyncCleanup(service.close)
         return service
+
+    async def test_memory_reads_leave_one_shared_slot_for_identity(self):
+        release, ordinary_entered, identity_entered = (
+            asyncio.Event(),
+            asyncio.Event(),
+            asyncio.Event(),
+        )
+        seen, tasks = [], []
+        active = peak = 0
+
+        async def handler(request):
+            nonlocal active, peak
+            seen.append(request.url.path)
+            active += 1
+            peak = max(peak, active)
+            if len(seen) == 3:
+                ordinary_entered.set()
+            if request.url.path == IDENTITY:
+                identity_entered.set()
+            try:
+                await release.wait()
+                return httpx.Response(200, json={"ok": True})
+            finally:
+                active -= 1
+
+        service = self.service(handler)
+        reads = [
+            (SELECT, {}),
+            ("/internal/v2/memory/context/verify", {}),
+            ("/internal/v1/memory/candidates/process", {"job_id": "job:fixture", "output": None}),
+        ]
+        try:
+            tasks.extend(asyncio.create_task(service.call(path, body)) for path, body in reads)
+            await asyncio.wait_for(ordinary_entered.wait(), 1)
+            tasks.append(asyncio.create_task(service.call(SELECT, {})))
+            await asyncio.sleep(0)
+            tasks.append(asyncio.create_task(service.call(IDENTITY, {})))
+            await asyncio.wait_for(identity_entered.wait(), 1)
+            self.assertEqual(len(seen), 4)
+            self.assertFalse(tasks[3].done())
+            self.assertEqual(peak, 4)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(len(seen), 5)
+        self.assertEqual(peak, 4)
+
+    async def test_identity_can_borrow_all_four_slots_without_exceeding_total(self):
+        release, entered = asyncio.Event(), asyncio.Event()
+        seen, tasks = [], []
+
+        async def handler(request):
+            seen.append(request.url.path)
+            if len(seen) == 4:
+                entered.set()
+            await release.wait()
+            return httpx.Response(200, json={"ok": True})
+
+        service = self.service(handler)
+        try:
+            tasks.extend(asyncio.create_task(service.call(IDENTITY, {})) for _ in range(4))
+            await asyncio.wait_for(entered.wait(), 1)
+            tasks.append(asyncio.create_task(service.call(IDENTITY, {})))
+            tasks.append(asyncio.create_task(service.call(SELECT, {})))
+            await asyncio.sleep(0)
+            self.assertEqual(seen, [IDENTITY] * 4)
+            self.assertFalse(tasks[-1].done())
+            self.assertFalse(tasks[-2].done())
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(len(seen), 6)
+
+    async def test_other_peer_reads_keep_their_four_slots(self):
+        for path, body in (
+            ("/internal/v1/origins/resolve", {}),
+            ("/internal/v2/bot-delivery/context", {}),
+            ("/internal/v1/model-requests/model:" + "a" * 32, None),
+        ):
+            with self.subTest(path=path):
+                release, entered = asyncio.Event(), asyncio.Event()
+                seen, tasks = [], []
+
+                async def handler(request):
+                    seen.append(request)
+                    if len(seen) == 4:
+                        entered.set()
+                    await release.wait()
+                    return httpx.Response(200, json={"ok": True})
+
+                service = self.service(handler)
+                try:
+                    tasks.extend(asyncio.create_task(service.call(path, body)) for _ in range(4))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    self.assertEqual(len(seen), 4)
+                finally:
+                    release.set()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_commands_do_not_wait_for_query_capacity(self):
+        release, entered = asyncio.Event(), asyncio.Event()
+        reads, writes, tasks = [], [], []
+
+        async def handler(request):
+            if request.url.path == IDENTITY:
+                reads.append(request)
+                if len(reads) == 4:
+                    entered.set()
+                await release.wait()
+            else:
+                writes.append(request.url.path)
+            return httpx.Response(200, json={"ok": True})
+
+        service = self.service(handler)
+        paths = [
+            "/internal/v1/identity/register",
+            "/internal/v1/memory/candidates/process",
+            "/internal/v2/bot-delivery/send",
+        ]
+        try:
+            tasks.extend(asyncio.create_task(service.call(IDENTITY, {})) for _ in range(4))
+            await asyncio.wait_for(entered.wait(), 1)
+            for path in paths:
+                self.assertEqual({"ok": True}, await asyncio.wait_for(service.call(path, {}), 1))
+            self.assertEqual(writes, paths)
+            self.assertTrue(all(not task.done() for task in tasks))
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_memory_and_identity_cooldowns_are_isolated_both_ways(self):
+        for cooled, other in ((SELECT, IDENTITY), (IDENTITY, SELECT)):
+            with self.subTest(cooled=cooled):
+                seen = []
+
+                async def handler(request):
+                    seen.append(request.url.path)
+                    if request.url.path == cooled:
+                        return httpx.Response(
+                            429,
+                            json=dict(
+                                code="queue_full", execution_state="not_started", retryable=True
+                            ),
+                            headers={"Retry-After": "1"},
+                        )
+                    return httpx.Response(200, json={"ok": True})
+
+                service = self.service(handler)
+                with self.assertRaises(Fault) as caught:
+                    await service.call(cooled, {})
+                self.assertEqual(caught.exception.read_execution, "not_started")
+                self.assertGreaterEqual(caught.exception.retry_after_seconds, 0.99)
+                waiting = asyncio.create_task(service.call(cooled, {}))
+                try:
+                    await asyncio.sleep(0)
+                    self.assertEqual(
+                        {"ok": True}, await asyncio.wait_for(service.call(other, {}), 0.5)
+                    )
+                    self.assertEqual(seen, [cooled, other])
+                    self.assertFalse(waiting.done())
+                finally:
+                    waiting.cancel()
+                    await asyncio.gather(waiting, return_exceptions=True)
+
+    async def test_cooldown_extended_during_capacity_wait_releases_shared_slot(self):
+        release_identity, release_ordinary = asyncio.Event(), asyncio.Event()
+        full, fourth_identity = asyncio.Event(), asyncio.Event()
+        seen, tasks = [], []
+
+        async def handler(request):
+            body = json.loads(request.content)
+            seen.append(body["probe"])
+            if len(seen) == 4:
+                full.set()
+            if request.url.path == IDENTITY:
+                if body["probe"] == "identity:4":
+                    fourth_identity.set()
+                await release_identity.wait()
+                return httpx.Response(200, json={"ok": True})
+            await release_ordinary.wait()
+            return httpx.Response(
+                429,
+                json=dict(code="queue_full", execution_state="not_started", retryable=True),
+                headers={"Retry-After": "1"},
+            )
+
+        service = self.service(handler)
+        try:
+            tasks.extend(
+                asyncio.create_task(service.call(IDENTITY, {"probe": f"identity:{i}"}))
+                for i in range(3)
+            )
+            source = asyncio.create_task(service.call(SELECT, {"probe": "source"}))
+            tasks.append(source)
+            await asyncio.wait_for(full.wait(), 1)
+            queued = [
+                asyncio.create_task(service.call(SELECT, {"probe": f"queued:{i}"}))
+                for i in range(2)
+            ]
+            tasks.extend(queued)
+            await asyncio.sleep(0)
+            release_ordinary.set()
+            with self.assertRaises(Fault):
+                await source
+            tasks.append(asyncio.create_task(service.call(IDENTITY, {"probe": "identity:4"})))
+            await asyncio.wait_for(fourth_identity.wait(), 0.5)
+            self.assertFalse(any(probe.startswith("queued:") for probe in seen))
+            self.assertTrue(all(not task.done() for task in queued))
+        finally:
+            release_identity.set()
+            release_ordinary.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_capacity_wait_timeout_and_cancellation_do_not_leak_either_limit(self):
+        for waiting_path in (SELECT, IDENTITY):
+            with self.subTest(waiting_path=waiting_path):
+                release, full = asyncio.Event(), asyncio.Event()
+                seen, tasks = [], []
+                active = 0
+
+                async def handler(request):
+                    nonlocal active
+                    seen.append(request.url.path)
+                    active += 1
+                    if active == 4:
+                        full.set()
+                    try:
+                        await release.wait()
+                        return httpx.Response(200, json={"ok": True})
+                    finally:
+                        active -= 1
+
+                service = self.service(handler)
+                try:
+                    tasks.extend(asyncio.create_task(service.call(SELECT, {})) for _ in range(3))
+                    tasks.append(asyncio.create_task(service.call(IDENTITY, {})))
+                    await asyncio.wait_for(full.wait(), 1)
+                    service.QUERY_BUDGET_SECONDS = 0.04
+                    with self.assertRaises(Fault) as caught:
+                        await service.call(waiting_path, {})
+                    self.assertEqual(caught.exception.read_execution, "waiting")
+                    waiting = asyncio.create_task(service.call(waiting_path, {}))
+                    tasks.append(waiting)
+                    await asyncio.sleep(0)
+                    waiting.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await waiting
+                    self.assertEqual(len(seen), 4)
+                    release.set()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    # Refill all four positions after both abandoned waits.
+                    release, full = asyncio.Event(), asyncio.Event()
+                    service.QUERY_BUDGET_SECONDS = 15
+                    tasks = [asyncio.create_task(service.call(SELECT, {})) for _ in range(3)]
+                    tasks.append(asyncio.create_task(service.call(IDENTITY, {})))
+                    await asyncio.wait_for(full.wait(), 1)
+                    self.assertEqual(len(seen), 8)
+                finally:
+                    release.set()
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
     async def test_late_worker_is_not_replaced_during_peer_cooldown_or_local_wait_timeout(self):
         # The HTTP owner can stop while a separately owned peer worker lives.

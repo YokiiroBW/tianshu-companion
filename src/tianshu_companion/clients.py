@@ -6,7 +6,7 @@ import time
 import uuid
 import ssl
 import math
-from contextlib import AsyncExitStack, aclosing
+from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from datetime import datetime, timezone
@@ -150,7 +150,9 @@ class JsonService:
             raise ValueError("Internal service URL must be an explicitly configured HTTPS URL")
         self.url, self.token = url, token
         self.query_slots = asyncio.Semaphore(4)
+        self.memory_query_slots = asyncio.Semaphore(3)
         self.query_not_before = 0.0
+        self.identity_not_before = 0.0
         # A registered interface label for the runtime event stream. It is never the
         # configured URL, host or any other deployment value.
         self.label = _label(label, obs.PEER_LABELS)
@@ -302,16 +304,21 @@ class JsonService:
         headers.setdefault(
             obs.CORRELATION_HEADER, obs.current_correlation_id() or obs.new_correlation_id()
         )
+        # Classify only already-recognized reads. Other peers keep their four
+        # slots; Memory's ordinary reads leave one available for identity lookup.
+        resource = (
+            "identity"
+            if path == "/internal/v1/identity/resolve"
+            else "memory"
+            if path.startswith(
+                ("/internal/v1/memory/", "/internal/v2/memory/", "/internal/v1/relationships/")
+            )
+            else "peer"
+        )
         started = False
         try:
-            # Share the peer's capacity fairly; commands never enter this replay path.
             async with asyncio.timeout(self.QUERY_BUDGET_SECONDS):
-                async with self.query_slots:
-                    # Backpressure belongs to this peer, not just the caller
-                    # that happened to see it. Waiting consumes the same local
-                    # budget and never starts a second semantic request.
-                    while self.query_not_before > time.monotonic():
-                        await asyncio.sleep(self.query_not_before - time.monotonic())
+                async with self._query_capacity(resource):
                     started = True
                     return await self._call_once(
                         path,
@@ -325,24 +332,51 @@ class JsonService:
                 "dependency_unavailable", retryable_read=True, cause=self._cause(error, "query")
             )
             failure.read_execution = "unconfirmed" if started else "waiting"
-            self._cool_query(failure)
+            self._cool_query(failure, resource)
             raise failure from None
         except Fault as error:
-            self._cool_query(error)
+            self._cool_query(error, resource)
             raise
 
-    def _cool_query(self, error):
+    def _query_cooldown(self, resource):
+        return self.identity_not_before if resource == "identity" else self.query_not_before
+
+    @asynccontextmanager
+    async def _query_capacity(self, resource):
+        while True:
+            delay = self._query_cooldown(resource) - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+            async with AsyncExitStack() as stack:
+                # Waiting for the class limit never occupies the shared limit.
+                if resource == "memory":
+                    await stack.enter_async_context(self.memory_query_slots)
+                await stack.enter_async_context(self.query_slots)
+                # Another request may have extended this class's cooldown while
+                # we waited. Release both limits before waiting for it again.
+                if self._query_cooldown(resource) > time.monotonic():
+                    continue
+                yield
+                return
+
+    def _cool_query(self, error, resource):
         if not error.retryable_read:
             return
+        deadline = self._query_cooldown(resource)
         # A timed-out HTTP owner does not stop the peer's worker. Avoid
         # immediately adding more work while that worker actually drains.
         if getattr(error, "read_execution", None) != "waiting":
             delay = 1.0 if getattr(error, "read_execution", None) == "unconfirmed" else 0.2
             delay = max(delay, getattr(error, "retry_after_seconds", None) or 0)
-            self.query_not_before = max(self.query_not_before, time.monotonic() + delay)
+            deadline = max(deadline, time.monotonic() + delay)
+            if resource == "identity":
+                self.identity_not_before = deadline
+            else:
+                self.query_not_before = deadline
         error.retry_after_seconds = max(
             getattr(error, "retry_after_seconds", None) or 0,
-            self.query_not_before - time.monotonic(),
+            deadline - time.monotonic(),
         )
 
     @classmethod
