@@ -165,6 +165,7 @@ Return exactly one result for each target, echoing its person ID and complete or
 new_member_ids as covered_member_ids. A result with memories=[] is valid when there is nothing
 useful to retain. Never omit a person, add a target or claim coverage for different messages.
 Write useful memories about what that person said, asked, thought, agreed or experienced.
+Use at most 8 topics, 8 memories per person and 32 memories in total for the segment; retain concise, useful meaning without covering every sentence.
 Keep attribution, corrections, conditions and unfinished or unknown progress in the meaning.
 Do not turn a question, a report about another person or a BOT suggestion into the target's
 confirmed action. Topics describe this conversation; they are not identities or permissions.
