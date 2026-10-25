@@ -139,11 +139,7 @@ class ConsolidationJointBase(SourceChain):
         )
 
     def summary_output(self, material):
-        summary = "\n".join(
-            row["text"]
-            for row in material["conversation"]
-            if row["role"] == "user" and row["purpose"] == "new"
-        )
+        summary = "\n".join(row["text"] for row in material["subject_messages"])
         portrait = None
         if material["portrait_input"] is not None:
             portrait = "\n".join(

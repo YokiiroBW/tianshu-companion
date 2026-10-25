@@ -62,6 +62,41 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.h.core.store.put("turns", turn)
 
+    def projected_members(self, material):
+        """Reconstruct the supplied member order without duplicating reply text."""
+        members = []
+        for row in [*material["subject_messages"], *material["conversation_context"]]:
+            if row["role"] == "user":
+                members.append(row)
+                continue
+            offset = 0
+            for fragment in row["provided_fragments"]:
+                end = offset + fragment["text_length"]
+                members.append(
+                    dict(
+                        fragment,
+                        role=row["role"],
+                        speaker=row["speaker"],
+                        turn_id=row["turn_id"],
+                        turn_sequence=row["turn_sequence"],
+                        text=row["text"][offset:end],
+                    )
+                )
+                offset = end
+            self.assertEqual(len(row["text"]), offset)
+        return sorted(members, key=lambda row: row["position"])
+
+    def assert_projection_matches_window(self, material, window):
+        self.assertNotIn("conversation", material)
+        projected = self.projected_members(material)
+        original = window["manifest"]["members"]
+        self.assertEqual(list(range(len(original))), [row["position"] for row in projected])
+        texts = {row["member_id"]: row["text"] for row in window["members"]}
+        for actual, expected in zip(projected, original, strict=True):
+            for key in ("member_id", "turn_id", "turn_sequence", "speaker", "observed_at", "role"):
+                self.assertEqual(expected[key], actual[key])
+            self.assertEqual(texts[expected["member_id"]], actual["text"])
+
     async def test_group_window_preserves_speakers_bot_and_later_correction(self):
         first = await self.chat("我周六想去看看", group=True, channel="group:window")
         other = await self.chat("我可能周日去", account="b", group=True, channel="group:window")
@@ -76,16 +111,18 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(row["role"] == "assistant" for row in members))
         self.assertEqual("valid", self.check(window)["state"])
         prompt = json.loads(messages(self.h.contracts, window, None)[1]["content"])
+        self.assert_projection_matches_window(prompt, window)
         self.assertEqual(
-            [row["speaker"] for row in members], [row["speaker"] for row in prompt["conversation"]]
+            [row["speaker"] for row in members],
+            [row["speaker"] for row in self.projected_members(prompt)],
         )
-        new_human = [
-            row
-            for row in prompt["conversation"]
-            if row["role"] == "user" and row["purpose"] == "new"
-        ]
+        new_human = prompt["subject_messages"]
         self.assertEqual(1, len(new_human))
         self.assertIn("刚才只是设想", new_human[0]["text"])
+        self.assertEqual(
+            [first["id"], other["id"]],
+            [row["turn_id"] for row in prompt["conversation_context"] if row["role"] == "user"],
+        )
 
     async def test_append_does_not_replace_or_invalidate_captured_members(self):
         first = await self.chat()
@@ -133,7 +170,12 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(last["scope"], {key: material["subject"][key] for key in last["scope"]})
         self.assertEqual(last["bundle"]["collection_key"]["author"], material["subject"]["account"])
         self.assertTrue(material["subject"]["new_member_ids"])
-        for member in material["conversation"]:
+        self.assert_projection_matches_window(material, window)
+        self.assertEqual(
+            material["subject"]["new_member_ids"],
+            [member["member_id"] for member in material["subject_messages"]],
+        )
+        for member in [*material["subject_messages"], *material["conversation_context"]]:
             expected = (
                 "subject"
                 if member["role"] == "user"
@@ -142,7 +184,9 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(expected, member["relation_to_subject"])
         earlier_owner = next(
-            row for row in material["conversation"] if row["member_id"] == human["member_id"]
+            row
+            for row in material["conversation_context"]
+            if row.get("member_id") == human["member_id"]
         )
         self.assertEqual(
             ("context", "subject"), (earlier_owner["purpose"], earlier_owner["relation_to_subject"])
@@ -152,6 +196,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
             [row["text"] for row in material["portrait_input"]["summaries"][0]["subject_material"]],
         )
         self.assertNotIn("text", material["portrait_input"]["summaries"][0])
+        self.assertEqual(portrait, material["portrait_input"])
         for level in ("portrait", "summary", "member", "refs", "size"):
             with self.subTest(level=level):
                 wrong = copy.deepcopy(portrait)
@@ -173,6 +218,80 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
                     )
                 with self.assertRaises(Fault):
                     messages(self.h.contracts, window, wrong)
+
+    async def test_model_projection_combines_exact_provided_consecutive_reply_fragments(self):
+        self.h.gateway.segments = ["第一段\n", " 第二段", "。\n"]
+        last = await self.chat("本轮的问题")
+        self.allow_empty_memory_provenance()
+        window = self.h.core.summary_windows.read([last["id"]])
+        original = copy.deepcopy(window)
+        self.assertEqual("valid", self.check(window)["state"])
+        material = json.loads(messages(self.h.contracts, window, None)[1]["content"])
+        self.assert_projection_matches_window(material, window)
+        self.assertEqual(original, window)
+        self.assertEqual(1, len(material["subject_messages"]))
+        self.assertEqual(1, len(material["conversation_context"]))
+        combined = material["conversation_context"][0]
+        self.assertEqual("".join(self.h.gateway.segments), combined["text"])
+        originals = [
+            member for member in window["manifest"]["members"] if member["role"] == "assistant"
+        ]
+        self.assertEqual(
+            [member["reference"]["segment_sequence"] for member in originals],
+            [fragment["segment_sequence"] for fragment in combined["provided_fragments"]],
+        )
+        self.assertEqual(last["result_version"], combined["result_version"])
+        self.assertEqual(
+            [len(text) for text in self.h.gateway.segments],
+            [fragment["text_length"] for fragment in combined["provided_fragments"]],
+        )
+
+    async def test_model_projection_never_joins_across_member_or_reply_identity_boundaries(self):
+        last = await self.chat("本轮的问题")
+        self.allow_empty_memory_provenance()
+        window = self.h.core.summary_windows.read([last["id"]])
+        self.assertEqual("valid", self.check(window)["state"])
+        self.assertEqual(
+            ["user", "assistant", "assistant"],
+            [row["role"] for row in window["manifest"]["members"]],
+        )
+        # Mutate projection-only copies to isolate every join boundary. These
+        # copies do not stand in for an owner-authorized window/check result.
+        for change in (
+            "turn",
+            "actor",
+            "result_version",
+            "segment_gap",
+            "context_human",
+            "new_human",
+        ):
+            with self.subTest(change=change):
+                separate = copy.deepcopy(window)
+                members = separate["manifest"]["members"]
+                if change == "turn":
+                    members[2]["turn_id"] = "turn:other"
+                elif change == "actor":
+                    members[2]["speaker"]["actor_id"] = "actor:other"
+                elif change == "result_version":
+                    members[2]["reference"]["result_version"] += 1
+                elif change == "segment_gap":
+                    members[2]["reference"]["segment_sequence"] += 1
+                elif change == "context_human":
+                    human = copy.deepcopy(members[0])
+                    human.update(member_id="input:intervening", purpose="context")
+                    members.insert(2, human)
+                    separate["members"].append(
+                        dict(member_id=human["member_id"], text="之前的本人发言")
+                    )
+                else:
+                    members[:] = [members[1], members[0], members[2]]
+                material = json.loads(messages(self.h.contracts, separate, None)[1]["content"])
+                bots = [
+                    row for row in material["conversation_context"] if row["role"] == "assistant"
+                ]
+                self.assertEqual(2, len(bots))
+                self.assertTrue(all(len(row["provided_fragments"]) == 1 for row in bots))
+                self.assert_projection_matches_window(material, separate)
 
     async def test_window_check_reuses_reconstruction_only_inside_one_call(self):
         await self.chat()
@@ -592,8 +711,12 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
             [row["output"]["summary"] if row["output"] else None for row in self.calls],
         )
         material = json.loads(self.generated[1][1]["content"])
-        self.assertEqual(1, sum(row["purpose"] == "new" for row in material["conversation"]))
-        self.assertTrue(any(row["purpose"] == "context" for row in material["conversation"]))
+        self.assertEqual(1, len(material["subject_messages"]))
+        self.assertTrue(all(row["purpose"] == "new" for row in material["subject_messages"]))
+        self.assertTrue(
+            any(row["purpose"] == "context" for row in material["conversation_context"])
+        )
+        self.assertNotIn("conversation", material)
         self.assertNotIn("source_hints", material)
         self.assertTrue(all(row["cursor"]["job_ids"] == [row["job_id"]] for row in tasks))
         self.assertNotEqual(tasks[0]["cursor"], tasks[1]["cursor"])
