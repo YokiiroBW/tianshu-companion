@@ -12,6 +12,15 @@ from .life_read_index import create_page_index, prepare_page_index
 from . import work_index
 from .payload_files import PayloadFiles
 
+
+def _exact_scope_filter(scope):
+    keys = ("actor_id", "person_id", "audience", "conversation_id")
+    return (
+        " AND ".join(f"json_extract(body,'$.scope.{key}')=?" for key in keys),
+        tuple(scope[key] for key in keys),
+    )
+
+
 LIFE_TABLES = {
     "life_worlds",
     "life_rooms",
@@ -747,7 +756,7 @@ class Store:
         )
         return [json.loads(row[0])["source"] for row in rows][::-1]
 
-    def recent_turns(self, conversation_id, before_sequence, limit):
+    def recent_turns(self, conversation_id, before_sequence, limit, *, scope=None):
         # This is the short-context reader, not a full turn export. A completed
         # row also contains provider/checkpoint/retry material which no history
         # candidate uses. Keep it persisted and load full rows only for selected
@@ -771,11 +780,13 @@ class Store:
             "short_context",
         )
         paths = ",".join("'$." + field + "'" for field in fields)
-        rows = self.db.execute(
-            f"SELECT json_extract(body,{paths}) FROM turns WHERE conversation_id=? AND position<? "
-            "ORDER BY position DESC LIMIT ?",
-            (conversation_id, before_sequence, limit),
-        )
+        sql = f"SELECT json_extract(body,{paths}) FROM turns WHERE conversation_id=? AND position<?"
+        parameters = (conversation_id, before_sequence)
+        if scope is not None:
+            predicate, values = _exact_scope_filter(scope)
+            sql += " AND " + predicate
+            parameters += values
+        rows = self.db.execute(sql + " ORDER BY position DESC LIMIT ?", (*parameters, limit))
         return [dict(zip(fields, json.loads(row[0]), strict=True)) for row in rows]
 
     def previous_scope_turn(self, scope, before_sequence):
@@ -784,19 +795,13 @@ class Store:
         Filtering on validity here would silently substitute an older plan when
         the actual preceding result is revoked, failed or still being delivered.
         """
+        predicate, values = _exact_scope_filter(scope)
         row = self.db.execute(
-            "SELECT body FROM turns WHERE conversation_id=? "
-            "AND json_extract(body,'$.scope.actor_id')=? "
-            "AND json_extract(body,'$.scope.person_id')=? "
-            "AND json_extract(body,'$.scope.audience')=? "
-            "AND json_extract(body,'$.scope.conversation_id')=? "
+            f"SELECT body FROM turns WHERE conversation_id=? AND {predicate} "
             "AND position<? ORDER BY position DESC LIMIT 1",
             (
                 scope["conversation_id"],
-                scope["actor_id"],
-                scope["person_id"],
-                scope["audience"],
-                scope["conversation_id"],
+                *values,
                 before_sequence,
             ),
         ).fetchone()

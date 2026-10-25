@@ -165,7 +165,7 @@ class SummaryWindows:
         # reply whose inherited closure cannot fit is optional context only.
         return None if any(len(values) > 64 for values in result.values()) else result
 
-    def _members(self, turn, purpose, *, turns):
+    def _input_members(self, turn, purpose):
         common = dict(
             turn_id=turn["id"],
             turn_sequence=turn["sequence"],
@@ -198,9 +198,20 @@ class SummaryWindows:
                     text,
                 )
             )
+        return values
+
+    def _members(self, turn, purpose, *, turns):
+        """Reconstruct complete members still required by older frozen windows."""
+        values = self._input_members(turn, purpose)
         dependencies = self._reply_dependencies(turn, turns)
         if dependencies is None or turn["result_version"] < 1:
             return values
+        common = dict(
+            turn_id=turn["id"],
+            turn_sequence=turn["sequence"],
+            source_scope=copy.deepcopy(turn["scope"]),
+            binding_version=turn["binding_version"],
+        )
         for reply in self.store.replies_for_turns([turn["id"]], "sent")[turn["id"]]:
             receipt = reply.get("receipt")
             if not receipt or receipt["state"] != "sent" or not receipt.get("channel_message_ids"):
@@ -230,6 +241,7 @@ class SummaryWindows:
         return values
 
     def read(self, new_turn_ids, *, max_bytes=MAX_REQUEST_BYTES):
+        """Capture complete new inputs and bounded same-scope human history."""
         if not 1 <= len(new_turn_ids) <= MAX_NEW_TURNS or len(set(new_turn_ids)) != len(
             new_turn_ids
         ):
@@ -247,7 +259,7 @@ class SummaryWindows:
                 raise Fault("scope_changed")
             self._current(turn, scope, channel)
         recent = self.store.recent_turns(
-            anchor["conversation_id"], anchor["sequence"] + 1, MAX_TURNS + 1
+            anchor["conversation_id"], anchor["sequence"] + 1, MAX_TURNS + 1, scope=scope
         )
         selected = {turn["id"]: turn for turn in fresh}
         omitted = len(recent) > MAX_TURNS
@@ -279,23 +291,8 @@ class SummaryWindows:
             reverse=True,
         )
         for turn in ordered:
-            members = self._members(
-                turn, "new" if turn["id"] in new_turn_ids else "context", turns=selected
-            )
-            if (
-                self._reply_dependencies(turn, selected) is None
-                and self.store.replies_for_turns([turn["id"]], "sent")[turn["id"]]
-            ):
-                omitted = True
+            members = self._input_members(turn, "new" if turn["id"] in new_turn_ids else "context")
             added = sum(len(text.encode("utf-8")) for _, text in members)
-            if turn["id"] in new_turn_ids and (
-                count + len(members) > MAX_MEMBERS or size + added > MAX_TEXT_BYTES
-            ):
-                # BOT context is optional, including replies to a new input.
-                # The complete new human text can never be silently dropped.
-                members = [pair for pair in members if pair[0]["role"] == "user"]
-                added = sum(len(text.encode("utf-8")) for _, text in members)
-                omitted = True
             if count + len(members) > MAX_MEMBERS or size + added > MAX_TEXT_BYTES:
                 if turn["id"] in new_turn_ids:
                     raise Fault("budget_exceeded")
@@ -305,17 +302,6 @@ class SummaryWindows:
             count, size = count + len(members), size + added
 
         def package():
-            nonlocal omitted
-            # A dropped context group cannot remain a hidden prerequisite of
-            # a BOT reply, including a group omitted by the wire-byte budget.
-            included = {identity: selected[identity] for identity in groups}
-            for identity, members in groups.items():
-                if (
-                    any(pair[0]["role"] == "assistant" for pair in members)
-                    and self._reply_dependencies(selected[identity], included) is None
-                ):
-                    groups[identity] = [pair for pair in members if pair[0]["role"] == "user"]
-                    omitted = True
             pairs = [
                 pair
                 for turn in sorted(selected.values(), key=lambda turn: turn["sequence"])
@@ -346,24 +332,11 @@ class SummaryWindows:
             len(canonical(window).encode("utf-8")) > min(MAX_REQUEST_BYTES, max_bytes)
             or source_upper_bound(window["manifest"]) > MAX_SOURCES
         ):
-            # The request includes exact dependency arrays as well as text.
-            # Omit optional context whole; never trim a covered new input.
-            assistants = next(
-                (
-                    identity
-                    for identity, members in groups.items()
-                    if any(pair[0]["role"] == "assistant" for pair in members)
-                ),
-                None,
-            )
+            # Omit optional owner history whole; never trim a new input.
             older = next(
                 (identity for identity in reversed(groups) if identity not in new_turn_ids), None
             )
-            if assistants is not None:
-                groups[assistants] = [
-                    pair for pair in groups[assistants] if pair[0]["role"] == "user"
-                ]
-            elif older is not None:
+            if older is not None:
                 del groups[older]
             else:
                 raise Fault("budget_exceeded")
@@ -460,6 +433,9 @@ class SummaryWindows:
         # window check. A multi-segment BOT reply otherwise repeats the same
         # recursive dependency and sent-reply reads for every member.
         validated, captured_members = set(), {}
+        reply_turn_ids = {
+            member["turn_id"] for member in manifest["members"] if member["role"] == "assistant"
+        }
 
         def current(turn):
             if turn is None or turn["id"] not in validated:
@@ -469,8 +445,11 @@ class SummaryWindows:
         def members(turn):
             identity = turn["id"]
             if identity not in captured_members:
-                captured_members[identity] = self._members(
-                    turn, "new" if identity in new_ids else "context", turns=turns
+                purpose = "new" if identity in new_ids else "context"
+                captured_members[identity] = (
+                    self._members(turn, purpose, turns=turns)
+                    if identity in reply_turn_ids
+                    else self._input_members(turn, purpose)
                 )
             return captured_members[identity]
 

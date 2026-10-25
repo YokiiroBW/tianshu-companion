@@ -22,6 +22,41 @@ from tianshu_companion.runtime_capabilities import read_capabilities
 from tianshu_companion.summary_windows import sent_digest
 
 
+def legacy_window(h, turn, turns=None):
+    """Use the real compatibility builder for a previously capturable full window."""
+    windows = h.core.summary_windows
+    window = windows.read([turn["id"]])
+    if turns is None:
+        turns = [
+            row
+            for row in h.turns()
+            if all(
+                row["scope"][key] == turn["scope"][key]
+                for key in ("actor_id", "audience", "conversation_id")
+            )
+        ]
+    current = {row["id"]: h.core.store.get("turns", row["id"]) for row in turns}
+    pairs = [
+        pair
+        for row in sorted(current.values(), key=lambda row: row["sequence"])
+        for pair in windows._members(
+            row, "new" if row["id"] == turn["id"] else "context", turns=current
+        )
+    ]
+    manifest = window["manifest"]
+    manifest["members"] = [member for member, _ in pairs]
+    manifest["window_id"] = digest(
+        {key: value for key, value in manifest.items() if key != "window_id"}
+    )
+    window["members"] = [dict(member_id=member["member_id"], text=value) for member, value in pairs]
+    checked = windows.check(
+        "memory", dict(schema_version=1, request_id="legacy-window:check", manifest=manifest)
+    )
+    if checked["state"] != "valid":
+        raise AssertionError("Real compatibility reconstruction did not validate")
+    return window
+
+
 class WindowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -62,40 +97,41 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.h.core.store.put("turns", turn)
 
-    def projected_members(self, material):
-        """Reconstruct the supplied member order without duplicating reply text."""
-        members = []
-        for row in [*material["subject_messages"], *material["conversation_context"]]:
-            if row["role"] == "user":
-                members.append(row)
-                continue
-            offset = 0
-            for fragment in row["provided_fragments"]:
-                end = offset + fragment["text_length"]
-                members.append(
-                    dict(
-                        fragment,
-                        role=row["role"],
-                        speaker=row["speaker"],
-                        turn_id=row["turn_id"],
-                        turn_sequence=row["turn_sequence"],
-                        text=row["text"][offset:end],
-                    )
-                )
-                offset = end
-            self.assertEqual(len(row["text"]), offset)
-        return sorted(members, key=lambda row: row["position"])
-
     def assert_projection_matches_window(self, material, window):
         self.assertNotIn("conversation", material)
-        projected = self.projected_members(material)
-        original = window["manifest"]["members"]
-        self.assertEqual(list(range(len(original))), [row["position"] for row in projected])
+        self.assertNotIn("conversation_context", material)
+        subject = window["manifest"]["scope"]
+        original = [
+            (position, member)
+            for position, member in enumerate(window["manifest"]["members"])
+            if member["role"] == "user"
+            and member["speaker"]["person_id"] == subject["person_id"]
+            and member["source_scope"] == subject
+        ]
+        projected = sorted(
+            [*material["subject_messages"], *material["subject_history"]],
+            key=lambda member: member["position"],
+        )
+        self.assertEqual(
+            [position for position, _ in original], [member["position"] for member in projected]
+        )
         texts = {row["member_id"]: row["text"] for row in window["members"]}
-        for actual, expected in zip(projected, original, strict=True):
-            for key in ("member_id", "turn_id", "turn_sequence", "speaker", "observed_at", "role"):
+        for actual, (_, expected) in zip(projected, original, strict=True):
+            for key in (
+                "member_id",
+                "turn_id",
+                "turn_sequence",
+                "speaker",
+                "observed_at",
+                "role",
+                "purpose",
+            ):
                 self.assertEqual(expected[key], actual[key])
             self.assertEqual(texts[expected["member_id"]], actual["text"])
+        self.assertTrue(all(member["purpose"] == "new" for member in material["subject_messages"]))
+        self.assertTrue(
+            all(member["purpose"] == "context" for member in material["subject_history"])
+        )
 
     async def test_group_window_preserves_speakers_bot_and_later_correction(self):
         first = await self.chat("我周六想去看看", group=True, channel="group:window")
@@ -105,23 +141,28 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         window = self.h.core.summary_windows.read([last["id"]])
         members = window["manifest"]["members"]
         people = [row for row in members if row["role"] == "user"]
-        self.assertEqual([first["id"], other["id"], last["id"]], [row["turn_id"] for row in people])
-        self.assertNotEqual(people[0]["speaker"], people[1]["speaker"])
-        self.assertEqual(["context", "context", "new"], [row["purpose"] for row in people])
-        self.assertTrue(any(row["role"] == "assistant" for row in members))
+        self.assertEqual([first["id"], last["id"]], [row["turn_id"] for row in people])
+        self.assertEqual(["context", "new"], [row["purpose"] for row in people])
+        self.assertTrue(all(row["role"] == "user" for row in members))
+        legacy = legacy_window(self.h, last, [first, other, last])
+        self.assertTrue(any(row["role"] == "assistant" for row in legacy["manifest"]["members"]))
+        self.assertTrue(
+            any(row["source_scope"] == other["scope"] for row in legacy["manifest"]["members"])
+        )
+        old_model = json.loads(messages(self.h.contracts, legacy, None)[1]["content"])
+        self.assert_projection_matches_window(old_model, legacy)
         self.assertEqual("valid", self.check(window)["state"])
+        original = copy.deepcopy(window)
         prompt = json.loads(messages(self.h.contracts, window, None)[1]["content"])
         self.assert_projection_matches_window(prompt, window)
-        self.assertEqual(
-            [row["speaker"] for row in members],
-            [row["speaker"] for row in self.projected_members(prompt)],
-        )
+        self.assertEqual(original, window)
+        self.assertEqual(window["manifest"]["coverage"], prompt["coverage"])
         new_human = prompt["subject_messages"]
         self.assertEqual(1, len(new_human))
         self.assertIn("刚才只是设想", new_human[0]["text"])
         self.assertEqual(
-            [first["id"], other["id"]],
-            [row["turn_id"] for row in prompt["conversation_context"] if row["role"] == "user"],
+            [first["id"]],
+            [row["turn_id"] for row in prompt["subject_history"]],
         )
 
     async def test_append_does_not_replace_or_invalidate_captured_members(self):
@@ -164,8 +205,9 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 )
             ],
-            current_text="",
+            current_text="旧版画像的解释，不应反馈为原始依据。",
         )
+        original_window, original_portrait = copy.deepcopy(window), copy.deepcopy(portrait)
         material = json.loads(messages(self.h.contracts, window, portrait)[1]["content"])
         self.assertEqual(last["scope"], {key: material["subject"][key] for key in last["scope"]})
         self.assertEqual(last["bundle"]["collection_key"]["author"], material["subject"]["account"])
@@ -175,29 +217,21 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
             material["subject"]["new_member_ids"],
             [member["member_id"] for member in material["subject_messages"]],
         )
-        for member in [*material["subject_messages"], *material["conversation_context"]]:
-            expected = (
-                "subject"
-                if member["role"] == "user"
-                and member["speaker"]["person_id"] == last["scope"]["person_id"]
-                else "context"
-            )
-            self.assertEqual(expected, member["relation_to_subject"])
+        for member in [*material["subject_messages"], *material["subject_history"]]:
+            self.assertEqual("subject", member["relation_to_subject"])
         earlier_owner = next(
-            row
-            for row in material["conversation_context"]
-            if row.get("member_id") == human["member_id"]
+            row for row in material["subject_history"] if row["member_id"] == human["member_id"]
         )
-        self.assertEqual(
-            ("context", "subject"), (earlier_owner["purpose"], earlier_owner["relation_to_subject"])
-        )
+        self.assertEqual("context", earlier_owner["purpose"])
         self.assertEqual(
             [text],
             [row["text"] for row in material["portrait_input"]["summaries"][0]["subject_material"]],
         )
         self.assertNotIn("text", material["portrait_input"]["summaries"][0])
-        self.assertEqual(portrait, material["portrait_input"])
-        for level in ("portrait", "summary", "member", "refs", "size"):
+        self.assertEqual(dict(portrait, current_text=""), material["portrait_input"])
+        self.assertEqual(original_portrait, portrait)
+        self.assertEqual(original_window, window)
+        for level in ("portrait", "summary", "member", "refs", "size", "schema"):
             with self.subTest(level=level):
                 wrong = copy.deepcopy(portrait)
                 if level == "portrait":
@@ -210,95 +244,92 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
                     )
                 elif level == "refs":
                     wrong["summary_refs"][0]["record_id"] = "record:other"
-                else:
+                elif level == "size":
                     raw = wrong["summaries"][0]["subject_material"][0]
                     raw["text"] = "甲" * 3001
                     wrong["summaries"][0]["subject_material"].append(
                         dict(raw, member_id="input:more")
                     )
+                else:
+                    wrong["current_text"] = []
                 with self.assertRaises(Fault):
                     messages(self.h.contracts, window, wrong)
 
-    async def test_model_projection_combines_exact_provided_consecutive_reply_fragments(self):
-        self.h.gateway.segments = ["第一段\n", " 第二段", "。\n"]
-        last = await self.chat("本轮的问题")
+    async def test_owner_history_keeps_original_unicode_and_linked_account_identity(self):
+        first_text = "我之前说‘🍋’还没决定。\n原话不改。"
+        first = await self.chat(first_text, group=True, channel="group:accounts")
+        # The existing identity port double explicitly links both real input
+        # accounts to one person. Core still builds and checks the full window.
+        self.h.memory.accounts[
+            tuple(sorted(dict(namespace="qq", immutable_account_id="b").items()))
+        ] = first["scope"]["person_id"]
+        last = await self.chat(
+            "后来想了想，仍没确定。🪶", account="b", group=True, channel="group:accounts"
+        )
         self.allow_empty_memory_provenance()
         window = self.h.core.summary_windows.read([last["id"]])
-        original = copy.deepcopy(window)
         self.assertEqual("valid", self.check(window)["state"])
+        original = copy.deepcopy(window)
         material = json.loads(messages(self.h.contracts, window, None)[1]["content"])
         self.assert_projection_matches_window(material, window)
+        history = material["subject_history"]
+        self.assertEqual(1, len(history))
+        self.assertEqual(first_text, history[0]["text"])
+        self.assertNotEqual(material["subject"]["account"], history[0]["speaker"]["account"])
+        self.assertEqual(material["subject"]["person_id"], history[0]["speaker"]["person_id"])
+        self.assertIsNone(material["portrait_input"])
         self.assertEqual(original, window)
-        self.assertEqual(1, len(material["subject_messages"]))
-        self.assertEqual(1, len(material["conversation_context"]))
-        combined = material["conversation_context"][0]
-        self.assertEqual("".join(self.h.gateway.segments), combined["text"])
-        originals = [
-            member for member in window["manifest"]["members"] if member["role"] == "assistant"
-        ]
-        self.assertEqual(
-            [member["reference"]["segment_sequence"] for member in originals],
-            [fragment["segment_sequence"] for fragment in combined["provided_fragments"]],
-        )
-        self.assertEqual(last["result_version"], combined["result_version"])
-        self.assertEqual(
-            [len(text) for text in self.h.gateway.segments],
-            [fragment["text_length"] for fragment in combined["provided_fragments"]],
+        self.assertEqual(1, material["subject_messages"][0]["position"])
+        legacy = legacy_window(self.h, last, [first, last])
+        old_model = json.loads(messages(self.h.contracts, legacy, None)[1]["content"])
+        self.assert_projection_matches_window(old_model, legacy)
+        self.assertGreater(
+            old_model["subject_messages"][0]["position"],
+            old_model["subject_history"][0]["position"] + 1,
         )
 
-    async def test_model_projection_never_joins_across_member_or_reply_identity_boundaries(self):
-        last = await self.chat("本轮的问题")
+    async def test_model_history_does_not_cross_the_original_exact_source_scope(self):
+        first = await self.chat("之前的本人原话")
+        last = await self.chat("本轮的本人原话")
         self.allow_empty_memory_provenance()
         window = self.h.core.summary_windows.read([last["id"]])
         self.assertEqual("valid", self.check(window)["state"])
-        self.assertEqual(
-            ["user", "assistant", "assistant"],
-            [row["role"] for row in window["manifest"]["members"]],
-        )
-        # Mutate projection-only copies to isolate every join boundary. These
-        # copies do not stand in for an owner-authorized window/check result.
-        for change in (
-            "turn",
-            "actor",
-            "result_version",
-            "segment_gap",
-            "context_human",
-            "new_human",
+        # Projection-only copies isolate scope filtering; they are not claimed
+        # to pass the real owner check above after their metadata is altered.
+        for key, value in (
+            ("actor_id", "actor:other"),
+            ("person_id", "person:other"),
+            ("audience", "group"),
+            ("conversation_id", "conv:other"),
         ):
-            with self.subTest(change=change):
-                separate = copy.deepcopy(window)
-                members = separate["manifest"]["members"]
-                if change == "turn":
-                    members[2]["turn_id"] = "turn:other"
-                elif change == "actor":
-                    members[2]["speaker"]["actor_id"] = "actor:other"
-                elif change == "result_version":
-                    members[2]["reference"]["result_version"] += 1
-                elif change == "segment_gap":
-                    members[2]["reference"]["segment_sequence"] += 1
-                elif change == "context_human":
-                    human = copy.deepcopy(members[0])
-                    human.update(member_id="input:intervening", purpose="context")
-                    members.insert(2, human)
-                    separate["members"].append(
-                        dict(member_id=human["member_id"], text="之前的本人发言")
-                    )
-                else:
-                    members[:] = [members[1], members[0], members[2]]
-                material = json.loads(messages(self.h.contracts, separate, None)[1]["content"])
-                bots = [
-                    row for row in material["conversation_context"] if row["role"] == "assistant"
-                ]
-                self.assertEqual(2, len(bots))
-                self.assertTrue(all(len(row["provided_fragments"]) == 1 for row in bots))
-                self.assert_projection_matches_window(material, separate)
+            with self.subTest(key=key):
+                changed = copy.deepcopy(window)
+                human = next(
+                    member
+                    for member in changed["manifest"]["members"]
+                    if member["role"] == "user" and member["turn_id"] == first["id"]
+                )
+                human["source_scope"][key] = value
+                material = json.loads(messages(self.h.contracts, changed, None)[1]["content"])
+                self.assertEqual([], material["subject_history"])
+                self.assertEqual(
+                    [last["id"]], [member["turn_id"] for member in material["subject_messages"]]
+                )
+                new_human = next(
+                    member
+                    for member in changed["manifest"]["members"]
+                    if member["role"] == "user" and member["purpose"] == "new"
+                )
+                new_human["source_scope"][key] = value
+                with self.assertRaises(Fault):
+                    messages(self.h.contracts, changed, None)
 
     async def test_window_check_reuses_reconstruction_only_inside_one_call(self):
         await self.chat()
         last = await self.chat("补充一句")
         self.allow_empty_memory_provenance()
         windows = self.h.core.summary_windows
-        window = windows.read([last["id"]])
+        window = legacy_window(self.h, last)
         count = len({member["turn_id"] for member in window["manifest"]["members"]})
         with (
             patch.object(windows, "_current", wraps=windows._current) as current,
@@ -354,18 +385,18 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertEqual("invalid", checked["state"])
 
-    async def test_old_bot_without_provenance_is_omitted_but_human_remains(self):
+    async def test_new_capture_does_not_require_old_bot_provenance(self):
         turn = await self.chat()
         window = self.h.core.summary_windows.read([turn["id"]])
         self.assertEqual(["user"], [row["role"] for row in window["manifest"]["members"]])
         self.assertIn("我周六想去看看", window["members"][0]["text"])
-        self.assertFalse(window["manifest"]["coverage"]["complete"])
+        self.assertTrue(window["manifest"]["coverage"]["complete"])
 
     async def test_bot_context_cannot_be_separated_from_its_complete_human_input(self):
         first = await self.chat()
         last = await self.chat("还没决定")
         self.allow_empty_memory_provenance()
-        window = self.h.core.summary_windows.read([last["id"]])
+        window = legacy_window(self.h, last)
         manifest = window["manifest"]
         self.assertTrue(
             any(
@@ -384,7 +415,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
     async def test_sent_receipt_poll_metadata_does_not_change_stable_reference(self):
         turn = await self.chat()
         self.allow_empty_memory_provenance()
-        window = self.h.core.summary_windows.read([turn["id"]])
+        window = legacy_window(self.h, turn)
         reply = self.h.core.store.turn_replies(turn["id"])[0]
         original = sent_digest(reply)
         reply["receipt"].update(observed_at="2026-10-24T01:00:00Z", attempt_id="attempt:later-poll")
@@ -417,15 +448,15 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
             episode_dependencies=[episode], source_dependencies=[source]
         )
         self.h.core.store.put("turns", turn)
-        window = self.h.core.summary_windows.read([turn["id"]])
+        window = legacy_window(self.h, turn)
         bot = next(row for row in window["manifest"]["members"] if row["role"] == "assistant")
         self.assertEqual([episode], bot["memory_dependencies"]["episode_dependencies"])
         source["owner_scope"]["conversation_id"] = "conversation:another-private"
         self.h.core.store.put("turns", turn)
-        private = self.h.core.summary_windows.read([turn["id"]])
+        private = legacy_window(self.h, turn)
         self.assertEqual(["user"], [row["role"] for row in private["manifest"]["members"]])
 
-    async def test_source_union_limit_omits_bot_and_preserves_complete_new_human(self):
+    async def test_new_capture_ignores_unused_bot_source_dependencies(self):
         turn = await self.chat()
         self.allow_empty_memory_provenance()
         fixture = next(
@@ -449,7 +480,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         window = self.h.core.summary_windows.read([turn["id"]])
         self.assertEqual(["user"], [row["role"] for row in window["manifest"]["members"]])
         self.assertEqual("我周六想去看看", window["members"][0]["text"])
-        self.assertFalse(window["manifest"]["coverage"]["complete"])
+        self.assertTrue(window["manifest"]["coverage"]["complete"])
         self.assertEqual("valid", self.check(window)["state"])
 
     def source_dependencies(self, turn, start, count):
@@ -478,7 +509,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
                     turn, 0, count
                 )
                 self.h.core.store.put("turns", turn)
-                window = self.h.core.summary_windows.read([turn["id"]])
+                window = legacy_window(self.h, turn)
                 bots = [row for row in window["manifest"]["members"] if row["role"] == "assistant"]
                 self.assertEqual(count == 64, bool(bots))
                 if bots:
@@ -487,8 +518,6 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertEqual("我周六想去看看", window["members"][0]["text"])
                 self.assertEqual("valid", self.check(window)["state"])
-                if count == 65:
-                    self.assertFalse(window["manifest"]["coverage"]["complete"])
 
     async def test_inherited_reply_dependencies_are_bounded_after_complete_deduplication(self):
         first = await self.chat()
@@ -506,7 +535,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
                     last, start, count
                 )
                 self.h.core.store.put("turns", last)
-                window = self.h.core.summary_windows.read([last["id"]])
+                window = legacy_window(self.h, last)
                 bots = [
                     row
                     for row in window["manifest"]["members"]
@@ -525,7 +554,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         first = await self.chat()
         last = await self.chat("刚才还没决定")
         self.allow_empty_memory_provenance()
-        window = self.h.core.summary_windows.read([last["id"]])
+        window = legacy_window(self.h, last)
         invalid = next(
             row["member_id"]
             for row in window["manifest"]["members"]
@@ -542,13 +571,84 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_new_turn_bot_keeps_its_new_human_and_does_not_refill(self):
         turn = await self.chat()
         self.allow_empty_memory_provenance()
-        window = self.h.core.summary_windows.read([turn["id"]])
+        window = legacy_window(self.h, turn)
         invalid = next(
             row["member_id"] for row in window["manifest"]["members"] if row["role"] == "assistant"
         )
         reduced = self.h.core.summary_windows.without_context(window, [invalid])
         self.assertEqual(["user"], [row["role"] for row in reduced["manifest"]["members"]])
         self.assertEqual("我周六想去看看", reduced["members"][0]["text"])
+
+    async def test_owner_history_is_filtered_before_the_original_candidate_limit(self):
+        first = await self.chat("本人较早的原话", group=True, channel="group:crowded")
+        for index in range(14):
+            await self.chat(
+                f"他人的第{index}次发言", account="b", group=True, channel="group:crowded"
+            )
+        last = await self.chat("本人后来补充", group=True, channel="group:crowded")
+        store, windows = self.h.core.store, self.h.core.summary_windows
+        unfiltered = store.recent_turns(last["conversation_id"], last["sequence"] + 1, 13)
+        self.assertNotIn(first["id"], [row["id"] for row in unfiltered])
+        exact = store.recent_turns(
+            last["conversation_id"], last["sequence"] + 1, 13, scope=last["scope"]
+        )
+        self.assertEqual([last["id"], first["id"]], [row["id"] for row in exact])
+        with patch.object(store, "recent_turns", wraps=store.recent_turns) as recent:
+            window = windows.read([last["id"]])
+        self.assertEqual(1, recent.call_count)
+        self.assertEqual(last["scope"], recent.call_args.kwargs["scope"])
+        self.assertEqual(
+            [first["id"], last["id"]], [row["turn_id"] for row in window["manifest"]["members"]]
+        )
+        self.assertTrue(window["manifest"]["coverage"]["complete"])
+        self.assertEqual("valid", self.check(window)["state"])
+
+    async def test_new_capture_and_check_never_read_unused_reply_material(self):
+        first = await self.chat("本人第一轮")
+        last = await self.chat("本人第二轮")
+        windows = self.h.core.summary_windows
+        with (
+            patch.object(
+                windows,
+                "_reply_dependencies",
+                side_effect=AssertionError("unused reply dependency"),
+            ),
+            patch.object(
+                self.h.core.store,
+                "replies_for_turns",
+                side_effect=AssertionError("unused sent reply"),
+            ),
+            patch.object(
+                windows, "_members", side_effect=AssertionError("legacy reply reconstruction")
+            ),
+        ):
+            window = windows.read([last["id"]])
+            self.assertEqual("valid", self.check(window)["state"])
+        self.assertEqual(
+            [first["id"], last["id"]], [row["turn_id"] for row in window["manifest"]["members"]]
+        )
+
+    async def test_foreign_and_bot_changes_leave_the_new_owner_capture_unchanged(self):
+        first = await self.chat("本人原话", group=True, channel="group:isolated")
+        foreign = await self.chat("他人原话", account="b", group=True, channel="group:isolated")
+        last = await self.chat("本人补充", group=True, channel="group:isolated")
+        self.allow_empty_memory_provenance()
+        old = legacy_window(self.h, last, [first, foreign, last])
+        fresh = self.h.core.summary_windows.read([last["id"]])
+        reply = self.h.core.store.turn_replies(last["id"])[0]
+        original_reply = copy.deepcopy(reply)
+        reply["receipt"] = dict(reply["receipt"], state="failed")
+        self.h.core.store.put("replies", reply)
+        self.assertEqual(fresh, self.h.core.summary_windows.read([last["id"]]))
+        self.assertEqual("valid", self.check(fresh)["state"])
+        self.assertEqual("invalid", self.check(old)["state"])
+        self.h.core.store.put("replies", original_reply)
+        self.assertEqual("valid", self.check(old)["state"])
+        foreign["cancelled"] = True
+        self.h.core.store.put("turns", foreign)
+        self.assertEqual(fresh, self.h.core.summary_windows.read([last["id"]]))
+        self.assertEqual("valid", self.check(fresh)["state"])
+        self.assertEqual("invalid", self.check(old)["state"])
 
     async def test_private_window_cannot_include_other_person_or_actor(self):
         first = await self.chat()
@@ -713,9 +813,7 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
         material = json.loads(self.generated[1][1]["content"])
         self.assertEqual(1, len(material["subject_messages"]))
         self.assertTrue(all(row["purpose"] == "new" for row in material["subject_messages"]))
-        self.assertTrue(
-            any(row["purpose"] == "context" for row in material["conversation_context"])
-        )
+        self.assertTrue(any(row["purpose"] == "context" for row in material["subject_history"]))
         self.assertNotIn("conversation", material)
         self.assertNotIn("source_hints", material)
         self.assertTrue(all(row["cursor"]["job_ids"] == [row["job_id"]] for row in tasks))
@@ -738,6 +836,47 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.calls[-1]["output"])
         self.assertIsNone(self.calls[-1]["window"])
         self.assertEqual(original["window"], self.tasks()[0]["window"])
+
+    async def test_old_frozen_bot_window_survives_unknown_commit_recovery_unchanged(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        item = self.tasks()[0]
+        turn = self.h.core.store.get("turns", item["turn_id"])
+        self.assertFalse(turn.get("profile_checks"))
+        turn["memory_context"] = dict(
+            bundle=dict(group_dependencies=[], episode_dependencies=[], source_dependencies=[])
+        )
+        self.h.core.store.put("turns", turn)
+        frozen = legacy_window(self.h, turn)
+        self.assertTrue(
+            any(member["role"] == "assistant" for member in frozen["manifest"]["members"])
+        )
+        # The real capture boundary persists these together. A retained window
+        # without its job_ids is not a valid captured task.
+        item.update(job_ids=[item["job_id"]], window=copy.deepcopy(frozen))
+        self.h.core.store.put("metadata", item)
+        self.lost_ack = True
+        await self.h.core.memory_learning.work()
+        retained = self.tasks()[0]
+        self.assertEqual("pending", retained["state"])
+        self.assertIsNotNone(retained["output"])
+        self.assertEqual(
+            ("result_unknown", "commit"),
+            (retained["first_failure"]["code"], retained["first_failure"]["stage"]),
+        )
+        self.assertEqual(1, len(self.generated))
+        self.assertEqual(frozen, retained["window"])
+        await self.h.core.close()
+        self.h.core = self.h.new_core()
+        self.h.core.recover()
+        self.h.clock.advance(10)
+        await self.h.core.memory_learning.work()
+        final = self.tasks()[0]
+        self.assertEqual("completed", final["state"])
+        self.assertEqual(frozen, final["window"])
+        self.assertEqual(1, len(self.generated))
+        self.assertIsNone(self.calls[-1]["window"])
+        self.assertIsNone(self.calls[-1]["output"])
 
     async def test_uncertain_predecessor_cannot_complete_or_drop_the_next_queued_job(self):
         await self.chat("第一段")
@@ -957,7 +1096,10 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(index + 1, len(self.generated))
                 material = json.loads(self.generated[-1][1]["content"])
-                self.assertEqual(basis, material["portrait_input"])
+                self.assertEqual(
+                    None if basis is None else dict(basis, current_text=""),
+                    material["portrait_input"],
+                )
                 submitted = [
                     call["output"]
                     for call in self.calls
@@ -1167,6 +1309,7 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(self.calls[0]["job_ids"]))
         new_texts = [row["text"] for row in self.window["members"]]
         self.assertEqual(["乙" * 9000], new_texts)
+        self.assertFalse(self.window["manifest"]["coverage"]["complete"])
         tasks = self.tasks()
         self.assertEqual(["completed", "completed"], [row["state"] for row in tasks])
 
