@@ -292,6 +292,19 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.core = self.h.new_core()
         self.h.core.recover()
 
+    def offer_revision(self, original):
+        # Memory's real revision cases return a distinct material_ref and the
+        # same opaque source_key. Exercise that accepted descriptor at the
+        # consumer boundary; this double does not attest remote currentness.
+        material = dict(original["materials"][0], material_ref="material:revision:2")
+        self.h.core.memory_learning._offer_materials(
+            dict(
+                schema_version=1,
+                candidate_job_ref=None,
+                materials=[dict(material, frame=original["scope"])],
+            )
+        )
+
     async def test_interleaved_people_share_one_sealed_job_and_model_with_exact_coverage(self):
         for person, text in (
             ("a", "我打算周六去"),
@@ -327,6 +340,73 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.clock.advance(119)
         await self.drain()
         self.assertEqual([], self.peer.generated)
+
+    async def test_material_revision_seals_old_collecting_input_without_mixing_revisions(self):
+        await self.chat("最初的原话", message="same-physical-message")
+        first = copy.deepcopy(self.tasks()[0])
+        self.h.clock.advance(30)
+        self.offer_revision(first)
+        old, current = self.tasks()
+        previous, revised = old["materials"][0], current["materials"][0]
+        self.assertNotEqual(previous["material_ref"], revised["material_ref"])
+        self.assertEqual(previous["source_key"], revised["source_key"])
+        self.assertEqual("source_revision", old["close_reason"])
+        self.assertEqual("pending", old["state"])
+        self.assertEqual(first["materials"], old["materials"])
+        self.assertEqual([previous["material_ref"]], old["create_request"]["material_refs"])
+        self.assertIsNone(old["output"])
+        self.assertIsNone(old["receipt"])
+        self.assertEqual("collecting", current["state"])
+        self.assertEqual(self.h.clock() + 120, current["deadline"])
+        self.assertEqual([], self.peer.creates)
+        self.assertEqual([], self.peer.generated)
+
+    async def test_material_revision_preserves_old_unknown_window_output_and_receipt_recovery(self):
+        await self.chat("原版本", message="same-physical-message")
+        self.peer.lose_commit = True
+        self.h.clock.advance(120)
+        await self.drain()
+        frozen = copy.deepcopy(self.tasks()[0])
+        self.assertIsNotNone(frozen["output"])
+        self.assertIsNone(frozen["receipt"])
+        self.offer_revision(frozen)
+        self.assertEqual(frozen, self.tasks()[0])
+        self.assertEqual("collecting", self.tasks()[1]["state"])
+        await self.restart()
+        self.h.clock.advance(10)
+        await self.drain()
+        restored = self.tasks()[0]
+        self.assertEqual("completed", restored["state"])
+        for key in ("materials", "create_request", "segment_window", "output"):
+            self.assertEqual(frozen[key], restored[key])
+        self.assertEqual(1, len(self.peer.generated))
+        self.assertEqual(1, sum(output is not None for _, output, _ in self.peer.processed))
+        self.assertIsNone(self.peer.processed[-1][1])
+
+    async def test_material_revision_after_completion_keeps_old_receipt_and_strict_ref_identity(
+        self,
+    ):
+        await self.chat("原版本", message="same-physical-message")
+        self.h.clock.advance(120)
+        await self.drain()
+        completed = copy.deepcopy(self.tasks()[0])
+        self.offer_revision(completed)
+        self.assertEqual(completed, self.tasks()[0])
+        current = copy.deepcopy(self.tasks()[1])
+        descriptor = current["materials"][0]
+        self.h.clock.advance(30)
+        segments = self.h.core.memory_learning.segments
+        self.assertFalse(segments.offer(current["scope"], [descriptor]))
+        self.assertEqual(current, self.tasks()[1])
+        for field, value in (
+            ("text_bytes", descriptor["text_bytes"] + 1),
+            ("source_key", "different-source"),
+            ("person_id", "other-person"),
+        ):
+            with self.subTest(field=field), self.assertRaises(Fault) as raised:
+                segments.offer(current["scope"], [dict(descriptor, **{field: value})])
+            self.assertEqual("idempotency_conflict", raised.exception.code)
+        self.assertEqual(current, self.tasks()[1])
 
     async def test_max_wait_seals_without_requiring_a_quiet_conversation(self):
         await self.chat()
@@ -384,6 +464,8 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_observation_handoff_is_durable_and_deduplicates_same_accepted_source(self):
         await self.chat()
+        original = copy.deepcopy(self.tasks()[0])
+        self.h.clock.advance(30)
         identity = self.tasks()[0]["materials"][0]["material_ref"]
         self.peer.materials["observation:duplicate"] = self.peer.materials[identity]
         await self.h.core.memory_learning.observation_archived(
@@ -392,6 +474,8 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
         before = self.tasks()[0]
         await self.restart()
         await self.drain()
+        self.assertEqual(1, len(self.tasks()))
+        self.assertEqual(original["deadline"], self.tasks()[0]["deadline"])
         self.assertEqual(before["materials"], self.tasks()[0]["materials"])
         self.assertEqual(before["deadline"], self.tasks()[0]["deadline"])
         self.assertEqual(
@@ -476,6 +560,88 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("invalidated", task["state"])
         self.assertIsNone(task["receipt"])
         self.assertEqual([], self.peer.generated)
+
+    async def assert_preseal_negative_uses_real_client_and_original_request(self, *, lose_ack):
+        await self.chat()
+        self.h.clock.advance(120)
+        calls, persisted = [], {}
+
+        async def handler(request):
+            body = json.loads(request.content)
+            calls.append((request.url.path, copy.deepcopy(body)))
+            if request.url.path == "/internal/v1/memory/candidates/segments":
+                if persisted:
+                    self.assertEqual(persisted["request"], body)
+                else:
+                    persisted.update(request=copy.deepcopy(body), job_id="job:negative")
+                    if lose_ack:
+                        raise httpx.ReadError("Synthetic negative job persisted before lost ACK")
+                return httpx.Response(
+                    200,
+                    json=dict(
+                        schema_version=1,
+                        segment_id=body["segment_id"],
+                        job_id=persisted["job_id"],
+                        candidate_job_ref=persisted["job_id"],
+                        state="invalidated",
+                    ),
+                )
+            self.assertEqual("/internal/v1/memory/candidates/process", request.url.path)
+            self.assertEqual(
+                dict(extraction_schema=6, job_id="job:negative", batch_ref=None, output=None),
+                body,
+            )
+            return httpx.Response(
+                200,
+                json=dict(
+                    state="invalidated",
+                    extraction_schema=6,
+                    job_id="job:negative",
+                    batch_ref=None,
+                    result=None,
+                ),
+            )
+
+        client = JsonService(
+            "https://memory.synthetic.invalid",
+            "companion-only",
+            transport=httpx.MockTransport(handler),
+        )
+        self.addAsyncCleanup(client.close)
+        memory = Memory(self.h.contracts, client)
+        self.h.memory.create_segment = memory.create_segment
+        self.h.memory.process_candidate = memory.process_candidate
+        await self.drain()
+        if lose_ack:
+            uncertain = copy.deepcopy(self.tasks()[0])
+            self.assertEqual("pending", uncertain["state"])
+            self.assertNotIn("job_id", uncertain)
+            self.assertEqual(persisted["request"], uncertain["create_request"])
+            self.assertEqual(1, len(calls))
+            await self.restart()
+            self.h.clock.advance(10)
+            await self.drain()
+        actual = self.tasks()[0]
+        self.assertEqual("invalidated", actual["state"])
+        self.assertEqual("job:negative", actual["job_id"])
+        self.assertEqual(persisted["request"], actual["create_request"])
+        self.assertIsNone(actual["output"])
+        self.assertIsNone(actual["receipt"])
+        self.assertNotIn("segment_window", actual)
+        self.assertNotIn("cursor", actual)
+        self.assertEqual([], self.peer.generated)
+        self.assertEqual({}, self.peer.receipts)
+        self.assertEqual(
+            ["/internal/v1/memory/candidates/segments"] * (2 if lose_ack else 1)
+            + ["/internal/v1/memory/candidates/process"],
+            [path for path, _ in calls],
+        )
+
+    async def test_preseal_negative_job_finishes_without_model_or_false_coverage(self):
+        await self.assert_preseal_negative_uses_real_client_and_original_request(lose_ack=False)
+
+    async def test_preseal_negative_job_lost_ack_recovers_same_segment_before_receipt_only(self):
+        await self.assert_preseal_negative_uses_real_client_and_original_request(lose_ack=True)
 
     async def test_only_real_segment_creation_and_submission_install_mutation_wait(self):
         await self.chat()

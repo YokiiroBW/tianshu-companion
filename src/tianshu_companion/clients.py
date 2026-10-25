@@ -90,8 +90,9 @@ def command(origin, key, now, seconds=30):
 
 
 class JsonService:
-    # Published text/profile/source-sync queries only. Source barriers may persist
-    # invalidations, but repeating these queries cannot issue a business command.
+    # Explicitly repeatable authority reads. Source barriers may persist
+    # invalidations; delivery context may monotonically renew its existing origin.
+    # Neither admits input nor creates an expression, send or execution receipt.
     QUERY_PATHS = frozenset(
         {
             "/internal/v1/origins/resolve",
@@ -112,6 +113,7 @@ class JsonService:
             "/internal/v2/memory/context/verify",
             "/internal/v2/memory/context/prepare",
             "/internal/v2/memory/context/profiles",
+            "/internal/v2/bot-delivery/context",
             "/internal/v2/bot-delivery/query",
         }
     )

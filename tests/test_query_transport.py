@@ -28,6 +28,7 @@ QUERIES = [
     ("/internal/v1/memory/context/input-history", {}),
     ("/internal/v1/memory/profiles/select", {}),
     ("/internal/v1/memory/source-sync/check", {}),
+    ("/internal/v2/bot-delivery/context", {}),
     ("/internal/v1/memory/candidates/process", {"job_id": "candidate:fixture", "output": None}),
     ("/internal/v1/model-requests/model:" + "a" * 32, None),
 ]
@@ -39,6 +40,9 @@ WRITES = [
     "/internal/v1/conversation/ingest",
     "/internal/v1/conversation/ingest-actors",
     "/internal/v1/conversation/send",
+    "/internal/v2/bot-delivery/send",
+    "/internal/v2/bot-delivery/finalize",
+    "/internal/v2/bot-delivery/cancel",
     "/v1/chat/completions",
 ]
 
@@ -507,6 +511,9 @@ class QueryTLS(unittest.IsolatedAsyncioTestCase):
                     await service.call(path, {"operation": "input", "idempotency_key": "fixed"})
                 self.assertEqual(before + 1, len(seen))
                 self.assertEqual(path, seen[-1][0])
+            core_send_path = "/internal/v1/conversation/send"
+            before_core_send = sum(path == core_send_path for path, _ in seen)
+            self.assertEqual(1, before_core_send)
             h = Harness(silence_ms=0)
             try:
                 h.core.sender = Sender(h.contracts, service)
@@ -514,13 +521,21 @@ class QueryTLS(unittest.IsolatedAsyncioTestCase):
                 await h.cycles(40)
                 self.assertEqual("reconciling", h.turns()[0]["phase"])
                 self.assertEqual("unknown", h.turns()[0]["delivery_state"])
-                sends = len([path for path, _ in seen if path.endswith("/send")])
-                self.assertEqual(2, sends)  # One raw probe and one Core send.
+                self.assertEqual(
+                    before_core_send + 1, sum(path == core_send_path for path, _ in seen)
+                )
+                self.assertEqual(
+                    {path: 1 + (path == core_send_path) for path in WRITES},
+                    {path: sum(seen_path == path for seen_path, _ in seen) for path in WRITES},
+                )
                 await h.cycles(40)
                 h.clock.advance(h.core.policy.delivery_reconcile_timeout_ms / 1000 + 1)
                 await h.cycles(40)
                 self.assertEqual("closed_unknown", h.turns()[0]["phase"])
                 self.assertTrue(h.turns()[0]["unresolved_delivery"])
-                self.assertEqual(sends, len([path for path, _ in seen if path.endswith("/send")]))
+                self.assertEqual(
+                    {path: 1 + (path == core_send_path) for path in WRITES},
+                    {path: sum(seen_path == path for seen_path, _ in seen) for path in WRITES},
+                )
             finally:
                 await h.core.close()

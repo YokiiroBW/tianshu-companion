@@ -102,7 +102,7 @@ class MemorySegments:
                     or not material["person_id"]
                 ):
                     raise Fault("invalid_input")
-                key = "memory-material:" + digest([frame, material["source_key"]])
+                key = "memory-material:" + digest([frame, material["material_ref"]])
                 previous = store.get("metadata", key)
                 if previous is not None:
                     if previous["material"] != material or previous["scope"] != frame:
@@ -110,6 +110,15 @@ class MemorySegments:
                     continue
                 if not self._fits([material]):
                     raise Fault("budget_exceeded")
+                if segment is not None and any(
+                    assigned["source_key"] == material["source_key"]
+                    for assigned in segment["materials"]
+                ):
+                    # A selector can have successive authoritative revisions.
+                    # Keep the old atomic input intact; it must pass Memory's
+                    # current-source checks rather than borrow the new revision.
+                    self.seal(segment, "source_revision")
+                    segment = None
                 if segment is not None and not self._fits(segment["materials"] + [material]):
                     if context_windows:
                         segment["omitted_context"] = True

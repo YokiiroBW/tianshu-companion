@@ -11,6 +11,7 @@ TS-023 在 JsonService 中只允许以下调用恢复一次；并非按 GET/POST
 | POST /internal/v1/memory/select | text-dialogue/v1 semantics §5 与 source-sync/v1 semantics §5；重新查询仍执行来源屏障和版本校验。 |
 | POST /internal/v1/memory/profiles/select | profile-memory/v1 只读选择与 source-sync/v1 屏障；原 scope/target/known version 不变。 |
 | POST /internal/v1/memory/source-sync/check | source-sync/v1 interfaces.json memory.check 与 semantics §5；重新检查同一范围和来源。 |
+| POST /internal/v2/bot-delivery/context | 重新核对当前身份、scope、channel、连接和权限，仅单调续租原 origin；不接收入站、不创建表达式或发送/执行回执。真实未确认映射的暂不可用沿既有读取恢复，403仍终止。 |
 | GET /internal/v1/model-requests/model:{32位小写hex} | text-dialogue/v1 semantics §7 的授权回执查询；仅覆盖当前 Gateway.generate 生成的 uid("model")，不重新生成模型结果。 |
 
 Memory 查询与 check 的来源屏障可能提交水位/失效记录。因此“查询恢复”不表示无数据库写入或第一次未执行。重发原查询仍需重新建立屏障，现有 schema、请求关联、范围、known_scope_version、有效期检查继续执行；明确 scope_changed/version_conflict 不自动重试。
