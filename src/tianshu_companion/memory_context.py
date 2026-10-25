@@ -1,5 +1,6 @@
 """Typed Memory evidence and exact batch checks; no independent memory authority."""
 
+import copy
 import hashlib
 
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
@@ -343,10 +344,22 @@ def legacy_check(check, header):
     scope = check["scope"]
     domain = check["version_domain"]
     if domain == "text-input/v1" and "input_sources" in check:
-        # Core explicitly awaits source-sync/check with this exact payload.
-        # It remains in Core's full catalog/AND, not this legacy four-kind wire.
-        return None
-    if domain == PROFILE_DOMAIN:
+        kind = "input_sources"
+        request = dict(
+            query=header,
+            requested_scope=scope,
+            source_check=dict(
+                schema_version=1,
+                request_id=header["request_id"],
+                turn_id=check["source_turn_id"],
+                input_revision=check["input_revision"],
+                scope=scope,
+                sources=copy.deepcopy(check["input_sources"]),
+            ),
+        )
+        # This checks current exact sources, not an old room/history version.
+        expected = {}
+    elif domain == PROFILE_DOMAIN:
         kind = "profile"
         request = dict(
             query=header,

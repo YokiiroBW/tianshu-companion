@@ -866,17 +866,13 @@ class Memory:
         return validate_response(request, response, time.time(), epoch)
 
     async def verify_context(self, origin, scope, bundle, checks=()):
-        # The wire bound is per batch, never a new rejection of a long valid history.
-        # Every batch is awaited and validated before the caller can generate/send.
-        batches = [list(checks)[i : i + 64] for i in range(0, len(checks), 64)] or [[]]
-        for batch in batches:
-            request = dict(
-                schema_version=2,
-                query=query(origin),
-                requested_scope=scope,
-                bundle=bundle,
-                checks=batch,
-            )
+        from .memory_preparation import packages
+
+        # Count and complete UTF-8 body bounds are shared with preparation.
+        # Every package is mandatory; none extends an earlier returned proof.
+        deadlines = []
+        for request in packages(origin, scope, bundle, checks):
+            batch = request["checks"]
             self.contracts.check("memory-context-v2#verify_request", request)
             response = await self.client.call("/internal/v2/memory/context/verify", request)
             self.contracts.check("memory-context-v2#verify_response", response)
@@ -887,10 +883,8 @@ class Memory:
                 or current["effective_scope"] != scope
             ):
                 raise Fault("forbidden")
-            if (
-                epoch(response["valid_until"]) <= time.time()
-                or epoch(current["valid_until"]) <= time.time()
-            ):
+            deadlines.extend((epoch(response["valid_until"]), epoch(current["valid_until"])))
+            if min(deadlines) <= time.time():
                 raise Fault("scope_changed")
             if current.get("retrieval_mode", "factual") != bundle.get("retrieval_mode", "factual"):
                 raise Fault("invalid_input")
@@ -917,6 +911,8 @@ class Memory:
             expected = [(c["check_id"], c["kind"], "valid") for c in batch]
             if [(c["check_id"], c["kind"], c["status"]) for c in response["checks"]] != expected:
                 raise Fault("invalid_input")
+        if min(deadlines) <= time.time():
+            raise Fault("scope_changed")
         return response
 
     async def prepare_context(self, origin, scope, bundle, checks, required_check_ids):

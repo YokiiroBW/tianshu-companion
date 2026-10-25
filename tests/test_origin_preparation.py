@@ -215,7 +215,6 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.h.core._save_turn(previous)
         ref = old["origin"]["assertion_ref"]
         original_prepare = self.h.memory.prepare_context
-        original_sources = self.h.memory.check_sources
         for boundary in ("origin", "memory"):
             with self.subTest(boundary=boundary):
                 reads, raw, preparations = [], [], []
@@ -226,6 +225,11 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
 
                 async def prepare(origin, scope, bundle, checks, required):
                     preparations.append(copy.deepcopy(checks))
+                    raw.extend(
+                        c["request"]["source_check"]["turn_id"]
+                        for c in checks
+                        if c["kind"] == "input_sources"
+                    )
                     result = await original_prepare(origin, scope, bundle, checks, required)
                     if boundary == "memory":
                         for check in checks:
@@ -233,9 +237,8 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
                                 result[check["check_id"]] = "unavailable"
                     return result
 
-                async def sources(source, values):
-                    raw.append(source["id"])
-                    return await original_sources(source, values)
+                async def sources(*args):
+                    raise AssertionError("raw must share the prepare batch")
 
                 self.origins(mode)
                 self.h.memory.prepare_context = prepare
@@ -249,7 +252,7 @@ class OriginPreparationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([previous["id"]], raw)
                 self.assertEqual(1, reads.count(ref))
                 self.assertEqual(2, len(preparations))
-                self.assertEqual([], preparations[1])
+                self.assertEqual({"input_sources"}, {c["kind"] for c in preparations[1]})
                 self.assertTrue(all(check["origin"] != old["origin"] for check in checks))
 
     async def test_identity_read_cannot_borrow_origin_transport_marker(self):

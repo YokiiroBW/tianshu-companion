@@ -245,9 +245,9 @@ async def _prepare_candidates(core, turn, checks, batches):
                 if identity in required:
                     required_memory.add(key)
         ordered = [memory[key] for key in sorted(memory)]
-        # Exact raw inputs were really checked through source-sync/check above.
-        # AND those independent RPC proofs with the complete legacy catalog;
-        # an empty legacy set is not a raw-source proof or a common snapshot.
+        # Raw inputs and legacy dependencies enter the same complete Memory
+        # catalog. The client preserves every package's AND and original lease;
+        # multiple bounded packages are not a single shared snapshot.
         outcomes = await core.memory.prepare_context(
             turn["origin"],
             turn["scope"],
@@ -263,8 +263,8 @@ async def _prepare_candidates(core, turn, checks, batches):
             if any(outcomes[key] == "unavailable" for key in values)
         )
         if unavailable_origins & required_origins:
-            # A raw-only required proof is absent from the legacy wire list,
-            # but retains the complete catalog's required-origin priority.
+            # Keep the complete catalog's required-origin priority, including
+            # required checks in other bounded producer packages.
             raise Fault(
                 "dependency_unavailable",
                 retryable_read=True,

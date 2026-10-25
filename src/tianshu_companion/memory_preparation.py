@@ -83,26 +83,32 @@ def _catalog(checks, required_ids):
     return list(catalog.values()), required
 
 
-def packages(origin, scope, bundle, checks, required_ids):
-    catalog, required = _catalog(checks, required_ids)
+def packages(origin, scope, bundle, checks, required_ids=None):
+    """Freeze and pack complete requests; None uses the mandatory verify wire."""
+    catalog, required = _catalog(checks, required_ids if required_ids is not None else ())
     result = []
 
     def request(items):
-        return dict(
+        value = dict(
             schema_version=2,
             query=query(origin),
             requested_scope=scope,
             bundle=bundle,
             checks=items,
-            required_check_ids=[c["check_id"] for c in items if c["check_id"] in required],
         )
+        if required_ids is not None:
+            value["required_check_ids"] = [
+                c["check_id"] for c in items if c["check_id"] in required
+            ]
+        return value
 
     current = request([])
     for check in catalog:
         proposed = dict(current, checks=current["checks"] + [check])
-        proposed["required_check_ids"] = [
-            c["check_id"] for c in proposed["checks"] if c["check_id"] in required
-        ]
+        if required_ids is not None:
+            proposed["required_check_ids"] = [
+                c["check_id"] for c in proposed["checks"] if c["check_id"] in required
+            ]
         if len(proposed["checks"]) > 64 or len(canonical(proposed).encode()) > BODY_LIMIT:
             if not current["checks"]:
                 raise Fault("budget_exceeded")

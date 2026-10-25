@@ -2,7 +2,7 @@
 
 RELEASES = {
     "memory-extraction/v1": "41bb91c75889b15c8d658840306f8a15b024e5515474112139f9aaadb2b9fd7a",
-    "memory-context/v2": "dc162b6dba3390dcdf0a672fcbb9f9c0bd0fa08c7a06d343ed8e823224bc792e",
+    "memory-context/v2": "1bc86a0ac2dcc7e027294d1cddaf25fbd3fa081f5dac5d007e2fcf3fb4680544",
     "reading-state/v1": "2dc05bb8658988a46e286de6ef283d49bfb286e45141a4d2cfc0501d79bf1ebb",
     "skills/v1": "0ad3a444e8bff26721c14664260d08b463feb3288a556364e1af35f3e277d0f2",
     "bot-connection/v1": "ba4c23494452e911526b10aa85fb8c2d994e7feaa1bc1e24e1f8f7cd69a4223d",
@@ -21,7 +21,7 @@ RELEASES = {
     "profile-memory/v1": "757b243a25945a75d55dafab9da94828e79a009a0a77ce2aeb43039e4c2565c9",
     "role-relationship/v1": "2045e5a3e7e8618c688df0234e4ff2cb3e0001576d123822f2d18966e364d925",
     "source-sync/v1": "6d5c417c2e407aaf055151c1a3639d3b4e2ce4ad7da999f95273b6fcbf487370",
-    "source-sync-batch/v1": "ac6f39d1f0afe55677fbbb0ce2da1b212d22c49f18917d8fe2ed613d424c4327",
+    "source-sync-batch/v1": "7f4c4587f1acea34f8af79f3792280b1532953bec018ab646532d670aa81c091",
     "text-dialogue/v1": "90697e6ecbb587d3db8c8e4682f7f8f43a8b1a98f70d8835c8282b03828d2d3a",
     "web-conversation/v1": "3ccb44c13f5969ce4cd279c51d14f58d95c9cd4e75ca85cd8d6af286b3db0417",
     "knowledge-content/v1": "75d210454102af5af505ec1f72d69cc7dfd344550f7cf90e70125c082fdf4cd7",

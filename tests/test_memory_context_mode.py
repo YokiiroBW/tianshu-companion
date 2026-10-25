@@ -246,21 +246,23 @@ class SelectedContextTests(unittest.IsolatedAsyncioTestCase):
 
         async def prepare(origin, scope, bundle, checks, required):
             calls.append(copy.deepcopy(checks))
+            raw.extend(
+                c["request"]["source_check"]["turn_id"]
+                for c in checks
+                if c["kind"] == "input_sources"
+            )
             return {
                 c["check_id"]: "rejected" if c["kind"] == "history" else "valid" for c in checks
             }
 
-        original = self.h.memory.check_sources
-
-        async def sources(turn, values):
-            raw.append(turn["id"])
-            return await original(turn, values)
+        async def sources(*args):
+            raise AssertionError("unused standalone source check")
 
         self.h.memory.prepare_context, self.h.memory.check_sources = prepare, sources
         result = await _v2_variants(self.h.core, current, [], [selected])
         self.assertEqual(2, len(calls))
         self.assertTrue(calls[0])
-        self.assertEqual([], calls[1])
+        self.assertEqual({"input_sources"}, {c["kind"] for c in calls[1]})
         self.assertCountEqual([first["id"], second["id"]], raw)
         self.assertEqual([first["id"], second["id"]], [g["turn_id"] for g in result[0][0][0]])
         self.assertTrue(all(not g["replies"] for g in result[0][0][0]))

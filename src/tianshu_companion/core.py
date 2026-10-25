@@ -2164,10 +2164,20 @@ class Core(Delivery):
             # lease must not reuse the authority or history proof of the old one.
             lease_deadline = previous["source_deadline"]
         await self._authorize_context(check, checkpoint, lease_deadline)
+        if memory_checks is not None:
+            from .memory_context import legacy_check
+
+            memory_check = legacy_check(check, query(check["origin"]))
+            if memory_check is not None:
+                if check["version_domain"] == TEXT_INPUT_DOMAIN and "input_sources" in check:
+                    # The exact captured payload must still match after author
+                    # authority awaits. Memory proves it in the complete batch.
+                    self._context_source(check)
+                memory_checks[memory_check["check_id"]] = memory_check
+                return lease_deadline
         if check["version_domain"] == TEXT_INPUT_DOMAIN and "input_sources" in check:
-            # This is a real Memory read in this checkpoint, not a local guard
-            # or an input_history request with a weakened old snapshot. The
-            # original author proof and captured lease still bound this RPC.
+            # Independent/v1 callers keep their real source-sync read. V2
+            # collectors above share its exact semantics in prepare/verify.
             previous = self._context_source(check)
             try:
                 await checkpoint.once(
@@ -2183,13 +2193,6 @@ class Core(Delivery):
                 raise failure from None
             self._context_source(check)
             return lease_deadline
-        if memory_checks is not None:
-            from .memory_context import legacy_check
-
-            memory_check = legacy_check(check, query(check["origin"]))
-            if memory_check is not None:
-                memory_checks[memory_check["check_id"]] = memory_check
-                return lease_deadline
         if check["version_domain"] == PROFILE_DOMAIN:
             await checkpoint.once(
                 [

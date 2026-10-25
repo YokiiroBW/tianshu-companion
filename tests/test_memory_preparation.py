@@ -42,6 +42,8 @@ class PreparationProtocolTests(unittest.IsolatedAsyncioTestCase):
             ]
             if change:
                 result = change(body, result)
+                if isinstance(result, httpx.Response):
+                    return result
             return httpx.Response(200, json=result)
 
         wire = JsonService(
@@ -302,6 +304,268 @@ class PreparationProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before + 1, len(self.calls))
         self.assertFalse(getattr(caught.exception, "memory_selection_invalid", False))
 
+    def raw_catalog(self, count=4):
+        request = copy.deepcopy(self.fixture["prepare_request"])
+        old = copy.deepcopy(request["checks"][0])
+        seed = example("memory-context/v2", "exact-raw-component-in-existing-boundary")[
+            "legacy_check"
+        ]
+        raw = []
+        for index in range(count):
+            check = copy.deepcopy(seed)
+            check["check_id"] = f"check:raw-{index}"
+            check["request"]["query"]["request_id"] = f"request:raw-{index}"
+            nested = check["request"]["source_check"]
+            nested.update(request_id=f"request:source-{index}", turn_id=f"turn:source-{index}")
+            raw.append(check)
+        request.update(checks=[old, *raw], required_check_ids=[old["check_id"]])
+        return request
+
+    async def test_exact_raw_and_legacy_use_the_real_client_complete_batches(self):
+        request = self.raw_catalog()
+        frozen = copy.deepcopy(request["checks"])
+        memory = await self.client()
+        outcomes = await self.prepare(memory, request)
+        await memory.verify_context(
+            request["query"]["origin"],
+            request["requested_scope"],
+            request["bundle"],
+            request["checks"],
+        )
+        self.assertEqual(
+            ["/internal/v2/memory/context/prepare", "/internal/v2/memory/context/verify"],
+            [path for path, _ in self.calls],
+        )
+        self.assertEqual([5, 5], [len(body["checks"]) for _, body in self.calls])
+        self.assertEqual(frozen, request["checks"])
+        self.assertEqual({check["check_id"]: "valid" for check in frozen}, outcomes)
+        for _, body in self.calls:
+            self.assertEqual(frozen, body["checks"])
+            for item in body["checks"][1:]:
+                self.assertEqual({}, item["expected"])
+                self.assertEqual(
+                    item["request"]["requested_scope"], item["request"]["source_check"]["scope"]
+                )
+
+    async def test_exact_raw_response_id_kind_order_and_status_remain_strict(self):
+        request = self.raw_catalog()
+
+        def wrong_id(body, response):
+            response["checks"][1]["check_id"] = "check:wrong"
+            return response
+
+        def wrong_kind(body, response):
+            response["checks"][1]["kind"] = "history"
+            return response
+
+        def reversed_order(body, response):
+            response["checks"].reverse()
+            return response
+
+        def missing(body, response):
+            response["checks"].pop()
+            return response
+
+        def duplicate(body, response):
+            response["checks"][2] = copy.deepcopy(response["checks"][1])
+            return response
+
+        for change in (wrong_id, wrong_kind, reversed_order, missing, duplicate):
+            for operation in ("prepare", "verify"):
+                with self.subTest(change=change.__name__, operation=operation):
+                    memory = await self.client(change)
+                    with self.assertRaises(Fault):
+                        if operation == "prepare":
+                            await self.prepare(memory, request)
+                        else:
+                            await memory.verify_context(
+                                request["query"]["origin"],
+                                request["requested_scope"],
+                                request["bundle"],
+                                request["checks"],
+                            )
+
+        def rejected(body, response):
+            response["checks"][1].update(status="rejected", reason="dependency_changed")
+            return response
+
+        outcomes = await self.prepare(await self.client(rejected), request)
+        self.assertEqual("rejected", outcomes[request["checks"][1]["check_id"]])
+        with self.assertRaises(Fault):
+            await (await self.client(rejected)).verify_context(
+                request["query"]["origin"],
+                request["requested_scope"],
+                request["bundle"],
+                request["checks"],
+            )
+
+    async def test_raw_required_negative_uses_original_prepare_failure_component(self):
+        request = self.raw_catalog()
+        identity = request["checks"][1]["check_id"]
+        request["required_check_ids"] = [identity]
+
+        def invalid(body, response):
+            return dict(
+                schema_version=2,
+                version_domain="memory-context/v2",
+                request_id=body["query"]["request_id"],
+                effective_scope=body["requested_scope"],
+                state="invalid",
+                component="required_check",
+                check_id=identity,
+                failure=Fault("scope_changed").wire(body["query"]["request_id"]),
+            )
+
+        with self.assertRaises(Fault) as caught:
+            await self.prepare(await self.client(invalid), request)
+        self.assertEqual("scope_changed", caught.exception.code)
+        self.assertEqual(200, caught.exception.cause["http_status"])
+        self.assertFalse(getattr(caught.exception, "memory_selection_invalid", False))
+
+    async def test_raw_items_preserve_all_packages_and_required_members(self):
+        request = self.raw_catalog(65)
+        request["required_check_ids"] = [request["checks"][-1]["check_id"]]
+        memory = await self.client()
+        outcomes = await self.prepare(memory, request)
+        self.assertEqual([64, 2], [len(body["checks"]) for _, body in self.calls])
+        self.assertEqual(66, len(outcomes))
+        self.assertEqual(
+            [[], request["required_check_ids"]],
+            [body["required_check_ids"] for _, body in self.calls],
+        )
+        self.assertTrue(all(len(canonical(body).encode()) <= 262144 for _, body in self.calls))
+        self.calls.clear()
+        await memory.verify_context(
+            request["query"]["origin"],
+            request["requested_scope"],
+            request["bundle"],
+            request["checks"],
+        )
+        self.assertEqual([64, 2], [len(body["checks"]) for _, body in self.calls])
+        self.assertEqual(request["checks"], [c for _, body in self.calls for c in body["checks"]])
+
+    def large_raw_catalog(self):
+        request = self.raw_catalog()
+        for index, check in enumerate(request["checks"][1:]):
+            original = check["request"]["source_check"]["sources"][0]
+            sources = []
+            for offset in range(256):
+                source = copy.deepcopy(original)
+                source["receipt_id"] = f"receipt:{index * 256 + offset:032x}"
+                source["message_key"]["message_id"] = f"message:{index * 256 + offset:032x}"
+                sources.append(source)
+            check["request"]["source_check"]["sources"] = sources
+        return request
+
+    async def test_large_raw_verification_packs_full_body_and_validates_every_item_once(self):
+        request = self.large_raw_catalog()
+        whole = {
+            key: request[key]
+            for key in ("schema_version", "query", "requested_scope", "bundle", "checks")
+        }
+        self.assertLess(len(whole["checks"]), 64)
+        self.assertGreater(len(canonical(whole).encode()), 262144)
+        memory = await self.client()
+        await memory.verify_context(
+            request["query"]["origin"],
+            request["requested_scope"],
+            request["bundle"],
+            request["checks"],
+        )
+        self.assertGreater(len(self.calls), 1)
+        self.assertEqual(
+            request["checks"], [check for _, body in self.calls for check in body["checks"]]
+        )
+        self.assertTrue(all(len(canonical(body).encode()) <= 262144 for _, body in self.calls))
+        self.assertTrue(all("required_check_ids" not in body for _, body in self.calls))
+        self.assertEqual(
+            5, len({check["check_id"] for _, body in self.calls for check in body["checks"]})
+        )
+
+    def test_shared_packer_counts_exact_utf8_limit_including_bundle(self):
+        from unittest.mock import patch
+
+        request = self.raw_catalog(1)
+        check = copy.deepcopy(request["checks"][-1])
+        check["test_padding"] = ""
+        args = request["query"]["origin"], request["requested_scope"], request["bundle"]
+        # This unit isolates wire-size arithmetic, as in the existing packing
+        # test; padding is deliberately not sent through the contract client.
+        with patch("tianshu_companion.memory_preparation.query", return_value=request["query"]):
+            body = packages(*args, [check])[0]
+            check["test_padding"] = "x" * (262144 - len(canonical(body).encode()))
+            body = packages(*args, [check])[0]
+            self.assertEqual(262144, len(canonical(body).encode()))
+            other = copy.deepcopy(request["checks"][-1])
+            other["check_id"] = "check:second"
+            split = packages(*args, [check, other])
+            self.assertEqual([1, 1], [len(value["checks"]) for value in split])
+            self.assertTrue(all(len(canonical(value).encode()) <= 262144 for value in split))
+            # Increasing only the envelope/bundle must count, too; the raw
+            # component that exactly fit cannot silently exceed the body cap.
+            larger = dict(request["bundle"], test_padding="汉")
+            with self.assertRaises(Fault) as caught:
+                packages(args[0], args[1], larger, [check])
+            self.assertEqual("budget_exceeded", caught.exception.code)
+
+    async def test_large_raw_later_package_failure_never_adopts_partial_success(self):
+        request = self.large_raw_catalog()
+        for failure in ("missing", "negative", "unknown"):
+            with self.subTest(failure=failure):
+                self.calls.clear()
+
+                def second(body, response):
+                    if len(self.calls) == 2:
+                        if failure == "missing":
+                            response["checks"].pop()
+                        else:
+                            fault = (
+                                Fault("result_unknown", unknown=True)
+                                if failure == "unknown"
+                                else Fault("scope_changed")
+                            )
+                            return httpx.Response(409, json=fault.wire(body["query"]["request_id"]))
+                    return response
+
+                memory = await self.client(second)
+                with self.assertRaises(Fault) as caught:
+                    await memory.verify_context(
+                        request["query"]["origin"],
+                        request["requested_scope"],
+                        request["bundle"],
+                        request["checks"],
+                    )
+                self.assertEqual(2, len(self.calls))
+                self.assertEqual(failure == "unknown", caught.exception.unknown)
+                self.assertFalse(getattr(caught.exception, "memory_selection_invalid", False))
+
+    async def test_large_raw_later_package_cannot_extend_first_proof_expiry(self):
+        from unittest.mock import patch
+
+        request = self.large_raw_catalog()
+        clock = [time.time()]
+
+        def expiry(body, response):
+            if len(self.calls) == 1:
+                response["valid_until"] = utc(clock[0] + 1)
+            else:
+                clock[0] += 2
+                response.update(checked_at=utc(clock[0]), valid_until=utc(clock[0] + 30))
+                response["bundle"]["valid_until"] = utc(clock[0] + 60)
+            return response
+
+        memory = await self.client(expiry)
+        with patch("tianshu_companion.clients.time.time", side_effect=lambda: clock[0]):
+            with self.assertRaises(Fault) as caught:
+                await memory.verify_context(
+                    request["query"]["origin"],
+                    request["requested_scope"],
+                    request["bundle"],
+                    request["checks"],
+                )
+        self.assertEqual("scope_changed", caught.exception.code)
+        self.assertEqual(2, len(self.calls))
+
     async def test_pure_timeout_marker_excludes_tls_protocol_and_unclassified_connection(self):
         for kind in ["timeout", "reset", "tls", "protocol", "connect", "pool"]:
             with self.subTest(kind=kind):
@@ -349,12 +613,7 @@ class CorePreparationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_full_rejection_then_input_proof_preserves_mandatory(self):
         previous, current = await self.turns()
-        calls, sources = [], []
-        original = self.h.memory.check_sources
-
-        async def source_check(turn, selected):
-            sources.append((turn["id"], copy.deepcopy(selected)))
-            return await original(turn, selected)
+        calls = []
 
         async def prepare(origin, scope, bundle, checks, required):
             calls.append((copy.deepcopy(checks), list(required)))
@@ -362,15 +621,19 @@ class CorePreparationTests(unittest.IsolatedAsyncioTestCase):
                 c["check_id"]: "rejected" if c["kind"] == "history" else "valid" for c in checks
             }
 
+        async def independent(*args):
+            raise AssertionError("exact raw must share the complete prepare batch")
+
         self.h.memory.prepare_context = prepare
-        self.h.memory.check_sources = source_check
+        self.h.memory.check_sources = independent
         context, *_ = await self.h.core._prepare_context(current, [])
         self.assertEqual(2, len(calls))
         self.assertEqual({"history"}, {c["kind"] for c in calls[0][0]})
-        self.assertEqual(([], []), calls[1])
-        self.assertEqual(
-            [(previous["id"], [m["source"] for m in previous["bundle"]["messages"]])], sources
-        )
+        self.assertEqual({"input_sources"}, {c["kind"] for c in calls[1][0]})
+        self.assertEqual([], calls[1][1])
+        request = calls[1][0][0]["request"]["source_check"]
+        self.assertEqual(previous["id"], request["turn_id"])
+        self.assertEqual([m["source"] for m in previous["bundle"]["messages"]], request["sources"])
         self.assertTrue(context.data["recent_dialogue"][0]["input_only"])
         self.assertFalse(context.data["recent_dialogue"][0]["replies"])
 

@@ -30,14 +30,50 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
             await self.h.cycles()
         turns = self.h.turns()
         self.assertEqual(["sent"] * count, [turn["phase"] for turn in turns])
-        self.source_calls = []
-        original = self.h.memory.check_sources
+        self.source_calls, self.independent_calls, self.preparations = [], [], []
+        original_verify = self.h.memory.verify_context
+        original_source = self.h.memory.check_sources
 
-        async def sources(turn, selected):
-            self.source_calls.append((copy.deepcopy(turn), copy.deepcopy(selected)))
-            return await original(turn, selected)
+        async def valid(request):
+            return "valid"
 
-        self.h.memory.check_sources = sources
+        self.raw_result = valid
+
+        async def statuses(checks):
+            result = {}
+            for check in checks:
+                value = "valid"
+                if check["kind"] == "input_sources":
+                    request = copy.deepcopy(check["request"]["source_check"])
+                    self.source_calls.append(request)
+                    value = await self.raw_result(request)
+                result[check["check_id"]] = value
+            return result
+
+        async def verify(origin, scope, bundle, checks=()):
+            await original_verify(origin, scope, bundle, checks)
+            if any(value != "valid" for value in (await statuses(checks)).values()):
+                raise Fault(
+                    "scope_changed", cause=dict(peer="memory", operation="query", http_status=409)
+                )
+
+        async def prepare(origin, scope, bundle, checks, required):
+            self.preparations.append(copy.deepcopy(checks))
+            await original_verify(origin, scope, bundle, checks)
+            result = await statuses(checks)
+            if any(result[key] != "valid" for key in required):
+                raise Fault(
+                    "scope_changed", cause=dict(peer="memory", operation="query", http_status=200)
+                )
+            return result
+
+        async def independent(turn, selected):
+            self.independent_calls.append((turn["id"], copy.deepcopy(selected)))
+            return await original_source(turn, selected)
+
+        self.h.memory.prepare_context = prepare
+        self.h.memory.verify_context = verify
+        self.h.memory.check_sources = independent
         self.verifications.clear()
         return turns
 
@@ -170,16 +206,11 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirmed_memory_negative_excludes_whole_linked_raw_batch_only(self):
         first, second, current = await self.turns(3)
         groups = self.groups(current)
-        calls = []
 
-        def response(request):
-            calls.append(request["turn_id"])
-            return self.source_response(request, invalid=request["turn_id"] == first["id"])
+        async def result(request):
+            return "rejected" if request["turn_id"] == first["id"] else "valid"
 
-        self.h.memory.check_sources = self.source_client(response).check_sources
-        # The profile's independent dependencies remain valid, even though it
-        # shares the raw source's author origin. A negative source is not an
-        # origin authorization failure and must not block this required read.
+        self.raw_result = result
         required = profile_check(
             first,
             dict(kind="person", person_id=first["scope"]["person_id"]),
@@ -188,22 +219,25 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
             dict(scope_version=self.h.memory.profile_version),
         )
         batch = [input_only(groups[t["id"]]) for t in (first, second)]
-        result = await _v2_variants(self.h.core, current, [required], [batch])
-        self.assertEqual([[]], result)
-        self.assertCountEqual([first["id"], second["id"]], calls)
-        self.assertEqual("profile", self.verifications[-1][0]["kind"])
-        self.assertEqual(first["origin"], required["origin"])
+        self.assertEqual([[]], await _v2_variants(self.h.core, current, [required], [batch]))
+        self.assertCountEqual(
+            [first["id"], second["id"]], [r["turn_id"] for r in self.source_calls]
+        )
+        self.assertEqual({"profile", "input_sources"}, {c["kind"] for c in self.preparations[-1]})
         self.assertEqual(first["id"], self.h.core._context_source(self.raw(first))["id"])
-        # The healthy raw source still succeeds on its own; no negative cache,
-        # Core physical withdrawal or whole-origin exclusion was installed.
+        # Same origin is not the same source dependency; no negative cache or
+        # physical withdrawal was installed by the optional negative result.
         result = await _v2_variants(self.h.core, current, [required], [[batch[1]]])
         self.assertEqual([second["id"]], [g["turn_id"] for g in result[0][0][0]])
+        self.assertEqual([], self.independent_calls)
 
     async def test_confirmed_negative_remains_fault_for_required_main_and_adopted_raw(self):
         previous, current = await self.turns()
-        self.h.memory.check_sources = self.source_client(
-            lambda request: self.source_response(request, invalid=True)
-        ).check_sources
+
+        async def rejected(request):
+            return "rejected"
+
+        self.raw_result = rejected
         for stage in ("required", "main", "adopted"):
             with self.subTest(stage=stage):
                 check = self.raw(current if stage == "main" else previous)
@@ -213,31 +247,35 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
                         await self.h.core._preflight_once(current)
                     else:
                         await _v2_variants(self.h.core, current, [check], [])
-                self.assertTrue(caught.exception.context_dependency_invalid)
                 self.assertEqual("scope_changed", caught.exception.code)
-                self.assertEqual(409, caught.exception.cause["http_status"])
+                self.assertEqual(
+                    409 if stage == "adopted" else 200, caught.exception.cause["http_status"]
+                )
                 self.assertFalse(caught.exception.unknown)
+                self.assertFalse(getattr(caught.exception, "memory_selection_invalid", False))
+        self.assertEqual([], self.independent_calls)
 
     async def test_unproved_source_errors_still_fail_optional_preparation(self):
         previous, current = await self.turns()
         group = input_only(self.groups(current)[previous["id"]])
-        for changes, status in (
-            (dict(request_id="req:wrong"), 409),
-            (dict(execution_state="unknown"), 409),
-            (dict(code="forbidden"), 403),
-            (dict(code="dependency_unavailable", retryable=True), 503),
+        for code, unknown in (
+            ("version_conflict", False),
+            ("forbidden", False),
+            ("dependency_unavailable", False),
+            ("result_unknown", True),
         ):
-            with self.subTest(changes=changes, status=status):
+            with self.subTest(code=code, unknown=unknown):
 
-                def response(request):
-                    value = Fault("version_conflict").wire(request["request_id"])
-                    value.update(changes)
-                    return httpx.Response(status, json=value)
+                async def failed(request):
+                    raise Fault(code, unknown=unknown)
 
-                self.h.memory.check_sources = self.source_client(response).check_sources
+                self.raw_result = failed
                 with self.assertRaises(Fault) as caught:
                     await _v2_variants(self.h.core, current, [], [[group]])
+                self.assertEqual(code, caught.exception.code)
+                self.assertEqual(unknown, caught.exception.unknown)
                 self.assertFalse(getattr(caught.exception, "context_dependency_invalid", False))
+        self.assertEqual([], self.independent_calls)
 
     async def test_forget_tool_refresh_and_next_turn_omit_still_locally_active_raw(self):
         await self.h.ingest(text="这段原始输入稍后会被检索遗忘。")
@@ -261,21 +299,17 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
                 result["query_results"] = []
             return result
 
-        def response(request):
-            calls.append(request["turn_id"])
-            return self.source_response(
-                request, invalid=forgotten and request["turn_id"] == previous["id"]
-            )
-
         async def prepare(origin, scope, bundle, checks, required):
-            # Synthetic Memory ports mirror the known negative for the old
-            # complete-reply alternative as well as the real raw error port.
+            calls.extend(
+                c["request"]["source_check"]["turn_id"]
+                for c in checks
+                if c["kind"] == "input_sources"
+            )
             return {c["check_id"]: "rejected" for c in checks}
 
         self.h.memory.forget_episode = forget
         self.h.memory.query_context = query
         self.h.memory.prepare_context = prepare
-        self.h.memory.check_sources = self.source_client(response).check_sources
         receipt = await self.h.core.role_actions.memory_propose(current, "tool:forget-raw", value)
         self.assertEqual("tombstoned", receipt["state"])
         self.assertEqual(1, len(submitted))
@@ -312,7 +346,10 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
 
         async def prepare(origin, scope, bundle, checks, required):
             calls.append(copy.deepcopy(checks))
-            return {check["check_id"]: "rejected" for check in checks}
+            return {
+                check["check_id"]: "valid" if check["kind"] == "input_sources" else "rejected"
+                for check in checks
+            }
 
         self.h.memory.prepare_context = prepare
         batch = [groups[source["id"]] for source in previous]
@@ -321,11 +358,12 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         adopted, checks = variants[0][0]
         self.assertEqual([source["id"] for source in previous], [g["turn_id"] for g in adopted])
         self.assertTrue(all(g["input_only"] and not g["replies"] for g in adopted))
-        self.assertEqual(3, len(self.source_calls))
+        self.assertEqual([], self.independent_calls)
         self.assertTrue(all("input_sources" in check for check in checks))
         self.assertEqual(2, len(calls))
         self.assertTrue(calls[0])
-        self.assertEqual([], calls[1])
+        self.assertEqual(3, len(calls[1]))
+        self.assertEqual({"input_sources"}, {c["kind"] for c in calls[1]})
         self.assertNotIn("input_history", {check["kind"] for check in calls[0]})
         self.assertEqual(old_snapshots, [source["input_history_snapshot"] for source in previous])
 
@@ -345,7 +383,13 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         from tianshu_companion.memory_context import legacy_check
 
         self.assertEqual("input_history", legacy_check(old, query(old["origin"]))["kind"])
-        self.assertIsNone(legacy_check(raw, query(raw["origin"])))
+        serialized = legacy_check(raw, query(raw["origin"]))
+        self.assertEqual("input_sources", serialized["kind"])
+        self.assertEqual({}, serialized["expected"])
+        self.assertEqual(raw["source_turn_id"], serialized["request"]["source_check"]["turn_id"])
+        self.assertEqual(raw["input_sources"], serialized["request"]["source_check"]["sources"])
+        raw["input_sources"].clear()
+        self.assertEqual(expected, serialized["request"]["source_check"]["sources"])
 
     async def test_raw_success_and_current_memory_bundle_are_both_required(self):
         previous, current = await self.turns()
@@ -353,8 +397,12 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         self.invalid = True
         with self.assertRaises(Fault):
             await self.h.core._preflight_once(current)
-        self.assertEqual(1, len(self.source_calls))
-        self.assertEqual([[]], self.verifications)
+        self.assertEqual(
+            2, len(self.verifications)
+        )  # Complete verify, then existing bundle-only probe.
+        self.assertEqual("input_sources", self.verifications[0][0]["kind"])
+        self.assertEqual([], self.verifications[1])
+        self.assertEqual([], self.independent_calls)
 
     async def test_input_only_label_cannot_prove_visible_reply_text(self):
         previous, current = await self.turns()
@@ -400,44 +448,36 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     self.h.core.store.put("turns", saved)
 
-    async def test_empty_legacy_catalog_still_reads_raw_sources_at_each_fresh_checkpoint(self):
+    async def test_raw_only_catalog_is_verified_at_each_fresh_checkpoint(self):
         previous, current = await self.turns()
         self.adopt(current, [self.raw(previous)])
         await self.h.core._preflight_once(current)
         await self.h.core._preflight_once(current)
         self.assertEqual(2, len(self.source_calls))
-        self.assertEqual([[], []], self.verifications)
-        for captured, sources in self.source_calls:
-            self.assertEqual(previous["id"], captured["id"])
+        self.assertEqual([1, 1], [len(c) for c in self.verifications])
+        for request in self.source_calls:
+            self.assertEqual(previous["id"], request["turn_id"])
+            self.assertEqual(previous["bundle"]["collection_revision"], request["input_revision"])
             self.assertEqual(
-                previous["bundle"]["collection_revision"], captured["bundle"]["collection_revision"]
+                [m["source"] for m in previous["bundle"]["messages"]], request["sources"]
             )
-            self.assertEqual([m["source"] for m in previous["bundle"]["messages"]], sources)
+            self.assertEqual(previous["scope"], request["scope"])
+        self.assertNotEqual(self.source_calls[0]["request_id"], self.source_calls[1]["request_id"])
+        self.assertEqual([], self.independent_calls)
 
     async def test_current_source_version_is_not_compared_to_old_history_version(self):
         previous, current = await self.turns()
         self.adopt(current, [self.raw(previous)])
-        original = self.h.memory.check_sources
-
-        async def newer(*args):
-            await original(*args)
-            return previous["scope_version"] + 100
-
-        self.h.memory.check_sources = newer
         await self.h.core._preflight_once(current)
+        check = self.verifications[0][0]
+        self.assertEqual({}, check["expected"])
+        self.assertEqual({"query", "requested_scope", "source_check"}, set(check["request"]))
         self.assertEqual(1, len(self.source_calls))
-        self.assertEqual([[]], self.verifications)
+        self.assertEqual([], self.independent_calls)
 
     async def test_memory_negative_or_unclassified_failure_never_becomes_optional_valid(self):
         previous, current = await self.turns()
         group = input_only(self.groups(current)[previous["id"]])
-        calls = []
-
-        async def prepare(*args):
-            calls.append(args)
-            return {}
-
-        self.h.memory.prepare_context = prepare
         for code, unknown in (
             ("version_conflict", False),
             ("dependency_unavailable", False),
@@ -449,12 +489,12 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
                 async def failed(*args):
                     raise Fault(code, unknown=unknown)
 
-                self.h.memory.check_sources = failed
+                self.h.memory.prepare_context = failed
                 with self.assertRaises(Fault) as caught:
                     await _v2_variants(self.h.core, current, [], [[group]])
                 self.assertEqual(code, caught.exception.code)
                 self.assertEqual(unknown, caught.exception.unknown)
-                self.assertEqual([], calls)
+                self.assertEqual([], self.independent_calls)
 
     async def test_one_invalid_linked_member_cannot_leave_an_isolated_valid_anchor(self):
         first, second, current = await self.turns(3)
@@ -463,7 +503,7 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         self.withdraw(second)
         result = await _v2_variants(self.h.core, current, [], [batch])
         self.assertEqual([[]], result)
-        self.assertEqual([first["id"]], [turn["id"] for turn, _ in self.source_calls])
+        self.assertEqual([first["id"]], [request["turn_id"] for request in self.source_calls])
 
     async def test_required_raw_source_cannot_be_discarded_with_an_optional_batch(self):
         previous, current = await self.turns()
@@ -484,7 +524,10 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
 
                 async def prepare(origin, scope, bundle, checks, required):
                     calls.append(copy.deepcopy(checks))
-                    return {check["check_id"]: status for check in checks}
+                    return {
+                        check["check_id"]: "valid" if check["kind"] == "input_sources" else status
+                        for check in checks
+                    }
 
                 self.h.memory.prepare_context = prepare
                 variants = await _v2_variants(self.h.core, current, [], [[group]])
@@ -495,9 +538,9 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(1, len(calls))
                     self.assertEqual([[]], variants)
                 else:
-                    self.assertEqual(1, len(self.source_calls))
+                    self.assertEqual([], self.independent_calls)
                     self.assertEqual(2, len(calls))
-                    self.assertEqual([], calls[1])
+                    self.assertEqual({"input_sources"}, {c["kind"] for c in calls[1]})
                     self.assertEqual(1, len(variants[0]))
                     selected, checks = variants[0][0]
                     self.assertEqual([previous["id"]], [group["turn_id"] for group in selected])
@@ -510,7 +553,7 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         async def prepare(origin, scope, bundle, checks, required):
-            self.assertEqual([], required)
+            self.assertEqual(["check:" + digest(self.raw(previous))], required)
             calls.append(copy.deepcopy(checks))
             return {check["check_id"]: "unavailable" for check in checks}
 
@@ -522,17 +565,25 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(caught.exception.unknown)
         self.assertEqual("memory", caught.exception.cause["peer"])
         self.assertEqual(200, caught.exception.cause["http_status"])
-        self.assertEqual(1, len(self.source_calls))
+        self.assertEqual([], self.independent_calls)
         self.assertEqual(1, len(calls))
-        self.assertEqual({"history"}, {check["kind"] for check in calls[0]})
+        self.assertEqual({"history", "input_sources"}, {check["kind"] for check in calls[0]})
 
-    async def test_raw_rpc_await_closes_captured_revision_sources_and_identity(self):
+    async def test_raw_batch_await_closes_captured_revision_sources_identity_and_deadline(self):
         previous, current = await self.turns()
         check = self.raw(previous)
         self.adopt(current, [check])
         saved = copy.deepcopy(previous)
-        for field in ("input_revision", "input_sources", "binding", "channel", "person"):
+        for field in (
+            "input_revision",
+            "input_sources",
+            "binding",
+            "channel",
+            "person",
+            "deadline",
+        ):
             with self.subTest(field=field):
+                self.verifications.clear()
 
                 async def changed(*args):
                     fresh = copy.deepcopy(saved)
@@ -547,50 +598,56 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
                         fresh["binding_version"] += 1
                     elif field == "channel":
                         fresh["bundle"]["collection_key"]["channel"]["binding_id"] = "binding:other"
+                    elif field == "deadline":
+                        fresh["source_deadline"] -= 1
                     else:
                         fresh["scope"]["person_id"] = "person:other"
                     self.h.core.store.put("turns", fresh)
-                    return 1
+                    return "valid"
 
-                self.h.memory.check_sources = changed
+                self.raw_result = changed
                 try:
                     with self.assertRaises(Fault):
                         await self.h.core._preflight_once(current)
-                    self.assertEqual([], self.verifications)
+                    self.assertEqual(1, len(self.verifications))
                 finally:
                     self.h.core.store.put("turns", saved)
 
-    async def test_core_withdrawal_between_raw_rpc_and_memory_closing_rejects(self):
+    async def test_core_withdrawal_after_complete_raw_batch_rejects(self):
         previous, current = await self.turns()
         self.adopt(current, [self.raw(previous)])
         original = self.h.memory.verify_context
 
         async def barrier(*args):
-            self.assertEqual(1, len(self.source_calls))
+            self.assertEqual([], self.source_calls)
             result = await original(*args)
+            self.assertEqual(1, len(self.source_calls))
             self.withdraw(previous)
             return result
 
         self.h.memory.verify_context = barrier
         with self.assertRaises(Fault):
             await self.h.core._preflight_once(current)
-        self.assertEqual([[]], self.verifications)
+        self.assertEqual(
+            [["input_sources"]], [[c["kind"] for c in batch] for batch in self.verifications]
+        )
 
-    async def test_preparation_closing_rejects_withdrawal_after_raw_rpc(self):
+    async def test_preparation_closing_rejects_withdrawal_after_raw_batch(self):
         previous, current = await self.turns()
         group = input_only(self.groups(current)[previous["id"]])
         calls = []
 
         async def prepare(origin, scope, bundle, checks, required):
             calls.append(checks)
-            self.assertEqual(1, len(self.source_calls))
+            self.assertEqual({"input_sources"}, {c["kind"] for c in checks})
+            self.assertEqual([], self.independent_calls)
             self.withdraw(previous)
             return {check["check_id"]: "valid" for check in checks}
 
         self.h.memory.prepare_context = prepare
         with self.assertRaises(Fault):
             await _v2_variants(self.h.core, current, [], [[group]])
-        self.assertEqual([[]], calls)
+        self.assertEqual([["input_sources"]], [[c["kind"] for c in batch] for batch in calls])
 
     async def test_duplicate_raw_proofs_share_only_the_same_fullkey_checkpoint(self):
         previous, current = await self.turns()
@@ -601,7 +658,7 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         await self.h.core._preflight_once(current)
         self.assertEqual(2, len(self.source_calls))
 
-    async def test_raw_rpc_near_margin_uses_renewed_authority_and_captured_key(self):
+    async def test_raw_batch_near_margin_uses_renewed_authority_and_captured_key(self):
         from test_context_lease import lease_sender
 
         previous, current = await self.turns()
@@ -609,8 +666,17 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
         old = previous["source_deadline"]
         self.adopt(current, [self.raw(previous)])
         lease_sender(self.h)
+        proofs = []
+        original = self.h.core._authorize_context
+
+        async def authorize(check, checkpoint, captured):
+            if check.get("source_turn_id") == previous["id"]:
+                proofs.append(captured)
+            return await original(check, checkpoint, captured)
+
+        self.h.core._authorize_context = authorize
         await self.h.core._preflight_once(current)
-        captured = self.source_calls[0][0]["source_deadline"]
+        captured = proofs[-1]
         self.assertGreater(captured, old)
         self.assertEqual(
             captured, self.h.core.store.get("turns", previous["id"])["source_deadline"]
@@ -630,14 +696,12 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
             return await original(check, checkpoint, captured)
 
         self.h.core._authorize_context = authorize
-        sources = self.h.memory.check_sources
 
-        async def extended(*args):
-            result = await sources(*args)
+        async def extended(request):
             self.lease(previous, 180)
-            return result
+            return "valid"
 
-        self.h.memory.check_sources = extended
+        self.raw_result = extended
         await self.h.core._preflight_once(current)
         new = previous["source_deadline"]
         self.assertGreater(new, old)
@@ -666,9 +730,11 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
             await self.h.core._preflight_once(current)
         self.assertTrue(caught.exception.retryable_read)
         self.assertEqual(1, len(self.source_calls))
-        self.assertEqual([[]], self.verifications)
+        self.assertEqual(
+            [["input_sources"]], [[c["kind"] for c in batch] for batch in self.verifications]
+        )
 
-    async def test_cancellation_during_raw_rpc_drains_the_actual_read(self):
+    async def test_cancellation_during_complete_raw_batch_drains_the_actual_read(self):
         previous, current = await self.turns()
         self.adopt(current, [self.raw(previous)])
         entered, stopped = asyncio.Event(), asyncio.Event()
@@ -680,11 +746,46 @@ class RawInputProvenanceTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 stopped.set()
 
-        self.h.memory.check_sources = blocked
+        self.raw_result = blocked
         job = asyncio.create_task(self.h.core._preflight_once(current))
         await asyncio.wait_for(entered.wait(), 1)
         job.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await job
         self.assertTrue(stopped.is_set())
+        self.assertEqual(
+            [["input_sources"]], [[c["kind"] for c in batch] for batch in self.verifications]
+        )
+
+    async def test_four_authors_raw_and_required_legacy_share_complete_batch(self):
+        *previous, current = await self.turns(5)
+        groups = self.groups(current)
+        legacy = scope_check(previous[0])
+        batches = [[input_only(groups[t["id"]])] for t in previous]
+        selected = await _v2_variants(self.h.core, current, [legacy], batches)
+        self.assertTrue(all(len(variants) == 1 for variants in selected))
+        self.assertEqual(1, len(self.preparations))
+        checks = self.preparations[0]
+        self.assertEqual(5, len(checks))
+        self.assertEqual(4, sum(c["kind"] == "input_sources" for c in checks))
+        self.assertEqual(1, sum(c["kind"] == "history" for c in checks))
+        self.assertEqual(4, len({r["scope"]["person_id"] for r in self.source_calls}))
+        self.assertEqual({t["id"] for t in previous}, {r["turn_id"] for r in self.source_calls})
+        self.adopt(current, [legacy, *(self.raw(t) for t in previous)])
+        self.verifications.clear()
+        await self.h.core._preflight_once(current)
+        await self.h.core._preflight_once(current)
+        self.assertEqual([5, 5], [len(batch) for batch in self.verifications])
+        self.assertEqual(12, len(self.source_calls))  # Four sources at three fresh boundaries.
+        self.assertEqual([], self.independent_calls)
+
+    async def test_standalone_raw_check_still_uses_real_source_sync(self):
+        from tianshu_companion.context_checks import VerificationCheckpoint
+
+        previous, current = await self.turns()
+        check = self.raw(previous)
+        async with VerificationCheckpoint() as checkpoint:
+            await self.h.core._verify_context_check(current, check, checkpoint)
+        self.assertEqual([(previous["id"], check["input_sources"])], self.independent_calls)
+        self.assertEqual([], self.source_calls)
         self.assertEqual([], self.verifications)

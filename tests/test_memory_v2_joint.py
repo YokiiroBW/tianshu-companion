@@ -859,8 +859,9 @@ def test_real_producer_forget_episode_uses_receipt_and_blocks_reindex(sync):
             required = scope_check(forgotten, input_only=True, raw_input=old_group)
             with pytest.raises(Fault) as required_negative:
                 await _v2_variants(h.core, current, [required], [])
-            assert required_negative.value.context_dependency_invalid
-            assert required_negative.value.cause["http_status"] == 409
+            assert required_negative.value.code == "scope_changed"
+            assert not getattr(required_negative.value, "memory_selection_invalid", False)
+            assert required_negative.value.cause["http_status"] == 200
         finally:
             await h.core.close()
             await wire.close()
