@@ -65,12 +65,24 @@ def open_database(path, logical_name, schema_sql, tables, *, settings=None, orde
                     "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname=current_schema()"
                 )
             }
-            required = set(tables) | {"nonebot_schema"}
-            if not required <= actual:
+            if "nonebot_schema" not in actual:
                 raise RuntimeError("NoneBot PostgreSQL tables missing")
             version = connection.native("SELECT version FROM nonebot_schema").fetchone()
             if version is None or version[0] != 1 or source is not None:
                 raise RuntimeError("Unsupported NoneBot target schema")
+            if logical_name == "rpc":
+                from .participation import (
+                    SCHEMA as participation_schema,
+                    TABLES as participation_tables,
+                )
+
+                missing = set(tables) - actual
+                if missing and missing <= set(participation_tables):
+                    connection.executescript(participation_schema)
+                    actual.update(participation_tables)
+            required = set(tables) | {"nonebot_schema"}
+            if not required <= actual:
+                raise RuntimeError("NoneBot PostgreSQL tables missing")
             return
         if (
             source is not None

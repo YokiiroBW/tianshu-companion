@@ -46,6 +46,9 @@ def create_host(*, host, port, data_dir, access_token, storage_backends=None):
     nonebot.get_driver().register_adapter(Adapter)
     if nonebot.load_plugin("tianshu_nonebot.adapter_plugin") is None:
         raise RuntimeError("Tianshu adapter could not be loaded")
+    from .adapter_plugin import participation_host
+
+    participation_host.enable_owned_entry()
     app = nonebot.get_asgi()
 
     @app.get("/health/live", include_in_schema=False)

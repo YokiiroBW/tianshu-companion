@@ -1,5 +1,11 @@
 # 天枢 AstrBot 适配器候选 0.6.0
 
+## 普通群消息参与候选（AL11）
+
+固定 AstrBot 4.27.3 的公开 hook 不能证明整个处理流水线正常结束，普通候选只提供 `ownership_unknown`，不支持自动语义 claim。`/tianshu/adapter/v1/participation/capabilities` 的 `available` 表示协议可用，`claim_supported=false` 明确表示不能自动领取；版本无法确认时协议能力也不可用。原 @、关键词、命令、精确路由和普通观察继续使用原路径，不能把 `_has_send_oper=false` 当作无人处理。
+
+新操作为 `participation/{capabilities,ownership,candidate,decision,claim,register,bind}`，认证和观察行仍属于原 AdapterService。候选 DTO 检查器随 ZIP 发行，manifest pin 为 `347b60a1dde6967adf559597e5bd7dfaa948f5b268d158d04ea3e3ad78b7c826`，无工作区绝对路径依赖。ACK、领取历史和原 messages/send/status 账本分工不变；没有 AL12 语义消费者时普通候选保持静默。本批未安装 AstrBot SDK，不能把共享 SQLite/RPC 验证称为真实 AstrBot 流水线验收。
+
 适用于 AstrBot **4.27.3** 的 aiocqhttp/OneBot v11 QQ 纯文本。插件默认运行 `tianshu.bot-adapter/v1`：平台主动读取事件、提交已授权回复。安装后没有绑定，不接管聊天或发送消息。
 
 ## 安装、监听与获取密钥

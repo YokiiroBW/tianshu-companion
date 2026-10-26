@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from .rpc import PREFIX, AdapterService, onebot_media, request_limit
 from .sdk import UnsupportedEvent, observation_event, text_event
+from .participation_host import execution, install as install_participation_host
 
 
 class Config(BaseModel):
@@ -138,6 +139,13 @@ for suffix in (
     "observation/ack",
     "observation/messages/send",
     "observation/messages/status",
+    "participation/capabilities",
+    "participation/ownership",
+    "participation/candidate",
+    "participation/decision",
+    "participation/claim",
+    "participation/register",
+    "participation/bind",
 ):
     path = f"{PREFIX}/{suffix}"
     app.add_api_route(
@@ -150,27 +158,37 @@ for suffix in (
     _routes.append(app.routes[-1])
 
 
-async def _observe(bot: BaseBot, event: BaseEvent) -> bool:
+async def _observe(bot: BaseBot, event: BaseEvent, state) -> bool:
+    proof = execution(state)
     if not isinstance(bot, OneBotBot):
         return False
     try:
         value = observation_event(bot, event)
     except (UnsupportedEvent, ValueError, KeyError, OverflowError, OSError):
         return False
-    await service.capture_observation(
-        value["account_id"],
-        value["conversation"],
-        value["author"],
-        value["event_id"],
-        value["sent_at"],
-        value["text"],
-        value["mentioned"],
-        value["content_state"],
-        True,
-        value["nickname"],
-        value["group_card"],
-        value["message_context"],
-    )
+    if proof:
+        proof.captured_value(value)
+    try:
+        outcome = await service.capture_observation_result(
+            value["account_id"],
+            value["conversation"],
+            value["author"],
+            value["event_id"],
+            value["sent_at"],
+            value["text"],
+            value["mentioned"],
+            value["content_state"],
+            True,
+            value["nickname"],
+            value["group_card"],
+            value["message_context"],
+        )
+        if proof:
+            await proof.step("capture", outcome)
+    except BaseException:
+        if proof:
+            proof.failed = True
+        raise
     return False  # Observing never claims reply ownership in NoneBot.
 
 
@@ -182,16 +200,25 @@ async def _observed():
     return None
 
 
-async def _claim_observation_reply(bot: BaseBot, event: BaseEvent) -> bool:
+async def _claim_observation_reply(bot: BaseBot, event: BaseEvent, state) -> bool:
+    proof = execution(state)
     if not isinstance(bot, OneBotBot):
         return False
     try:
         value = observation_event(bot, event)
     except (UnsupportedEvent, ValueError, KeyError, OverflowError, OSError):
         return False
-    return await service.observation_claimed(
-        value["account_id"], value["conversation"], value["author"], value["event_id"]
-    )
+    try:
+        outcome = await service.observation_claim_result(
+            value["account_id"], value["conversation"], value["author"], value["event_id"]
+        )
+        if proof:
+            await proof.step("explicit_reply", outcome)
+        return outcome == "claimed"
+    except BaseException:
+        if proof:
+            proof.failed = True
+        raise
 
 
 # A live Platform lease and the current policy are required for ownership.
@@ -203,24 +230,33 @@ async def _claimed_observation_reply():
     return None
 
 
-async def _scope(bot: BaseBot, event: BaseEvent) -> bool:
+async def _scope(bot: BaseBot, event: BaseEvent, state) -> bool:
+    proof = execution(state)
     if not isinstance(bot, OneBotBot):
         return False
     try:
         value = text_event(bot, event)
     except (UnsupportedEvent, ValueError, KeyError):
         return False
-    return await service.capture(
-        str(bot.self_id),
-        value.conversation_id,
-        value.account_id,
-        value.event_id,
-        value.sent_at,
-        value.text,
-        value.nickname,
-        value.group_card,
-        value.message_context,
-    )
+    try:
+        outcome = await service.capture_result(
+            str(bot.self_id),
+            value.conversation_id,
+            value.account_id,
+            value.event_id,
+            value.sent_at,
+            value.text,
+            value.nickname,
+            value.group_card,
+            value.message_context,
+        )
+        if proof:
+            await proof.step("scope", "claimed" if outcome == "captured" else outcome)
+        return outcome == "captured"
+    except BaseException:
+        if proof:
+            proof.failed = True
+        raise
 
 
 # Rule runs before blocking. Unknown authors and conversations pass to other plugins.
@@ -232,12 +268,16 @@ async def _handled():
     return None
 
 
+participation_host = install_participation_host(sys.modules[__name__])
+
+
 def unregister():
     """Explicit host shutdown/unload hook; NoneBot itself has no hot-unload API."""
     for route in _routes:
         if route in app.routes:
             app.routes.remove(route)
     _routes.clear()
+    participation_host.close()
     service.close()
 
 

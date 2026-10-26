@@ -50,7 +50,7 @@ class NoneBotHostTests(unittest.TestCase):
                             getattr(route, "path", "").startswith("/tianshu/adapter/v1")
                             for route in nonebot.get_asgi().routes
                         ),
-                        14,
+                        21,
                     )
                     self.assertEqual(await host._accounts(), [])
                     adapter = Adapter(driver)

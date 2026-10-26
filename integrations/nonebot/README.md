@@ -2,6 +2,8 @@
 
 新版网页自助适配器安装、密钥与地址说明见 [ADAPTER.md](ADAPTER.md)。以下仅用于加载 `tianshu_nonebot.plugin` 的旧 pull 模式；与新版 `tianshu_nonebot.adapter_plugin` 互斥。
 
+AL11 普通群参与的受控独立入口、协议和发行依赖见 [ADAPTER.md 的参与候选说明](ADAPTER.md#普通群消息参与候选al11)。本文旧 pull 入口不支持普通语义自动领取。
+
 此插件在现有 NoneBot 进程内运行。当前验证组合为 Python 3.12、NoneBot 2.5.0、`nonebot-adapter-onebot` 2.4.0；线上宿主版本未获知，安装前应先读取宿主 manifest 并在隔离环境中验证兼容性。首轮只支持 OneBot v11/NapCat 的私聊或群聊文本；群聊默认仅处理发给本机器人的消息。媒体、任意第三方 @、回复段、编辑、撤回、TG 均未启用。它不启动第二个陪伴 Core，也不使用 NoneBot `matcher.send` 回复。
 
 ## 部署前提
@@ -11,7 +13,7 @@
 3. 在运行 NoneBot/NapCat 的机器安装本仓库包。Python 3.12 隔离环境示例：
 
    ```powershell
-   python -m pip install vendor/tianshu_storage-0.1.0-py3-none-any.whl
+   python -m pip install vendor/tianshu_storage-0.1.3-py3-none-any.whl
    python -m pip install -r requirements-nonebot.txt
    python -m pip install --no-deps -e .
    ```

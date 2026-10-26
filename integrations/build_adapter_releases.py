@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT.parent / ".runtime" / "adapter-artifacts"
 VERSION = "0.6.0"
-STORAGE_WHEEL = ROOT.parent / "vendor" / "tianshu_storage-0.1.0-py3-none-any.whl"
+STORAGE_WHEEL = ROOT.parent / "vendor" / "tianshu_storage-0.1.3-py3-none-any.whl"
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
@@ -43,12 +43,17 @@ def _write_entry(archive: zipfile.ZipFile, name: str, data: bytes) -> None:
 
 
 def main() -> None:
-    source = (ROOT / "shared" / "tianshu_adapter_rpc.py").read_bytes()
+    shared = {
+        "rpc.py": "tianshu_adapter_rpc.py",
+        "participation.py": "participation.py",
+        "participation_protocol.py": "participation_protocol.py",
+    }
     astr = ROOT / "astrbot" / "astrbot_plugin_tianshu"
     none = ROOT / "nonebot" / "tianshu_nonebot"
     for folder in (astr, none):
-        if (folder / "rpc.py").read_bytes() != source:
-            raise SystemExit(f"stale vendored RPC module: {folder}")
+        for destination, source in shared.items():
+            if (folder / destination).read_bytes() != (ROOT / "shared" / source).read_bytes():
+                raise SystemExit(f"stale vendored adapter module: {folder / destination}")
     OUT.mkdir(parents=True, exist_ok=True)
     astr_zip = OUT / f"astrbot_plugin_tianshu-{VERSION}.zip"
     with zipfile.ZipFile(astr_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -78,7 +83,7 @@ def main() -> None:
         f"Version: {VERSION}\nRequires-Python: >=3.12\n"
         "Requires-Dist: nonebot2[fastapi]>=2.5,<2.6\n"
         "Requires-Dist: nonebot-adapter-onebot>=2.4,<2.5\n"
-        "Requires-Dist: tianshu-storage==0.1.0\n"
+        "Requires-Dist: tianshu-storage==0.1.3\n"
     ).encode()
     entries[dist + "/README.md"] = (ROOT / "nonebot" / "ADAPTER.md").read_bytes()
     record = dist + "/RECORD"
