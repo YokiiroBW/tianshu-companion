@@ -22,6 +22,10 @@ from .context import (
     TEXT_DOMAIN,
     TEXT_INPUT_DOMAIN,
     MEMORY_CONTEXT_DOMAIN,
+    CHAT_HISTORY_DOMAIN,
+    ACTOR_MEMORY_DOMAIN,
+    TOOL_READ_DOMAINS,
+    tool_input_checks,
     TurnContext,
     inherited_checks,
     merge_checks,
@@ -142,6 +146,10 @@ class Core(Delivery):
         relationships=None,
         knowledge_client=None,
         background_gateway=None,
+        background_model_selector=None,
+        chat_history_client=None,
+        chat_history_mappings=(),
+        actor_memory_authority=None,
     ):
         self._automatic_memory_candidates = candidates_enabled(automatic_memory_candidates)
         self.default_model_selector = default_model_selector
@@ -158,6 +166,9 @@ class Core(Delivery):
         self.summary_windows = SummaryWindows(self)
         self.memory_learning = MemoryLearning(self)
         self.knowledge_client = knowledge_client or getattr(memory, "client", None)
+        from .chat_history import ChatHistory
+
+        self.chat_history = ChatHistory(self, chat_history_client, chat_history_mappings)
         # The injected runtime-event port. It records what already happened and decides
         # nothing: no rule is moved here, no table is created, and a port that fails or is
         # absent cannot change one business outcome. An explicit port is honoured; otherwise
@@ -208,8 +219,21 @@ class Core(Delivery):
                 background_limit=self.models.background_limit,
             )
             self.life.generation_writing = True if life_writing is None else life_writing
-            self.life.model_selector = default_model_selector
-            self.life.default_config_version = config_version
+            if background_model_selector is not None and background_gateway is None:
+                raise ValueError("Background model selection requires its own Gateway client")
+            self.life.model_selector = (
+                background_model_selector
+                if background_gateway is not None
+                else default_model_selector
+            )
+            self.life.generation_caller_service = (
+                "companion_background" if background_gateway is not None else "companion"
+            )
+            # An independently authenticated background caller cannot borrow a
+            # foreground dynamic grant or its selected/default version.
+            self.life.default_config_version = (
+                config_version if background_gateway is None else None
+            )
             self.images = Images(self.life, **(image_options or {}))
             from .life_album import Album
 
@@ -265,6 +289,10 @@ class Core(Delivery):
             from .runtime_execution import RuntimeExecution
 
             self.reading = Reading(self)
+            from .actor_memory import ActorMemory
+
+            self.actor_memory = ActorMemory(self, actor_memory_authority)
+            self.life.actor_memory = self.actor_memory
             self.images.original_reader = self.reading.original
             self.image_backend.runtime = self.life_runtime
             self.runtime_execution = RuntimeExecution(self)
@@ -1042,6 +1070,7 @@ class Core(Delivery):
             # silently rewrite an in-flight turn's persona.
             self.persona_problems = self.personas.recover()
         with self.store.transaction():
+            self.actor_memory.recover()
             if self.automatic_memory_candidates:
                 # A persisted intent cannot prove whether Memory accepted it before exit.
                 # Disabled startup preserves even these rows byte-for-byte.
@@ -1855,6 +1884,7 @@ class Core(Delivery):
 
         pending = Segments()
         output, route_receipts = [], []
+        external_tool_checks = []
         streaming = self.expression_sender(turn) is not None
 
         async def delta(text):
@@ -1876,6 +1906,12 @@ class Core(Delivery):
             fresh = self.store.get("turns", turn["id"])
             if fresh["cancelled"] or fresh["phase"] in TERMINAL:
                 raise Fault("scope_changed")
+            if iteration and any(
+                check["version_domain"] in TOOL_READ_DOMAINS for check in dispatch_checks["checks"]
+            ):
+                # Archive evidence in an earlier tool result remains actual model input.
+                # Recheck it after all intervening tool awaits, before this dispatch.
+                await self._preflight(fresh)
             for attempt in range(2):
                 try:
                     fresh = self._record_model_dispatch(turn["id"], dispatch_checks)
@@ -2005,6 +2041,14 @@ class Core(Delivery):
                 )
                 messages.extend(attachments)
                 fresh = self.store.get("turns", turn["id"])
+                if result["state"] == "completed":
+                    external_tool_checks = merge_checks(
+                        external_tool_checks, tool_input_checks(fresh)
+                    )
+                    dispatch_checks = dict(
+                        dispatch_checks,
+                        checks=merge_checks(dispatch_checks["checks"], external_tool_checks),
+                    )
                 if call["function"]["name"] == "memory_propose" or (
                     call["function"]["name"] == "memory_recall" and result["state"] == "completed"
                 ):
@@ -2033,7 +2077,7 @@ class Core(Delivery):
                             self._check_input_versions(fresh)
                             fresh.update(
                                 short_context=metadata,
-                                context_checks=checks,
+                                context_checks=merge_checks(checks, external_tool_checks),
                                 profile_checks=profiles,
                                 history_snapshot=history,
                                 input_history_snapshot=inputs,
@@ -2139,7 +2183,13 @@ class Core(Delivery):
                 read_budget=(
                     clients.JsonService.QUERY_BUDGET_SECONDS
                     if check["version_domain"]
-                    in {TEXT_DOMAIN, TEXT_INPUT_DOMAIN, PROFILE_DOMAIN, MEMORY_CONTEXT_DOMAIN}
+                    in {
+                        TEXT_DOMAIN,
+                        TEXT_INPUT_DOMAIN,
+                        PROFILE_DOMAIN,
+                        MEMORY_CONTEXT_DOMAIN,
+                        *TOOL_READ_DOMAINS,
+                    }
                     else 0
                 ),
             ),
@@ -2270,6 +2320,22 @@ class Core(Delivery):
                 lambda: self.memory.verify_context(
                     check["origin"], scope, check["memory_bundle"], []
                 ),
+            )
+            self._context_source(check)
+            if lease_deadline is not None and lease_deadline <= self.clock():
+                raise Fault("forbidden")
+        elif check["version_domain"] == CHAT_HISTORY_DOMAIN:
+            await checkpoint.once(
+                ["chat_history", check, lease_deadline],
+                lambda: self.chat_history.verify(check),
+            )
+            self._context_source(check)
+            if lease_deadline is not None and lease_deadline <= self.clock():
+                raise Fault("forbidden")
+        elif check["version_domain"] == ACTOR_MEMORY_DOMAIN:
+            await checkpoint.once(
+                ["actor_memory", check, lease_deadline],
+                lambda: self.actor_memory.verify(check),
             )
             self._context_source(check)
             if lease_deadline is not None and lease_deadline <= self.clock():
@@ -2653,7 +2719,7 @@ class Core(Delivery):
                 self._save_turn(fresh)
 
     async def flush_outbox(self):
-        if not self.automatic_memory_candidates:
+        if not self.automatic_memory_candidates and not self.actor_memory.available:
             return
         await self.memory_learning.work(outbox_only=True)
 

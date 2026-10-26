@@ -115,6 +115,11 @@ class JsonService:
             "/internal/v2/memory/context/profiles",
             "/internal/v2/bot-delivery/context",
             "/internal/v2/bot-delivery/query",
+            "/internal/evidence/search",
+            "/internal/evidence/read-locator",
+            "/internal/evidence/check",
+            "/internal/v1/memory/browser/archive-check",
+            "/internal/v1/actor-self-memory/authority",
         }
     )
     QUERY_BUDGET_SECONDS = 15
@@ -386,6 +391,19 @@ class JsonService:
 
     @classmethod
     def _is_query(cls, path, body):
+        if path == "/internal/v1/actor-capabilities/operate":
+            return (
+                type(body) is dict
+                and body.get("schema_version") == 1
+                and body.get("operation") == "discover"
+            )
+        if path == "/internal/v1/actor-self-memory/operate":
+            return (
+                type(body) is dict
+                and body.get("schema_version") == 1
+                and body.get("operation")
+                in {"query", "check_memory", "get_episode", "check_episode", "get_receipt"}
+            )
         if path == "/internal/v1/memory/candidates/process":
             # This endpoint has both receipt lookup and proposal submission.
             # Only the exact null-output lookup can recover a stale connection

@@ -89,6 +89,8 @@ class Life:
         self.runtime_readers = ()
         self.generation_writing = writing
         self.model_selector = None
+        self.generation_caller_service = "companion"
+        self.actor_memory = None
         self.default_config_version = None
         from .life_daily import DailyLife
         from .life_influences import LifeInfluences
@@ -141,7 +143,11 @@ class Life:
         from .model_selection import SelectionRequest, resolve_selection, verify_lease
 
         if self.model_selector is not None:
-            if (task.get("model_selection") or {}).get("turn_id") != task["generation_turn_id"]:
+            retained = task.get("model_selection") or {}
+            if (
+                retained.get("turn_id") != task["generation_turn_id"]
+                or retained.get("caller_service", "companion") != self.generation_caller_service
+            ):
                 actor = task["actor_id"]
                 chosen = await resolve_selection(
                     self.model_selector,
@@ -152,6 +158,7 @@ class Life:
                         audience="self_private",
                         conversation_id="life:" + digest(actor),
                         function_id="writing",
+                        caller_service=self.generation_caller_service,
                     ),
                     self.clock,
                 )
@@ -159,8 +166,14 @@ class Life:
                 task["model_selection"] = {
                     "expires_at": chosen.expires_at,
                     "turn_id": task["generation_turn_id"],
+                    "caller_service": self.generation_caller_service,
                 }
             verify_lease(task["model_selection"]["expires_at"], self.clock())
+        elif self.generation_caller_service == "companion_background":
+            if self.config_version is None:
+                raise Fault("dependency_unavailable")
+            task["config_version"] = self.config_version
+            task.pop("model_selection", None)
         elif task.get("config_version") is None:
             task["config_version"] = self.config_version or self.default_config_version
         if task.get("config_version") is None:

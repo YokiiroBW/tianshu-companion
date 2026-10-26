@@ -48,12 +48,17 @@ class DefaultModelSelector(Protocol):
 class HttpDefaultModelSelector:
     """Dedicated companion identity; the platform proves the exact publication."""
 
-    def __init__(self, client):
+    def __init__(self, client, *, caller_service="companion"):
         if not client.url or not client.token:
             raise ValueError("provider selector service is not configured")
+        if caller_service not in {"companion", "companion_background"}:
+            raise ValueError("Unsupported model selector caller")
         self.client = client
+        self.caller_service = caller_service
 
     async def select(self, request: SelectionRequest) -> ModelSelection:
+        if request.caller_service != self.caller_service:
+            raise Fault("forbidden")
         payload = asdict(request)
         if request.function_id == "chat":
             payload.pop("function_id")  # Preserve the existing chat request and grant digest.

@@ -8,6 +8,7 @@ from .context import (
     TEXT_DOMAIN,
     TEXT_INPUT_DOMAIN,
     MEMORY_CONTEXT_DOMAIN,
+    TOOL_READ_DOMAINS,
     bound_recent_provenance,
     merge_checks,
     profile_check,
@@ -209,7 +210,13 @@ async def _prepare_candidates(core, turn, checks, batches):
                     identity not in required
                     and origins[identity] not in required_origins
                     and check["version_domain"]
-                    in {TEXT_DOMAIN, TEXT_INPUT_DOMAIN, PROFILE_DOMAIN, MEMORY_CONTEXT_DOMAIN}
+                    in {
+                        TEXT_DOMAIN,
+                        TEXT_INPUT_DOMAIN,
+                        PROFILE_DOMAIN,
+                        MEMORY_CONTEXT_DOMAIN,
+                        *TOOL_READ_DOMAINS,
+                    }
                     and not error.unknown
                     and not getattr(error, "context_renewal_failure", False)
                     and getattr(error, "origin_read_unavailable", False)

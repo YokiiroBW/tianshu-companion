@@ -284,6 +284,9 @@ def test_aggregate_contract_limit_rolls_back_source_catalog(monkeypatch):
         try:
             catalog = h.core.skills
             builtin_count = len(catalog.result("actor:a")["skills"])
+            maximum = h.contracts.schemas["skills"]["$defs"]["result"]["properties"]["skills"][
+                "maxItems"
+            ]
             assert "memory.recall" in {s["id"] for s in catalog.result("actor:a")["skills"]}
             await manage(h, "source.configure", source())
             entries = [
@@ -295,7 +298,7 @@ def test_aggregate_contract_limit_rolls_back_source_catalog(monkeypatch):
                     ["query"],
                     "uninstalled",
                 )
-                for n in range(90)
+                for n in range(maximum - builtin_count - 1)
             ]
             current = manifest(entries)
 

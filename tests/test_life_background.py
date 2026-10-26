@@ -19,6 +19,7 @@ from tianshu_companion.clients import JsonService, utc
 from tianshu_companion.life import Life
 from tianshu_companion.model_slots import ModelSlots
 from tianshu_companion.store import Store
+from tianshu_companion.model_selection import HttpDefaultModelSelector, SelectionRequest
 
 
 class ActivityModel:
@@ -54,6 +55,102 @@ class ActivityModel:
         ), {"fixture": True}
 
 
+def test_background_dynamic_selection_uses_its_own_authenticated_caller():
+    async def run():
+        seen = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            seen.append(body)
+            assert request.headers["authorization"] == "Bearer background-selector"
+            return httpx.Response(
+                200,
+                json=dict(
+                    config_version=37,
+                    expires_at=1_900_000_000,
+                    revoked=False,
+                    caller_service="companion_background",
+                    workload="companion.text",
+                ),
+            )
+
+        wire = JsonService(
+            "https://platform.fixture.invalid",
+            "background-selector",
+            transport=httpx.MockTransport(handler),
+        )
+        selector = HttpDefaultModelSelector(wire, caller_service="companion_background")
+        h = Harness()
+        await h.core.close()
+        h.core = h.new_core(background_gateway=ActivityModel(), background_model_selector=selector)
+        try:
+            task = dict(
+                actor_id="actor:a",
+                generation_turn_id="actual:background",
+                config_version=99,
+                model_selection=dict(
+                    turn_id="actual:background",
+                    expires_at=1_900_000_000,
+                    caller_service="companion",
+                ),
+            )
+            await h.core.life.select_generation(task)
+            assert task["config_version"] == 37
+            assert seen[0]["caller_service"] == "companion_background"
+            assert seen[0]["function_id"] == "writing"
+            with pytest.raises(Fault, match="forbidden"):
+                await selector.select(
+                    SelectionRequest("front", "actor:a", "person:a", "self_private", "conv:a")
+                )
+            assert len(seen) == 1
+        finally:
+            await h.core.close()
+            await wire.close()
+
+    asyncio.run(run())
+
+
+def test_background_gateway_cannot_borrow_front_dynamic_or_default_version():
+    async def run():
+        class ForbiddenFrontSelector:
+            async def select(self, request):
+                raise AssertionError("background must not borrow a front grant")
+
+        h = Harness()
+        await h.core.close()
+        h.core = h.new_core(
+            background_gateway=ActivityModel(), default_model_selector=ForbiddenFrontSelector()
+        )
+        try:
+            assert not h.core.life.generation_available()
+            with pytest.raises(Fault, match="dependency_unavailable"):
+                await h.core.life.select_generation(
+                    dict(
+                        actor_id="actor:a",
+                        generation_turn_id="background:no-binding",
+                        config_version=None,
+                    )
+                )
+        finally:
+            await h.core.close()
+        h.core = h.new_core(
+            background_gateway=ActivityModel(),
+            life_config_version=41,
+            default_model_selector=ForbiddenFrontSelector(),
+        )
+        try:
+            task = dict(
+                actor_id="actor:a", generation_turn_id="background:published", config_version=None
+            )
+            await h.core.life.select_generation(task)
+            assert task["config_version"] == 41 and h.core.life.generation_available()
+            assert "model_selection" not in task
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
 def activity_core(h, model):
     h.core.life.gateway = model
     h.core.recover()
@@ -76,7 +173,7 @@ def test_activity_uses_background_reserve_and_separate_gateway():
         h = Harness()
         await h.core.close()
         model = ActivityModel()
-        h.core = h.new_core(model_slots=2, background_gateway=model)
+        h.core = h.new_core(model_slots=2, background_gateway=model, life_config_version=1)
         model.gate = asyncio.Event()
         saved = activity_core(h, model)
         step = asyncio.create_task(h.core.life.activities.work(actor_id="actor:a"))
@@ -301,7 +398,7 @@ def test_activity_round_yields_and_restart_resumes_exact_known_messages(tmp_path
             frozen = copy.deepcopy(h.core.store.get("metadata", operation))
             assert len(model.calls) == 1 and frozen["state"] == "pending"
             await h.core.close()
-            h.core = h.new_core(background_gateway=model)
+            h.core = h.new_core(background_gateway=model, life_config_version=1)
             h.core.recover()
             model.tool = False
             await h.core.life.activities.work(actor_id="actor:a")
@@ -328,7 +425,7 @@ def test_unknown_activity_model_is_not_replayed_on_restart(tmp_path):
         try:
             await h.core.life.activities.work(actor_id="actor:a")
             await h.core.close()
-            h.core = h.new_core(background_gateway=model)
+            h.core = h.new_core(background_gateway=model, life_config_version=1)
             h.core.recover()
             for _ in range(3):
                 await h.core.life.activities.work(actor_id="actor:a")

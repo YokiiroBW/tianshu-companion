@@ -496,6 +496,14 @@ def build_runtime(config):
                 if "gateway_background" in config.get("services", {})
                 else None
             ),
+            background_model_selector=(
+                HttpDefaultModelSelector(
+                    client("provider_selector_background", "platform"),
+                    caller_service="companion_background",
+                )
+                if "provider_selector_background" in config.get("services", {})
+                else None
+            ),
             default_model_selector=provider_selector,
             qq_admin=qq_admin,
             qq_identity_required=qq_admission,
@@ -504,6 +512,17 @@ def build_runtime(config):
                 client("knowledge", "knowledge")
                 if "knowledge" in config.get("services", {})
                 else memory.client
+            ),
+            chat_history_client=(
+                client("chat_history", "chat")
+                if "chat_history" in config.get("services", {})
+                else None
+            ),
+            chat_history_mappings=config.get("chat_history_mappings", []),
+            actor_memory_authority=(
+                client("actor_memory_authority", "platform")
+                if "actor_memory_authority" in config.get("services", {})
+                else None
             ),
             policy=Policy(**config.get("policy", {})),
             short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
@@ -826,6 +845,8 @@ def create_app(core=None, tokens=None, life_readers=None):
                 return await core.web_snapshot(service, body)
             if operation == "facts":
                 return core.source_facts(service, body)
+            if operation == "actor-memory-source":
+                return await core.actor_memory.source(service, body)
             if operation == "summary-window-check":
                 return core.summary_windows.check(service, body)
             if operation == "ingest-receipt":
@@ -946,6 +967,10 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v1/source-facts/read")
     async def source_facts(request: Request):
         return await dispatch(request, "facts")
+
+    @app.post("/internal/v1/actor-self-memory/source")
+    async def actor_memory_source(request: Request):
+        return await dispatch(request, "actor-memory-source")
 
     @app.post("/internal/v1/memory/consolidation/window/check")
     async def summary_window_check(request: Request):

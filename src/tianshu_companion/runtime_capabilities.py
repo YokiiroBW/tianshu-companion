@@ -57,5 +57,11 @@ def read_capabilities(core):
             },
             "memory_write_verification": "not_verified",
         },
-        "chat_audit": {"enabled": False, "state": "not_integrated"},
+        "chat_audit": {
+            "enabled": core.chat_history.available,
+            "state": "configured_network_unverified",
+            "access": "current_channel_read_only",
+        }
+        if core.chat_history.available
+        else {"enabled": False, "state": "not_integrated"},
     }

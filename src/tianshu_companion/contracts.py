@@ -113,6 +113,10 @@ class Contracts:
                 raise ValueError("Unsupported contract dependency")
 
         aliases = {
+            "actor-capabilities/candidate-v1": "actor-capabilities",
+            "actor-self-memory/candidate-v1": "actor-self-memory",
+            "chat-history/candidate-v1": "chat-history",
+            "archive-memory-check/candidate-v1": "archive-memory-check",
             "profile-memory/v1": "profiles",
             "life-read/v1": "life-read",
             "life-runtime/v2": "life-runtime",
@@ -126,6 +130,12 @@ class Contracts:
             "image-backend/v1": "image-backend",
             "skills/v1": "skills",
             "reading-state/v1": "reading-state",
+        }
+        candidates = {
+            "actor-capabilities/candidate-v1": "1.0.0-candidate.1",
+            "actor-self-memory/candidate-v1": "1.0.0-candidate.2",
+            "chat-history/candidate-v1": "1.0.0-candidate.1",
+            "archive-memory-check/candidate-v1": "1.0.0-candidate.1",
         }
         for package in (
             "text-dialogue/v1",
@@ -147,6 +157,11 @@ class Contracts:
                 if (packages / "reading-state/v1/manifest.json").is_file()
                 else ()
             ),
+            *(
+                package
+                for package in candidates
+                if (packages / package / "manifest.json").is_file()
+            ),
         ):
             package_root = (packages / package).resolve()
             manifest = read(package_root / "manifest.json")
@@ -162,6 +177,7 @@ class Contracts:
                 if package.endswith("/v2")
                 else "1.0.0"
             )
+            expected_version = candidates.get(package, expected_version)
             if release.get("version") != expected_version:
                 raise ValueError("Unsupported contract version")
             dependencies = release.get("dependencies", [])

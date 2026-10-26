@@ -416,8 +416,16 @@ class MemoryLearning:
 
     def _automatic_due(self):
         store, now = self.core.store, self.core.clock()
+        from .actor_memory import OUTBOX_PENDING
+
+        actor_due = self.core.actor_memory.available and store.due(
+            "outbox", OUTBOX_PENDING, now, limit=1
+        )
+        if not self.core.automatic_memory_candidates:
+            return bool(actor_due)
         return bool(
-            store.db.execute(
+            actor_due
+            or store.db.execute(
                 "SELECT 1 FROM metadata WHERE conversation_id=? "
                 "AND status IN ('pending','material_pending') AND deadline<=? LIMIT 1",
                 (QUEUE, now),
@@ -436,7 +444,7 @@ class MemoryLearning:
         Credit is bounded, and idle foreground traffic cannot bank future work.
         This counter belongs to automatic I/O, independently of model-slot fairness.
         """
-        if not self.core.automatic_memory_candidates:
+        if not self.core.automatic_memory_candidates and not self.core.actor_memory.available:
             return
         self._foreground_finished = (
             min(3, self._foreground_finished + 1) if self._automatic_due() else 0
@@ -480,7 +488,7 @@ class MemoryLearning:
 
     def _select_phase(self, *, outbox_only):
         core, now = self.core, self.core.clock()
-        if not outbox_only and self._ordered:
+        if core.automatic_memory_candidates and not outbox_only and self._ordered:
             drain = self._next(drain_only=True)
             if drain is not None:
                 # These real persisted exclusion barriers are holding queued
@@ -491,11 +499,22 @@ class MemoryLearning:
             if outbox_only
             else ("outbox", "observation", "learning", "relationship")
         )
+        if not core.automatic_memory_candidates:
+            families = ()
+        if core.actor_memory.available:
+            families += ("actor_memory",)
+        if not families:
+            return None
         busy = core.automatic_memory_foreground_demand()
         for offset in range(len(families)):
             index = (self._family + offset) % len(families)
             family = families[index]
-            if family in {"outbox", "relationship"}:
+            if family == "actor_memory":
+                from .actor_memory import OUTBOX_PENDING
+
+                rows = core.store.due("outbox", OUTBOX_PENDING, now, limit=1)
+                item = rows[0] if rows else None
+            elif family in {"outbox", "relationship"}:
                 if family == "relationship" and core.relationships is None:
                     continue
                 states = (
@@ -564,6 +583,8 @@ class MemoryLearning:
                     async with core._outbox_lock:
                         if phase["family"] == "outbox":
                             await core._flush_outbox(item)
+                        elif phase["family"] == "actor_memory":
+                            await core.actor_memory.flush(item)
                         else:
                             await core.relationships.flush(core)
                 core.counted("memory.work")
@@ -583,13 +604,17 @@ class MemoryLearning:
                     del self.jobs[key]
                     if not job.cancelled():
                         job.result()
-            if not core.automatic_memory_candidates:
+            if not core.automatic_memory_candidates and not core.actor_memory.available:
                 return
-            changed = self.backfill()
-            if getattr(core.memory, "extraction_schema", 5) == 6:
+            changed = self.backfill() if core.automatic_memory_candidates else False
+            if (
+                core.automatic_memory_candidates
+                and getattr(core.memory, "extraction_schema", 5) == 6
+            ):
                 changed = self.segments.seal_due() or changed
-            changed = self._recover_legacy() or changed
-            changed = self._order_pending() or changed
+            if core.automatic_memory_candidates:
+                changed = self._recover_legacy() or changed
+                changed = self._order_pending() or changed
             if changed:
                 core.counted("memory.work")
             if self.jobs:

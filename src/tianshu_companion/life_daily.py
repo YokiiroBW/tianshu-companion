@@ -457,7 +457,38 @@ class DailyLife:
                         if one:
                             return True
                         continue
+                    if self.life.actor_memory is not None and self.life.actor_memory.available:
+                        task["actor_memory_input"] = await self.life.actor_memory.query(
+                            task["actor_id"],
+                            dict(
+                                purpose="plan" if kind == "plan" else "reflection",
+                                audience=dict(kind="actor_only"),
+                            ),
+                            "与本阶段和后续计划有关的自身实际阅读、理解与兴趣",
+                            limit=6,
+                            budget_bytes=4096,
+                        )
+                        await self.life.actor_memory.check(task["actor_memory_input"])
+                        if self._current(task) is None:
+                            task["state"] = "superseded"
+                            self._status(task)
+                            if one:
+                                return True
+                            continue
                     self._save(task)
+                    messages = self._messages(task, actor, plan)
+                    if task.get("actor_memory_input") is not None:
+                        messages.append(
+                            dict(
+                                role="user",
+                                content=canonical(
+                                    dict(
+                                        actor_self_memory=task["actor_memory_input"]["items"],
+                                        meaning="Sourced past actor material; future plans and fictional scenes remain distinct.",
+                                    )
+                                ),
+                            )
+                        )
                     output, receipt = await asyncio.wait_for(
                         self.life.gateway.generate(
                             {
@@ -466,7 +497,7 @@ class DailyLife:
                                 "actor_id": task["actor_id"],
                                 "conversation_id": "life:" + digest(task["actor_id"]),
                             },
-                            self._messages(task, actor, plan),
+                            messages,
                         ),
                         60,
                     )

@@ -7,6 +7,9 @@ from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 TEXT_DOMAIN = "text-dialogue/v1"
 TEXT_INPUT_DOMAIN = "text-input/v1"
 MEMORY_CONTEXT_DOMAIN = "memory-context/v2"
+CHAT_HISTORY_DOMAIN = "chat-history/candidate-v1"
+ACTOR_MEMORY_DOMAIN = "actor-self-memory/candidate-v1"
+TOOL_READ_DOMAINS = frozenset({CHAT_HISTORY_DOMAIN, ACTOR_MEMORY_DOMAIN})
 CONTEXT_LIMIT = 16384
 
 
@@ -105,6 +108,17 @@ def merge_checks(*parts):
     # The v2 wire check limit applies to a batch, not the lifetime of a conversation.
     # Callers keep the complete deduplicated dependency set and validate every batch.
     return list(checks.values())
+
+
+def tool_input_checks(turn):
+    """Real read tools add evidence to native messages, independently of Memory refresh."""
+    return copy.deepcopy(
+        [
+            check
+            for check in turn.get("context_checks", [])
+            if check["version_domain"] in TOOL_READ_DOMAINS
+        ]
+    )
 
 
 def reply_provenance_checks(turn):

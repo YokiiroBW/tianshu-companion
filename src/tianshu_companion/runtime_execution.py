@@ -341,9 +341,33 @@ class RuntimeExecution:
             ),
         ]
         messages = copy.deepcopy(marker.get("messages", messages))
+        memory_input = marker.get("actor_memory_input")
+        if "messages" not in marker and self.core.actor_memory.available:
+            memory_input = await self.core.actor_memory.query(
+                actor,
+                dict(purpose="plan", audience=dict(kind="actor_only")),
+                activity["title"],
+                limit=6,
+                budget_bytes=4096,
+            )
+            messages.append(
+                dict(
+                    role="user",
+                    content=canonical(
+                        dict(
+                            actor_self_memory=memory_input["items"],
+                            meaning="Actual past actor material, not completion of this activity or user experiences.",
+                        )
+                    ),
+                )
+            )
+            marker.update(messages=copy.deepcopy(messages), actor_memory_input=memory_input)
+            self.store.put("metadata", marker)
         receipts = copy.deepcopy(marker.get("receipts", []))
         reads = copy.deepcopy(marker.get("reads", []))
         async with self.core.life.model_slots:
+            if memory_input is not None:
+                await self.core.actor_memory.check(memory_input)
             self.current_sources(source_inputs)
             if any(source["owner"] != "companion" for source in source_inputs):
                 if activity["scope"] is None:

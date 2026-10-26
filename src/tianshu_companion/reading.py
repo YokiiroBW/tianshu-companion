@@ -106,16 +106,34 @@ class Reading:
         self.core.contracts.check("knowledge-content#" + operation + "_request", request)
         if self.core.knowledge_client is None:
             raise Fault("dependency_unavailable")
-        response = await self.core.knowledge_client.call(
-            "/internal/v1/knowledge/content/" + operation, request, uncertain_write=uncertain
-        )
-        self.core.contracts.check("knowledge-content#" + operation + "_response", response)
         principal = request["principal"]
         request_id = (
             principal["request_id"]
             if principal["kind"] == "actor"
             else principal["query"]["request_id"]
         )
+        missing = False
+
+        def owner_error(status, value, error):
+            nonlocal missing
+            if operation == "read" and status == 404:
+                self.core.contracts.check("common#error", value)
+                if value["request_id"] != request_id:
+                    raise Fault("invalid_input")
+                missing = value["code"] == "not_found" and value["execution_state"] == "not_started"
+
+        try:
+            response = await self.core.knowledge_client.call(
+                "/internal/v1/knowledge/content/" + operation,
+                request,
+                uncertain_write=uncertain,
+                error_response=owner_error,
+            )
+        except Fault as error:
+            if missing:
+                raise Fault("not_found", cause=error.cause) from None
+            raise
+        self.core.contracts.check("knowledge-content#" + operation + "_response", response)
         if (
             response["request_id"] != request_id
             or epoch(response["available_until"]) <= self.core.clock()
@@ -260,7 +278,7 @@ class Reading:
             elif operation == "reading.read":
                 item = self.get(actor, value["id"], scope)
                 require_version(item, expected)
-                self._advance(item, prepared)
+                self._advance(item, prepared, actor_observed=return_content)
             else:
                 item = self.get(actor, value["id"], scope)
                 require_version(item, expected)
@@ -389,7 +407,7 @@ class Reading:
             raise Fault("scope_changed")
         return result.get("available_until")
 
-    def _advance(self, item, result):
+    def _advance(self, item, result, *, actor_observed=False):
         actual = result["coverage"]
         coverage = item["content_ref"]["coverage"]
         if (
@@ -448,6 +466,10 @@ class Reading:
                 gaps=result.get("gaps", []),
             )
         )
+        if actor_observed:
+            # Only actual BOT tool execution received this original. A human's
+            # browser read may advance the same UI progress, but is not the BOT's experience.
+            self.core.actor_memory.record_read(item, result)
 
     async def read_content(self, request):
         actor, scope, reading_id = request["actor_id"], request["scope"], request["reading_id"]

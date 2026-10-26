@@ -48,6 +48,8 @@ def definition(skill_id, title, description, domain, operations, handler_id=None
 def install(registry):
     from .image import ImageSkill
     from .gscore import GSCoreSkill
+    from .chat import ChatHistorySkill
+    from .actor_memory import ActorMemorySkill
     from ..role_actions import OPERATIONS
 
     life = {
@@ -56,6 +58,26 @@ def install(registry):
         if operation != "image.request"
     }
     life.update({"life.read": "life_read", "life.send_content": "life_send_content"})
+    registry.register(
+        definition(
+            "actor-memory",
+            "自身经历与认识",
+            "按真实来源查阅自身经历，并保留可修正的理解和兴趣；不写到用户画像。",
+            "memory",
+            ["actor-memory.recall", "actor-memory.remember"],
+        ),
+        ActorMemorySkill(),
+    )
+    registry.register(
+        definition(
+            "chat.history",
+            "聊天历史查证",
+            "在当前真实会话中按需搜索与邻读已归档原话，保留说话人、时间和来源。",
+            "chat",
+            ["chat.search", "chat.read"],
+        ),
+        ChatHistorySkill(),
+    )
     registry.register(
         definition(
             "memory.recall",

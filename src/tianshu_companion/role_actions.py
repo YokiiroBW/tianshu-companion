@@ -732,7 +732,9 @@ class RoleActions:
             intent=value["intent"],
             material=prompt_material(response),
             omissions=response["omissions"],
-            chat_archive="not_integrated",
+            chat_archive="separate_tool_available_not_queried"
+            if self.core.chat_history.available
+            else "not_integrated",
         )
 
     async def _refresh_memory_context(
