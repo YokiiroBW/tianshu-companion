@@ -39,6 +39,9 @@ class MemoryLearning:
         self.lock = asyncio.Lock()
         self.jobs = {}
         self.closed = False
+        self._phase = None
+        self._family = 0
+        self._foreground_finished = 0
         self.mutation_scopes = {}
         self.segments = MemorySegments(core, QUEUE)
         boundary = core.store.get("metadata", "memory-learning-schema5-boundary")
@@ -156,15 +159,7 @@ class MemoryLearning:
                     ),
                 )
 
-    async def _flush_observation_material(self):
-        row = self.core.store.db.execute(
-            "SELECT body FROM metadata WHERE conversation_id=? AND status='material_pending' "
-            "AND deadline<=? ORDER BY deadline,position,id LIMIT 1",
-            (QUEUE, self.core.clock()),
-        ).fetchone()
-        if row is None:
-            return False
-        item = json.loads(row[0])
+    async def _flush_observation_material(self, item):
         try:
             response = await self.core.memory.accept_materials(
                 dict(schema_version=1, observation_refs=[item["source_ref"]])
@@ -222,7 +217,7 @@ class MemoryLearning:
         self._ordered = len(rows) < 64
         return bool(rows)
 
-    def _next(self, *, retry_only=False):
+    def _next(self, *, retry_only=False, drain_only=False):
         # A delayed extraction must not be overtaken by its own correction:
         # Memory's known_facts would otherwise omit the original. Other scopes
         # can progress during its cooldown. Both predecessor probes are indexed.
@@ -231,16 +226,26 @@ class MemoryLearning:
         # already-due retry at the end of the queue. Grant it at least every
         # fourth selection, still subject to the same scope predecessors.
         if not retry_only and getattr(self, "_fresh_grants", 0) >= 3:
-            retry = self._next(retry_only=True)
+            retry = self._next(retry_only=True, drain_only=drain_only)
             if retry is not None:
                 return retry
-        cursor_name = "_retry_cursor" if retry_only else "_due_cursor"
+        cursor_name = (
+            ("_drain_retry_cursor" if retry_only else "_drain_cursor")
+            if drain_only
+            else ("_retry_cursor" if retry_only else "_due_cursor")
+        )
         cursor = getattr(self, cursor_name, (-1, -1, ""))
         retry_clause = "AND deadline>0 " if retry_only else ""
+        drain_clause = (
+            "AND json_extract(body,'$.stage') IN ('capture_wait','commit_wait') "
+            if drain_only
+            else ""
+        )
         rows = store.db.execute(
             "SELECT deadline,position,id FROM metadata WHERE conversation_id=? "
             "AND status='pending' AND deadline<=? "
             + retry_clause
+            + drain_clause
             + "AND (deadline,position,id)>(?,?,?) "
             "ORDER BY deadline,position,id LIMIT 64",
             (QUEUE, self.core.clock(), *cursor),
@@ -267,6 +272,12 @@ class MemoryLearning:
             ).fetchone()
             if row:
                 item = json.loads(row[0])
+                if (
+                    item.get("stage") not in MUTATION_WAIT
+                    and self._candidate_mutates(item, None)
+                    and self.core.has_active_dialogue(item["scope"])
+                ):
+                    continue
                 if item.get("stage") in MUTATION_WAIT:
                     try:
                         self._source_turn(item)
@@ -403,8 +414,166 @@ class MemoryLearning:
             self.core.store.put("metadata", item)
         return response
 
-    async def work(self, *, wait=True):
-        """Pump bounded independent jobs; the runtime loop need not await model I/O."""
+    def _automatic_due(self):
+        store, now = self.core.store, self.core.clock()
+        return bool(
+            store.db.execute(
+                "SELECT 1 FROM metadata WHERE conversation_id=? "
+                "AND status IN ('pending','material_pending') AND deadline<=? LIMIT 1",
+                (QUEUE, now),
+            ).fetchone()
+            or store.due(
+                "outbox",
+                ["blocked_scope", "pending", "unknown", "relationship_pending"],
+                now,
+                limit=1,
+            )
+        )
+
+    def foreground_finished(self):
+        """A real foreground completion can grant one old automatic phase after three.
+
+        Credit is bounded, and idle foreground traffic cannot bank future work.
+        This counter belongs to automatic I/O, independently of model-slot fairness.
+        """
+        if not self.core.automatic_memory_candidates:
+            return
+        self._foreground_finished = (
+            min(3, self._foreground_finished + 1) if self._automatic_due() else 0
+        )
+
+    def _unblocks_foreground(self, family, item):
+        if family == "learning":
+            return item.get("stage") in MUTATION_WAIT
+        if family != "outbox":
+            return False
+        scope = item["event"]["scope"]
+        return any(
+            memory_scopes_overlap(json.loads(row[0]), scope)
+            for row in self.core.store.db.execute(
+                "SELECT CAST(json_extract(body,'$.scope') AS TEXT) FROM metadata "
+                "WHERE conversation_id=? AND status='pending' "
+                "AND json_extract(body,'$.stage') IN ('capture_wait','commit_wait')",
+                (QUEUE,),
+            )
+        )
+
+    def _start_phase(self, item=None):
+        """Admit actual work, never spend a retry budget on ordinary queue waiting."""
+        phase = self._phase
+        # Explicit receipt reconciliation and direct internal callers retain their
+        # existing semantics. Only the automatic dispatcher owns this decision.
+        if phase is None or (item is not None and phase["item"]["id"] != item["id"]):
+            return True
+        if phase["started"]:
+            return True
+        if not self._unblocks_foreground(phase["family"], phase["item"]):
+            if self.core.automatic_memory_foreground_demand():
+                if self._foreground_finished < 3:
+                    return False
+                self._foreground_finished = 0
+            else:
+                # A quiet opportunity must not also bank an extra busy grant.
+                self._foreground_finished = 0
+        phase["started"] = True
+        return True
+
+    def _select_phase(self, *, outbox_only):
+        core, now = self.core, self.core.clock()
+        if not outbox_only and self._ordered:
+            drain = self._next(drain_only=True)
+            if drain is not None:
+                # These real persisted exclusion barriers are holding queued
+                # foreground work. Finish their original recovery first.
+                return dict(family="learning", item=drain, started=False)
+        families = (
+            ("outbox", "relationship")
+            if outbox_only
+            else ("outbox", "observation", "learning", "relationship")
+        )
+        busy = core.automatic_memory_foreground_demand()
+        for offset in range(len(families)):
+            index = (self._family + offset) % len(families)
+            family = families[index]
+            if family in {"outbox", "relationship"}:
+                if family == "relationship" and core.relationships is None:
+                    continue
+                states = (
+                    ["relationship_pending"]
+                    if family == "relationship"
+                    else ["blocked_scope", "pending", "unknown"]
+                )
+                rows = core.store.due("outbox", states, now, limit=64)
+                item = (
+                    (rows[0] if rows else None)
+                    if family == "relationship"
+                    else next(
+                        (
+                            row
+                            for row in rows
+                            if core._turn_allows(
+                                core.store.get("turns", row["event"]["aggregate_id"]),
+                                "memory.write",
+                            )
+                            and (
+                                not busy
+                                or self._foreground_finished >= 3
+                                or self._unblocks_foreground(family, row)
+                            )
+                        ),
+                        None,
+                    )
+                )
+            elif family == "observation":
+                if getattr(core.memory, "extraction_schema", 5) != 6:
+                    continue
+                row = core.store.db.execute(
+                    "SELECT body FROM metadata WHERE conversation_id=? AND status='material_pending' "
+                    "AND deadline<=? ORDER BY deadline,position,id LIMIT 1",
+                    (QUEUE, now),
+                ).fetchone()
+                item = json.loads(row[0]) if row else None
+            else:
+                item = (
+                    self._next(drain_only=busy and self._foreground_finished < 3)
+                    if self._ordered and hasattr(core.memory, "process_candidate")
+                    else None
+                )
+            if item is None:
+                continue
+            if (
+                busy
+                and self._foreground_finished < 3
+                and not self._unblocks_foreground(family, item)
+            ):
+                continue
+            self._family = (index + 1) % len(families)
+            return dict(family=family, item=item, started=False)
+        return None
+
+    async def _run_phase(self, phase):
+        self._phase = phase
+        core, item = self.core, phase["item"]
+        try:
+            if phase["family"] == "learning":
+                await self._work(item)
+            elif self._start_phase():
+                if phase["family"] == "observation":
+                    await self._flush_observation_material(item)
+                else:
+                    async with core._outbox_lock:
+                        if phase["family"] == "outbox":
+                            await core._flush_outbox(item)
+                        else:
+                            await core.relationships.flush(core)
+                core.counted("memory.work")
+        finally:
+            self._phase = None
+            if not self._automatic_due():
+                self._foreground_finished = 0
+
+    async def work(self, *, wait=True, outbox_only=False):
+        """One automatic phase at a time, selected from the existing durable queues."""
         core = self.core
         async with self.dispatch_lock:
             if self.closed:
@@ -414,29 +583,25 @@ class MemoryLearning:
                     del self.jobs[key]
                     if not job.cancelled():
                         job.result()
-            if not core.automatic_memory_candidates or not hasattr(
-                core.memory, "process_candidate"
-            ):
+            if not core.automatic_memory_candidates:
                 return
             changed = self.backfill()
             if getattr(core.memory, "extraction_schema", 5) == 6:
-                changed = await self._flush_observation_material() or changed
                 changed = self.segments.seal_due() or changed
             changed = self._recover_legacy() or changed
             changed = self._order_pending() or changed
             if changed:
                 core.counted("memory.work")
-            if not self._ordered:
-                return
-            # Bounded lookahead overlaps receipt/source I/O with generation. It
-            # does not increase provider capacity or bypass scope predecessors.
-            limit = max(2, 2 * core.models.background_limit)
-            while len(self.jobs) < limit:
-                item = self._next()
-                if item is None:
-                    break
-                self.jobs[item["id"]] = asyncio.create_task(self._work(item))
-            selected = list(self.jobs.values())
+            if self.jobs:
+                # Explicit learning drains may await the current phase; an
+                # outbox pump must not wait for an unrelated held model.
+                selected = [] if outbox_only else list(self.jobs.values())
+            else:
+                phase = self._select_phase(outbox_only=outbox_only)
+                if phase is None:
+                    return
+                self.jobs[phase["item"]["id"]] = asyncio.create_task(self._run_phase(phase))
+                selected = list(self.jobs.values())
         if wait and selected:
             try:
                 done, _ = await asyncio.wait(selected, return_when=asyncio.FIRST_COMPLETED)
@@ -457,6 +622,12 @@ class MemoryLearning:
             await asyncio.gather(*self.jobs.values(), return_exceptions=True)
             self.jobs.clear()
 
+    @staticmethod
+    def _candidate_mutates(item, output):
+        return output != {"memories": []} and not (
+            item.get("extraction_schema") == 6 and item.get("job_id") is not None and output is None
+        )
+
     async def _candidate(self, item, output, *, reserve_attempt=False, reconcile=False):
         # Retained protocols can capture an episode on a null lookup. Schema6
         # claims at seal: a known job's null-output window/receipt read creates
@@ -464,15 +635,22 @@ class MemoryLearning:
         # Serial source I/O leaves the shared peer read slots available to live
         # dialogue. Models remain outside this lock; waiting spends no attempt
         # and creates no new mutation gate. The existing budget includes waiting.
+        if not reconcile:
+            if (
+                self._phase is not None
+                and not self._phase["started"]
+                and item.get("stage") not in MUTATION_WAIT
+                and self._candidate_mutates(item, output)
+                and self.core.has_active_dialogue(item["scope"])
+            ):
+                return None
+            if not self._start_phase(item):
+                return None
         async with asyncio.timeout(45):
             async with self.lock:
                 try:
                     turn = self._source_turn(item)
-                    mutates = output != {"memories": []} and not (
-                        item.get("extraction_schema") == 6
-                        and item.get("job_id") is not None
-                        and output is None
-                    )
+                    mutates = self._candidate_mutates(item, output)
                     if mutates and self.core.has_active_dialogue(turn["scope"]):
                         if reconcile:
                             # Explicit receipt recovery neither regenerates nor
@@ -552,13 +730,21 @@ class MemoryLearning:
         if schema == 6:
             if not item.get("job_id"):
                 response = await self.core.memory.create_segment(item["create_request"])
-                item.update(job_id=response["job_id"], stage="receipt")
+                item.update(
+                    job_id=response["job_id"],
+                    stage="receipt",
+                    last_error=None,
+                    recovery_reason=None,
+                )
                 with self.core.store.transaction():
                     self.core.store.put("metadata", item)
                     self.core.store.put(
                         "metadata",
                         dict(id="memory-job:" + digest(item["job_id"]), learning_id=item["id"]),
                     )
+                # Creation has its own durable identity and uncertain replay.
+                # The next phase can read this same job without creating again.
+                return None
             return await self.core.memory.process_candidate(
                 item["job_id"], output, extraction_schema=6, batch_ref=item.get("batch_ref")
             )
@@ -762,7 +948,9 @@ class MemoryLearning:
             if item["extraction_schema"] == 6:
                 # The observation part has no local Core admission. Refresh the
                 # complete real Memory/Platform proof after both awaited gates.
-                response = await self._candidate(item, None)
+                response = await self._candidate(
+                    item, None, reserve_attempt=item.get("last_error") is not None
+                )
                 if response is None:
                     return None
                 if response["state"] in {"completed", "invalidated"}:
@@ -783,15 +971,29 @@ class MemoryLearning:
     async def _segment_work(self, item):
         from .memory_summaries import check_segment_output, parse_segment
 
-        response = await self._candidate(
-            item, None, reserve_attempt=item.get("stage") != "commit_wait"
-        )
-        if response is None:
+        if not item.get("job_id"):
+            await self._candidate(item, None, reserve_attempt=True)
             return
-        if response["state"] in {"completed", "invalidated"}:
-            self._finish_segment(item, response)
-            return
-        self._pin_segment_window(item, response)
+        # Retained/uncertain outputs always reconcile first. A model-ready
+        # frozen window, however, is not a reason to repeat the initial full
+        # receipt read before waiting for the real model/selection gates.
+        if item["output"] is not None or item.get("segment_window") is None:
+            response = await self._candidate(
+                item,
+                None,
+                reserve_attempt=item.get("last_error") is not None
+                and item.get("stage") != "commit_wait",
+            )
+            if response is None:
+                return
+            if response["state"] in {"completed", "invalidated"}:
+                self._finish_segment(item, response)
+                return
+            self._pin_segment_window(item, response)
+            if item["output"] is None:
+                item.update(stage="model", last_error=None, recovery_reason=None)
+                self.core.store.put("metadata", item)
+                return
         if item["output"] is None:
             identity = "memory-generation:" + digest(item["segment_id"])
             generation = dict(
@@ -809,7 +1011,10 @@ class MemoryLearning:
             item["stage"] = "proposal"
             item["output"] = parse_segment(self.core.contracts, raw, item["segment_window"])
             item["stage"] = "commit"
+            item["last_error"] = None
+            item["recovery_reason"] = None
             self.core.store.put("metadata", item)
+            return
         check_segment_output(self.core.contracts, item["output"], item["segment_window"])
         response = await self._candidate(item, item["output"])
         if response is None:

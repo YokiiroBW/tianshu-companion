@@ -79,7 +79,7 @@ def recover(core):
 
 
 async def flush(runtime, core):
-    for item in core.store.due("outbox", ["relationship_pending"], core.clock()):
+    for item in core.store.due("outbox", ["relationship_pending"], core.clock(), limit=1):
         turn = core.store.get("turns", item["event"]["aggregate_id"])
         attempts = item.get("relationship_attempts", 0) + 1
         outcome, code = "succeeded", None

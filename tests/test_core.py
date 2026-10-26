@@ -214,6 +214,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         unknown_request = h.sender.calls[1]
         h.core.record_receipt(unknown_request["reply_id"], h.sender.receipt(unknown_request))
         await h.core.flush_outbox()
+        await h.core.flush_outbox()
         self.assertEqual(2, len(h.memory.commits))
         projections = h.core.store.list("outbox", states=["local_projection"])
         self.assertEqual(1, len(projections))

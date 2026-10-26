@@ -781,6 +781,7 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
 
     async def flush(self):
         await self.h.core.flush_outbox()
+        await self.h.core.flush_outbox()  # Retained singleton fixtures may offer two events.
         await self.h.core.memory_learning.work()
 
     async def process(self, job, output, **request):
@@ -1386,6 +1387,7 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
         # Simulate a real pre-schema5 database: delivered outbox, no local job
         # metadata and no upgrade boundary. The producer already locked a pin.
         self.h.core.store.delete("metadata", "memory-learning-schema5-boundary")
+        self.h.core.store.delete("metadata", "memory-learning-backfill")
         await self.h.core.close()
         requests = []
 

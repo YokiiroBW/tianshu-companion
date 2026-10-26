@@ -257,6 +257,356 @@ class SegmentPeer:
         return [canonical(output_for(supplied["segment_window"]))], {}
 
 
+class AutomaticMemorySchedulingTests(unittest.IsolatedAsyncioTestCase):
+    """Real Core queue/state; synthetic Memory authority and provider only."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.h = Harness(Path(self.temp.name) / "scheduling.sqlite", silence_ms=0)
+        self.peer = SegmentPeer(self.h)
+        self.worker = self.h.core.memory_learning
+
+    async def asyncTearDown(self):
+        await self.h.core.close()
+
+    async def chat(self, text="本人的原话", **fields):
+        await self.h.ingest(text=text, group=True, channel="group:old", **fields)
+        await self.h.cycles()
+        self.assertEqual("sent", self.h.turns()[-1]["phase"])
+
+    def task(self):
+        return next(
+            row
+            for row in self.h.core.store.list("metadata", QUEUE)
+            if row.get("extraction_schema") == 6
+        )
+
+    async def prepared_segment(self, *, model=False):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        self.h.clock.advance(120)
+        await self.worker.work()  # Create, durably store job; no content lookup yet.
+        await self.worker.work()  # Receipt/window only.
+        self.assertEqual("model", self.task()["stage"])
+        if model:
+            await self.worker.work()
+            self.assertEqual("commit", self.task()["stage"])
+        return copy.deepcopy(self.task())
+
+    async def queued(self, *, released=True, channel="group:new"):
+        result = await self.h.core.ingest(
+            "nonebot",
+            self.h.request(text="新前台发言", channel=channel, group=True),
+            defer_processing=not released,
+        )
+        self.h.core._seal_due(self.h.clock())
+        queued = next(row for row in reversed(self.h.turns()) if row["phase"] == "queued")
+        return result, queued
+
+    async def test_create_window_model_and_commit_are_separate_durable_phases(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        self.h.clock.advance(120)
+        await self.worker.work()
+        self.assertEqual(
+            (1, 0, 0), (len(self.peer.creates), len(self.peer.processed), len(self.peer.generated))
+        )
+        self.assertIsNotNone(self.task()["job_id"])
+        await self.worker.work()
+        frozen = copy.deepcopy(self.task()["segment_window"])
+        self.assertEqual(
+            (1, 0, "model"),
+            (len(self.peer.processed), len(self.peer.generated), self.task()["stage"]),
+        )
+        await self.worker.work()
+        self.assertEqual(
+            (2, 1, "commit"),
+            (len(self.peer.processed), len(self.peer.generated), self.task()["stage"]),
+        )
+        self.assertIsNotNone(self.task()["output"])
+        self.assertIsNone(self.task()["receipt"])
+        await self.worker.work()
+        self.assertEqual("completed", self.task()["state"])
+        self.assertEqual(frozen, self.task()["segment_window"])
+        self.assertEqual(1, self.task()["attempts"])
+        self.assertEqual({}, self.task()["recovery_failures"])
+        self.assertEqual(1, sum(output is not None for _, output, _ in self.peer.processed))
+
+    async def test_runnable_front_queue_defers_all_auto_io_without_spending_attempts(self):
+        await self.prepared_segment()
+        await self.chat("另一个待受理事件", account="b")
+        identity = self.task()["materials"][0]["material_ref"]
+        self.peer.materials["observation:waiting"] = self.peer.materials[identity]
+        await self.worker.observation_archived(dict(source_ref="observation:waiting"), {})
+        before = copy.deepcopy(self.task())
+        await self.queued()
+        self.assertTrue(self.h.core.automatic_memory_foreground_demand())
+        counts = tuple(map(len, (self.peer.accepted, self.peer.creates, self.peer.processed)))
+        for _ in range(8):
+            await self.worker.work()
+            await self.h.core.flush_outbox()
+        self.assertEqual(
+            counts, tuple(map(len, (self.peer.accepted, self.peer.creates, self.peer.processed)))
+        )
+        self.assertEqual(before, self.task())
+        passive = self.h.core.store.get(
+            "metadata", "memory-observation:" + digest("observation:waiting")
+        )
+        self.assertEqual(
+            ("material_pending", 0, 0), (passive["state"], passive["attempts"], passive["deadline"])
+        )
+
+    async def test_unreleased_response_is_not_a_runnable_front_queue(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        self.h.clock.advance(120)
+        _, queued = await self.queued(released=False)
+        self.assertFalse(self.h.core._responses_released(queued))
+        self.assertFalse(self.h.core.automatic_memory_foreground_demand())
+        await self.worker.work()
+        self.assertEqual(1, len(self.peer.creates))
+        for message in queued["bundle"]["messages"]:
+            await self.h.core.acknowledge_ingest(message["source"]["receipt_id"])
+        self.assertTrue(self.h.core.automatic_memory_foreground_demand())
+        await self.worker.work()
+        self.assertEqual([], self.peer.processed)
+        conversation = self.h.core.store.conversation(queued["conversation_id"])
+        conversation["source_quarantined"] = True
+        self.h.core.store.put("conversations", conversation)
+        for phase in ("ready_to_send", "waiting_dependency", "reconciling"):
+            with self.subTest(quarantined_phase=phase):
+                queued.update(phase=phase, retry_at=0)
+                self.h.core.store.put("turns", queued)
+                self.assertFalse(self.h.core.automatic_memory_foreground_demand())
+        await self.worker.work()
+        self.assertEqual("model", self.task()["stage"])
+        self.assertEqual(1, len(self.peer.processed))
+
+    async def test_inflight_material_finishes_but_cannot_start_another_phase(self):
+        await self.chat()
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = self.peer.accept
+
+        async def held(request):
+            entered.set()
+            await release.wait()
+            return await original(request)
+
+        self.h.memory.accept_materials = held
+        await self.worker.work(wait=False)
+        await asyncio.wait_for(entered.wait(), 2)
+        await self.queued()
+        for _ in range(4):
+            await self.worker.work(wait=False)
+            await self.h.core.flush_outbox()
+        self.assertEqual(1, len(self.worker.jobs))
+        self.assertFalse(next(iter(self.worker.jobs.values())).cancelled())
+        release.set()
+        await asyncio.gather(*self.worker.jobs.values())
+        self.h.clock.advance(120)
+        await self.worker.work()
+        self.assertEqual(1, len(self.peer.accepted))
+        self.assertEqual([], self.peer.creates)
+        self.assertEqual(
+            ("pending", "create", 0),
+            (self.task()["state"], self.task()["stage"], self.task()["attempts"]),
+        )
+
+    async def test_slot_wait_yields_to_new_front_demand_without_repeating_window_read(self):
+        from tianshu_companion.model_slots import ModelSlots
+
+        await self.prepared_segment()
+        self.h.core.models = ModelSlots(1)
+        before = copy.deepcopy(self.task())
+        async with self.h.core.models:
+            await self.worker.work(wait=False)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            await self.queued()
+            self.assertEqual(1, len(self.peer.processed))
+        await asyncio.gather(*self.worker.jobs.values())
+        self.assertEqual(before, self.task())
+        self.assertEqual(1, len(self.peer.processed))
+        self.assertEqual([], self.peer.generated)
+        await self.h.cycles()
+        await self.h.core.flush_outbox()
+        await self.worker.work()
+        self.assertEqual((2, 1), (len(self.peer.processed), len(self.peer.generated)))
+        self.assertEqual("commit", self.task()["stage"])
+
+    async def test_model_output_is_persisted_before_front_demand_defers_commit(self):
+        before = await self.prepared_segment()
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = self.peer.generate
+
+        async def held(turn, messages):
+            if turn["id"].startswith("memory-generation:"):
+                entered.set()
+                await release.wait()
+            return await original(turn, messages)
+
+        self.h.gateway.generate = held
+        await self.worker.work(wait=False)
+        await asyncio.wait_for(entered.wait(), 2)
+        await self.queued()
+        release.set()
+        await asyncio.gather(*self.worker.jobs.values())
+        frozen = copy.deepcopy(self.task())
+        self.assertEqual(
+            ("pending", "commit", 1), (frozen["state"], frozen["stage"], len(self.peer.generated))
+        )
+        self.assertEqual(before["segment_window"], frozen["segment_window"])
+        self.assertEqual(output_for(frozen["segment_window"]), frozen["output"])
+        for _ in range(4):
+            await self.worker.work()
+        self.assertEqual(frozen, self.task())
+        self.assertFalse(any(output is not None for _, output, _ in self.peer.processed))
+
+    async def test_three_real_front_completions_grant_one_old_phase_without_banking(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        self.h.clock.advance(120)
+        self.worker.segments.seal_due()
+        self.assertEqual(("pending", "create"), (self.task()["state"], self.task()["stage"]))
+        self.assertEqual([], self.peer.creates)
+        self.assertEqual([], self.peer.processed)
+        self.assertEqual([], self.peer.generated)
+        for index in range(3):
+            await self.h.ingest(text=f"前台{index}", group=True, channel=f"group:live:{index}")
+            await self.h.cycles()
+            terminal = next(
+                row for row in self.h.turns() if self.h.core._input_text(row) == f"前台{index}"
+            )
+            self.h.core._finish(terminal, "sent", "sent")  # Duplicate cannot mint credit.
+            self.assertEqual(index + 1, self.worker._foreground_finished)
+        _, queued = await self.queued()
+        await self.worker.work()
+        self.assertEqual(1, len(self.peer.creates))
+        self.assertEqual(0, self.worker._foreground_finished)
+        for _ in range(5):
+            await self.worker.work()
+        self.assertEqual([], self.peer.processed)
+        self.assertTrue(self.h.core.automatic_memory_foreground_demand())
+        self.assertEqual("queued", self.h.core.store.get("turns", queued["id"])["phase"])
+
+    async def test_observed_turns_do_not_grant_busy_background_opportunities(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        self.h.clock.advance(120)
+        self.h.gateway.segments = []
+        for index in range(4):
+            await self.h.ingest(text=f"只观察{index}", group=True, channel=f"group:observe:{index}")
+            await self.h.cycles()
+            observed = next(
+                row for row in self.h.turns() if self.h.core._input_text(row) == f"只观察{index}"
+            )
+            self.assertEqual("observed", observed["phase"])
+        self.assertEqual(0, self.worker._foreground_finished)
+        await self.queued()
+        await self.worker.work()
+        self.assertEqual([], self.peer.creates)
+
+    async def test_commit_wait_unblocks_queued_front_without_global_queue_deadlock(self):
+        old = await self.prepared_segment(model=True)
+        old["stage"] = "commit_wait"
+        self.h.core.store.put("metadata", old)
+        _, queued = await self.queued(channel="group:old")
+        self.assertTrue(self.worker.admission_blocked(queued["scope"]))
+        self.assertFalse(self.h.core.automatic_memory_foreground_demand())
+        await self.worker.work()
+        self.assertEqual("completed", self.task()["state"])
+        self.assertEqual(old["output"], self.task()["output"])
+        self.assertEqual(1, len(self.peer.generated))
+        self.assertFalse(self.worker.admission_blocked(queued["scope"]))
+        await self.h.cycles()
+        self.assertEqual("sent", self.h.core.store.get("turns", queued["id"])["phase"])
+
+    async def test_accepted_output_restarts_with_receipt_without_another_model(self):
+        frozen = await self.prepared_segment(model=True)
+        await self.h.core.close()
+        self.h.core = self.h.new_core()
+        self.h.core.recover()
+        self.worker = self.h.core.memory_learning
+        await self.worker.work()
+        restored = self.task()
+        self.assertEqual("completed", restored["state"])
+        for key in ("create_request", "segment_window", "output", "attempts"):
+            self.assertEqual(frozen[key], restored[key])
+        self.assertEqual(1, len(self.peer.generated))
+        self.assertIsNone(self.peer.processed[-2][1])
+        self.assertEqual(frozen["output"], self.peer.processed[-1][1])
+
+    async def test_outbox_observation_and_learning_share_one_fair_phase_owner(self):
+        await self.prepared_segment()
+        identity = self.task()["materials"][0]["material_ref"]
+        self.peer.materials["observation:old"] = self.peer.materials[identity]
+        await self.worker.observation_archived(dict(source_ref="observation:old"), {})
+        await self.chat("下一个事件", account="b")
+        calls, active = [], 0
+        accept, process, generate = self.peer.accept, self.peer.process, self.peer.generate
+
+        async def accepted(request):
+            nonlocal active
+            active += 1
+            self.assertEqual(1, active)
+            calls.append("observation" if "observation_refs" in request else "outbox")
+            await asyncio.sleep(0)
+            try:
+                return await accept(request)
+            finally:
+                active -= 1
+
+        async def processed(*args, **fields):
+            nonlocal active
+            active += 1
+            self.assertEqual(1, active)
+            calls.append("process")
+            await asyncio.sleep(0)
+            try:
+                return await process(*args, **fields)
+            finally:
+                active -= 1
+
+        async def generated(turn, messages):
+            calls.append("model")
+            return await generate(turn, messages)
+
+        self.h.memory.accept_materials, self.h.memory.process_candidate = accepted, processed
+        self.h.gateway.generate = generated
+        for expected in ("outbox", "observation", "model"):
+            before = len(calls)
+            await self.worker.work()
+            self.assertIn(expected, calls[before:])
+        self.assertEqual(["outbox", "observation", "process", "model"], calls)
+        self.assertEqual(0, active)
+
+    async def test_outbox_scope_repair_returns_before_the_material_write(self):
+        await self.chat()
+        item = self.h.core.store.list("outbox")[0]
+        item.update(state="blocked_scope")
+        item["event"]["scope_version"] = None
+        self.h.core.store.put("outbox", item)
+        checks = []
+        original = self.h.memory.check_sources
+
+        async def checked(turn, sources):
+            checks.append(copy.deepcopy(sources))
+            return await original(turn, sources)
+
+        self.h.memory.check_sources = checked
+        await self.h.core.flush_outbox()
+        repaired = self.h.core.store.get("outbox", item["id"])
+        self.assertEqual("pending", repaired["state"])
+        self.assertEqual(1, len(checks))
+        self.assertEqual([], self.peer.accepted)
+        self.assertEqual(self.h.memory.scope_version, repaired["event"]["scope_version"])
+        await self.h.core.flush_outbox()
+        self.assertEqual("delivered", self.h.core.store.get("outbox", item["id"])["state"])
+        self.assertEqual(1, len(checks))
+        self.assertEqual(1, len(self.peer.accepted))
+
+
 class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -654,6 +1004,9 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("capture_wait", item["stage"])
         self.assertEqual([], self.peer.creates)
         with patch.object(self.h.core, "has_active_dialogue", return_value=False):
+            self.assertIsNone(await learning._candidate(item, None))
+            self.assertIsNotNone(item["job_id"])
+            self.assertEqual("receipt", item["stage"])
             pending = await learning._candidate(item, None)
         learning._pin_segment_window(item, pending)
         with patch.object(self.h.core, "has_active_dialogue", return_value=True):

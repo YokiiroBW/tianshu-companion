@@ -279,6 +279,9 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
         h.memory.check_sources = validated
         h.clock.advance(2)
         await h.core.flush_outbox()
+        self.assertEqual("pending", h.core.store.list("outbox")[0]["state"])
+        self.assertFalse(h.memory.commits)
+        await h.core.flush_outbox()
         self.assertEqual(7, h.memory.commits[0]["scope_version"])
 
     def test_store_single_owner_lock(self):

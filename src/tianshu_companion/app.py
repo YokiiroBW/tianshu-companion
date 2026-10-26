@@ -649,7 +649,6 @@ def create_app(core=None, tokens=None, life_readers=None):
                 await core.image_backend.catalog.restore()
                 jobs = [
                     loop("core.tick", core.tick, 0.05, _counter(core, "core.tick")),
-                    loop("core.outbox", core.flush_outbox, 0.5, _counter(core, "core.outbox")),
                     loop(
                         "memory.work",
                         lambda: core.memory_learning.work(wait=False),

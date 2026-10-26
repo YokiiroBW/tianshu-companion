@@ -124,6 +124,7 @@ class RelationshipTests(unittest.IsolatedAsyncioTestCase):
         await self.h.core.ingest("nonebot", request)
         await self.h.cycles(100)
         await self.h.core.flush_outbox()
+        await self.h.core.flush_outbox()  # Relationship settlement is a later automatic phase.
         return request
 
     def prompt(self, index=-1):

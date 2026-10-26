@@ -955,6 +955,8 @@ class Core(Delivery):
             result_version=1,
         )
         self._save_turn(turn)
+        if phase != "observed":
+            self.memory_learning.foreground_finished()
         if not self.automatic_memory_candidates or not self._turn_allows(turn, "memory.write"):
             return
         # Failure before authoritative scope lookup retains a pending local event;
@@ -1111,16 +1113,9 @@ class Core(Delivery):
                     if not self._preparation_available(phases):
                         break
                     turn = self.store.get("turns", turn_id)
-                    current = self.store.conversation(cid)
-                    if current is None or current.get("source_quarantined"):
-                        break
                     if turn is None or turn["phase"] != "queued" or turn["cancelled"]:
                         continue
-                    if self.store.work_turn_count(cid, ACTIVE) >= 2:
-                        break
-                    if self.memory_learning.admission_blocked(turn["scope"]):
-                        break
-                    if not self._responses_released(turn):
+                    if not self._queued_preparation_ready(turn, phases):
                         break
                     config_version = turn["config_version"]
                     if config_version is None and self.default_model_selector is None:
@@ -1216,6 +1211,50 @@ class Core(Delivery):
             memory_scopes_overlap(other, scope)
             for other in self.store.active_scopes(ACTIVE, scope["actor_id"])
         )
+
+    def _queued_preparation_ready(self, turn, phases):
+        """The same local admission facts serve tick and automatic-work priority."""
+        current = self.store.conversation(turn["conversation_id"])
+        return (
+            current is not None
+            and not current.get("source_quarantined")
+            and self._preparation_available(phases)
+            and self.store.work_turn_count(turn["conversation_id"], ACTIVE) < 2
+            and not self.memory_learning.admission_blocked(turn["scope"])
+            and self._responses_released(turn)
+        )
+
+    def automatic_memory_foreground_demand(self):
+        """Reuse the bounded, column-based front queue; never restore all turn bodies."""
+        if any(not job.done() for job in (*self.jobs.values(), *self.send_jobs.values())):
+            return True
+        conversations = self.store.work_conversations()
+        candidates = self.store.work_candidates(conversations)
+        phases = self.store.turn_phases(self.jobs)
+        for candidate in candidates.values():
+            current = candidate["conversation"]
+            if current is None or current.get("source_quarantined"):
+                continue
+            if candidate["deliver"] or any(
+                at <= self.clock() for at in candidate["reconcile"].values()
+            ):
+                return True
+            if self._preparation_available(phases) and any(
+                at <= self.clock() for _, at in candidate["retry"]
+            ):
+                return True
+            if candidate["active"] >= 2 or not candidate["queued"]:
+                continue
+            # Tick also considers the oldest queued turn first; a blocked older
+            # response must not be bypassed by an eager later turn.
+            for key in candidate["queued"]:
+                turn = self.store.get("turns", key)
+                if turn is None or turn["phase"] != "queued" or turn["cancelled"]:
+                    continue
+                if self._queued_preparation_ready(turn, phases):
+                    return True
+                break
+        return False
 
     def _preparation_available(self, phases=None):
         # Generation keeps its provider slot, but no longer also occupies a
@@ -2614,15 +2653,19 @@ class Core(Delivery):
     async def flush_outbox(self):
         if not self.automatic_memory_candidates:
             return
-        async with self._outbox_lock:
-            await self._flush_outbox()
-            if self.relationships is not None:
-                await self.relationships.flush(self)
+        await self.memory_learning.work(outbox_only=True)
 
-    async def _flush_outbox(self):
+    async def _flush_outbox(self, selected=None):
         # Only due work is materialized; completed history is never read to infer outcomes.
         attempted = False
-        for item in self.store.due("outbox", ["blocked_scope", "pending", "unknown"], self.clock()):
+        items = (
+            [selected]
+            if selected is not None
+            else self.store.due(
+                "outbox", ["blocked_scope", "pending", "unknown"], self.clock(), limit=1
+            )
+        )
+        for item in items:
             turn = self.store.get("turns", item["event"]["aggregate_id"])
             if not self._turn_allows(turn, "memory.write"):
                 continue
@@ -2639,7 +2682,9 @@ class Core(Delivery):
                         item = self.store.get("outbox", item["id"])
                         if item["state"] != "pending":
                             outcome = "cancelled"
-                    if item["state"] == "pending":
+                        # A real source-version repair is one automatic phase.
+                        # Persist it before selecting the later material write.
+                    elif item["state"] == "pending":
                         ensure_channel(self.store, turn["bundle"]["collection_key"]["channel"])
                         if (
                             not sources_current(self.store, turn)

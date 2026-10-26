@@ -99,7 +99,8 @@ class CandidatePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before, self.rows())
         self.assertEqual([], h.memory.commits)
         await self.restart(True)
-        await h.core.flush_outbox()
+        for _ in range(5):  # Four events and the independent blocked-scope repair phase.
+            await h.core.flush_outbox()
         self.assertEqual(4, len(h.memory.commits))
         states = [r[3] for r in self.rows()]
         self.assertEqual(0, states.count("unknown"))

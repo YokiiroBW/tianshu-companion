@@ -87,6 +87,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
 
     async def flush(self):
         await self.h.core.flush_outbox()
+        await self.h.core.flush_outbox()  # Explicitly offer the two-event retained fixtures.
         await self.h.core.memory_learning.work()
 
     async def chat(self):
@@ -232,9 +233,10 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls[-1][1], {"memories": []})
         self.assertEqual(self.generated[1]["generation_budget"]["reasoning_effort"], "low")
 
-    async def test_group_commit_does_not_wait_for_unrelated_group_or_private_generation(self):
+    async def test_new_automatic_work_yields_to_unrelated_foreground_generation(self):
         await self.h.ingest(text=TEXT, group=True, channel="group:a")
         await self.h.cycles()
+        await self.h.core.flush_outbox()
         gate = asyncio.Event()
         original = self.generate
 
@@ -249,10 +251,14 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.h.cycles()
         self.assertEqual(sum(t["phase"] == "generating" for t in self.h.turns()), 2)
         await self.flush()
-        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(("pending", 0), (self.task()["state"], self.task()["attempts"]))
+        self.assertFalse(self.h.core.memory_learning.admission_blocked(self.task()["scope"]))
+        self.assertEqual([], self.calls)
         gate.set()
         await self.h.cycles(80)
         self.assertTrue(all(t["phase"] == "sent" for t in self.h.turns()))
+        await self.flush()
+        self.assertEqual("completed", self.task()["state"])
 
     async def test_group_commit_wait_allows_new_unrelated_room_to_start(self):
         await self.h.ingest(text=TEXT, group=True, channel="group:a")
@@ -287,10 +293,13 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_raw_capture_waits_without_attempt_or_model_and_survives_restart(self):
         await self.chat()
+        await self.h.core.flush_outbox()
         self.h.gateway.gates[2] = asyncio.Event()
         await self.h.ingest(text="同范围回复仍在生成")
         await self.h.cycles()
-        await self.flush()
+        # Restore the real retained mutation-wait boundary; ordinary automatic
+        # waiting now stays pending and does not create this admission barrier.
+        await self.h.core.memory_learning._candidate(self.task(), None, reserve_attempt=True)
         waiting = self.task()
         self.assertEqual(("capture_wait", 0), (waiting["stage"], waiting["attempts"]))
         self.assertEqual({}, waiting["recovery_failures"])
@@ -310,11 +319,12 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
     async def test_capture_wait_blocks_room_followers_but_other_rooms_continue(self):
         await self.h.ingest(text=TEXT, group=True, channel="group:a")
         await self.h.cycles()
+        await self.h.core.flush_outbox()
         gate = asyncio.Event()
         self.h.gateway.gates[2] = gate
         await self.h.ingest(text="同群慢回复", group=True, channel="group:a")
         await self.h.cycles()
-        await self.flush()
+        await self.h.core.memory_learning._candidate(self.task(), None, reserve_attempt=True)
         self.assertEqual("capture_wait", self.task()["stage"])
         await self.h.ingest(text="同群排队", group=True, channel="group:a")
         await self.h.ingest(text="另一群可回复", group=True, channel="group:b", account="b")
@@ -333,10 +343,11 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalidated_waiting_source_releases_gate_without_capture(self):
         await self.chat()
+        await self.h.core.flush_outbox()
         self.h.gateway.gates[2] = asyncio.Event()
         await self.h.ingest(text="同范围慢回复")
         await self.h.cycles()
-        await self.flush()
+        await self.h.core.memory_learning._candidate(self.task(), None, reserve_attempt=True)
         waiting = self.task()
         source = self.h.core.store.get("turns", waiting["turn_id"])
         source["cancelled"] = True
@@ -382,6 +393,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.h.cycles()
         await self.h.core.flush_outbox()
+        await self.h.core.flush_outbox()
         items = self.h.core.store.list("metadata", "memory:learning")
         self.assertEqual(2, len(items))
         gates = {item["job_id"]: asyncio.Event() for item in items}
@@ -403,6 +415,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, self.h.core.store.get("metadata", second["id"])["attempts"])
         worker.jobs[first["id"]].cancel()
         await asyncio.gather(worker.jobs[first["id"]], return_exceptions=True)
+        await worker.work(wait=False)
         await asyncio.wait_for(entered[second["job_id"]].wait(), 2)
         self.assertNotIn(first["id"], worker.mutation_scopes)
         self.assertIn(second["id"], worker.mutation_scopes)
@@ -573,7 +586,12 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.h.core.memory_learning.admission_blocked(waiting["scope"]))
         self.h.memory.process_candidate = self.process
         self.h.clock.advance(10)
-        await self.h.core.memory_learning.work()
+        # The first phase may service a newly completed foreground outbox.
+        # Follow this original job, without replacing its proposal or budgets.
+        for _ in range(6):
+            await self.h.core.memory_learning.work()
+            if self.h.core.store.get("metadata", waiting["id"])["state"] == "completed":
+                break
         self.assertEqual(self.task()["state"], "completed")
         self.assertEqual(self.task()["attempts"], 2)
         self.assertEqual(len(self.generated), 1)
@@ -732,6 +750,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         correction_turn = self.h.turns()[-1]["id"]
         await self.h.ingest(text="我每天早上喝红茶。", account="b", channel="private:b")
         await self.h.cycles()
+        await self.h.core.flush_outbox()
         await self.h.core.flush_outbox()
         tasks = self.h.core.store.list("metadata", "memory:learning")
         correction = next(x for x in tasks if x["turn_id"] == correction_turn)
@@ -1008,6 +1027,11 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.h.ingest(text=TEXT, group=True, channel="group:a")
         await self.h.ingest(text=TEXT, group=True, channel="group:b", account="b")
         await self.h.cycles()
+        limited_turn = next(
+            turn["id"]
+            for turn in self.h.turns()
+            if turn["bundle"]["collection_key"]["channel"]["channel_conversation_id"] == "group:a"
+        )
         generate = self.generate
         receipts = {}
 
@@ -1035,9 +1059,18 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.h.gateway.generate = pressure
         self.h.memory.process_candidate = scoped_process
         await self.flush()
-        await self.h.core.memory_learning.work()
+        for _ in range(4):
+            await self.h.core.memory_learning.work()
+            jobs = self.h.core.store.list("metadata", "memory:learning")
+            limited = next(item for item in jobs if item["turn_id"] == limited_turn)
+            if (
+                limited.get("recovery_reason") == "rate_limit_cooldown"
+                and sum(item["state"] == "completed" for item in jobs) == 1
+            ):
+                break
         jobs = self.h.core.store.list("metadata", "memory:learning")
-        pending = next(item for item in jobs if item["state"] == "pending")
+        pending = next(item for item in jobs if item["turn_id"] == limited_turn)
+        self.assertEqual("pending", pending["state"])
         self.assertEqual(sum(item["state"] == "completed" for item in jobs), 1)
         self.assertEqual(pending["recovery_reason"], "rate_limit_cooldown")
         self.assertEqual(pending["deadline"] - self.h.clock(), 45)
@@ -1420,14 +1453,17 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.h.ingest(text=TEXT, group=True, channel="group:independent", account="b")
         await self.h.cycles()
         await self.h.core.flush_outbox()
-        tasks = self.h.core.store.list("metadata", "memory:learning")
-        second = next(job for job in tasks if job["turn_id"] != first_turn)
+        second_outbox = next(
+            row
+            for row in self.h.core.store.list("outbox")
+            if row["event"]["aggregate_id"] != first_turn
+        )
         await worker.work(wait=False)
         for _ in range(60):
             await asyncio.sleep(0)
-        waiting = self.h.core.store.get("metadata", second["id"])
+        waiting = self.h.core.store.get("outbox", second_outbox["id"])
         self.assertEqual(("pending", 0), (waiting["state"], waiting["attempts"]))
-        self.assertNotIn(second["id"], worker.mutation_scopes)
+        self.assertEqual(1, len(worker.jobs))
         self.assertEqual(self.h.core.store.get("metadata", first["id"])["state"], "pending")
         await worker.work(wait=False)
         self.assertEqual(len(reads), 1)
@@ -1437,6 +1473,14 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         gate.set()
         await asyncio.gather(*worker.jobs.values())
         self.assertEqual(self.h.core.store.get("metadata", first["id"])["state"], "completed")
+        for _ in range(4):
+            await self.h.core.flush_outbox()
+            await worker.work()
+        second = next(
+            job
+            for job in self.h.core.store.list("metadata", "memory:learning")
+            if job["turn_id"] == second_outbox["event"]["aggregate_id"]
+        )
         self.assertEqual(self.h.core.store.get("metadata", second["id"])["state"], "completed")
 
     async def test_candidate_lock_wait_has_no_new_admission_gate_attempt_or_io(self):
@@ -1663,7 +1707,7 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({}, worker.mutation_scopes)
         self.assertFalse(worker.lock.locked())
 
-    async def test_background_models_overlap_but_same_scope_correction_keeps_order(self):
+    async def test_automatic_models_are_serial_and_same_scope_correction_keeps_order(self):
         from tianshu_companion.model_slots import ModelSlots
 
         self.unique_jobs()
@@ -1678,7 +1722,8 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
             turn_ids.append(
                 next(turn["id"] for turn in self.h.turns() if self.h.core._input_text(turn) == text)
             )
-        await self.h.core.flush_outbox()
+        for _ in turn_ids:
+            await self.h.core.flush_outbox()
         tasks = self.h.core.store.list("metadata", "memory:learning")
         first, correction, unrelated = [
             next(job for job in tasks if job["turn_id"] == turn_id) for turn_id in turn_ids
@@ -1698,17 +1743,26 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await worker.work(wait=False)
         for _ in range(60):
             await asyncio.sleep(0)
-        self.assertEqual(len(entered), 2)
+        self.assertEqual(len(entered), 1)
         self.assertEqual(self.h.core.store.get("metadata", correction["id"])["attempts"], 0)
-        self.assertEqual(self.h.core.store.get("metadata", first["id"])["attempts"], 1)
-        self.assertEqual(self.h.core.store.get("metadata", unrelated["id"])["attempts"], 1)
+        self.assertEqual(
+            1,
+            sum(
+                self.h.core.store.get("metadata", job["id"])["attempts"]
+                for job in (first, unrelated)
+            ),
+        )
+        self.assertEqual(1, len(worker.jobs))
         gate.set()
         await asyncio.gather(*worker.jobs.values())
-        self.completed = None
-        await worker.work()
+        for _ in range(3):
+            self.completed = None
+            await worker.work()
         self.assertEqual(self.h.core.store.get("metadata", correction["id"])["state"], "completed")
+        own = [turn["sequence"] for turn in self.generated if turn["scope"] == first["scope"]]
+        self.assertEqual([first["sequence"], correction["sequence"]], own)
 
-    async def test_waiting_commit_does_not_hold_independent_extraction(self):
+    async def test_waiting_commit_does_not_start_other_extraction_during_foreground_load(self):
         self.unique_jobs()
         await self.h.ingest(text=TEXT, group=True, channel="group:a")
         await self.h.cycles()
@@ -1734,9 +1788,12 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.h.core.memory_learning.work()
         jobs = self.h.core.store.list("metadata", "memory:learning")
         self.assertEqual(self.h.core.store.get("metadata", first["id"])["stage"], "commit_wait")
-        self.assertEqual(sum(job["state"] == "completed" for job in jobs), 1)
+        self.assertEqual(sum(job["state"] == "completed" for job in jobs), 0)
         gate.set()
         await self.h.cycles()
+        for _ in range(4):
+            await self.h.core.memory_learning.work()
+        self.assertEqual("completed", self.h.core.store.get("metadata", first["id"])["state"])
 
     async def test_close_cancels_owned_generation_and_restart_keeps_attempt(self):
         await self.chat()
