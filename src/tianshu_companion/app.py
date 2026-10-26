@@ -511,7 +511,10 @@ def build_runtime(config):
             knowledge_client=(
                 client("knowledge", "knowledge")
                 if "knowledge" in config.get("services", {})
-                else memory.client
+                # Source callbacks can reenter the same Memory origin while its
+                # outer actor requests own their admission. Keep this dependency
+                # independent, with the same configured credentials and 3/4 gates.
+                else client("memory", "knowledge")
             ),
             chat_history_client=(
                 client("chat_history", "chat")

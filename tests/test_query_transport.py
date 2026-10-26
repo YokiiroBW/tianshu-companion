@@ -151,7 +151,10 @@ class QueryTransportTests(unittest.IsolatedAsyncioTestCase):
 
         memory, gateway = core.memory.client, core.gateway.client
         try:
-            self.assertIs(core.knowledge_client, memory)
+            self.assertIsNot(core.knowledge_client, memory)
+            self.assertIn(core.knowledge_client, clients)
+            self.assertEqual(core.knowledge_client.url, memory.url)
+            self.assertEqual(core.knowledge_client.token, memory.token)
             for service in (memory, gateway):
                 await service.client.aclose()
                 service.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -183,6 +186,142 @@ class QueryTransportTests(unittest.IsolatedAsyncioTestCase):
             await core.close()
             for service in clients:
                 await service.close()
+
+    async def test_runtime_knowledge_callback_has_independent_bounded_memory_admission(self):
+        from tianshu_companion.app import build_runtime
+
+        settings = {
+            "contracts_path": os.environ["TIANSHU_CONTRACTS"],
+            "database_path": ":memory:",
+            "services": {
+                "memory": {"url": "https://synthetic.invalid", "token_env": "CALLBACK_MEMORY"},
+            },
+        }
+        with mock.patch.dict(os.environ, {"CALLBACK_MEMORY": "same-owner-token"}):
+            core, _, clients, _ = build_runtime(settings)
+        memory, knowledge = core.memory.client, core.knowledge_client
+        release, outer_full, full = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        tasks, seen = [], {"memory": [], "knowledge": []}
+        active, peak = {"memory": 0, "knowledge": 0}, {"memory": 0, "knowledge": 0}
+        read_path = "/internal/v1/knowledge/content/read"
+        outer_path = "/internal/v1/actor-self-memory/operate"
+
+        async def handler(request):
+            owner = (
+                "memory"
+                if request.url.path == outer_path
+                else "knowledge"
+                if request.url.path == read_path
+                else request.headers["x-fixture-owner"]
+            )
+            self.assertEqual(request.url.host, "synthetic.invalid")
+            self.assertEqual(request.headers["authorization"], "Bearer same-owner-token")
+            seen[owner].append(request.url.path)
+            active[owner] += 1
+            peak[owner] = max(peak[owner], active[owner])
+            try:
+                if request.url.path == IDENTITY:
+                    return httpx.Response(200, json={"identity": owner})
+                if owner == "memory":
+                    self.assertEqual(request.url.path, outer_path)
+                    if active[owner] == 3:
+                        outer_full.set()
+                    await outer_full.wait()
+                    result = await knowledge.call(read_path, {"source": "exact-reading-leaf"})
+                    return httpx.Response(200, json=result)
+                self.assertEqual(request.url.path, read_path)
+                if active[owner] == 3:
+                    full.set()
+                await release.wait()
+                return httpx.Response(200, json={"original": "真实区间🍋"})
+            finally:
+                active[owner] -= 1
+
+        try:
+            self.assertIn(knowledge, clients)
+            self.assertEqual(JsonService.QUERY_BUDGET_SECONDS, 15)
+            self.assertEqual(JsonService.COMMAND_BUDGET_SECONDS, 15)
+            for service in dict.fromkeys((memory, knowledge)):
+                await service.client.aclose()
+                service.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            body = dict(
+                schema_version=1,
+                actor_id="actor:actual",
+                role_version=7,
+                operation="get_episode",
+                episode_id="episode:actual",
+                expected_revision=1,
+                context=dict(purpose="reflection", audience=dict(kind="actor_only")),
+            )
+            tasks.extend(
+                asyncio.create_task(memory.call(outer_path, dict(body, request_id=f"outer:{i}")))
+                for i in range(3)
+            )
+            await asyncio.wait_for(full.wait(), 1)
+            tasks.extend(
+                [
+                    asyncio.create_task(
+                        memory.call(outer_path, dict(body, request_id="outer:fourth"))
+                    ),
+                    asyncio.create_task(knowledge.call(read_path, {"source": "fourth-leaf"})),
+                ]
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(len(seen["memory"]), 3)
+            self.assertEqual(len(seen["knowledge"]), 3)
+            self.assertTrue(all(not task.done() for task in tasks))
+            for owner, service in (("memory", memory), ("knowledge", knowledge)):
+                self.assertEqual(
+                    {"identity": owner},
+                    await asyncio.wait_for(
+                        service.call(IDENTITY, {}, headers={"X-Fixture-Owner": owner}), 1
+                    ),
+                )
+            self.assertEqual(peak, {"memory": 4, "knowledge": 4})
+            release.set()
+            self.assertEqual(
+                await asyncio.wait_for(asyncio.gather(*tasks), 1),
+                [{"original": "真实区间🍋"}] * 5,
+            )
+            self.assertEqual(seen["memory"].count(outer_path), 4)
+            self.assertEqual(seen["knowledge"].count(read_path), 5)
+            self.assertEqual(peak, {"memory": 4, "knowledge": 4})
+        finally:
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await core.close()
+            for service in clients:
+                await service.close()
+            self.assertTrue(all(service.client.is_closed for service in clients))
+
+        explicit = dict(
+            settings,
+            services=dict(
+                settings["services"],
+                knowledge={
+                    "url": "https://knowledge.synthetic.invalid",
+                    "token_env": "CALLBACK_KNOWLEDGE",
+                },
+            ),
+        )
+        with mock.patch.dict(
+            os.environ, {"CALLBACK_MEMORY": "memory", "CALLBACK_KNOWLEDGE": "knowledge"}
+        ):
+            core, _, clients, _ = build_runtime(explicit)
+        try:
+            self.assertEqual(core.knowledge_client.url, "https://knowledge.synthetic.invalid")
+            self.assertEqual(core.knowledge_client.token, "knowledge")
+            self.assertIsNot(core.memory.client, core.knowledge_client)
+            self.assertFalse(core.knowledge_client._memory_dependency)
+            self.assertIn(core.knowledge_client, clients)
+        finally:
+            await core.close()
+            for service in clients:
+                await service.close()
+            self.assertTrue(all(service.client.is_closed for service in clients))
 
     async def test_waiting_memory_write_timeout_and_cancellation_never_send_or_leak(self):
         for path in (

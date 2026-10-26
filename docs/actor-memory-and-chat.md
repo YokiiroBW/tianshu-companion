@@ -10,6 +10,8 @@
 
 outbox 沿现有自动 Memory dispatcher 公平推进。未知提交先查原回执，保持原正文、键、请求号及角色版；当前角色版可用于查旧回执，不能改旧命令重写。回执必须指向首次请求号。认识写入工具只接受实际自身检索返回的 episode_refs；明确 not_started 可在同角色版下查回执后重交原包，未知且无回执继续保未知。内部 actor_only 仅要求当前可读，外部群私上下文另核可披露权限。
 
+运行装配未配置 `services.knowledge` 时，用原 `services.memory` 的 URL、凭据及 CA 建立独立 Knowledge 客户端并纳入原关闭生命周期。每个客户端仍按原普通 3/总 4 容量和 15 秒预算运行；按依赖边界分离是为避免外层 Memory 请求占用容量时，来源回调等待同一客户端自己的名额，不是增加模型槽。显式 Knowledge 配置与直接构造 Core 的旧注入行为保持原样。
+
 `actor_memory_recall` 的每项实际取回完整 episode fact，保 provenance/outcome/content_reads；不能完整核验或放入同次读取预算的整项不进入模型。对话、内部计划和活动共用这份有来源投影，实际下一次模型前复核。认识属于解释，现实动作、观察、转述与虚构材料的原性质不变；自身经历不写到用户 person。现可发布 fictional diary 的读取链仅有原日记 ACL，不能承载每条真实材料的受众与遗忘复核，因此首版不向日记模型注入自身真实记忆。
 
 后台动态生成须同时配置独立 `services.gateway_background` 与 `services.provider_selector_background`，两端固定真实身份 `companion_background`。只有后台 Gateway 时仅允许显式 `life_config_version` 的独立已发布写作版本，不借前台动态 grant 或默认版本；后台 selector 单独配置拒绝。未配置后台 Gateway 保原兼容行为，不冒称 Gateway 已使用 background。真实受保护 binding、服务凭据和发布配置由协调者管理。
