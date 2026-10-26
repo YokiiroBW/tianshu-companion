@@ -53,6 +53,15 @@ def setup(store=None, *, writing=True, version=19, tz="UTC"):
     return life, clock, model
 
 
+async def advance_diary(life, diary_id):
+    """Wait for this existing diary phase rather than assuming a selected actor."""
+    for _ in range(8):
+        await life.work()
+        if life.diary_metadata(diary_id)["state"] != "queued":
+            return
+    raise AssertionError("The due diary phase did not advance")
+
+
 @pytest.fixture
 def env():
     life, clock, model = setup()
@@ -210,7 +219,7 @@ def test_draft_revision_publish_lock_and_admin_are_separate(env):
     life.record_event("private", "world", "fictional shell", participants=["a"])
     meta = life.request_diary("a", "2026-09-14")
     assert "material" not in meta and "content" not in meta
-    asyncio.run(life.work())
+    asyncio.run(advance_diary(life, meta["id"]))
     meta = life.diary_metadata(meta["id"])
     assert meta["state"] == "draft"
     assert model.calls[0][0]["config_version"] == 19
@@ -260,12 +269,12 @@ def test_recipe_immutable_and_empty_model_is_failed(env):
     life.record_event("e", "world", "fictional moment", participants=["a"])
     meta = life.request_diary("a", "2026-09-14")
     model.output = ""
-    asyncio.run(life.work())
+    asyncio.run(advance_diary(life, meta["id"]))
     failed = life.diary_metadata(meta["id"])
     assert failed["state"] == "failed" and failed["current_revision"] is None
     model.output = "Quiet fiction."
     life.retry_diary(meta["id"], expected=failed["version"])
-    asyncio.run(life.work())
+    asyncio.run(advance_diary(life, meta["id"]))
     assert life.diary_metadata(meta["id"])["state"] == "draft"
 
 

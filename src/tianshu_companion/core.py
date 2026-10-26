@@ -141,6 +141,7 @@ class Core(Delivery):
         qq_identity_required=False,
         relationships=None,
         knowledge_client=None,
+        background_gateway=None,
     ):
         self._automatic_memory_candidates = candidates_enabled(automatic_memory_candidates)
         self.default_model_selector = default_model_selector
@@ -199,11 +200,12 @@ class Core(Delivery):
             self.life = Life(
                 store,
                 clock,
-                gateway,
+                background_gateway if background_gateway is not None else gateway,
                 life_config_version,
                 self.models.background,
                 writing=False if life_writing is None else life_writing,
                 timezone_name=life_timezone,
+                background_limit=self.models.background_limit,
             )
             self.life.generation_writing = True if life_writing is None else life_writing
             self.life.model_selector = default_model_selector
@@ -311,9 +313,9 @@ class Core(Delivery):
         """
         work = getattr(unit, "work")
 
-        async def counted_work():
+        async def counted_work(*args, **kwargs):
             try:
-                return await work()
+                return await work(*args, **kwargs)
             finally:
                 self.pass_counters[name] = self.store.db.total_changes
 
@@ -2819,6 +2821,7 @@ class Core(Delivery):
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
         await self.memory_learning.close()
+        await self.life.close()
         await self.image_backend.close()
         self.store.close()
         if getattr(self, "storage_runtime", None) is not None:

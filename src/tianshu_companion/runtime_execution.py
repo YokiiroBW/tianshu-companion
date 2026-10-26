@@ -299,8 +299,30 @@ class RuntimeExecution:
             )
             for name in operations
         ]
-        generation, lease = await self.generation(actor, operation)
+        marker = self.store.get("metadata", operation)
+        round_ = marker.get("round", 0)
+        if round_ >= 8:
+            raise Fault("budget_exceeded")
+        if marker.get("expected_version", activity["version"]) != activity["version"]:
+            raise Fault("scope_changed")
+        generation, lease = await self.generation(actor, operation + ":" + str(round_))
         persona = self.core.life.persona_reader(actor)
+        concerns = self.core.life.concerns.page(actor, scope=activity["scope"], open_only=True)[0]
+        source_inputs = copy.deepcopy(marker.get("source_inputs", activity["sources"]))
+        if "source_inputs" not in marker:
+            for concern in concerns:
+                for source in concern["sources"] + [
+                    source for part in concern["fragments"] for source in part["sources"]
+                ]:
+                    if source not in source_inputs:
+                        source_inputs.append(source)
+        # The activity's own CAS is checked separately; its successful checkpoint
+        # transition does not revoke an earlier known tool receipt from this step.
+        source_inputs = [
+            source
+            for source in source_inputs
+            if not (source["owner"] == "companion" and source["object_id"] == activity["id"])
+        ]
         messages = [
             dict(
                 role="system",
@@ -312,118 +334,203 @@ class RuntimeExecution:
                     dict(
                         persona=persona,
                         activity=activity,
-                        concerns=self.core.life.concerns.page(
-                            actor, scope=activity["scope"], open_only=True
-                        )[0],
+                        concerns=concerns,
                         now=utc(self.core.clock()),
                     )
                 ),
             ),
         ]
-        receipts = []
-        async with self.core.models:
-            for _ in range(8):
-                self.core.reading.actor_operation(actor, activity["id"])
-                message, receipt = await self.core.gateway.complete(
-                    generation, messages, tools=tools
+        messages = copy.deepcopy(marker.get("messages", messages))
+        receipts = copy.deepcopy(marker.get("receipts", []))
+        reads = copy.deepcopy(marker.get("reads", []))
+        async with self.core.life.model_slots:
+            self.current_sources(source_inputs)
+            if any(source["owner"] != "companion" for source in source_inputs):
+                if activity["scope"] is None:
+                    raise Fault("dependency_unavailable")
+                await self.validate_sources(
+                    dict(activity["scope"], sources=source_inputs, content_refs=[])
                 )
-                receipts.append(receipt)
-                messages.append(message)
-                calls = message.get("tool_calls") or []
-                if not calls:
-                    break
-                for call in calls:
-                    try:
-                        value = strict_json(call["function"]["arguments"])
-                        name = next(
-                            name
-                            for name in operations
-                            if "life_" + name.replace(".", "_") == call["function"]["name"]
+            deadlines = []
+            for observed in reads:
+                available = await self.core.reading.check_read(actor, observed)
+                if available is not None:
+                    deadlines.append(epoch(available))
+            self.core.reading.actor_operation(actor, activity["id"])
+            self.current_sources(source_inputs)
+            if (
+                self.core.life.activities.get(actor, activity["id"])["version"]
+                != activity["version"]
+            ):
+                raise Fault("scope_changed")
+            self.core.life.verify_generation_lease(lease)
+            if any(deadline <= self.core.clock() for deadline in deadlines):
+                raise Fault("scope_changed")
+            marker.update(state="submitted", round=round_, source_inputs=source_inputs)
+            self.store.put("metadata", marker)
+            message, receipt = await self.core.life.gateway.complete(
+                generation, messages, tools=tools
+            )
+            self.core.life.verify_generation_lease(lease)
+            self.core.reading.actor_operation(actor, activity["id"])
+            if (
+                self.core.life.activities.get(actor, activity["id"])["version"]
+                != activity["version"]
+            ):
+                raise Fault("scope_changed")
+            receipts.append(receipt)
+            messages.append(message)
+            calls = message.get("tool_calls") or []
+            marker.update(messages=messages, receipts=receipts, state="tools_pending")
+            self.store.put("metadata", marker)
+            for call in calls:
+                unknown_tool = False
+                try:
+                    value = strict_json(call["function"]["arguments"])
+                    name = next(
+                        name
+                        for name in operations
+                        if "life_" + name.replace(".", "_") == call["function"]["name"]
+                    )
+                    supplied = copy.deepcopy(value["value"])
+                    properties = schema["$defs"][name.replace(".", "_") + "_value"]["properties"]
+                    sources = [
+                        dict(
+                            owner="companion",
+                            object_id=activity["id"],
+                            version=activity["version"],
                         )
-                        supplied = copy.deepcopy(value["value"])
-                        properties = schema["$defs"][name.replace(".", "_") + "_value"][
-                            "properties"
-                        ]
-                        sources = [
-                            dict(
-                                owner="companion",
-                                object_id=activity["id"],
-                                version=activity["version"],
-                            )
-                        ]
-                        if "sources" in properties:
-                            supplied["sources"] = sources
-                        if "scope" in properties:
-                            supplied["scope"] = activity["scope"]
-                        if "query" in properties:
-                            if activity["scope"] is not None:
-                                raise Fault("dependency_unavailable")
-                            # Null-scope actor principal uses its actual activity instead of an origin.
-                            supplied["query"] = None
-                        for fragment in supplied.get("fragments", []):
-                            fragment["sources"] = sources
-                        request = dict(
-                            schema_version=2,
-                            request_id="activity-action:" + digest([operation, call["id"]]),
-                            actor_id=actor,
-                            operation=name,
-                            expected_version=value["expected_version"],
-                            value=supplied,
+                    ]
+                    if "sources" in properties:
+                        supplied["sources"] = sources
+                    if "scope" in properties:
+                        supplied["scope"] = activity["scope"]
+                    if "query" in properties:
+                        if activity["scope"] is not None:
+                            raise Fault("dependency_unavailable")
+                        # Null-scope actor principal uses its actual activity instead of an origin.
+                        supplied["query"] = None
+                    for fragment in supplied.get("fragments", []):
+                        fragment["sources"] = sources
+                    request = dict(
+                        schema_version=2,
+                        request_id="activity-action:" + digest([operation, call["id"]]),
+                        actor_id=actor,
+                        operation=name,
+                        expected_version=value["expected_version"],
+                        value=supplied,
+                    )
+                    marker["active_request"] = copy.deepcopy(request)
+                    self.store.put("metadata", marker)
+                    if name.startswith("reading.") or name == "content.acquire":
+                        result = await self.core.reading.action(
+                            "actor:" + actor,
+                            request,
+                            operation_ref=activity["id"],
+                            return_content=True,
                         )
-                        if name.startswith("reading.") or name == "content.acquire":
-                            result = await self.core.reading.action(
-                                "actor:" + actor,
-                                request,
-                                operation_ref=activity["id"],
-                                return_content=True,
-                            )
-                        else:
-                            self.core.contracts.check("life-runtime#manage_request", request)
-                            prepared = await self.core.life_runtime.prepare_action(
+                    else:
+                        self.core.contracts.check("life-runtime#manage_request", request)
+                        prepared = await self.core.life_runtime.prepare_action(
+                            actor,
+                            name,
+                            supplied,
+                            value["expected_version"],
+                            model_slot_held=True,
+                        )
+                        result = self.core.life.concerns.operation(
+                            "actor:" + actor,
+                            request,
+                            lambda: self.core.life_runtime._execute(
                                 actor,
                                 name,
                                 supplied,
                                 value["expected_version"],
-                                model_slot_held=True,
-                            )
-                            result = self.core.life.concerns.operation(
-                                "actor:" + actor,
-                                request,
-                                lambda: self.core.life_runtime._execute(
-                                    actor,
-                                    name,
-                                    supplied,
-                                    value["expected_version"],
-                                    request["request_id"],
-                                    actor,
-                                    prepared=prepared,
+                                request["request_id"],
+                                actor,
+                                prepared=prepared,
+                            ),
+                        )
+                    actual = result.pop("actual_content", None)
+                    unknown_tool = result.get("state") == "unknown"
+                    if name == "content.acquire" and result.get("content_ref"):
+                        reference = result["content_ref"]
+                        coverage = reference["coverage"]
+                        reads.append(
+                            dict(
+                                operation_ref=activity["id"],
+                                scope=activity["scope"],
+                                content_ref=reference,
+                                coverage=dict(
+                                    unit=coverage["unit"],
+                                    start=coverage["start"],
+                                    end=min(coverage["start"] + 1, coverage["end"]),
                                 ),
+                                content_digest=None,
                             )
-                        actual = result.pop("actual_content", None)
-                        attachments = (
-                            self.core.role_actions.content_messages(actual) if actual else []
                         )
-                        if actual:
-                            result["actual_content"] = {
-                                key: actual[key] for key in ("text", "coverage", "complete", "gaps")
-                            }
-                        result = dict(state="completed", result=result)
-                    except (Fault, ValueError, KeyError, StopIteration) as error:
-                        result = dict(
-                            state="unknown"
-                            if isinstance(error, Fault) and error.unknown
-                            else "rejected",
-                            error_code=error.code if isinstance(error, Fault) else "invalid_input",
+                    attachments = self.core.role_actions.content_messages(actual) if actual else []
+                    if actual:
+                        session = self.core.reading.get(actor, supplied["id"], activity["scope"])
+                        observed = dict(
+                            operation_ref=session["id"],
+                            scope=session["scope"],
+                            content_ref=session["content_ref"],
+                            coverage=actual["coverage"],
+                            content_digest=self.core.reading.read_signature(actual),
                         )
-                        attachments = []
-                    messages.append(
-                        dict(role="tool", tool_call_id=call["id"], content=canonical(result))
+                        if observed not in reads:
+                            reads.append(observed)
+                        result["actual_content"] = {
+                            key: actual[key] for key in ("text", "coverage", "complete", "gaps")
+                        }
+                    result = dict(state="completed", result=result)
+                except (Fault, ValueError, KeyError, StopIteration) as error:
+                    unknown_tool = isinstance(error, Fault) and error.unknown
+                    result = dict(
+                        state="unknown" if unknown_tool else "rejected",
+                        error_code=error.code if isinstance(error, Fault) else "invalid_input",
                     )
-                    messages.extend(attachments)
-                if len(canonical(messages).encode()) > 4_000_000:
-                    raise Fault("budget_exceeded")
-            else:
+                    attachments = []
+                messages.append(
+                    dict(role="tool", tool_call_id=call["id"], content=canonical(result))
+                )
+                messages.extend(attachments)
+                # Preserve each received tool result before any further awaited action.
+                marker.update(messages=messages, receipts=receipts, reads=reads)
+                self.store.put("metadata", marker)
+                if unknown_tool:
+                    marker.update(state="unknown", unknown_call_id=call["id"])
+                    self.store.put("metadata", marker)
+                    current = self.core.life.activities.get(actor, activity["id"])
+                    if current["state"] == "running":
+                        self.core.life.activities.transition(
+                            actor,
+                            current["id"],
+                            "paused",
+                            expected=current["version"],
+                            reason="unknown_step",
+                        )
+                    raise Fault("result_unknown", unknown=True)
+            if len(canonical(messages).encode()) > 4_000_000:
                 raise Fault("budget_exceeded")
+            if calls:
+                current = self.core.life.activities.get(actor, activity["id"])
+                # The complete model/tool round is durable before yielding. An
+                # interrupted submitted round is never silently reissued.
+                marker.update(
+                    state="pending",
+                    messages=messages,
+                    receipts=receipts,
+                    reads=reads,
+                    round=round_ + 1,
+                    expected_version=current["version"],
+                )
+                with self.store.transaction():
+                    self.store.put("metadata", marker)
+                    current["step_operation"] = operation
+                    self.store.put("life_activities", current)
+                return False
         self.core.life.verify_generation_lease(lease)
         current = self.core.life.activities.get(actor, activity["id"])
         # Thinking is not a fabricated completed activity. A model that took no advancing
@@ -532,8 +639,11 @@ class RuntimeExecution:
             )
             attachments.extend(self.core.role_actions.content_messages(original))
         material["actual_originals"] = originals
-        async with self.core.models:
-            output, receipt = await self.core.gateway.generate(
+        async with self.core.life.model_slots:
+            current = await self.current_context(candidate)
+            await self.validate_sources(candidate, current["origin"])
+            self.core.life.verify_generation_lease(lease)
+            output, receipt = await self.core.life.gateway.generate(
                 generation,
                 [
                     dict(

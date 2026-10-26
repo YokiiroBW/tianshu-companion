@@ -413,14 +413,16 @@ class DailyLife:
             {"role": "user", "content": canonical(captured)},
         ]
 
-    async def work(self):
+    async def work(self, *, actor_id=None, one=False):
         """At most one plan and one stage per pass, independent of each other's failures."""
         for kind in ("plan", "stage"):
             rows = self.store.db.execute(
                 "SELECT body FROM metadata WHERE conversation_id=? AND status IN "
                 "('queued','unavailable','failed') AND deadline<=? "
-                "AND json_extract(body,'$.attempt')<3 ORDER BY deadline,position,id LIMIT 1",
-                (TASK_SCOPE + ":" + kind, self.life.clock()),
+                "AND json_extract(body,'$.attempt')<3 "
+                "AND (? IS NULL OR json_extract(body,'$.actor_id')=?) "
+                "ORDER BY deadline,position,id LIMIT 1",
+                (TASK_SCOPE + ":" + kind, self.life.clock(), actor_id, actor_id),
             ).fetchall()
             task = json.loads(rows[0][0]) if rows else None
             if task is None:
@@ -452,6 +454,8 @@ class DailyLife:
                     if self._current(task) is None:
                         task["state"] = "superseded"
                         self._status(task)
+                        if one:
+                            return True
                         continue
                     self._save(task)
                     output, receipt = await asyncio.wait_for(
@@ -472,12 +476,16 @@ class DailyLife:
                 with self.store.transaction():
                     fresh = self.store.get("metadata", task["id"])
                     if fresh["state"] != "generating" or fresh["attempt"] != attempt:
+                        if one:
+                            return True
                         continue
                     fresh["receipt"] = receipt
                     current = self._current(fresh)
                     if current is None:
                         fresh.update(state="superseded", outcome="late_result")
                         self._status(fresh)
+                        if one:
+                            return True
                         continue
                     actor, plan = current
                     if kind == "plan":
@@ -542,6 +550,9 @@ class DailyLife:
                     else "failed"
                 )
                 self._failure(task, state, type(exc).__name__)
+            if one:
+                return True
+        return False
 
     def _failure(self, task, state, reason):
         with self.store.transaction():

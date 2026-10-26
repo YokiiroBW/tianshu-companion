@@ -3,7 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from test_life import setup
+from test_life import setup, advance_diary
 from tianshu_companion.model_selection import (
     HttpDefaultModelSelector,
     ModelSelection,
@@ -61,12 +61,12 @@ def test_diary_uses_writing_binding_without_static_config_and_retries_with_new_g
             meta = life.request_diary("a", "2026-09-14")
             assert meta["state"] == "queued"
             model.fail = True
-            await life.work()
+            await advance_diary(life, meta["id"])
             failed = life.diary_metadata(meta["id"])
             assert failed["state"] == "failed"
             life.retry_diary(meta["id"], expected=failed["version"])
             model.fail = False
-            await life.work()
+            await advance_diary(life, meta["id"])
             assert life.diary_metadata(meta["id"])["state"] == "draft"
             assert len(requests) == 2
             assert all(request.function_id == "writing" for request in requests)

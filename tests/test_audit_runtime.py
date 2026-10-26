@@ -185,7 +185,21 @@ class RuntimeFixTests(unittest.IsolatedAsyncioTestCase):
                     response = await client.get(
                         "/health/ready", headers={"Authorization": "Bearer test-diagnostics"}
                     )
-                    self.assertEqual(200, response.status_code)
+                    self.assertEqual(
+                        200,
+                        response.status_code,
+                        (
+                            response.json(),
+                            {
+                                name: dict(
+                                    failed=value["failed"],
+                                    observed=value["last_success"] is not None,
+                                    done=value["task"].done(),
+                                )
+                                for name, value in app.state.health.workers.workers.items()
+                            },
+                        ),
+                    )
             self.assertFalse(app.state.health.workers.healthy())
 
     async def test_debounce_restart_delivery_and_failed_commit_share_correlation(self):

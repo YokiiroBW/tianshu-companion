@@ -16,7 +16,7 @@ import pytest
 from support import Clock, Harness
 from test_images import complete, png, workflow  # noqa: F401
 from test_images import server as comfy_server  # noqa: F401  (fixture import)
-from test_life import Model
+from test_life import Model, advance_diary
 from tianshu_companion.images import ComfyUI, Images
 from tianshu_companion.life import Life
 from tianshu_companion.store import Store
@@ -183,7 +183,7 @@ def test_chain_knowledge_state_diary_capture(tmp_path):
                     )
                     == revision
                 )
-                await restarted.work()
+                await advance_diary(restarted, later["id"])
                 assert len(model.calls) == calls + 1  # only the new material version
                 assert restarted.read_diary(meta_b["id"], reader="reader") == published
                 assert store.source_head() == head

@@ -487,6 +487,15 @@ def build_runtime(config):
             bindings=config.get("bindings", {}),
             roles=config.get("roles", {}),
             config_version=config.get("config_version"),
+            background_gateway=(
+                Gateway(
+                    contracts,
+                    client("gateway_background", "gateway"),
+                    caller_service="companion_background",
+                )
+                if "gateway_background" in config.get("services", {})
+                else None
+            ),
             default_model_selector=provider_selector,
             qq_admin=qq_admin,
             qq_identity_required=qq_admission,
@@ -655,7 +664,12 @@ def create_app(core=None, tokens=None, life_readers=None):
                         1,
                         _counter(core, "memory.work"),
                     ),
-                    loop("life.work", core.life.work, 2, _counter(core, "life.work")),
+                    loop(
+                        "life.work",
+                        lambda: core.life.work(wait=False),
+                        2,
+                        _counter(core, "life.work"),
+                    ),
                     loop("images.work", core.images.work, 2, _counter(core, "images.work")),
                     loop("writing.work", core.writing.work, 5, _counter(core, "writing.work")),
                     loop(

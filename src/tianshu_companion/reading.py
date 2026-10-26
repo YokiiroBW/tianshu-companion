@@ -362,6 +362,33 @@ class Reading:
             )
         raise Fault("dependency_unavailable")
 
+    @staticmethod
+    def read_signature(result):
+        """Exact model-visible original, excluding a renewable owner's read lease."""
+        return digest(
+            {
+                key: result[key]
+                for key in ("text", "coverage", "complete", "representations", "gaps")
+            }
+        )
+
+    async def check_read(self, actor, observed):
+        """Revalidate a persisted original without advancing a reading or emitting an event."""
+        result = await self._read(
+            actor,
+            observed["scope"],
+            observed["content_ref"],
+            observed["coverage"],
+            None,
+            observed["operation_ref"],
+        )
+        if (
+            observed["content_digest"] is not None
+            and self.read_signature(result) != observed["content_digest"]
+        ):
+            raise Fault("scope_changed")
+        return result.get("available_until")
+
     def _advance(self, item, result):
         actual = result["coverage"]
         coverage = item["content_ref"]["coverage"]

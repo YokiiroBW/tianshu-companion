@@ -119,6 +119,14 @@ def generation_tasks(life, kind):
     return life.store.list("metadata", TASK_SCOPE + ":" + kind)
 
 
+async def advance_life(life, *, until=None):
+    """Drive bounded owner phases; a single pump no longer means drain all work."""
+    for _ in range(8):
+        await life.work()
+        if until is not None and until():
+            return
+
+
 def test_new_managed_role_is_readable_without_a_static_actor_entry():
     async def scenario():
         h = Harness(personas=persona_config())
@@ -160,7 +168,7 @@ def test_new_managed_role_is_readable_without_a_static_actor_entry():
                         },
                     )
                     assert response.status_code == 200, response.text
-                await h.core.life.work()
+                await advance_life(h.core.life)
                 headers = {"Authorization": "Bearer fixture-life"}
                 before = facts(h.core.store)
                 listed = await client.post(
@@ -216,7 +224,7 @@ def test_autonomous_generation_uses_each_actor_selected_model_and_explicit_false
             h.core.recover()
             assert not h.core.life.writing_available()  # Legacy diary/long-form switch unchanged.
             for _ in range(4):
-                await h.core.life.work()
+                await advance_life(h.core.life)
             assert {request.actor_id for request in requests} == {"actor:a", "actor:b"}
             for request in requests:
                 assert request.function_id == "writing"
@@ -237,7 +245,7 @@ def test_autonomous_generation_uses_each_actor_selected_model_and_explicit_false
             h.core = h.new_core(default_model_selector=Selector(), life_writing=False)
             h.core.recover()
             before = len(h.gateway.calls), len(requests)
-            await h.core.life.work()
+            await advance_life(h.core.life)
             assert before == (len(h.gateway.calls), len(requests))
             assert plan(h.core.life, "actor:a")["generation_state"] == "unavailable"
         finally:
@@ -265,7 +273,7 @@ def test_expired_selection_lease_cannot_commit_late_generated_experience():
         try:
             life.model_selector = Selector()
             model.generate = expire
-            await life.work()
+            await advance_life(life)
             stage = generation_tasks(life, "stage")[0]
             assert stage["state"] == "unavailable"
             assert not life.store.get("life_actors", "actor:0").get("experience")
@@ -319,7 +327,7 @@ def test_source_withdrawn_during_day_plan_cannot_return_via_planned_detail():
 
             async def work_until_plan():
                 for _ in range(8):
-                    await life.work()
+                    await advance_life(life)
                     if started.is_set():
                         break
 
@@ -399,13 +407,13 @@ def test_selected_attempt_identity_matches_real_gateway_header_and_retry():
             life.model_selector = Selector()
             life.gateway = Gateway(contracts(), Transport())
             model.timeout_stage = True
-            await life.work()
+            await advance_life(life)
             stage = generation_tasks(life, "stage")[0]
             assert stage["state"] == "interrupted"
             first = stage["generation_turn_id"]
             model.timeout_stage = False
             life.retry_generation(stage["id"], expected=stage["version"])
-            await life.work()
+            await advance_life(life)
             current = life.store.get("metadata", stage["id"])
             assert current["state"] == "completed"
             assert current["generation_turn_id"] != first
@@ -421,11 +429,19 @@ def test_disable_and_enable_same_persona_cannot_revive_inflight_stage():
     async def scenario():
         life, clock, model = make_life()
         try:
-            await life.work()
+            await advance_life(life)
             before = len(life.store.list("life_events"))
             clock.advance(3 * 3600)
             model.gate = asyncio.Event()
-            pending = asyncio.create_task(life.work())
+            before_calls = len([call for call in model.calls if call[0] == "stage"])
+            pending = asyncio.create_task(
+                advance_life(
+                    life,
+                    until=lambda: (
+                        len([call for call in model.calls if call[0] == "stage"]) > before_calls
+                    ),
+                )
+            )
             for _ in range(20):
                 await asyncio.sleep(0)
                 if any(t["state"] == "generating" for t in generation_tasks(life, "stage")):
@@ -486,7 +502,7 @@ def test_generation_retry_http_is_management_only_and_versioned():
             life, model = h.core.life, Model()
             life.gateway, life.config_version = model, 19
             model.timeout_stage = True
-            await life.work()
+            await advance_life(life)
             current = plan(life, "actor:a")
             app = create_app(h.core, {"platform": "synthetic-admin", "reader": "synthetic-read"})
             async with httpx.AsyncClient(
@@ -517,7 +533,7 @@ def test_generation_retry_http_is_management_only_and_versioned():
                 assert (await send("synthetic-admin", request)).status_code == 409
                 model.timeout_stage = False
                 for _ in range(4):
-                    await life.work()
+                    await advance_life(life)
                 assert life.store.get("life_actors", "actor:a").get("experience")
         finally:
             await h.core.close()
@@ -541,7 +557,7 @@ def test_life_is_registered_on_runtime_start_without_a_message_or_model():
             latest = h.core.life.summary("actor:a")
             assert latest["changed_at"] > initial["changed_at"]
             assert len(h.core.store.list("life_events")) >= 6
-            await h.core.life.work()
+            await advance_life(h.core.life)
             assert h.gateway.calls == []
             for actor in h.core.store.list("life_actors"):
                 row = plan(h.core.life, actor["id"])
@@ -581,7 +597,7 @@ def test_daily_plan_and_due_experience_generate_without_chat_and_enter_diary_mat
         life, clock, model = make_life()
         try:
             head = life.store.source_head()
-            await life.work()
+            await advance_life(life)
             assert [c[0] for c in model.calls] == ["plan", "stage"]
             today = plan(life)
             assert today["generation_state"] == "completed" and today["generated_by"] == "gateway"
@@ -589,12 +605,12 @@ def test_daily_plan_and_due_experience_generate_without_chat_and_enter_diary_mat
             material = life.materials("actor:0", "2026-10-03")
             assert any(m["summary"] == "I explored a quiet fictional moment." for m in material)
             old_events = life.store.list("life_events")
-            await life.work()
+            await advance_life(life)
             life.tick(force=True)
             assert life.store.list("life_events") == old_events
             clock.advance(3 * 3600)
             life.tick()
-            await life.work()
+            await advance_life(life)
             assert (
                 len([e for e in life.store.list("life_events") if e["kind"] == "stage_experience"])
                 == 2
@@ -608,7 +624,7 @@ def test_daily_plan_and_due_experience_generate_without_chat_and_enter_diary_mat
             assert life.store.source_head() == head
             clock.advance(24 * 3600)
             life.tick()
-            await life.work()
+            await advance_life(life)
             assert plan(life)["day"] == "2026-10-04"
             assert life.store.get("metadata", today["id"])["state"] == "completed"
             assert len([c for c in model.calls if c[0] == "plan"]) == 2
@@ -624,17 +640,17 @@ def test_plan_failure_does_not_block_stage_and_known_failures_retry_boundedly():
         life, clock, model = make_life()
         model.plan_failure = True
         try:
-            await life.work()
+            await advance_life(life)
             assert plan(life)["generation_state"] == "failed"
             assert any(e["kind"] == "stage_experience" for e in life.store.list("life_events"))
             for _ in range(5):
                 clock.advance(301)
-                await life.work()
+                await advance_life(life)
             tasks = generation_tasks(life, "plan")
             assert tasks[0]["attempt"] == 3
             model.plan_failure = False
             life.retry_generation(tasks[0]["id"], expected=tasks[0]["version"])
-            await life.work()
+            await advance_life(life)
             assert plan(life)["generation_state"] == "completed"
         finally:
             life.store.close()
@@ -647,7 +663,9 @@ def test_late_stage_result_and_changed_schedule_do_not_write_old_experience():
         life, clock, model = make_life()
         model.gate = asyncio.Event()
         try:
-            work = asyncio.create_task(life.work())
+            work = asyncio.create_task(
+                advance_life(life, until=lambda: any(call[0] == "stage" for call in model.calls))
+            )
             for _ in range(20):
                 await asyncio.sleep(0)
                 if any(c[0] == "stage" for c in model.calls):
@@ -661,7 +679,7 @@ def test_late_stage_result_and_changed_schedule_do_not_write_old_experience():
             ]
             old = generation_tasks(life, "stage")[0]
             assert old["state"] == "superseded" and old["outcome"] == "late_result"
-            await life.work()
+            await advance_life(life)
             assert (
                 len([e for e in life.store.list("life_events") if e["kind"] == "stage_experience"])
                 == 1
@@ -719,7 +737,7 @@ def test_cancellation_is_visible_and_never_automatically_repeats_unknown_call():
         life, _, model = make_life()
         model.gate = asyncio.Event()
         try:
-            worker = asyncio.create_task(life.work())
+            worker = asyncio.create_task(advance_life(life))
             for _ in range(20):
                 await asyncio.sleep(0)
                 if any(c[0] == "stage" for c in model.calls):
@@ -730,11 +748,11 @@ def test_cancellation_is_visible_and_never_automatically_repeats_unknown_call():
             task = generation_tasks(life, "stage")[0]
             assert task["state"] == "interrupted"
             calls = len(model.calls)
-            await life.work()
+            await advance_life(life)
             assert len(model.calls) == calls
             model.gate.set()
             life.retry_generation(task["id"], expected=task["version"])
-            await life.work()
+            await advance_life(life)
             assert generation_tasks(life, "stage")[0]["state"] == "completed"
         finally:
             life.store.close()
@@ -750,7 +768,7 @@ def test_dialogue_influence_is_deduplicated_impersonal_and_actor_isolated():
             model = Model()
             life = h.core.life
             life.gateway, life.writing, life.config_version = model, True, 19
-            await life.work()
+            await advance_life(life)
             old_events = copy.deepcopy(life.store.list("life_events"))
             request = h.request(text="Secret person 123456 想研究天体物理纪录片")
             await h.core.ingest("nonebot", request)
@@ -759,7 +777,7 @@ def test_dialogue_influence_is_deduplicated_impersonal_and_actor_isolated():
             assert (
                 actor["life_interests"] == []
             )  # Accepted source is queued, never a keyword-derived intention.
-            await life.work()
+            await advance_life(life)
             actor = life.store.get("life_actors", "actor:a")
             version = actor["life_content_version"]
             assert actor["life_interests"] == ["研究天体物理纪录片中的恒星演化"]
@@ -768,7 +786,7 @@ def test_dialogue_influence_is_deduplicated_impersonal_and_actor_isolated():
             assert life.store.get("life_actors", "actor:b").get("life_interests", []) == []
             life.tick(force=True)
             for _ in range(4):
-                await life.work()
+                await advance_life(life)
             calls = [c for c in model.calls if c[0] == "stage"]
             assert any(c[2]["interests"] == ["研究天体物理纪录片中的恒星演化"] for c in calls)
             assert "123456" not in json.dumps(calls)
@@ -1039,16 +1057,16 @@ def test_timeout_is_unknown_and_generated_projections_match_published_contract()
                 clock=clock,
             )
             model.timeout_stage = True
-            await life.work()
+            await advance_life(life)
             stage = generation_tasks(life, "stage")[0]
             assert stage["state"] == "interrupted"
             calls = len(model.calls)
             clock.advance(61)
-            await life.work()
+            await advance_life(life)
             assert len(model.calls) == calls
             model.timeout_stage = False
             life.retry_generation(stage["id"], expected=stage["version"])
-            await life.work()
+            await advance_life(life)
             before = facts(life.store)
             today = port.handle("platform", "today", {"schema_version": 1, "actor_id": "actor:0"})
             timeline = port.handle(
@@ -1110,7 +1128,7 @@ def test_open_specific_dialogue_changes_later_content_and_withdrawal_removes_it(
                 initial["life_interests"] == []
             )  # No keyword match; only real extraction can affect it.
             for _ in range(5):
-                await life.work()
+                await advance_life(life)
             influenced = life.store.get("life_actors", "actor:a")
             assert "研究天体物理纪录片中的恒星演化" in influenced["life_interests"]
             assert life.store.get("life_actors", "actor:b")["life_interests"] == []
@@ -1120,7 +1138,7 @@ def test_open_specific_dialogue_changes_later_content_and_withdrawal_removes_it(
             h.clock.advance(3 * 3600)
             await h.core.tick()
             for _ in range(3):
-                await life.work()
+                await advance_life(life)
             assert any(
                 "天体物理" in e["summary"]
                 for e in life.store.list("life_events")
@@ -1182,7 +1200,7 @@ def test_withdrawal_clears_generated_future_details_even_without_a_new_plan(rege
                 h.request(text="今天想让你研究天体物理纪录片", message="plan:committed-source"),
             )
             for _ in range(6):
-                await life.work()
+                await advance_life(life)
             before = plan(life, "actor:a")
             assert before["generation_state"] == "completed"
             assert any(
@@ -1214,13 +1232,13 @@ def test_withdrawal_clears_generated_future_details_even_without_a_new_plan(rege
             else:
                 model.available = False
             for _ in range(4):
-                await life.work()
+                await advance_life(life)
             h.clock.advance(3 * 3600)
             life.tick(force=True)
             model.available = True
             model.plan_failure = True
             for _ in range(4):
-                await life.work()
+                await advance_life(life)
             later = [
                 material
                 for kind, _, material in model.calls
@@ -1254,7 +1272,7 @@ def test_role_personas_and_ai_activity_names_reach_current_and_future_projection
             with patch.object(h.core.personas, "verify", wraps=h.core.personas.verify) as verify:
                 life.persona_verifier = verify
                 for _ in range(4):
-                    await life.work()
+                    await advance_life(life)
                 assert verify.call_count >= 4
             plans = [call for call in model.calls if call[0] == "plan"]
             assert {call[2]["persona_expression"] for call in plans} == {"Role A", "Role B"}
@@ -1288,7 +1306,7 @@ def test_source_withdrawn_during_intention_extraction_cannot_apply_late_result()
             model.influence_gate = asyncio.Event()
             request = h.request(text="研究天体物理纪录片", message="source:late")
             await h.core.ingest("nonebot", request)
-            worker = asyncio.create_task(life.work())
+            worker = asyncio.create_task(advance_life(life))
             for _ in range(20):
                 await asyncio.sleep(0)
                 if any(call[0] == "influence" for call in model.calls):

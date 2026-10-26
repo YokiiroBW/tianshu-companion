@@ -160,13 +160,15 @@ class LifeInfluences:
             return None
         return influence, actor, row
 
-    async def work(self):
+    async def work(self, *, actor_id=None):
         """One source extraction per pass; it cannot create a schedule or move its clock."""
         row = self.store.db.execute(
             "SELECT body FROM metadata WHERE conversation_id=? AND status IN "
             "('queued','unavailable','failed') AND deadline<=? "
-            "AND json_extract(body,'$.attempt')<3 ORDER BY deadline,position,id LIMIT 1",
-            (WORK_SCOPE, self.life.clock()),
+            "AND json_extract(body,'$.attempt')<3 "
+            "AND (? IS NULL OR json_extract(body,'$.actor_id')=?) "
+            "ORDER BY deadline,position,id LIMIT 1",
+            (WORK_SCOPE, self.life.clock(), actor_id, actor_id),
         ).fetchone()
         if not row:
             return
@@ -292,6 +294,7 @@ class LifeInfluences:
                 else "failed",
                 type(error).__name__,
             )
+        return True
 
     def _fail(self, task, state, reason):
         fresh = self.store.get("metadata", task["id"])

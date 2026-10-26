@@ -1454,8 +1454,9 @@ class Memory:
 
 
 class Gateway:
-    def __init__(self, contracts, client):
+    def __init__(self, contracts, client, *, caller_service="companion"):
         self.contracts, self.client = contracts, client
+        self.caller_service = caller_service
         # Live transport handles only; execution evidence remains the gateway's receipt.
         self.active_requests = {}
 
@@ -1580,7 +1581,7 @@ class Gateway:
         if (
             receipt["request_id"] != request_id
             or receipt["config_version"] != turn["config_version"]
-            or receipt["caller_service"] != "companion"
+            or receipt["caller_service"] != self.caller_service
         ):
             raise Fault("dependency_unavailable")
         return receipt

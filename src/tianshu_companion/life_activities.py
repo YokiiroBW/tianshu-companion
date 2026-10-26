@@ -14,7 +14,7 @@ class Activities:
     def __init__(self, life):
         self.life, self.store = life, life.store
         self.executor = None
-        self.lock = asyncio.Lock()
+        self._active = set()
 
     def get(self, actor_id, activity_id):
         item = self.store.get("life_activities", activity_id)
@@ -158,21 +158,34 @@ class Activities:
             if actor and actor.get("activity_id") == item["id"]:
                 item["unobserved_until"] = self.life.clock()
                 self.store.put("life_activities", item)
-                operation = "activity-step:" + digest([item["id"], item["version"]])
+                operation = item.get("step_operation") or "activity-step:" + digest(
+                    [item["id"], item["version"]]
+                )
                 marker = self.store.get("metadata", operation)
-                if marker and marker["state"] == "submitted":
+                if marker and marker["state"] in {"submitted", "tools_pending"}:
                     self._interrupt(item, "interrupted_step")
 
-    async def work(self):
-        if self.lock.locked() or self.executor is None or not self.life.generation_available():
+    async def work(self, *, actor_id=None):
+        if self.executor is None or not self.life.generation_available():
             return
-        row = self.store.db.execute(
-            "SELECT body FROM life_activities WHERE status='running' AND deadline<=? ORDER BY deadline,id LIMIT 1",
-            (self.life.clock(),),
-        ).fetchone()
-        if row is None:
-            return
-        item = json.loads(row[0])
+        if actor_id is not None:
+            actor = self.store.get("life_actors", actor_id)
+            item = self.store.get("life_activities", (actor or {}).get("activity_id", ""))
+            if (
+                not item
+                or item["state"] not in {"running", "paused"}
+                or item.get("next_due_at") is None
+                or item["next_due_at"] > self.life.clock()
+            ):
+                return
+        else:
+            row = self.store.db.execute(
+                "SELECT body FROM life_activities WHERE status IN ('running','paused') AND deadline<=? ORDER BY deadline,id LIMIT 1",
+                (self.life.clock(),),
+            ).fetchone()
+            if row is None:
+                return
+            item = json.loads(row[0])
         actor = self.store.get("life_actors", item["actor_id"])
         if (
             not actor
@@ -180,38 +193,51 @@ class Activities:
             or actor.get("activity_id") != item["id"]
         ):
             return
-        async with self.lock:
-            operation = "activity-step:" + digest([item["id"], item["version"]])
-            existing = self.store.get("metadata", operation)
-            if existing:
-                return  # Interrupted/unknown execution is never silently re-issued.
-            self.store.put(
-                "metadata",
-                dict(
-                    id=operation,
-                    state="submitted",
-                    activity_id=item["id"],
-                    version=item["version"],
-                    submitted_at=self.life.clock(),
-                ),
+        operation = item.get("step_operation") or "activity-step:" + digest(
+            [item["id"], item["version"]]
+        )
+        if operation in self._active:
+            return
+        existing = self.store.get("metadata", operation)
+        if existing and existing["state"] != "pending":
+            # A submitted model/tool call might have executed. A new operation is not
+            # proof that it did not; only an explicit checkpoint change can restart it.
+            return
+        if item["state"] == "paused" and not existing:
+            item = self.transition(
+                item["actor_id"], item["id"], "running", expected=item["version"]
             )
-            try:
-                await self.executor(item, operation)
+            operation = "activity-step:" + digest([item["id"], item["version"]])
+            existing = None
+        self._active.add(operation)
+        try:
+            if not existing:
                 self.store.put(
                     "metadata",
                     dict(
                         id=operation,
-                        state="completed",
+                        state="pending",
                         activity_id=item["id"],
                         version=item["version"],
-                        settled_at=self.life.clock(),
+                        submitted_at=self.life.clock(),
                     ),
                 )
-            except asyncio.CancelledError:
+            continuing = await self.executor(item, operation)
+            if continuing is False:
+                return True
+            marker = self.store.get("metadata", operation)
+            marker.update(state="completed", settled_at=self.life.clock())
+            self.store.put("metadata", marker)
+        except asyncio.CancelledError:
+            marker = self.store.get("metadata", operation)
+            if marker and marker["state"] != "pending":
                 self._interrupt(item, "interrupted_step")
-                raise
-            except (Fault, ValueError, KeyError, OSError):
-                self._interrupt(item, "step_unavailable")
+            raise
+        except (Fault, ValueError, KeyError, OSError):
+            self._interrupt(item, "step_unavailable")
+        finally:
+            self._active.remove(operation)
+        return True
 
     def _interrupt(self, item, reason):
         current = self.get(item["actor_id"], item["id"])
