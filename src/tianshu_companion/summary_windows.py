@@ -6,6 +6,7 @@ import hashlib
 from .clients import utc
 from .contracts import Fault, canonical, digest
 from .short_context import sources_current
+from .context import MEMORY_CONTEXT_DOMAIN, reply_provenance_checks
 from .source_sync import ensure_channel, link_learning_channel, selector
 
 
@@ -83,8 +84,9 @@ class SummaryWindows:
             if admission is None or admission["fact"]["binding_version"] != turn["binding_version"]:
                 raise Fault("scope_changed")
 
-    def _memory_dependencies(self, turn):
-        bundle = (turn.get("memory_context") or {}).get("bundle")
+    def _memory_dependencies(self, turn, *, bundle=None):
+        if bundle is None:
+            bundle = (turn.get("memory_context") or {}).get("bundle")
         if bundle is None or any(type(bundle.get(key)) is not list for key in DEPENDENCIES):
             # Old replies have no complete captured Memory provenance. Their
             # independent human inputs remain eligible; never invent proof.
@@ -123,16 +125,29 @@ class SummaryWindows:
             # were actually appended to the model context, not for candidates.
             # These old profile records lack exact v2 dependency arrays.
             return None
-        dependencies = self._memory_dependencies(turn)
+        recorded = reply_provenance_checks(turn)
+        if turn.get("reply_context_provenance") is not None and recorded is None:
+            # A new mixed/incomplete dispatch journal is not an old reply whose
+            # latest three arrays can stand in for every actual model input.
+            return None
+        dependencies = (
+            {key: [] for key in DEPENDENCIES}
+            if recorded is not None
+            else self._memory_dependencies(turn)
+        )
         if dependencies is None:
             return None
         visiting = visiting | {turn["id"]}
         inherited = []
-        for check in turn.get("context_checks", []):
+        for check in recorded if recorded is not None else turn.get("context_checks", []):
             identity = check.get("source_turn_id")
             if not identity or identity not in turns:
                 return None
-            if check["version_domain"] not in {"text-input/v1", "text-dialogue/v1"}:
+            if check["version_domain"] not in {
+                "text-input/v1",
+                "text-dialogue/v1",
+                MEMORY_CONTEXT_DOMAIN,
+            }:
                 return None
             try:
                 self.core._context_source(check)
@@ -140,6 +155,18 @@ class SummaryWindows:
                 if not getattr(error, "context_dependency_invalid", False):
                     raise
                 return None
+            if check["version_domain"] == MEMORY_CONTEXT_DOMAIN:
+                bundle = check["memory_bundle"]
+                if (
+                    bundle.get("retrieval_mode") != "context"
+                    or bundle.get("effective_scope") != check["scope"]
+                ):
+                    return None
+                selected = self._memory_dependencies(turns[identity], bundle=bundle)
+                if selected is None:
+                    return None
+                for key in DEPENDENCIES:
+                    dependencies[key].extend(selected[key])
             if check["version_domain"] == "text-dialogue/v1" and identity != turn["id"]:
                 if identity in blocked_replies:
                     return None

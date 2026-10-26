@@ -2,7 +2,7 @@
 
 RELEASES = {
     "memory-extraction/v1": "205239730bf6aa5ff320cf9f300ae9c301c15559c0147aecd1fe001e8bfe5b82",
-    "memory-context/v2": "fc03030586ac5fc9a32acb7fa2cdde56e5b03269df419278573ba26bad2127f9",
+    "memory-context/v2": "ec39155651f4c2d09183ccba5735cc9b9fc8ab9854de546223a89a46ff020ac9",
     "reading-state/v1": "2dc05bb8658988a46e286de6ef283d49bfb286e45141a4d2cfc0501d79bf1ebb",
     "skills/v1": "0ad3a444e8bff26721c14664260d08b463feb3288a556364e1af35f3e277d0f2",
     "bot-connection/v1": "ba4c23494452e911526b10aa85fb8c2d994e7feaa1bc1e24e1f8f7cd69a4223d",

@@ -21,9 +21,12 @@ from . import observability as obs
 from .context import (
     TEXT_DOMAIN,
     TEXT_INPUT_DOMAIN,
+    MEMORY_CONTEXT_DOMAIN,
     TurnContext,
     inherited_checks,
     merge_checks,
+    record_model_dispatch,
+    model_input_checks,
 )
 from .context_checks import VerificationCheckpoint, verify_checks
 from .short_context import (
@@ -1650,7 +1653,6 @@ class Core(Delivery):
                     if self._preparation_expired(turn, preparation_timeout):
                         raise Fault("timeout")
                     turn["phase"] = "generating"
-                    turn["model_calls"] += 1
                     turn["timings"]["model_started_at"] = utc(self.clock())
                     turn["timings"]["context_prepared_at"] = context_prepared_at
                     turn["timings"]["model_slot_wait_ms"] = slot_wait_ms
@@ -1661,7 +1663,6 @@ class Core(Delivery):
                     # request exists yet, so undo only this local reservation.
                     if self._preparation_expired(turn, preparation_timeout):
                         with self.store.transaction():
-                            turn["model_calls"] -= 1
                             turn["phase"] = "preparing"
                             turn["timings"].pop("model_started_at", None)
                             self._save_turn(turn)
@@ -1757,6 +1758,31 @@ class Core(Delivery):
                 except (Fault, OSError):
                     pass
 
+    def _record_model_dispatch(self, turn_id, inputs):
+        # No await separates the exact input/counter journal from dispatch.
+        with self.store.transaction():
+            turn = self.store.get("turns", turn_id)
+            if turn["cancelled"] or turn["phase"] in TERMINAL:
+                raise Fault("scope_changed")
+            self._check_input_versions(turn)
+            self._check_role(turn)
+            if inputs["complete"]:
+                from .memory_context import bundle_identity
+
+                captured = next(
+                    c
+                    for c in inputs["checks"]
+                    if c["version_domain"] == MEMORY_CONTEXT_DOMAIN
+                    and c["source_turn_id"] == turn_id
+                )
+                if bundle_identity(captured["memory_bundle"]) != bundle_identity(
+                    turn["memory_context"]["bundle"]
+                ):
+                    raise Fault("scope_changed")
+            record_model_dispatch(turn, inputs)
+            self._save_turn(turn)
+        return turn
+
     async def _respond_native(self, turn, messages, *, provenance=None):
         """Native tools continue the same actor dialogue after actual domain receipts."""
         from .role_actions import MEMORY_INSTRUCTION
@@ -1779,8 +1805,11 @@ class Core(Delivery):
             )
         if len(canonical(messages).encode()) > 524288:
             raise Fault("budget_exceeded")
+        dispatch_checks = model_input_checks(turn)
         if not native:
-            return await self.gateway.generate(turn, messages)
+            return await self.gateway.generate(
+                self._record_model_dispatch(turn["id"], dispatch_checks), messages
+            )
         from .expression import Segments
 
         pending = Segments()
@@ -1806,11 +1835,9 @@ class Core(Delivery):
             fresh = self.store.get("turns", turn["id"])
             if fresh["cancelled"] or fresh["phase"] in TERMINAL:
                 raise Fault("scope_changed")
-            if iteration:
-                fresh["model_calls"] += 1
-                self._save_turn(fresh)
             for attempt in range(2):
                 try:
+                    fresh = self._record_model_dispatch(turn["id"], dispatch_checks)
                     message, receipt = await self.gateway.complete(
                         fresh, messages, tools=self.role_actions.tools(fresh), on_delta=delta
                     )
@@ -1892,7 +1919,6 @@ class Core(Delivery):
                         self._check_role(fresh)
                         if fresh.get("model_selection"):
                             verify_lease(fresh["model_selection"]["expires_at"], self.clock())
-                        fresh["model_calls"] += 1
                         self._save_turn(fresh)
             route_receipts.append(receipt)
             if message.get("content"):
@@ -1974,6 +2000,7 @@ class Core(Delivery):
                             self._save_turn(fresh)
                         await self._preflight(fresh)
                     messages[1]["content"] = canonical(prompt)
+                    dispatch_checks = model_input_checks(fresh)
                     if provenance is not None:
                         messages[0]["content"] = system + material_provenance(
                             prompt, provenance[1], fresh["scope"]["person_id"]
@@ -2070,7 +2097,8 @@ class Core(Delivery):
                 checkpoint,
                 read_budget=(
                     clients.JsonService.QUERY_BUDGET_SECONDS
-                    if check["version_domain"] in {TEXT_DOMAIN, TEXT_INPUT_DOMAIN, PROFILE_DOMAIN}
+                    if check["version_domain"]
+                    in {TEXT_DOMAIN, TEXT_INPUT_DOMAIN, PROFILE_DOMAIN, MEMORY_CONTEXT_DOMAIN}
                     else 0
                 ),
             ),
@@ -2169,7 +2197,9 @@ class Core(Delivery):
 
             memory_check = legacy_check(check, query(check["origin"]))
             if memory_check is not None:
-                if check["version_domain"] == TEXT_INPUT_DOMAIN and "input_sources" in check:
+                if check["version_domain"] == MEMORY_CONTEXT_DOMAIN or (
+                    check["version_domain"] == TEXT_INPUT_DOMAIN and "input_sources" in check
+                ):
                     # The exact captured payload must still match after author
                     # authority awaits. Memory proves it in the complete batch.
                     self._context_source(check)
@@ -2193,7 +2223,17 @@ class Core(Delivery):
                 raise failure from None
             self._context_source(check)
             return lease_deadline
-        if check["version_domain"] == PROFILE_DOMAIN:
+        if check["version_domain"] == MEMORY_CONTEXT_DOMAIN:
+            await checkpoint.once(
+                ["context_bundle", check, lease_deadline],
+                lambda: self.memory.verify_context(
+                    check["origin"], scope, check["memory_bundle"], []
+                ),
+            )
+            self._context_source(check)
+            if lease_deadline is not None and lease_deadline <= self.clock():
+                raise Fault("forbidden")
+        elif check["version_domain"] == PROFILE_DOMAIN:
             await checkpoint.once(
                 [
                     "profiles",

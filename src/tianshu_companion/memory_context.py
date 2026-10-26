@@ -343,7 +343,13 @@ def legacy_check(check, header):
     """Serialize the original check semantics; local source/binding checks remain in Core."""
     scope = check["scope"]
     domain = check["version_domain"]
-    if domain == "text-input/v1" and "input_sources" in check:
+    if domain == "memory-context/v2":
+        kind = "context_bundle"
+        request = dict(
+            query=header, requested_scope=scope, bundle=copy.deepcopy(check["memory_bundle"])
+        )
+        expected = {}
+    elif domain == "text-input/v1" and "input_sources" in check:
         kind = "input_sources"
         request = dict(
             query=header,

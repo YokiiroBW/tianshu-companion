@@ -11,11 +11,17 @@ import httpx
 import test_memory_v2 as evidence_support
 
 from support import contracts
-from tianshu_companion.clients import JsonService, Memory, utc
-from tianshu_companion.context import scope_check
+from tianshu_companion.clients import JsonService, Memory, query, utc
+from tianshu_companion.context import (
+    MEMORY_CONTEXT_DOMAIN,
+    inherited_checks,
+    model_input_checks,
+    record_model_dispatch,
+    scope_check,
+)
 from tianshu_companion.context_preparation import _v2_variants
 from tianshu_companion.contracts import Fault, canonical
-from tianshu_companion.memory_context import query_request
+from tianshu_companion.memory_context import legacy_check, query_request
 
 
 class ContextModeProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -197,6 +203,50 @@ class ContextModeProtocolTests(unittest.IsolatedAsyncioTestCase):
                     await memory.prepare_context(
                         request["query"]["origin"], request["requested_scope"], bundle, [], []
                     )
+
+    async def test_historical_context_bundle_is_transmitted_whole_and_strictly_matched(self):
+        memory = self.client()
+        selected = await self.query(memory, "context")
+        request = self.fixture["query_request"]
+        old = copy.deepcopy(selected["bundle"])
+        old["valid_until"] = utc(time.time() - 120)
+        check = legacy_check(
+            dict(
+                version_domain=MEMORY_CONTEXT_DOMAIN,
+                scope=request["requested_scope"],
+                memory_bundle=old,
+            ),
+            query(request["query"]["origin"]),
+        )
+        self.assertEqual({}, check["expected"])
+        result = await memory.prepare_context(
+            request["query"]["origin"], request["requested_scope"], selected["bundle"], [check], []
+        )
+        self.assertEqual({check["check_id"]: "valid"}, result)
+        await memory.verify_context(
+            request["query"]["origin"], request["requested_scope"], selected["bundle"], [check]
+        )
+        self.assertEqual(old, self.requests[-1][1]["checks"][0]["request"]["bundle"])
+
+        def mismatched_kind(body, response):
+            response["checks"][0]["kind"] = "history"
+
+        wrong = self.client(mismatched_kind)
+        with self.assertRaises(Fault):
+            await wrong.verify_context(
+                request["query"]["origin"], request["requested_scope"], selected["bundle"], [check]
+            )
+        malformed = copy.deepcopy(check)
+        malformed["request"]["bundle"]["retrieval_mode"] = "factual"
+        before = len(self.requests)
+        with self.assertRaises(Fault):
+            await memory.verify_context(
+                request["query"]["origin"],
+                request["requested_scope"],
+                selected["bundle"],
+                [malformed],
+            )
+        self.assertEqual(before, len(self.requests))
 
 
 class SelectedContextTests(unittest.IsolatedAsyncioTestCase):
@@ -483,3 +533,288 @@ class SelectedContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(current["context_checks"])
         self.assertEqual("mixed", self.context_queries[-1]["queries"][0]["intent"])
         self.assertTrue(self.verifications[-1])
+
+
+class ContextBundleLineageTests(unittest.IsolatedAsyncioTestCase):
+    """Real Core dispatch/assembly with explicit, synthetic Memory authority ports."""
+
+    turns = SelectedContextTests.turns
+
+    async def asyncSetUp(self):
+        await evidence_support.CoreEvidenceTests.asyncSetUp(self)
+        original = self.h.memory.query_context
+        fixture = evidence_support.example("memory-context/v2", "context-positive")[
+            "query_response"
+        ]
+        self.bundle_number = 0
+        self.invalid_bundles = set()
+        self.invalidate_on_recall = False
+
+        async def read(origin, scope, text, budget, **kwargs):
+            prior = await original(origin, scope, text, budget, **kwargs)
+            response = copy.deepcopy(fixture)
+
+            def bind(value):
+                if isinstance(value, dict):
+                    if set(value) == {"actor_id", "person_id", "audience", "conversation_id"}:
+                        return copy.deepcopy(scope)
+                    return {k: bind(v) for k, v in value.items()}
+                if isinstance(value, list):
+                    return [bind(v) for v in value]
+                return value
+
+            response = bind(response)
+            response.update(request_id=prior["request_id"], effective_scope=copy.deepcopy(scope))
+            bundle = response["bundle"]
+            self.bundle_number += 1
+            bundle.update(
+                retrieval_mode=kwargs.get("retrieval_mode", "factual"),
+                bundle_id=f"bundle:dispatch:{self.bundle_number}",
+                scope_version=prior["bundle"]["scope_version"],
+                history_snapshot=prior["bundle"]["history_snapshot"],
+                input_history_snapshot=prior["bundle"]["input_history_snapshot"],
+                verified_at=utc(self.h.clock()),
+                valid_until=utc(self.h.clock() + 3600),
+            )
+            if kwargs.get("queries"):
+                bundle["queries"] = copy.deepcopy(kwargs["queries"])
+                if self.invalidate_on_recall:
+                    self.invalid_bundles.add(f"bundle:dispatch:{self.bundle_number - 1}")
+            return response
+
+        self.h.memory.query_context = read
+        original_verify = self.h.memory.verify_context
+
+        async def verify(origin, scope, bundle, checks=()):
+            await original_verify(origin, scope, bundle, checks)
+            if any(
+                c["kind"] == "context_bundle"
+                and c["request"]["bundle"]["bundle_id"] in self.invalid_bundles
+                for c in checks
+            ):
+                raise Fault("scope_changed")
+
+        self.h.memory.verify_context = verify
+
+    async def test_actual_dispatch_keeps_whole_reply_after_unrelated_history_changes(self):
+        generate = self.h.gateway.generate
+        recorded = []
+
+        async def dispatch(turn, messages):
+            stored = self.h.core.store.get("turns", turn["id"])
+            self.assertEqual(turn["model_calls"], stored["model_calls"])
+            self.assertTrue(stored["reply_context_provenance"]["complete"])
+            recorded.append(copy.deepcopy(stored["reply_context_provenance"]))
+            return await generate(turn, messages)
+
+        self.h.gateway.generate = dispatch
+        previous = (await self.turns(1))[0]
+        self.h.memory.scope_version += 1  # Unrelated history changes, selected facts unchanged.
+        await self.h.ingest(text="继续刚才的有源对话")
+        await self.h.cycles()
+        current = self.h.turns()[-1]
+        prompt = json.loads(self.h.gateway.calls[-1][1][1]["content"])
+        group = next(g for g in prompt["recent_dialogue"] if g["turn_id"] == previous["id"])
+        self.assertTrue(group["replies"])
+        checks = inherited_checks(previous)
+        self.assertEqual(
+            {"text-input/v1", MEMORY_CONTEXT_DOMAIN}, {c["version_domain"] for c in checks}
+        )
+        self.assertEqual(
+            [m["source"] for m in previous["bundle"]["messages"]],
+            next(c["input_sources"] for c in checks if "input_sources" in c),
+        )
+        self.assertTrue(
+            any(c["kind"] == "context_bundle" for batch in self.verifications for c in batch)
+        )
+        self.assertFalse(any(c["kind"] == "history" for batch in self.verifications for c in batch))
+        self.assertEqual(("sent", 2), (current["phase"], len(recorded)))
+
+    async def test_changed_selected_bundle_rejects_full_reply_but_keeps_its_exact_input(self):
+        previous, current = await self.turns()
+        self.invalid_bundles.add(previous["memory_context"]["bundle"]["bundle_id"])
+        context, *_ = await self.h.core._prepare_context(current, [])
+        old = next(g for g in context.data["recent_dialogue"] if g["turn_id"] == previous["id"])
+        self.assertEqual([], old["replies"])
+        self.assertIn("第0段", canonical(old["messages"]))
+        with self.assertRaises(Fault):
+            await _v2_variants(self.h.core, current, inherited_checks(previous), [])
+        adopted = copy.deepcopy(current)
+        adopted["context_checks"] = inherited_checks(previous)
+        with self.assertRaises(Fault):
+            await self.h.core._preflight(adopted)
+
+    async def test_optional_recorded_origin_unavailability_excludes_the_unit_without_raw_retry(
+        self,
+    ):
+        previous, current = await self.turns()
+        from tianshu_companion.short_context import select_recent
+
+        selected, _ = select_recent(
+            self.h.core.store, current, self.h.core.short_context_policy, self.h.clock()
+        )
+        original = self.h.origins.resolve
+
+        async def unavailable(service, envelope, now):
+            if envelope["origin"] == previous["origin"]:
+                error = Fault("dependency_unavailable")
+                error.origin_read_unavailable = True
+                raise error
+            return await original(service, envelope, now)
+
+        async def no_standalone_sources(*args):
+            raise AssertionError("Unavailable actual origin must not be retried as raw")
+
+        self.h.origins.resolve = unavailable
+        self.h.memory.check_sources = no_standalone_sources
+        result = await _v2_variants(
+            self.h.core,
+            current,
+            [],
+            [[next(g for g in selected if g["turn_id"] == previous["id"])]],
+        )
+        self.assertEqual([[]], result)
+
+    async def test_native_recall_unions_each_dispatched_bundle_without_poisoning_active_refresh(
+        self,
+    ):
+        seen = []
+        self.invalidate_on_recall = True
+
+        async def complete(turn, messages, *, tools=None, on_delta=None):
+            stored = self.h.core.store.get("turns", turn["id"])
+            seen.append(copy.deepcopy(stored))
+            self.assertEqual(len(seen), stored["model_calls"])
+            if len(seen) == 1:
+                message = dict(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        dict(
+                            id="recall:lineage",
+                            type="function",
+                            function=dict(
+                                name="memory_recall",
+                                arguments=canonical(dict(query="以前的材料", intent="mixed")),
+                            ),
+                        )
+                    ],
+                )
+            else:
+                message = dict(role="assistant", content="按刷新后的真实材料作答。")
+            return message, dict(config_version=1, fixture_only=True)
+
+        self.h.gateway.complete = complete
+        await self.h.ingest(text="请翻看以前的材料")
+        await self.h.cycles(80)
+        previous = self.h.turns()[-1]
+        self.assertEqual("sent", previous["phase"])
+        ids = {
+            c["memory_bundle"]["bundle_id"]
+            for c in inherited_checks(previous)
+            if c["version_domain"] == MEMORY_CONTEXT_DOMAIN
+        }
+        self.assertEqual(2, len(ids))
+        self.assertEqual(2, len(seen))
+        self.assertIn(seen[0]["memory_context"]["bundle"]["bundle_id"], self.invalid_bundles)
+        self.assertEqual(
+            1,
+            len(
+                {
+                    c["memory_bundle"]["bundle_id"]
+                    for c in seen[0]["reply_context_provenance"]["checks"]
+                    if c["version_domain"] == MEMORY_CONTEXT_DOMAIN
+                }
+            ),
+        )
+        await self.h.core._preflight(previous)  # Active latest prompt only.
+        for identity in ids:
+            with self.subTest(invalidated=identity):
+                self.invalid_bundles = {identity}
+                with self.assertRaises(Fault):
+                    await _v2_variants(self.h.core, previous, inherited_checks(previous), [])
+
+    async def test_mixed_factual_dispatch_preserves_its_original_full_proof_and_old_unknown_stays_full(
+        self,
+    ):
+        turn = copy.deepcopy((await self.turns(1))[0])
+        turn["model_calls"] = 0
+        turn.pop("reply_context_provenance")
+        record_model_dispatch(turn, model_input_checks(turn))
+        first = turn["memory_context"]["bundle"]["bundle_id"]
+        turn["memory_context"]["bundle"]["retrieval_mode"] = "factual"
+        factual = scope_check(turn)
+        record_model_dispatch(turn, model_input_checks(turn))
+        turn["history_snapshot"] = dict(turn["history_snapshot"], version_for_test="later")
+        turn["memory_context"]["bundle"].update(retrieval_mode="context", bundle_id="bundle:last")
+        record_model_dispatch(turn, model_input_checks(turn))
+        self.assertFalse(turn["reply_context_provenance"]["complete"])
+        checks = inherited_checks(turn)
+        self.assertIn(factual, checks)
+        self.assertEqual(
+            {first, "bundle:last"},
+            {
+                c["memory_bundle"]["bundle_id"]
+                for c in checks
+                if c["version_domain"] == MEMORY_CONTEXT_DOMAIN
+            },
+        )
+        turn.pop("reply_context_provenance")
+        record_model_dispatch(turn, model_input_checks(turn))
+        self.assertNotIn("reply_context_provenance", turn)
+        self.assertEqual(
+            [scope_check(turn)], inherited_checks(dict(turn, context_checks=[], profile_checks=[]))
+        )
+
+    async def test_indivisible_oversized_bundle_drops_optional_whole_reply_and_rejects_required(
+        self,
+    ):
+        previous, current = await self.turns()
+        recorded = next(
+            c
+            for c in previous["reply_context_provenance"]["checks"]
+            if c["version_domain"] == MEMORY_CONTEXT_DOMAIN
+        )
+        bundle = recorded["memory_bundle"]
+        template = bundle["group_dependencies"][0]
+        groups = []
+        for group in range(8):
+            identity = f"group:large:{group}:" + "g" * 100
+            records = [
+                dict(
+                    group_id=identity,
+                    record_id=f"record:{group}:{i}:" + "r" * 100,
+                    record_version=1,
+                )
+                for i in range(256)
+            ]
+            groups.append(
+                dict(
+                    copy.deepcopy(template),
+                    group=dict(
+                        semantic_group_id=identity,
+                        record_ids=[r["record_id"] for r in records],
+                        complete=True,
+                    ),
+                    records=records,
+                )
+            )
+        bundle["group_dependencies"] = groups
+        self.h.contracts.check("memory-context-v2#bundle", bundle)
+        request = dict(
+            schema_version=2,
+            query=query(current["origin"]),
+            requested_scope=current["scope"],
+            bundle=current["memory_context"]["bundle"],
+            checks=[legacy_check(recorded, query(previous["origin"]))],
+            required_check_ids=[],
+        )
+        self.assertGreater(len(canonical(request).encode()), 262144)
+        self.h.core.store.put("turns", previous)
+        context, *_ = await self.h.core._prepare_context(current, [])
+        group = next(g for g in context.data["recent_dialogue"] if g["turn_id"] == previous["id"])
+        self.assertFalse(group["replies"])
+        self.assertTrue(group["messages"])
+        with self.assertRaises(Fault) as caught:
+            await _v2_variants(self.h.core, current, inherited_checks(previous), [])
+        self.assertEqual("budget_exceeded", caught.exception.code)

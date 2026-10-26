@@ -7,6 +7,7 @@ from .clients import JsonService
 from .context import (
     TEXT_DOMAIN,
     TEXT_INPUT_DOMAIN,
+    MEMORY_CONTEXT_DOMAIN,
     bound_recent_provenance,
     merge_checks,
     profile_check,
@@ -180,6 +181,23 @@ async def _prepare_candidates(core, turn, checks, batches):
                     memory_checks=memory_checks,
                     read_budget=JsonService.QUERY_BUDGET_SECONDS,
                 )
+                # A signed bundle is indivisible. Check its real envelope with
+                # the current bundle before adopting an optional complete unit.
+                # Other items still use the same shared count/byte packer.
+                from .memory_preparation import packages
+
+                try:
+                    packages(
+                        turn["origin"],
+                        turn["scope"],
+                        turn["memory_context"]["bundle"],
+                        list(memory_checks.values()),
+                        list(memory_checks) if identity in required else [],
+                    )
+                except Fault as error:
+                    if error.code != "budget_exceeded" or identity in required:
+                        raise
+                    return identity, "rejected", {}, None
             except Fault as error:
                 if (
                     identity not in required
@@ -190,7 +208,8 @@ async def _prepare_candidates(core, turn, checks, batches):
                 if (
                     identity not in required
                     and origins[identity] not in required_origins
-                    and check["version_domain"] in {TEXT_DOMAIN, TEXT_INPUT_DOMAIN, PROFILE_DOMAIN}
+                    and check["version_domain"]
+                    in {TEXT_DOMAIN, TEXT_INPUT_DOMAIN, PROFILE_DOMAIN, MEMORY_CONTEXT_DOMAIN}
                     and not error.unknown
                     and not getattr(error, "context_renewal_failure", False)
                     and getattr(error, "origin_read_unavailable", False)

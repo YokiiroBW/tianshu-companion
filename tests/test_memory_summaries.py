@@ -14,7 +14,7 @@ import httpx
 from support import Harness, contracts
 from tianshu_companion.app import create_app
 from tianshu_companion.clients import JsonService, Memory, utc
-from tianshu_companion.context import scope_check
+from tianshu_companion.context import model_input_checks, record_model_dispatch, scope_check
 from tianshu_companion.contracts import Fault, canonical, digest
 from tianshu_companion.memory_summaries import messages, parse
 from tianshu_companion.memory_context import prompt_material, query_request
@@ -88,6 +88,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         # Record its complete, empty v2 dependency set explicitly.
         for turn in self.h.turns():
             self.assertFalse(turn.get("profile_checks"))
+            turn.pop("reply_context_provenance", None)  # Actual pre-journal frozen reply fixture.
             turn["memory_context"] = dict(
                 bundle=dict(
                     group_dependencies=[],
@@ -550,6 +551,60 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual("valid", self.check(window)["state"])
 
+    async def test_dispatch_journal_keeps_each_used_bundle_and_foreign_leaf_in_bot_window(self):
+        first = await self.chat(
+            "合成作者甲的发言", account="journal-a", group=True, channel="group:journal"
+        )
+        other = await self.chat(
+            "合成作者乙的发言", account="journal-b", group=True, channel="group:journal"
+        )
+        self.allow_empty_memory_provenance()
+        first = self.h.core.store.get("turns", first["id"])
+        first["model_calls"] = 0
+        bundle = first["memory_context"]["bundle"]
+        foreign = self.source_dependencies(first, 0, 1)[0]
+        foreign["owner_scope"] = copy.deepcopy(other["scope"])
+        bundle.update(
+            retrieval_mode="context",
+            effective_scope=copy.deepcopy(first["scope"]),
+            bundle_id="bundle:used:first",
+            source_dependencies=[foreign],
+        )
+        record_model_dispatch(first, model_input_checks(first))
+        own = self.source_dependencies(first, 1, 1)[0]
+        bundle.update(bundle_id="bundle:used:second", source_dependencies=[own])
+        record_model_dispatch(first, model_input_checks(first))
+        self.h.core.store.put("turns", first)
+        window = legacy_window(self.h, other)
+        bot = next(
+            m
+            for m in window["manifest"]["members"]
+            if m["role"] == "assistant" and m["turn_id"] == first["id"]
+        )
+        self.assertCountEqual([foreign, own], bot["memory_dependencies"]["source_dependencies"])
+        self.assertEqual("valid", self.check(window)["state"])
+
+    async def test_mixed_dispatch_journal_cannot_borrow_latest_bundle_for_bot_window(self):
+        turn = await self.chat()
+        self.allow_empty_memory_provenance()
+        turn = self.h.core.store.get("turns", turn["id"])
+        turn["model_calls"] = 0
+        bundle = turn["memory_context"]["bundle"]
+        bundle.update(
+            retrieval_mode="context",
+            effective_scope=copy.deepcopy(turn["scope"]),
+            bundle_id="bundle:before",
+        )
+        record_model_dispatch(turn, model_input_checks(turn))
+        bundle["retrieval_mode"] = "factual"
+        record_model_dispatch(turn, model_input_checks(turn))
+        bundle.update(retrieval_mode="context", bundle_id="bundle:after")
+        record_model_dispatch(turn, model_input_checks(turn))
+        self.h.core.store.put("turns", turn)
+        window = legacy_window(self.h, turn)
+        self.assertEqual(["user"], [m["role"] for m in window["manifest"]["members"]])
+        self.assertEqual("我周六想去看看", window["members"][0]["text"])
+
     async def test_known_context_invalidation_discards_old_turn_and_dependent_bot_only(self):
         first = await self.chat()
         last = await self.chat("刚才还没决定")
@@ -843,6 +898,7 @@ class SummaryLearningTests(unittest.IsolatedAsyncioTestCase):
         item = self.tasks()[0]
         turn = self.h.core.store.get("turns", item["turn_id"])
         self.assertFalse(turn.get("profile_checks"))
+        turn.pop("reply_context_provenance", None)  # Frozen before dispatch journals existed.
         turn["memory_context"] = dict(
             bundle=dict(group_dependencies=[], episode_dependencies=[], source_dependencies=[])
         )

@@ -6,6 +6,7 @@ from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
 
 TEXT_DOMAIN = "text-dialogue/v1"
 TEXT_INPUT_DOMAIN = "text-input/v1"
+MEMORY_CONTEXT_DOMAIN = "memory-context/v2"
 CONTEXT_LIMIT = 16384
 
 
@@ -106,13 +107,109 @@ def merge_checks(*parts):
     return list(checks.values())
 
 
+def reply_provenance_checks(turn):
+    """Only a complete dispatch journal replaces the old full-history proof."""
+    provenance = turn.get("reply_context_provenance")
+    if (
+        isinstance(provenance, dict)
+        and provenance.get("version") == 1
+        and isinstance(provenance.get("checks"), list)
+        and provenance.get("complete") is True
+    ):
+        return provenance["checks"]
+    return None
+
+
 def inherited_checks(previous):
     # Include the checks behind confirmed replies, not merely their visible text.
+    recorded = reply_provenance_checks(previous)
+    if recorded is not None:
+        return merge_checks(recorded)
+    provenance = previous.get("reply_context_provenance")
+    if (
+        isinstance(provenance, dict)
+        and provenance.get("version") == 1
+        and isinstance(provenance.get("checks"), list)
+    ):
+        if provenance["checks"]:
+            # Mixed dispatches already contain each actual full-history proof.
+            # Do not replace an intermediate factual input with the latest head.
+            return merge_checks(provenance["checks"])
     return merge_checks(
         [scope_check(previous)],
         previous.get("profile_checks", []),
         previous.get("context_checks", []),
     )
+
+
+def model_input_checks(turn):
+    """Freeze the sources of the prompt being assembled, not a later store read."""
+    bundle = (turn.get("memory_context") or {}).get("bundle")
+    if not (
+        isinstance(bundle, dict)
+        and bundle.get("retrieval_mode") == "context"
+        and isinstance(bundle.get("bundle_id"), str)
+        and bundle.get("effective_scope") == turn["scope"]
+        and all(
+            isinstance(bundle.get(key), list)
+            for key in ("group_dependencies", "episode_dependencies", "source_dependencies")
+        )
+    ):
+        return dict(
+            complete=False,
+            checks=copy.deepcopy(
+                merge_checks(
+                    [scope_check(turn)],
+                    turn.get("context_checks", []),
+                    turn.get("profile_checks", []),
+                )
+            ),
+        )
+    raw = dict(
+        actor_id=turn["scope"]["actor_id"],
+        person_id=turn["scope"]["person_id"],
+        author=turn["bundle"]["collection_key"]["author"],
+        collection_id=turn["bundle"]["collection_id"],
+        input_revision=turn["bundle"]["collection_revision"],
+        messages=turn["bundle"]["messages"],
+    )
+    selected = scope_check(turn)
+    for key in ("scope_version", "history_snapshot", "memory_snapshot"):
+        del selected[key]
+    selected.update(version_domain=MEMORY_CONTEXT_DOMAIN, memory_bundle=bundle)
+    return dict(
+        complete=True,
+        checks=copy.deepcopy(
+            merge_checks(
+                [scope_check(turn, input_only=True, raw_input=raw), selected],
+                turn.get("context_checks", []),
+                turn.get("profile_checks", []),
+            )
+        ),
+    )
+
+
+def record_model_dispatch(turn, inputs):
+    """Journal output lineage with the caller's model counter, before its await.
+
+    This is not the current prompt's active verification set. Tool refreshes may
+    replace that set, while a future reader must retain every dispatched input.
+    An old model attempt without this journal cannot acquire complete provenance
+    retrospectively. A dispatch whose acknowledgement is lost remains recorded.
+    """
+    provenance = turn.get("reply_context_provenance")
+    if provenance is None and not turn["model_calls"]:
+        provenance = dict(version=1, complete=True, checks=[])
+        turn["reply_context_provenance"] = provenance
+    turn["model_calls"] += 1
+    if not (
+        isinstance(provenance, dict)
+        and provenance.get("version") == 1
+        and isinstance(provenance.get("checks"), list)
+    ):
+        return
+    provenance["complete"] = provenance.get("complete") is True and inputs["complete"]
+    provenance["checks"] = copy.deepcopy(merge_checks(provenance["checks"], inputs["checks"]))
 
 
 def recent_checks(store, candidate, *, exact_inputs=False):
