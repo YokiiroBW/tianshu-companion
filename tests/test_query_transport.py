@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 import uvicorn
@@ -49,12 +50,363 @@ WRITES = [
 
 
 class QueryTransportTests(unittest.IsolatedAsyncioTestCase):
-    def service(self, handler):
+    def service(self, handler, *, memory_dependency=False):
         service = JsonService(
-            "https://synthetic.invalid", "synthetic-only", transport=httpx.MockTransport(handler)
+            "https://synthetic.invalid",
+            "synthetic-only",
+            transport=httpx.MockTransport(handler),
+            memory_dependency=memory_dependency,
         )
         self.addAsyncCleanup(service.close)
         return service
+
+    async def test_memory_reads_and_writes_share_capacity_and_leave_identity_room(self):
+        release, ordinary_entered, identity_entered = (
+            asyncio.Event(),
+            asyncio.Event(),
+            asyncio.Event(),
+        )
+        seen, tasks = [], []
+        active = peak = 0
+
+        async def handler(request):
+            nonlocal active, peak
+            seen.append(request.url.path)
+            active += 1
+            peak = max(peak, active)
+            if len(seen) == 3:
+                ordinary_entered.set()
+            if request.url.path == IDENTITY:
+                identity_entered.set()
+            try:
+                await release.wait()
+                return httpx.Response(200, json={"ok": True})
+            finally:
+                active -= 1
+
+        service = self.service(handler, memory_dependency=True)
+        initial = [
+            (SELECT, {}),
+            ("/internal/v1/memory/candidates/materials", {"event": "frozen"}),
+            ("/internal/v1/memory/candidates/process", {"job_id": "job:one", "output": {}}),
+        ]
+        queued = [
+            "/internal/v1/memory/candidates/segments",
+            "/internal/v1/identity/register",
+            "/internal/v2/memory/observations",
+            "/internal/v2/memory/observations/query",
+            "/internal/v1/relationships/settle",
+            "/synthetic/not-a-query",
+        ]
+        try:
+            tasks.extend(asyncio.create_task(service.call(path, body)) for path, body in initial)
+            await asyncio.wait_for(ordinary_entered.wait(), 1)
+            tasks.extend(asyncio.create_task(service.call(path, {})) for path in queued)
+            await asyncio.sleep(0)
+            tasks.append(asyncio.create_task(service.call(IDENTITY, {})))
+            await asyncio.wait_for(identity_entered.wait(), 1)
+            self.assertEqual(seen, [path for path, _ in initial] + [IDENTITY])
+            self.assertTrue(all(not task.done() for task in tasks[3:-1]))
+            self.assertEqual(peak, 4)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertCountEqual(seen, [path for path, _ in initial] + queued + [IDENTITY])
+        self.assertEqual(peak, 4)
+
+    async def test_runtime_marks_memory_dependency_without_url_or_label_inference(self):
+        from tianshu_companion.app import build_runtime
+
+        with mock.patch.dict(
+            os.environ,
+            {"SYNTHETIC_MEMORY": "synthetic-only", "SYNTHETIC_GATEWAY": "synthetic-only"},
+        ):
+            core, _, clients, _ = build_runtime(
+                {
+                    "contracts_path": os.environ["TIANSHU_CONTRACTS"],
+                    "database_path": ":memory:",
+                    "services": {
+                        "memory": {
+                            "url": "https://synthetic.invalid",
+                            "token_env": "SYNTHETIC_MEMORY",
+                        },
+                        "gateway": {
+                            "url": "https://synthetic.invalid",
+                            "token_env": "SYNTHETIC_GATEWAY",
+                        },
+                    },
+                }
+            )
+        release, entered = asyncio.Event(), asyncio.Event()
+        seen, tasks = [], []
+
+        async def handler(request):
+            probe = json.loads(request.content)["probe"]
+            seen.append(probe)
+            if probe.startswith("hold:"):
+                if len([value for value in seen if value.startswith("hold:")]) == 3:
+                    entered.set()
+                await release.wait()
+            return httpx.Response(200, json={"ok": True})
+
+        memory, gateway = core.memory.client, core.gateway.client
+        try:
+            self.assertIs(core.knowledge_client, memory)
+            for service in (memory, gateway):
+                await service.client.aclose()
+                service.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+                service.label = "gateway"
+            tasks.extend(
+                asyncio.create_task(memory.call(SELECT, {"probe": f"hold:{i}"})) for i in range(3)
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            path = "/internal/v1/memory/candidates/materials"
+            queued = asyncio.create_task(memory.call(path, {"probe": "memory-write"}))
+            tasks.append(queued)
+            await asyncio.sleep(0)
+            self.assertEqual(
+                {"ok": True},
+                await asyncio.wait_for(gateway.call(path, {"probe": "other-peer-write"}), 1),
+            )
+            self.assertEqual(
+                {"ok": True},
+                await asyncio.wait_for(memory.call(IDENTITY, {"probe": "identity"}), 1),
+            )
+            self.assertNotIn("memory-write", seen)
+            self.assertFalse(queued.done())
+            release.set()
+            await asyncio.gather(*tasks)
+            self.assertEqual(seen.count("memory-write"), 1)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await core.close()
+            for service in clients:
+                await service.close()
+
+    async def test_waiting_memory_write_timeout_and_cancellation_never_send_or_leak(self):
+        for path in (
+            "/internal/v1/memory/candidates/materials",
+            "/internal/v1/memory/candidates/segments",
+            "/internal/v1/memory/candidates/process",
+            "/internal/v1/identity/register",
+        ):
+            with self.subTest(path=path):
+                release, full = asyncio.Event(), asyncio.Event()
+                seen, tasks = [], []
+                active = 0
+
+                async def handler(request):
+                    nonlocal active
+                    seen.append(request.url.path)
+                    active += 1
+                    if active == 4:
+                        full.set()
+                    try:
+                        await release.wait()
+                        return httpx.Response(200, json={"ok": True})
+                    finally:
+                        active -= 1
+
+                service = self.service(handler, memory_dependency=True)
+                try:
+                    tasks.extend(asyncio.create_task(service.call(SELECT, {})) for _ in range(3))
+                    tasks.append(asyncio.create_task(service.call(IDENTITY, {})))
+                    await asyncio.wait_for(full.wait(), 1)
+                    service.COMMAND_BUDGET_SECONDS = 0.04
+                    with self.assertRaises(Fault) as caught:
+                        await service.call(path, {}, uncertain_write=True)
+                    self.assertFalse(caught.exception.unknown)
+                    self.assertFalse(caught.exception.retryable_read)
+                    self.assertEqual(caught.exception.cause["operation"], "command")
+                    waiting = asyncio.create_task(service.call(path, {}, uncertain_write=True))
+                    tasks.append(waiting)
+                    await asyncio.sleep(0)
+                    waiting.cancel("unsent memory write")
+                    with self.assertRaises(asyncio.CancelledError) as cancelled:
+                        await waiting
+                    self.assertEqual(cancelled.exception.args, ("unsent memory write",))
+                    self.assertEqual(len(seen), 4)
+                    release.set()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    release, full = asyncio.Event(), asyncio.Event()
+                    service.COMMAND_BUDGET_SECONDS = 15
+                    tasks = [
+                        asyncio.create_task(service.call(path, {}, uncertain_write=True))
+                        for _ in range(3)
+                    ]
+                    tasks.append(asyncio.create_task(service.call(IDENTITY, {})))
+                    await asyncio.wait_for(full.wait(), 1)
+                    self.assertEqual(len(seen), 8)
+                finally:
+                    release.set()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_memory_write_budget_includes_capacity_wait_and_sent_body_wait(self):
+        release, full, write_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        seen, tasks = [], []
+
+        class SlowBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                write_entered.set()
+                await asyncio.sleep(0.3)
+                yield b'{"ok": true}'
+
+        async def handler(request):
+            seen.append(request.url.path)
+            if request.url.path == SELECT:
+                if seen.count(SELECT) == 3:
+                    full.set()
+                await release.wait()
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, stream=SlowBody())
+
+        service = self.service(handler, memory_dependency=True)
+        service.COMMAND_BUDGET_SECONDS = 0.4
+        try:
+            tasks.extend(asyncio.create_task(service.call(SELECT, {})) for _ in range(3))
+            await asyncio.wait_for(full.wait(), 1)
+            path = "/internal/v1/memory/candidates/materials"
+            write = asyncio.create_task(
+                service.call(path, {"request_id": "req:frozen"}, uncertain_write=True)
+            )
+            tasks.append(write)
+            await asyncio.sleep(0.2)
+            self.assertFalse(write_entered.is_set())
+            release.set()
+            with self.assertRaises(Fault) as caught:
+                await write
+            self.assertTrue(write_entered.is_set())
+            self.assertTrue(caught.exception.unknown)
+            self.assertFalse(caught.exception.retryable_read)
+            self.assertEqual(caught.exception.cause["operation"], "command")
+            self.assertEqual(seen.count(path), 1)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_memory_write_admission_does_not_reclassify_or_replay_failures(self):
+        for failure in ("transport", "timeout", "not_started", "forbidden"):
+            with self.subTest(failure=failure):
+                seen = []
+
+                async def handler(request):
+                    seen.append(bytes(request.content))
+                    if failure == "transport":
+                        raise httpx.ReadError("synthetic response lost after acceptance")
+                    if failure == "timeout":
+                        await asyncio.Event().wait()
+                    return httpx.Response(
+                        503 if failure == "not_started" else 403,
+                        json=dict(
+                            code=(
+                                "dependency_unavailable"
+                                if failure == "not_started"
+                                else "forbidden"
+                            ),
+                            execution_state="not_started",
+                            retryable=failure == "not_started",
+                        ),
+                    )
+
+                service = self.service(handler, memory_dependency=True)
+                service.COMMAND_BUDGET_SECONDS = 0.04
+                request = {"request_id": "req:stable", "material_refs": ["material:stable"]}
+                with self.assertRaises(Fault) as caught:
+                    await service.call(
+                        "/internal/v1/memory/candidates/segments", request, uncertain_write=True
+                    )
+                self.assertEqual(caught.exception.unknown, failure in {"transport", "timeout"})
+                self.assertFalse(caught.exception.retryable_read)
+                self.assertEqual(caught.exception.cause["operation"], "command")
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(json.loads(seen[0]), request)
+
+    async def test_memory_query_retry_keeps_one_admission_with_mixed_writes(self):
+        release, writes_entered, retry_entered, identity_entered = (
+            asyncio.Event(),
+            asyncio.Event(),
+            asyncio.Event(),
+            asyncio.Event(),
+        )
+        seen, queries, tasks = [], [], []
+
+        async def handler(request):
+            seen.append(request.url.path)
+            if request.url.path == SELECT:
+                queries.append((bytes(request.content), dict(request.headers)))
+                if len(queries) == 1:
+                    raise httpx.RemoteProtocolError("synthetic idle close")
+                retry_entered.set()
+            elif request.url.path == IDENTITY:
+                identity_entered.set()
+            elif seen.count("/internal/v1/memory/candidates/materials") == 2:
+                writes_entered.set()
+            await release.wait()
+            return httpx.Response(200, json={"ok": True})
+
+        service = self.service(handler, memory_dependency=True)
+        path = "/internal/v1/memory/candidates/materials"
+        try:
+            tasks.extend(
+                asyncio.create_task(service.call(path, {"probe": i}, uncertain_write=True))
+                for i in range(2)
+            )
+            await asyncio.wait_for(writes_entered.wait(), 1)
+            tasks.append(asyncio.create_task(service.call(SELECT, {"request_id": "req:one-read"})))
+            await asyncio.wait_for(retry_entered.wait(), 1)
+            queued = asyncio.create_task(
+                service.call(path, {"probe": "queued"}, uncertain_write=True)
+            )
+            tasks.append(queued)
+            await asyncio.sleep(0)
+            tasks.append(asyncio.create_task(service.call(IDENTITY, {})))
+            await asyncio.wait_for(identity_entered.wait(), 1)
+            self.assertEqual(len(queries), 2)
+            self.assertEqual(queries[0], queries[1])
+            self.assertEqual(seen.count(path), 2)
+            self.assertFalse(queued.done())
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(seen.count(path), 3)
+        self.assertEqual(len(queries), 2)
+
+    async def test_memory_writes_share_ordinary_cooldown_without_blocking_identity(self):
+        for cooled in (SELECT, IDENTITY):
+            with self.subTest(cooled=cooled):
+                seen = []
+
+                async def handler(request):
+                    seen.append(request.url.path)
+                    if request.url.path == cooled:
+                        return httpx.Response(
+                            429,
+                            json=dict(
+                                code="queue_full", execution_state="not_started", retryable=True
+                            ),
+                            headers={"Retry-After": "1"},
+                        )
+                    return httpx.Response(200, json={"ok": True})
+
+                service = self.service(handler, memory_dependency=True)
+                with self.assertRaises(Fault) as caught:
+                    await service.call(cooled, {})
+                self.assertTrue(caught.exception.retryable_read)
+                write_path = "/internal/v1/memory/candidates/materials"
+                waiting_path = write_path if cooled == SELECT else IDENTITY
+                other_path = IDENTITY if cooled == SELECT else write_path
+                waiting = asyncio.create_task(service.call(waiting_path, {}))
+                try:
+                    await asyncio.sleep(0)
+                    self.assertEqual(
+                        {"ok": True}, await asyncio.wait_for(service.call(other_path, {}), 0.5)
+                    )
+                    self.assertEqual(seen, [cooled, other_path])
+                    self.assertFalse(waiting.done())
+                finally:
+                    waiting.cancel()
+                    await asyncio.gather(waiting, return_exceptions=True)
 
     async def test_memory_reads_leave_one_shared_slot_for_identity(self):
         release, ordinary_entered, identity_entered = (
@@ -586,9 +938,12 @@ class QueryTLS(unittest.IsolatedAsyncioTestCase):
             capture_output=True,
         )
 
-    def service(self, port):
+    def service(self, port, *, memory_dependency=False):
         service = JsonService(
-            f"https://127.0.0.1:{port}", "synthetic-only", ca_file=str(self.root / "cert.pem")
+            f"https://127.0.0.1:{port}",
+            "synthetic-only",
+            ca_file=str(self.root / "cert.pem"),
+            memory_dependency=memory_dependency,
         )
         self.addAsyncCleanup(service.close)
         return service
@@ -618,7 +973,8 @@ class QueryTLS(unittest.IsolatedAsyncioTestCase):
                 await h.ingest()
                 await h.cycles()
                 h.core.memory = Memory(
-                    h.contracts, self.service(server.sockets[0].getsockname()[1])
+                    h.contracts,
+                    self.service(server.sockets[0].getsockname()[1], memory_dependency=True),
                 )
                 await h.core.flush_outbox()
                 self.assertEqual(1, len(seen))

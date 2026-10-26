@@ -359,6 +359,7 @@ def build_runtime(config):
             os.environ.get(entry.get("token_env", "")),
             ca_file=entry.get("ca_file"),
             label=label,
+            memory_dependency=name == "memory",
         )
         clients.append(value)
         return value

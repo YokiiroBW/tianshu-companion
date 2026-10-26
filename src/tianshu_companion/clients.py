@@ -139,7 +139,16 @@ class JsonService:
             for item in chain
         )
 
-    def __init__(self, url=None, token=None, *, transport=None, ca_file=None, label=None):
+    def __init__(
+        self,
+        url=None,
+        token=None,
+        *,
+        transport=None,
+        ca_file=None,
+        label=None,
+        memory_dependency=False,
+    ):
         if url and (
             urlsplit(url).scheme != "https"
             or urlsplit(url).username
@@ -149,6 +158,8 @@ class JsonService:
         ):
             raise ValueError("Internal service URL must be an explicitly configured HTTPS URL")
         self.url, self.token = url, token
+        # Fixed by application dependency assembly, never by URL or event label.
+        self._memory_dependency = memory_dependency
         self.query_slots = asyncio.Semaphore(4)
         self.memory_query_slots = asyncio.Semaphore(3)
         self.query_not_before = 0.0
@@ -296,7 +307,7 @@ class JsonService:
         self, path, body=None, headers=None, *, uncertain_write=False, error_response=None
     ):
         retry_query = self._is_query(path, body)
-        if not retry_query:
+        if not retry_query and not self._memory_dependency:
             return await self._call_once(
                 path, body, headers, uncertain_write=uncertain_write, error_response=error_response
             )
@@ -304,36 +315,29 @@ class JsonService:
         headers.setdefault(
             obs.CORRELATION_HEADER, obs.current_correlation_id() or obs.new_correlation_id()
         )
-        # Classify only already-recognized reads. Other peers keep their four
-        # slots; Memory's ordinary reads leave one available for identity lookup.
+        # Admission and safe read recovery are separate. This Memory dependency
+        # shares its capacity across JSON reads/writes; other peer commands keep
+        # their original path. Only the exact recognized identity read has the
+        # reserved channel. Existing endpoint-classified reads remain compatible.
         resource = (
             "identity"
-            if path == "/internal/v1/identity/resolve"
+            if retry_query and path == "/internal/v1/identity/resolve"
             else "memory"
-            if path.startswith(
+            if self._memory_dependency
+            or path.startswith(
                 ("/internal/v1/memory/", "/internal/v2/memory/", "/internal/v1/relationships/")
             )
             else "peer"
         )
-        started = False
         try:
-            async with asyncio.timeout(self.QUERY_BUDGET_SECONDS):
-                async with self._query_capacity(resource):
-                    started = True
-                    return await self._call_once(
-                        path,
-                        body,
-                        headers,
-                        uncertain_write=uncertain_write,
-                        error_response=error_response,
-                    )
-        except TimeoutError as error:
-            failure = Fault(
-                "dependency_unavailable", retryable_read=True, cause=self._cause(error, "query")
+            return await self._call_once(
+                path,
+                body,
+                headers,
+                uncertain_write=uncertain_write,
+                error_response=error_response,
+                admission=resource,
             )
-            failure.read_execution = "unconfirmed" if started else "waiting"
-            self._cool_query(failure, resource)
-            raise failure from None
         except Fault as error:
             self._cool_query(error, resource)
             raise
@@ -343,6 +347,7 @@ class JsonService:
 
     @asynccontextmanager
     async def _query_capacity(self, resource):
+        """Existing shared capacity; admission does not grant read retry semantics."""
         while True:
             delay = self._query_cooldown(resource) - time.monotonic()
             if delay > 0:
@@ -413,7 +418,14 @@ class JsonService:
         )
 
     async def _call_once(
-        self, path, body=None, headers=None, *, uncertain_write=False, error_response=None
+        self,
+        path,
+        body=None,
+        headers=None,
+        *,
+        uncertain_write=False,
+        error_response=None,
+        admission=None,
     ):
         if not self.url or not self.token:
             raise Fault("dependency_unavailable")
@@ -444,17 +456,24 @@ class JsonService:
             duration_ms=None,
         )
         try:
-            request = self.client.build_request(
-                "GET" if body is None else "POST",
-                self.url.rstrip("/") + path,
-                json=body,
-                headers=request_headers,
-            )
-            # One wall-clock budget covers both attempts and the response body.
-            # Reuse serialized bytes/IDs/headers, never replace the shared client.
-            async with asyncio.timeout(
-                self.QUERY_BUDGET_SECONDS if retry_query else self.COMMAND_BUDGET_SECONDS
-            ):
+            budget = self.QUERY_BUDGET_SECONDS if retry_query else self.COMMAND_BUDGET_SECONDS
+            async with AsyncExitStack() as owner:
+                if admission is not None:
+                    # One owner/budget covers waiting, serialization, both safe
+                    # read attempts and the body. A waiting write is still unsent.
+                    await owner.enter_async_context(asyncio.timeout(budget))
+                    await owner.enter_async_context(self._query_capacity(admission))
+                request = self.client.build_request(
+                    "GET" if body is None else "POST",
+                    self.url.rstrip("/") + path,
+                    json=body,
+                    headers=request_headers,
+                )
+                if admission is None:
+                    # Non-Memory commands retain their original HTTP-only budget.
+                    await owner.enter_async_context(asyncio.timeout(budget))
+                # Reuse serialized bytes/IDs/headers; acquire only once even when
+                # an explicitly safe read needs its existing transport retry.
                 for attempt in range(2 if retry_query else 1):
                     attempts = attempt + 1
                     try:
@@ -565,8 +584,9 @@ class JsonService:
                 cause=cause,
             )
             if recover_read:
-                failure.read_execution = "unconfirmed"
-                failure.optional_read_unavailable = self._optional_transport_failure(error)
+                failure.read_execution = "unconfirmed" if sent else "waiting"
+                if sent:
+                    failure.optional_read_unavailable = self._optional_transport_failure(error)
             if (
                 path == "/internal/v1/origins/resolve"
                 and body_complete
