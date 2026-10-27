@@ -153,6 +153,7 @@ class JsonService:
         ca_file=None,
         label=None,
         memory_dependency=False,
+        log_adapter=None,
     ):
         if url and (
             urlsplit(url).scheme != "https"
@@ -163,6 +164,7 @@ class JsonService:
         ):
             raise ValueError("Internal service URL must be an explicitly configured HTTPS URL")
         self.url, self.token = url, token
+        self.log_adapter = log_adapter
         # Fixed by application dependency assembly, never by URL or event label.
         self._memory_dependency = memory_dependency
         self.query_slots = asyncio.Semaphore(4)
@@ -467,7 +469,7 @@ class JsonService:
         response = None
         body_complete = False
         value = None
-        LOG_PORT.emit(
+        (self.log_adapter if self.log_adapter is not None else LOG_PORT).emit(
             "peer.call.started",
             "started",
             correlation_id=correlation,
@@ -621,7 +623,7 @@ class JsonService:
             raise failure from None
 
     def _report(self, outcome, correlation, started, attempts, error=None):
-        LOG_PORT.emit(
+        (self.log_adapter if self.log_adapter is not None else LOG_PORT).emit(
             "peer.call.finished",
             outcome,
             level="INFO" if outcome == "succeeded" else "WARNING",

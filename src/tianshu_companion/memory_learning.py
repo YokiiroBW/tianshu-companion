@@ -733,6 +733,9 @@ class MemoryLearning:
                 if not job.cancelled():
                     job.result()
 
+    async def drain(self):
+        await asyncio.gather(*tuple(self.jobs.values()), return_exceptions=True)
+
     async def close(self):
         async with self.dispatch_lock:
             self.closed = True

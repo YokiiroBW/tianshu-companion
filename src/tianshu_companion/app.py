@@ -40,6 +40,7 @@ from .short_context import ShortContextPolicy
 from .model_selection import HttpDefaultModelSelector
 from .worker_health import WorkerHealth
 from . import runtime_capabilities
+from .lifecycle import RuntimeLifecycle
 
 LOG = logging.getLogger(__name__)
 
@@ -345,21 +346,44 @@ class RuntimeEvents:
         return self.port is not None and not self.port.accepts_business()
 
 
-def build_runtime(config):
+INTERNAL_SERVICE_TARGETS = {
+    "platform_sender": "platform",
+    "provider_selector": "platform",
+    "provider_selector_background": "platform",
+    "qq_admin": "platform",
+    "actor_memory_authority": "platform",
+    "image_credentials": "platform",
+    "memory": "memory",
+    "knowledge": "knowledge",
+    "gateway": "gateway",
+    "gateway_background": "gateway",
+}
+
+
+def build_runtime(config, *, internal_clients=None, environ=None, log_adapter=None):
+    environ = os.environ if environ is None else environ
     automatic_memory_candidates = runtime_capabilities.candidates_enabled(
         config.get("automatic_memory_candidates", True)
     )
     contracts = Contracts(config["contracts_path"])
     clients = []
+    service_role = object()
 
-    def client(name, label=None):
+    def client(name, label=None, *, target=service_role):
         entry = config.get("services", {}).get(name, {})
+        if target is service_role:
+            target = INTERNAL_SERVICE_TARGETS.get(name)
+        injected = {}
+        if internal_clients is not None and target is not None:
+            injected["transport"] = internal_clients.async_transport(target)
         value = JsonService(
             entry.get("url"),
-            os.environ.get(entry.get("token_env", "")),
+            environ.get(entry.get("token_env", "")),
+            **injected,
             ca_file=entry.get("ca_file"),
             label=label,
             memory_dependency=name == "memory",
+            log_adapter=log_adapter,
         )
         clients.append(value)
         return value
@@ -367,11 +391,18 @@ def build_runtime(config):
     incoming = {}
     issuers = {}
     for service, entry in config.get("callers", {}).items():
-        token = os.environ.get(entry["token_env"])
+        token = environ.get(entry["token_env"])
         if token:
             incoming[service] = token
             if service in {"platform", "nonebot"}:
-                issuers[service] = (entry["issuer"], client(entry["origin_service"], "origins"))
+                issuers[service] = (
+                    entry["issuer"],
+                    client(
+                        entry["origin_service"],
+                        "origins",
+                        target="platform" if service == "platform" else None,
+                    ),
+                )
     # Registered character personas: the deployment mapping seeds one absolute initial
     # version, and every later version is an explicit operator act. The management
     # credential is separate from the chat/ingest credentials so no channel or bridge
@@ -379,7 +410,7 @@ def build_runtime(config):
     persona_config = config.get("personas")
     persona_token = None
     if persona_config:
-        persona_token = os.environ.get(persona_config["admin_token_env"])
+        persona_token = environ.get(persona_config["admin_token_env"])
         if persona_token:
             incoming["persona_admin"] = persona_token
     image_options = dict(
@@ -392,7 +423,11 @@ def build_runtime(config):
         workflow = Workflow(
             image_config["api_graph"], image_config["bindings"], image_config["outputs"]
         )
-        transport = ComfyUI(image_config["base_url"], token_env=image_config.get("token_env"))
+        transport = ComfyUI(
+            image_config["base_url"],
+            token_env=image_config.get("token_env"),
+            environ=environ,
+        )
         clients.append(transport)
         image_options = dict(
             transport=transport,
@@ -464,7 +499,7 @@ def build_runtime(config):
         else None
     )
     storage = StorageRuntime(
-        StorageOptions.from_settings(config),
+        StorageOptions.from_settings(config, environ=environ),
         service="companion",
         state_directory=Path(
             storage_temporary.name if storage_temporary else config["database_path"] + ".storage"
@@ -540,6 +575,7 @@ def build_runtime(config):
             direct_options=direct_options,
             web_sender=PlatformBotSender(contracts, platform_client),
             personas=bool(persona_config),
+            events=log_adapter,
             # The whole deployment document: the persona module owns the rule for where a
             # character is declared, so startup and the maintenance CLI read it identically.
             persona_import=config if persona_config else None,
@@ -609,41 +645,69 @@ def apply_deployment_overrides(config, environ=None):
     return resolved
 
 
-def create_app(core=None, tokens=None, life_readers=None):
+def create_app(
+    core=None,
+    tokens=None,
+    life_readers=None,
+    *,
+    config=None,
+    config_path=None,
+    internal_clients=None,
+    environ=None,
+    log_adapter=None,
+):
+    environ = dict(os.environ if environ is None else environ)
+    if config is not None and config_path is not None:
+        raise ValueError("Supply config or config_path, not both")
+    if core is not None and (config is not None or config_path is not None):
+        raise ValueError("An existing Core cannot also load deployment configuration")
     clients = []
     configured = core is not None
-    if core is None and os.environ.get("TIANSHU_COMPANION_CONFIG"):
-        config = json.loads(
-            Path(os.environ["TIANSHU_COMPANION_CONFIG"]).read_text(encoding="utf-8")
-        )
-        core, tokens, clients, life_readers = build_runtime(apply_deployment_overrides(config))
-        configured = True
-    tokens = tokens or {}
-    if len(set(tokens.values())) != len(tokens) or any(not token for token in tokens.values()):
-        raise ValueError("Each caller needs its own non-empty service credential")
-    # Authorized life reading is assembled here rather than inside Core: the port needs no
-    # chat state, and Core must not grow a second read path. With no `life_readers` section
-    # the four routes answer 503 and nothing else about the deployment changes.
-    reads = None
-    if core is not None:
-        # The registry is passed in so an entry naming a service that holds no credential is
-        # a startup failure instead of a deployment that silently never authenticates.
-        mapping = read_reader_map(life_readers, set(tokens))
-        if mapping is not None:
-            core.life.install_runtime_readers(
-                entry["reader_id"] for entry in mapping.values() if entry.get("runtime_roles")
+    log_port = log_adapter if log_adapter is not None else log_adapter_from_environment(environ)
+    with ExitStack() as setup:
+        # This factory owns the log writer it creates, including on failed assembly.
+        # An injected adapter remains its host's responsibility until startup succeeds.
+        if log_adapter is None:
+            setup.callback(log_port.close)
+        if core is None:
+            config_path = config_path or environ.get("TIANSHU_COMPANION_CONFIG")
+            if config is None and config_path is not None:
+                config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        if core is None and config is not None:
+            core, tokens, clients, life_readers = build_runtime(
+                apply_deployment_overrides(config, environ),
+                internal_clients=internal_clients,
+                environ=environ,
+                log_adapter=log_port,
             )
-            reads = LifeRead(
-                LifeReadQueries(core.store.db),
-                readers=mapping,
-                contracts=core.contracts,
-            )
-        core.life_runtime.reader = reads
+            configured = True
+        tokens = tokens or {}
+        if len(set(tokens.values())) != len(tokens) or any(not token for token in tokens.values()):
+            raise ValueError("Each caller needs its own non-empty service credential")
+        # Authorized life reading is assembled here rather than inside Core: the port needs no
+        # chat state, and Core must not grow a second read path. With no `life_readers` section
+        # the four routes answer 503 and nothing else about the deployment changes.
+        reads = None
+        if core is not None:
+            # The registry is passed in so an entry naming a service that holds no credential is
+            # a startup failure instead of a deployment that silently never authenticates.
+            mapping = read_reader_map(life_readers, set(tokens))
+            if mapping is not None:
+                core.life.install_runtime_readers(
+                    entry["reader_id"] for entry in mapping.values() if entry.get("runtime_roles")
+                )
+                reads = LifeRead(
+                    LifeReadQueries(core.store.db),
+                    readers=mapping,
+                    contracts=core.contracts,
+                )
+            core.life_runtime.reader = reads
+        setup.pop_all()
 
-    log_port = log_adapter_from_environment()
     set_log_port(log_port)
     stopping = asyncio.Event()
     workers = WorkerHealth()
+    lifecycle = RuntimeLifecycle(core, stopping, workers)
 
     def _counter(owner, name):
         """A read-only view of the pass counter the work itself advances."""
@@ -673,40 +737,42 @@ def create_app(core=None, tokens=None, life_readers=None):
 
     @asynccontextmanager
     async def lifespan(app):
-        jobs = []
+        jobs = lifecycle.producers
         try:
             if core:
                 await obs.admit(log_port, "runtime.started", "succeeded")
                 core.recover()
                 await core.image_backend.restore()
                 await core.image_backend.catalog.restore()
-                jobs = [
-                    loop("core.tick", core.tick, 0.05, _counter(core, "core.tick")),
-                    loop(
-                        "memory.work",
-                        lambda: core.memory_learning.work(wait=False),
-                        1,
-                        _counter(core, "memory.work"),
-                    ),
-                    loop(
-                        "life.work",
-                        lambda: core.life.work(wait=False),
-                        2,
-                        _counter(core, "life.work"),
-                    ),
-                    loop("images.work", core.images.work, 2, _counter(core, "images.work")),
-                    loop("writing.work", core.writing.work, 5, _counter(core, "writing.work")),
-                    loop(
-                        "proactive.work",
-                        core.proactive.work,
-                        2,
-                        _counter(core, "proactive.work"),
-                    ),
-                    # Commands execute here, off the chat path and off the ingest route, so a
-                    # slow plugin cannot block message admission or the light conversation
-                    # schedule.
-                    loop("direct.work", core.direct.work, 0.5, _counter(core, "direct.work")),
-                ]
+                jobs.extend(
+                    [
+                        loop("core.tick", core.tick, 0.05, _counter(core, "core.tick")),
+                        loop(
+                            "memory.work",
+                            lambda: core.memory_learning.work(wait=False),
+                            1,
+                            _counter(core, "memory.work"),
+                        ),
+                        loop(
+                            "life.work",
+                            lambda: core.life.work(wait=False),
+                            2,
+                            _counter(core, "life.work"),
+                        ),
+                        loop("images.work", core.images.work, 2, _counter(core, "images.work")),
+                        loop("writing.work", core.writing.work, 5, _counter(core, "writing.work")),
+                        loop(
+                            "proactive.work",
+                            core.proactive.work,
+                            2,
+                            _counter(core, "proactive.work"),
+                        ),
+                        # Commands execute here, off the chat path and off the ingest route, so a
+                        # slow plugin cannot block message admission or the light conversation
+                        # schedule.
+                        loop("direct.work", core.direct.work, 0.5, _counter(core, "direct.work")),
+                    ]
+                )
                 if hasattr(core, "observations"):
 
                     async def observation_flush():
@@ -720,16 +786,13 @@ def create_app(core=None, tokens=None, life_readers=None):
                     jobs.append(asyncio.create_task(observation_flush()))
             yield
         finally:
-            workers.stopping = True
             # Shutdown is itself reported durably, and in the only order that makes the
             # records trustworthy: `stopped` is confirmed on the disk *before* the writer is
             # closed, so the last line of the stream is never a record that was still queued
             # when the handle went away.
             await obs.admit(log_port, "runtime.stopping", "started")
-            stopping.set()
-            for job in jobs:
-                job.cancel()
-            await asyncio.gather(*jobs, return_exceptions=True)
+            await lifecycle.quiesce()
+            await lifecycle.drain()
             if core:
                 await core.close()
             for client in clients:
@@ -742,13 +805,14 @@ def create_app(core=None, tokens=None, life_readers=None):
                 log_port.close()
 
     health_view = health_module.Health(
-        os.environ.get(health_module.TOKEN_ENV), core=core, log=log_port, workers=workers
+        environ.get(health_module.TOKEN_ENV), core=core, log=log_port, workers=workers
     )
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.core = core
     app.state.log = log_port
     app.state.health = health_view
     app.state.stopping = stopping
+    app.state.lifecycle = lifecycle
 
     @app.get("/healthz")
     async def health():
@@ -804,6 +868,7 @@ def create_app(core=None, tokens=None, life_readers=None):
             )
             if service is None:
                 raise Fault("unauthorized")
+            lifecycle.admit(operation)
             if operation.startswith(
                 ("life-runtime-", "image-backend-", "skills-")
             ) and not json_media_type(request.headers):
@@ -934,6 +999,8 @@ def create_app(core=None, tokens=None, life_readers=None):
             return await core.cancel(service, body)
         except Fault as error:
             return JSONResponse(error.wire(request_id), status_code=error.status)
+        finally:
+            lifecycle.release(operation)
 
     @app.post("/internal/v1/conversation/ingest")
     async def ingest(request: Request):

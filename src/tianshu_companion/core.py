@@ -2887,13 +2887,27 @@ class Core(Delivery):
             else None
         )
 
-    async def close(self):
+    async def drain(self):
+        """Finish current work while source callbacks and outgoing clients remain open."""
+        await asyncio.gather(
+            *tuple(self.jobs.values()),
+            *tuple(self.send_jobs.values()),
+            self.memory_learning.drain(),
+            self.life.drain(),
+            return_exceptions=True,
+        )
+
+    async def stop_work(self):
+        """Cancel work at a drain deadline without closing callback dependencies."""
         jobs = list(self.jobs.values()) + list(self.send_jobs.values())
         for job in jobs:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
         await self.memory_learning.close()
         await self.life.close()
+
+    async def close(self):
+        await self.stop_work()
         await self.image_backend.close()
         self.store.close()
         if getattr(self, "storage_runtime", None) is not None:

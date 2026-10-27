@@ -12,7 +12,9 @@ from .image_provider import ImageRejected, ImageResult
 class ComfyUI:
     provider = "comfyui"
 
-    def __init__(self, base_url, *, token_env=None, token=None, credential_ref=None, timeout=10):
+    def __init__(
+        self, base_url, *, token_env=None, token=None, credential_ref=None, timeout=10, environ=None
+    ):
         url = urlsplit(base_url)
         if (
             url.scheme not in {"http", "https"}
@@ -33,7 +35,8 @@ class ComfyUI:
                 raise ValueError("Public ComfyUI requires TLS")
         if not 0 < timeout <= 30:
             raise ValueError("Invalid network budget")
-        token = os.environ.get(token_env) if token_env else token
+        environ = os.environ if environ is None else environ
+        token = environ.get(token_env) if token_env else token
         if token_env and not token:
             raise ValueError("Missing authentication reference")
         self.identity = digest([base_url.rstrip("/"), credential_ref or token_env])

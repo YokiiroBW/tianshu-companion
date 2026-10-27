@@ -752,6 +752,9 @@ class Life:
                 self._phase_cursor[actor] = (index + 1) % len(phases)
                 return
 
+    async def drain(self):
+        await asyncio.gather(*tuple(self._jobs.values()), return_exceptions=True)
+
     async def close(self):
         jobs = list(self._jobs.values())
         for job in jobs:
