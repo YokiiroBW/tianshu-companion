@@ -32,6 +32,29 @@ docker build -f Dockerfile.onebot -t tianshu-onebot:local .
 
 本轮只验证本地进程和合成协议对端；容器构建、NAS 安装、真实 NapCat 登录与 QQ 收发以实际发布记录为准。
 
+## 统一宿主装配
+
+`tianshu_nonebot.onebot.create_host` 返回原 FastAPI ASGI app，不启动监听或调用 `nonebot.run`。统一宿主可在 OneBot 的 owner 线程/事件循环中构造它，以原 ASGI lifespan 执行 NoneBot startup/shutdown 钩子；对外的 OneBot reverse WebSocket 仍需要宿主持有的 18765 监听。内部模块可直接调用同一 app，公开监听和内部交换只能驱动一次 lifespan，避免重复初始化全局 driver。
+
+```python
+app = create_host(
+    host="0.0.0.0", port=18765, data_dir=onebot_data,
+    access_token=onebot_token,
+    storage_backends=onebot_storage_settings,
+    storage_environ=onebot_environment,
+)
+async with app.router.lifespan_context(app):
+    lifecycle = app.state.lifecycle
+    instance_id = lifecycle.instance_id
+    # 宿主在此服务内部调用和公开 WebSocket；不再调用 nonebot.run。
+```
+
+`storage_environ=None` 保持独立运行的原进程环境规则；显式 `{}` 表示只使用 `storage_backends` 与默认值，绝不继承 Platform 的 PostgreSQL/Redis URL 或 namespace。传入独立映射时沿原 StorageOptions 环境覆盖规则处理，不修改进程环境、数据库格式或账本。`instance_id` 是原持久适配器身份的只读字符串，生命周期接点不暴露连接密钥或数据库对象。已经初始化的 NoneBot driver 不会被重置，重复 factory 明确报错；独立 CLI 仍按原路径调用 `nonebot.run`。
+
+关闭时先 `await lifecycle.quiesce()` 停止受理新 SDK 事件，保持已受理事件、合法发送与回执 RPC、WebSocket API 回包可用。其他模块完成自己的在途调用后，`await lifecycle.drain(timeout=20)` 等事件最后的参与权 closure 回执与 RPC 实际结束；超时返回 `False`，不取消它们、不提前关库。取消 drain 等待者也不释放操作归属，可以再次等待。
+
+最后再退出 ASGI lifespan，原 driver shutdown 钩子停止新的 RPC 准入，等待真实操作归零后注销插件并关闭数据库。宿主持有总退出期限，强制停止不能当作正常排空；原发送中断的 `inflight` 仍由重启恢复为 `unknown`，不自动重发。必须在所有在途发送完成后才关闭公开 WebSocket，否则 SDK 无法取得发送回执。
+
 ## 上下文和消息结构
 
 SDK 原始消息链中的引用 ID 和精确 @ 账号会进入既有持久队列，再由 Platform 转换为 Core 的 `reply_refs` 和 `mentioned_accounts`。引用只在同一连接中匹配已经受理的消息；未知引用不补查其他房间内容。昵称、群名片和 @ 都不改变作者身份或管理员权限。

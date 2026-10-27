@@ -242,6 +242,7 @@ class AdapterService:
         send_media: Callable[[str, str, str, list[dict]], Awaitable[str | int]] | None = None,
         *,
         storage_backends: dict | None = None,
+        storage_environ: dict | None = None,
     ):
         if adapter not in {"astrbot", "nonebot", "onebot"}:
             raise ValueError("adapter")
@@ -321,34 +322,39 @@ class AdapterService:
                     *PARTICIPATION_TABLES,
                 ),
                 settings={"storage_backends": storage_backends or {}},
+                environ=storage_environ,
             )
         else:
             self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        self.db.execute("PRAGMA busy_timeout=5000")
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript(schema_sql)
-        for row in self.db.execute("SELECT group_policy FROM observation_accounts"):
-            group_policy.normalize(json.loads(row[0]))
         try:
-            if os.name != "nt":
-                os.chmod(path, 0o600)
-        except OSError:
-            pass
-        self.access_key = self._meta("access_key", lambda: secrets.token_urlsafe(48))
-        self.instance_id = self._meta("instance_id", lambda: uuid.uuid4().hex)
-        # An interrupted SDK call is unknown; it is never retried after restart.
-        self.db.execute(
-            "UPDATE deliveries SET receipt=json_set(receipt,'$.state','unknown') "
-            "WHERE json_extract(receipt,'$.state')='inflight'"
-        )
-        # ACK means the consumer has durably accepted the payload. Keep only the
-        # event identity so an old SDK replay can never become a new pending event.
-        self.db.execute("UPDATE events SET payload='{}' WHERE acked=1 AND payload<>'{}'")
-        self.adapter, self.accounts, self.send = adapter, accounts, send
-        self.send_media = send_media
-        self.lock = asyncio.Lock()
-        self.participation = Participation(self, RpcError)
+            self.db.execute("PRAGMA busy_timeout=5000")
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=FULL")
+            self.db.executescript(schema_sql)
+            for row in self.db.execute("SELECT group_policy FROM observation_accounts"):
+                group_policy.normalize(json.loads(row[0]))
+            try:
+                if os.name != "nt":
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
+            self.access_key = self._meta("access_key", lambda: secrets.token_urlsafe(48))
+            self.instance_id = self._meta("instance_id", lambda: uuid.uuid4().hex)
+            # An interrupted SDK call is unknown; it is never retried after restart.
+            self.db.execute(
+                "UPDATE deliveries SET receipt=json_set(receipt,'$.state','unknown') "
+                "WHERE json_extract(receipt,'$.state')='inflight'"
+            )
+            # ACK means the consumer has durably accepted the payload. Keep only the
+            # event identity so an old SDK replay can never become a new pending event.
+            self.db.execute("UPDATE events SET payload='{}' WHERE acked=1 AND payload<>'{}'")
+            self.adapter, self.accounts, self.send = adapter, accounts, send
+            self.send_media = send_media
+            self.lock = asyncio.Lock()
+            self.participation = Participation(self, RpcError)
+        except BaseException:
+            self.close()
+            raise
 
     def _meta(self, key: str, maker: Callable[[], str]) -> str:
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()

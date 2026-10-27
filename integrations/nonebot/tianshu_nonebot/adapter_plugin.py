@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from .rpc import PREFIX, AdapterService, onebot_media, request_limit
 from .sdk import UnsupportedEvent, event_enabled, observation_event, text_event
 from .participation_host import execution, install as install_participation_host
+from .adapter_lifecycle import AdapterLifecycle
 
 
 class Config(BaseModel):
@@ -29,6 +30,7 @@ class Config(BaseModel):
     tianshu_adapter_priority: int = 5
     tianshu_adapter_kind: Literal["nonebot", "onebot"] = "nonebot"
     storage_backends: dict = {}
+    tianshu_adapter_storage_environ: dict[str, str] | None = None
 
 
 __plugin_meta__ = PluginMetadata(
@@ -93,13 +95,25 @@ service = AdapterService(
     _send,
     _send,
     storage_backends=settings.storage_backends,
+    storage_environ=settings.tianshu_adapter_storage_environ,
 )
+lifecycle = AdapterLifecycle(service)
 semaphore = asyncio.Semaphore(8)
 app = get_asgi()
+app.state.lifecycle = lifecycle
 _routes = []
 
 
 async def _rpc(request: Request):
+    async with lifecycle.operation() as accepted:
+        if not accepted:
+            return JSONResponse(
+                {"code": "dependency_unavailable", "retryable": True}, status_code=503
+            )
+        return await _handle_rpc(request)
+
+
+async def _handle_rpc(request: Request):
     if not service.authorized(request.headers.get("authorization")):
         return JSONResponse({"code": "unauthorized", "retryable": False}, status_code=401)
     if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/json":
@@ -160,6 +174,8 @@ for suffix in (
 
 async def _observe(bot: BaseBot, event: BaseEvent, state) -> bool:
     proof = execution(state)
+    if not (proof.accepted if proof else lifecycle.accepting_events):
+        return False
     if not isinstance(bot, OneBotBot):
         return False
     try:
@@ -202,6 +218,8 @@ async def _observed():
 
 async def _claim_observation_reply(bot: BaseBot, event: BaseEvent, state) -> bool:
     proof = execution(state)
+    if not (proof.accepted if proof else lifecycle.accepting_events):
+        return False
     if not isinstance(bot, OneBotBot):
         return False
     if not event_enabled(bot, event, service.input_enabled, reply=True):
@@ -234,6 +252,8 @@ async def _claimed_observation_reply():
 
 async def _scope(bot: BaseBot, event: BaseEvent, state) -> bool:
     proof = execution(state)
+    if not (proof.accepted if proof else lifecycle.accepting_events):
+        return False
     if not isinstance(bot, OneBotBot):
         return False
     try:
@@ -275,12 +295,27 @@ participation_host = install_participation_host(sys.modules[__name__])
 
 def unregister():
     """Explicit host shutdown/unload hook; NoneBot itself has no hot-unload API."""
+    if lifecycle.closed:
+        return
+    if lifecycle.pending:
+        raise RuntimeError("Drain the Tianshu adapter before unregistering it")
+    lifecycle.closing = True
+    lifecycle.accepting_events = False
     for route in _routes:
         if route in app.routes:
             app.routes.remove(route)
     _routes.clear()
     participation_host.close()
     service.close()
+    lifecycle.closed = True
 
 
-driver.on_shutdown(unregister)
+async def shutdown():
+    # The driver lifespan is the final owner. The unified host first drains
+    # while callbacks are admitted; normal standalone shutdown also waits here.
+    lifecycle.closing = True
+    await lifecycle.drain(timeout=None)
+    unregister()
+
+
+driver.on_shutdown(shutdown)

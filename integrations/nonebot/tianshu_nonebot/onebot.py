@@ -23,7 +23,8 @@ def parser():
     return result
 
 
-def create_host(*, host, port, data_dir, access_token, storage_backends=None):
+def create_host(*, host, port, data_dir, access_token, storage_backends=None, storage_environ=None):
+    """Construct one owned ASGI app; its server and lifespan belong to the caller."""
     if not access_token or any(char.isspace() for char in access_token):
         raise ValueError("A OneBot access token is required")
     if not 1 <= port <= 65535:
@@ -32,6 +33,12 @@ def create_host(*, host, port, data_dir, access_token, storage_backends=None):
     from fastapi.responses import JSONResponse
     from nonebot.adapters.onebot.v11 import Adapter
 
+    try:
+        nonebot.get_driver()
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("NoneBot already has an initialized host")
     nonebot.init(
         driver="~fastapi",
         host=host,
@@ -41,29 +48,37 @@ def create_host(*, host, port, data_dir, access_token, storage_backends=None):
         tianshu_adapter_kind="onebot",
         tianshu_adapter_data_dir=str(data_dir),
         storage_backends=storage_backends or {},
+        tianshu_adapter_storage_environ=storage_environ,
         _env_file=None,
     )
-    nonebot.get_driver().register_adapter(Adapter)
-    if nonebot.load_plugin("tianshu_nonebot.adapter_plugin") is None:
-        raise RuntimeError("Tianshu adapter could not be loaded")
-    from .adapter_plugin import participation_host
+    plugin = None
+    try:
+        nonebot.get_driver().register_adapter(Adapter)
+        plugin = nonebot.load_plugin("tianshu_nonebot.adapter_plugin")
+        if plugin is None:
+            raise RuntimeError("Tianshu adapter could not be loaded")
+        from .adapter_plugin import participation_host
 
-    participation_host.enable_owned_entry()
-    app = nonebot.get_asgi()
+        participation_host.enable_owned_entry()
+        app = nonebot.get_asgi()
 
-    @app.get("/health/live", include_in_schema=False)
-    async def live():
-        return {"service": "tianshu-onebot", "status": "alive"}
+        @app.get("/health/live", include_in_schema=False)
+        async def live():
+            return {"service": "tianshu-onebot", "status": "alive"}
 
-    @app.get("/health/ready", include_in_schema=False)
-    async def ready():
-        connected = bool(nonebot.get_bots())
-        return JSONResponse(
-            {"service": "tianshu-onebot", "status": "ready" if connected else "offline"},
-            status_code=200 if connected else 503,
-        )
+        @app.get("/health/ready", include_in_schema=False)
+        async def ready():
+            connected = bool(nonebot.get_bots())
+            return JSONResponse(
+                {"service": "tianshu-onebot", "status": "ready" if connected else "offline"},
+                status_code=200 if connected else 503,
+            )
 
-    return app
+        return app
+    except BaseException:
+        if plugin is not None:
+            plugin.module.unregister()
+        raise
 
 
 def main():

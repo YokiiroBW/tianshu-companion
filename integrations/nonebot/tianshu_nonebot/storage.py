@@ -45,9 +45,11 @@ def dialect(connection, sql, parameters):
     return connection.native(native, parameters) if native != sql else None
 
 
-def open_database(path, logical_name, schema_sql, tables, *, settings=None, ordered=(), owner=True):
+def open_database(
+    path, logical_name, schema_sql, tables, *, settings=None, environ=None, ordered=(), owner=True
+):
     runtime = StorageRuntime(
-        StorageOptions.from_settings(settings or {}),
+        StorageOptions.from_settings(settings or {}, environ=environ),
         service="nonebot",
         state_directory=str(path) + ".storage",
     )
@@ -183,10 +185,10 @@ def close_database(runtime, db):
             runtime.close()
 
 
-def read_access_key(path, settings=None):
+def read_access_key(path, settings=None, *, environ=None):
     with closing(
         StorageRuntime.open_existing(
-            StorageOptions.from_settings(settings or {}),
+            StorageOptions.from_settings(settings or {}, environ=environ),
             service="nonebot",
             state_directory=str(path) + ".storage",
             name="rpc",

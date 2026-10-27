@@ -33,6 +33,7 @@ class Execution:
     post_completed: bool = False
     failed: bool = False
     eligible: bool = True
+    accepted: bool = True
 
     def captured_value(self, value):
         if not self.eligible:
@@ -161,30 +162,35 @@ class ControlledHost:
 
     def install(self):
         async def lifetime(bot: Bot, event: Event):
-            eligible = event_enabled(bot, event, self.host.service.participation_enabled)
-            proof = Execution(self, self.graph() if eligible else None, eligible=eligible)
-            try:
-                yield proof
-            except BaseException:
-                proof.failed = True
-                raise
-            finally:
-                # Cancellation may enter this block. Normal closure is an explicit
-                # conjunction of receipts, not inferred from reaching this finally.
-                if proof.native is not None:
-                    with anyio.CancelScope(shield=True):
-                        async with self.host.service.lock:
-                            with transaction(self.host.service.db):
-                                current = self.graph()
-                                self.host.service.participation.finish(
-                                    proof.native,
-                                    proof.handler_digest or "0" * 64,
-                                    not proof.failed
-                                    and proof.pre_completed
-                                    and proof.post_completed
-                                    and proof.handler_digest is not None
-                                    and current == proof.handler_digest,
-                                )
+            async with self.host.lifecycle.operation(event=True) as accepted:
+                eligible = accepted and event_enabled(
+                    bot, event, self.host.service.participation_enabled
+                )
+                proof = Execution(
+                    self, self.graph() if eligible else None, eligible=eligible, accepted=accepted
+                )
+                try:
+                    yield proof
+                except BaseException:
+                    proof.failed = True
+                    raise
+                finally:
+                    # Cancellation may enter this block. Normal closure is an explicit
+                    # conjunction of receipts, not inferred from reaching this finally.
+                    if proof.native is not None:
+                        with anyio.CancelScope(shield=True):
+                            async with self.host.service.lock:
+                                with transaction(self.host.service.db):
+                                    current = self.graph()
+                                    self.host.service.participation.finish(
+                                        proof.native,
+                                        proof.handler_digest or "0" * 64,
+                                        not proof.failed
+                                        and proof.pre_completed
+                                        and proof.post_completed
+                                        and proof.handler_digest is not None
+                                        and current == proof.handler_digest,
+                                    )
 
         async def event_pre(state: T_State, proof=Depends(lifetime)):
             state[STATE_KEY] = proof
