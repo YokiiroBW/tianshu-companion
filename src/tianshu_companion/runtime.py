@@ -20,12 +20,14 @@ class LifeRuntime:
         resolver = "platform" if issuers is not None and service not in issuers else service
         return await self.core.origins.resolve(resolver, query, self.core.clock())
 
-    async def prepare_action(self, actor, operation, value, expected, *, model_slot_held=False):
+    async def prepare_action(
+        self, actor, operation, value, expected, *, model_slot_held=False, background=False
+    ):
         if operation == "image.request":
             if model_slot_held and "character" in (value.get("intent") or {}):
                 raise Fault("forbidden")
             compiled = await self.core.image_backend.catalog.prepare_request(
-                actor, value, model_slot_held=model_slot_held
+                actor, value, model_slot_held=model_slot_held, background=background
             )
             references = await self.core.image_backend.prepare_job(actor, value)
             for reference in references:

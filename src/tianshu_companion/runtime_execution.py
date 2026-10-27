@@ -167,9 +167,27 @@ class RuntimeExecution:
             raise Fault("dependency_unavailable")
         return sender
 
-    async def generation(self, actor, operation):
+    async def generation(self, actor, operation, *, background=True):
         task = dict(actor_id=actor, generation_turn_id=operation, config_version=None)
-        await self.core.life.select_generation(task)
+        if background:
+            await self.core.life.select_generation(task)
+        else:
+            from .model_selection import SelectionRequest, pin_generation
+
+            await pin_generation(
+                task,
+                SelectionRequest(
+                    turn_id=operation,
+                    actor_id=actor,
+                    person_id="person:life:" + digest(actor),
+                    audience="self_private",
+                    conversation_id="life:" + digest(actor),
+                    function_id="writing",
+                ),
+                self.core.default_model_selector,
+                self.core.clock,
+                static_version=self.core.config_version,
+            )
         return dict(
             id=operation,
             actor_id=actor,
@@ -461,6 +479,7 @@ class RuntimeExecution:
                             supplied,
                             value["expected_version"],
                             model_slot_held=True,
+                            background=True,
                         )
                         result = self.core.life.concerns.operation(
                             "actor:" + actor,

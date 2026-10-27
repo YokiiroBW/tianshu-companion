@@ -104,3 +104,32 @@ async def resolve_selection(selector: DefaultModelSelector, request, clock):
         raise Fault("dependency_unavailable")
     verify_lease(result.expires_at, clock())
     return result
+
+
+async def pin_generation(
+    task, request, selector, clock, *, static_version=None, fallback_version=None, independent=False
+):
+    """Pin one generation to its actual caller; independent callers never borrow a grant."""
+    if selector is not None:
+        retained = task.get("model_selection") or {}
+        if (
+            retained.get("turn_id") != request.turn_id
+            or retained.get("caller_service", "companion") != request.caller_service
+        ):
+            chosen = await resolve_selection(selector, request, clock)
+            task["config_version"] = chosen.config_version
+            task["model_selection"] = {
+                "expires_at": chosen.expires_at,
+                "turn_id": request.turn_id,
+                "caller_service": request.caller_service,
+            }
+        verify_lease(task["model_selection"]["expires_at"], clock())
+    elif independent:
+        if static_version is None:
+            raise Fault("dependency_unavailable")
+        task["config_version"] = static_version
+        task.pop("model_selection", None)
+    elif task.get("config_version") is None:
+        task["config_version"] = static_version or fallback_version
+    if task.get("config_version") is None:
+        raise Fault("dependency_unavailable")

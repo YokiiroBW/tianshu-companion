@@ -5,13 +5,14 @@ import copy
 import json
 
 from .contracts import Fault, canonical, digest
-from .model_selection import SelectionRequest, resolve_selection
+from .model_selection import SelectionRequest, pin_generation
 from .memory_extraction import ProposalStructureError, parse_proposal, legacy_messages
 from .short_context import sources_current
 from .memory_segments import MemorySegments
 from . import observability as obs
 
 QUEUE = "memory:learning"
+MODEL_ROUTE_BOUNDARY = "memory-learning-generation-route-boundary"
 MAX_ATTEMPTS = 3
 MAX_RECOVERY_ATTEMPTS = 6
 MAX_TOTAL_ATTEMPTS = 3 * MAX_RECOVERY_ATTEMPTS
@@ -54,6 +55,16 @@ class MemoryLearning:
             )
             core.store.put("metadata", boundary)
         self.legacy_outbox_rowid = boundary["outbox_rowid"]
+        model_boundary = core.store.get("metadata", MODEL_ROUTE_BOUNDARY)
+        if model_boundary is None:
+            model_boundary = dict(
+                id=MODEL_ROUTE_BOUNDARY,
+                metadata_rowid=core.store.db.execute(
+                    "SELECT COALESCE(MAX(rowid),0) FROM metadata"
+                ).fetchone()[0],
+            )
+            core.store.put("metadata", model_boundary)
+        self.legacy_model_rowid = model_boundary["metadata_rowid"]
 
     def admission_blocked(self, scope):
         if not self.core.automatic_memory_candidates:
@@ -1035,6 +1046,46 @@ class MemoryLearning:
             )
         self.core.store.put("metadata", item)
 
+    async def _pin_model(self, item, generation, scope):
+        life = self.core.life
+        route = item.get("model_route")
+        if route is None:
+            row = self.core.store.db.execute(
+                "SELECT rowid FROM metadata WHERE id=?", (item["id"],)
+            ).fetchone()
+            retained = row is not None and row[0] <= self.legacy_model_rowid
+            caller = "companion" if retained else life.generation_caller_service
+            route = dict(
+                caller_service=caller,
+                turn_id=generation["id"]
+                if caller == "companion"
+                else "memory-generation:" + digest([generation["id"], caller]),
+            )
+            # A restart or later deployment change cannot reclassify an already
+            # selected/submitted model attempt under a new routing grant ID.
+            item["model_route"] = route
+            self.core.store.put("metadata", item)
+        independent = route["caller_service"] == "companion_background"
+        if route["caller_service"] not in {"companion", "companion_background"} or (
+            independent and life.generation_caller_service != "companion_background"
+        ):
+            raise Fault("dependency_unavailable")
+        generation["id"] = generation["conversation_id"] = route["turn_id"]
+        await pin_generation(
+            generation,
+            SelectionRequest(
+                turn_id=generation["id"],
+                **scope,
+                function_id="memory",
+                caller_service=route["caller_service"],
+            ),
+            life.model_selector if independent else self.core.default_model_selector,
+            self.core.clock,
+            static_version=life.config_version if independent else self.core.config_version,
+            independent=independent,
+        )
+        return life.gateway if independent else self.core.gateway
+
     async def _summary_model(self, item, generation):
         """Shared model-slot, selection and timeout owner for contextual protocols."""
         from .memory_summaries import messages, segment_messages
@@ -1045,15 +1096,9 @@ class MemoryLearning:
             self._source_turn(item)
             if item["extraction_schema"] == 5:
                 self._check_summary_window(item)
-            if self.core.default_model_selector is not None:
-                selected = await resolve_selection(
-                    self.core.default_model_selector,
-                    SelectionRequest(
-                        turn_id=generation["id"], **generation["scope"], function_id="memory"
-                    ),
-                    self.core.clock,
-                )
-                generation["config_version"] = selected.config_version
+            if not self._start_phase(item):
+                return None
+            gateway = await self._pin_model(item, generation, generation["scope"])
             self._source_turn(item)
             if not await self.core.group_processing.start(item):
                 return None
@@ -1078,7 +1123,7 @@ class MemoryLearning:
             item["stage"] = "model"
             self.core.store.put("metadata", item)
             segments, _ = await asyncio.wait_for(
-                self.core.gateway.generate(generation, supplied), MODEL_TIMEOUT_SECONDS
+                gateway.generate(generation, supplied), MODEL_TIMEOUT_SECONDS
             )
             return "\n".join(segments)
 
@@ -1306,17 +1351,7 @@ class MemoryLearning:
                         core.store.put("metadata", item)
                         async with core.models.background:
                             turn = self._source_turn(item)
-                            if core.default_model_selector is not None:
-                                selected = await resolve_selection(
-                                    core.default_model_selector,
-                                    SelectionRequest(
-                                        turn_id=generation["id"],
-                                        **turn["scope"],
-                                        function_id="memory",
-                                    ),
-                                    core.clock,
-                                )
-                                generation["config_version"] = selected.config_version
+                            gateway = await self._pin_model(item, generation, turn["scope"])
                             self._source_turn(item)
                             if not await core.group_processing.start(item):
                                 return
@@ -1336,7 +1371,7 @@ class MemoryLearning:
                                 diagnostics=item.get("proposal_diagnostics"),
                             )
                             segments, _ = await asyncio.wait_for(
-                                core.gateway.generate(generation, messages), MODEL_TIMEOUT_SECONDS
+                                gateway.generate(generation, messages), MODEL_TIMEOUT_SECONDS
                             )
                         raw = "\n".join(segments)
                         item["stage"] = "proposal"

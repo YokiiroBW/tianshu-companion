@@ -97,7 +97,7 @@ class RuntimePhotos:
                 )
                 self.core.contracts.check("life-runtime#manage_request", request)
                 prepared = await self.core.life_runtime.prepare_action(
-                    candidate["actor_id"], "image.request", value, 0
+                    candidate["actor_id"], "image.request", value, 0, background=True
                 )
                 fresh = self.store.get("proactive_candidates", candidate["id"])
                 if (

@@ -140,44 +140,26 @@ class Life:
 
     async def select_generation(self, task):
         """Pin the actor's published model choice using the existing selection lease port."""
-        from .model_selection import SelectionRequest, resolve_selection, verify_lease
+        from .model_selection import SelectionRequest, pin_generation
 
-        if self.model_selector is not None:
-            retained = task.get("model_selection") or {}
-            if (
-                retained.get("turn_id") != task["generation_turn_id"]
-                or retained.get("caller_service", "companion") != self.generation_caller_service
-            ):
-                actor = task["actor_id"]
-                chosen = await resolve_selection(
-                    self.model_selector,
-                    SelectionRequest(
-                        turn_id=task["generation_turn_id"],
-                        actor_id=actor,
-                        person_id="person:life:" + digest(actor),
-                        audience="self_private",
-                        conversation_id="life:" + digest(actor),
-                        function_id="writing",
-                        caller_service=self.generation_caller_service,
-                    ),
-                    self.clock,
-                )
-                task["config_version"] = chosen.config_version
-                task["model_selection"] = {
-                    "expires_at": chosen.expires_at,
-                    "turn_id": task["generation_turn_id"],
-                    "caller_service": self.generation_caller_service,
-                }
-            verify_lease(task["model_selection"]["expires_at"], self.clock())
-        elif self.generation_caller_service == "companion_background":
-            if self.config_version is None:
-                raise Fault("dependency_unavailable")
-            task["config_version"] = self.config_version
-            task.pop("model_selection", None)
-        elif task.get("config_version") is None:
-            task["config_version"] = self.config_version or self.default_config_version
-        if task.get("config_version") is None:
-            raise Fault("dependency_unavailable")
+        actor = task["actor_id"]
+        await pin_generation(
+            task,
+            SelectionRequest(
+                turn_id=task["generation_turn_id"],
+                actor_id=actor,
+                person_id="person:life:" + digest(actor),
+                audience="self_private",
+                conversation_id="life:" + digest(actor),
+                function_id="writing",
+                caller_service=self.generation_caller_service,
+            ),
+            self.model_selector,
+            self.clock,
+            static_version=self.config_version,
+            fallback_version=self.default_config_version,
+            independent=self.generation_caller_service == "companion_background",
+        )
 
     def verify_generation_lease(self, task):
         if task.get("model_selection"):
