@@ -1275,6 +1275,115 @@ class SequenceTests(unittest.TestCase):
 class DurabilityTests(unittest.TestCase):
     """Rotation, the directory budget, IO failure and the honest health state."""
 
+    def full_adapter(self, directory):
+        adapter = obs.LogAdapter(directory, max_segment_bytes=512, stderr=_Sink())
+        adapter.max_directory_bytes = 4096
+        for _ in range(50):
+            if not asyncio.run(adapter.admit("runtime.background_work", "succeeded")):
+                break
+        else:
+            self.fail("real log did not reach its budget")
+        self.assertEqual(adapter.health(), "capacity_exhausted")
+        self.addCleanup(adapter.close)
+        return adapter
+
+    def remove_sealed_prefix(self, adapter):
+        active = adapter._segment_path(adapter._segment_index)
+        paths = [path for path in adapter.directory.iterdir() if path != active]
+        self.assertTrue(paths)
+        before = active.read_bytes()
+        for path in paths:
+            path.unlink()
+        return active, before
+
+    def test_capacity_probe_remeasures_an_open_writer_after_external_sealed_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = self.full_adapter(directory)
+            try:
+                sequence = adapter._sequence
+                self.assertFalse(adapter.probe(), "still-full storage cannot become healthy")
+                self.assertEqual(adapter._sequence, sequence)
+                active, before = self.remove_sealed_prefix(adapter)
+                measured = sum(path.stat().st_size for path in adapter.directory.iterdir())
+                self.assertGreater(adapter._directory_bytes, measured)
+                self.assertTrue(adapter.probe())
+                self.assertEqual(adapter.health(), "ok")
+                self.assertTrue(active.read_bytes().startswith(before))
+                self.assertTrue(asyncio.run(adapter.admit("runtime.background_work", "succeeded")))
+                self.assertEqual(adapter.pending, 0)
+            finally:
+                adapter.close()
+
+    def test_idle_owner_automatically_proves_capacity_recovery_without_a_probe_request(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(obs, "RECOVERY_INTERVAL_SECONDS", 0.02),
+        ):
+            adapter = self.full_adapter(directory)
+            try:
+                active, before = self.remove_sealed_prefix(adapter)
+                deadline = time.monotonic() + 2
+                while adapter.health() != "ok" and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                self.assertEqual(adapter.health(), "ok")
+                self.assertTrue(active.read_bytes().startswith(before))
+                self.assertTrue(asyncio.run(adapter.admit("runtime.background_work", "succeeded")))
+            finally:
+                adapter.close()
+
+    def test_failed_capacity_probe_fsync_keeps_business_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = self.full_adapter(directory)
+            try:
+                self.remove_sealed_prefix(adapter)
+                sequence = adapter._sequence
+                with mock.patch.object(obs.os, "fsync", side_effect=PermissionError("denied")):
+                    self.assertFalse(adapter.probe())
+                self.assertEqual(
+                    adapter._sequence, sequence + 1, "unknown writes must spend their number"
+                )
+                self.assertTrue(adapter.degraded)
+                self.assertFalse(adapter.accepts_business())
+                self.assertEqual(adapter.pending, 0)
+                self.assertTrue(adapter.probe())
+                self.assertEqual(adapter.health(), "ok")
+            finally:
+                adapter.close()
+
+    def test_inflight_capacity_proof_keeps_flags_and_pending_until_the_real_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = self.full_adapter(directory)
+            entered, release = threading.Event(), threading.Event()
+            result = []
+            fsync = obs.os.fsync
+
+            def held(descriptor):
+                entered.set()
+                self.assertTrue(release.wait(2))
+                fsync(descriptor)
+
+            try:
+                self.remove_sealed_prefix(adapter)
+                with mock.patch.object(obs.os, "fsync", held):
+                    caller = threading.Thread(target=lambda: result.append(adapter.probe()))
+                    caller.start()
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        self.assertTrue(adapter.degraded)
+                        self.assertFalse(adapter.accepts_business())
+                        self.assertTrue(adapter.probe_pending)
+                        self.assertEqual(adapter.pending, 1)
+                    finally:
+                        release.set()
+                        caller.join(2)
+                    self.assertFalse(caller.is_alive())
+                self.assertEqual(result, [True])
+                self.assertEqual(adapter.health(), "ok")
+                self.assertEqual(adapter.pending, 0)
+            finally:
+                release.set()
+                adapter.close()
+
     def test_rotation_seals_a_segment_at_the_configured_size_without_deleting(self):
         with tempfile.TemporaryDirectory() as directory:
             adapter = obs.LogAdapter(

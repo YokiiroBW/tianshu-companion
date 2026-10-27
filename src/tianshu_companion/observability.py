@@ -339,6 +339,7 @@ ADMISSION_POLL_SECONDS = 0.001
 # ever. So the owner treats "nothing to write" as a moment to re-read the stop state, and a stop
 # request that cannot be delivered as a wake-up is still observed within this bound.
 OWNER_POLL_SECONDS = 0.001
+RECOVERY_INTERVAL_SECONDS = 1.0
 
 # The fixed labels an outbound peer call may carry. These are code-level interface names,
 # never a configured URL, host, account or channel identifier.
@@ -552,9 +553,19 @@ class _Queued:
     waiting side polls cannot be missed, because the waiter is the one doing the checking.
     """
 
-    __slots__ = ("line", "sequence", "size", "fsync", "durable", "settled", "ok", "stream")
+    __slots__ = (
+        "line",
+        "sequence",
+        "size",
+        "fsync",
+        "durable",
+        "settled",
+        "ok",
+        "stream",
+        "maintenance",
+    )
 
-    def __init__(self, line, sequence, *, fsync, durable=False, stream=False):
+    def __init__(self, line, sequence, *, fsync, durable=False, stream=False, maintenance=False):
         self.line = line
         self.sequence = sequence
         self.size = len(line)
@@ -567,6 +578,7 @@ class _Queued:
         # Which destination this record is for: the segment file, or the diagnostic stream the
         # process was started with when no directory is configured.
         self.stream = stream
+        self.maintenance = maintenance
         self.settled = False
         self.ok = False
 
@@ -591,7 +603,7 @@ class LogAdapter:
 
     Failure is never silent: `dropped` counts what was not written, `health()` reports it, and
     `accepts_business()` refuses new work while the destination is unusable. Recovery is an
-    explicit maintenance act (`probe`), never the side effect of a later lucky event.
+    owned maintenance proof (`probe` or the idle capacity check), never a later lucky event.
     """
 
     def __init__(
@@ -640,6 +652,7 @@ class LogAdapter:
         self.wrote_once = False
         self._warned = False
         self.probe_pending = False
+        self._recovery_due = None
         self.closing = False
         self.closed = False
         self._shutdown_started = False
@@ -968,6 +981,17 @@ class LogAdapter:
             try:
                 return self._queue.get(timeout=OWNER_POLL_SECONDS)
             except queue.Empty:
+                # Capacity recovery is maintenance on this same file owner. A read-only
+                # health poll never writes, and accepted work is always drained first.
+                if self.capacity_exhausted and not self.probe_pending:
+                    now = time.monotonic()
+                    if self._recovery_due is None:
+                        self._recovery_due = now + RECOVERY_INTERVAL_SECONDS
+                    elif now >= self._recovery_due:
+                        self._begin_probe()
+                        self._recovery_due = now + RECOVERY_INTERVAL_SECONDS
+                else:
+                    self._recovery_due = None
                 continue
 
     def _drain(self):
@@ -985,7 +1009,19 @@ class LogAdapter:
             try:
                 if item is None:
                     return
-                ok = self._write(item.line, fsync=item.fsync or item.durable)
+                if item.maintenance:
+                    used, _ = self._scan_directory()
+                    with self._state_lock:
+                        self._directory_bytes = used
+                        fits = used + item.size <= self.max_directory_bytes
+                        if fits:
+                            # A pure capacity refusal has not attempted an append. Only
+                            # spend the proof's number once bytes may reach the file;
+                            # an unknown write/fsync result must never reuse that number.
+                            self._sequence = item.sequence
+                    ok = fits and self._write(item.line, fsync=True)
+                else:
+                    ok = self._write(item.line, fsync=item.fsync or item.durable)
                 with self._state_lock:
                     self._pending -= 1
                     self._pending_bytes -= item.size
@@ -994,6 +1030,11 @@ class LogAdapter:
                     else:
                         self.dropped += 1
                     self._outstanding.discard(item.sequence)
+                    if item.maintenance:
+                        if ok:
+                            self.io_failed = self.capacity_exhausted = self.queue_full = False
+                            self._warned = False
+                        self.probe_pending = False
                 item.settle(ok)
             except Exception:  # noqa: BLE001 - the writer must outlive any single bad record
                 # One record that fails unexpectedly must not take the writer with it: a dead
@@ -1006,6 +1047,8 @@ class LogAdapter:
                     self.dropped += 1
                     self.io_failed = True
                     self._outstanding.discard(item.sequence)
+                    if item.maintenance:
+                        self.probe_pending = False
                 item.settle(False)
             finally:
                 # Only a record that was actually taken from the queue is accounted for. The stop
@@ -1213,23 +1256,18 @@ class LogAdapter:
 
     # ------------------------------------------------------------------ maintenance
 
-    def probe(self):
-        """Explicit maintenance action: prove a real write before trusting the log again.
-
-        Never called by the health endpoints or by any request path, so a probe never writes a
-        log record on its own account. Returns True only after a genuinely successful write;
-        until then the degraded state - and the `not_ready` verdict it forces - stands.
-        """
+    def _begin_probe(self):
+        """Queue one maintenance proof without waiting on this writer's own thread."""
         with self._state_lock:
-            if not self.durable or not self.degraded:
-                return not self.degraded
+            if (
+                not self.durable
+                or not self.degraded
+                or self.probe_pending
+                or self.closing
+                or self.closed
+            ):
+                return None
             self.probe_pending = True
-            was_io_failed, was_capacity, was_full = (
-                self.io_failed,
-                self.capacity_exhausted,
-                self.queue_full,
-            )
-            self.io_failed = self.capacity_exhausted = self.queue_full = False
             try:
                 line = encode_record(
                     {
@@ -1248,33 +1286,37 @@ class LogAdapter:
                     }
                 )
             except (ValueError, UnicodeError):
-                self.io_failed, self.capacity_exhausted, self.queue_full = (
-                    was_io_failed,
-                    was_capacity,
-                    was_full,
-                )
                 self.probe_pending = False
-                return False
-            item = _Queued(line, self._sequence + 1, fsync=True)
+                return None
+            item = _Queued(line, self._sequence + 1, fsync=True, maintenance=True)
             # Counted and marked outstanding *before* it is queued, for the same reason as
-            # `submit`: the writer can consume the record the moment it appears.
-            self._sequence += 1
+            # `submit`: the writer can consume the record the moment it appears. The
+            # degraded flags keep ordinary admissions closed until this proof is settled.
             self._pending += 1
             self._pending_bytes += item.size
             self._outstanding.add(item.sequence)
             try:
-                self._queue.put(item, timeout=self.drain_seconds)
+                self._queue.put_nowait(item)
             except queue.Full:
                 self._pending -= 1
                 self._pending_bytes -= item.size
                 self._outstanding.discard(item.sequence)
-                self.io_failed, self.capacity_exhausted, self.queue_full = (
-                    was_io_failed,
-                    was_capacity,
-                    was_full,
-                )
                 self.probe_pending = False
-                return False
+                return None
+            return item
+
+    def probe(self):
+        """Prove a fresh directory measurement and a durable write on the file owner.
+
+        Health routes never call this. Flags remain degraded until the actual writer
+        finishes the proof; a caller timing out cannot release its pending work.
+        """
+        with self._state_lock:
+            if not self.durable or not self.degraded:
+                return not self.degraded
+        item = self._begin_probe()
+        if item is None:
+            return False
         # Waiting for the writer outside the state lock, so a slow disk never blocks a reader
         # of `health()` - the maintenance action may wait, the health endpoint may not. The
         # completion flag is polled rather than awaited, for the same reason `admit` polls it.
@@ -1282,16 +1324,7 @@ class LogAdapter:
         while not item.settled and time.monotonic() < deadline:
             time.sleep(ADMISSION_POLL_SECONDS)
         with self._state_lock:
-            self.probe_pending = False
-            if item.settled and item.ok:
-                self._warned = False
-                return True
-            self.io_failed, self.capacity_exhausted, self.queue_full = (
-                was_io_failed,
-                was_capacity,
-                was_full,
-            )
-            return False
+            return item.settled and item.ok and not self.degraded
 
     # ---------------------------------------------------------------------- closing
 
