@@ -4,6 +4,9 @@ import json
 import copy
 import base64
 import hashlib
+from contextlib import nullcontext
+
+from . import observability as obs
 
 from .clients import epoch
 
@@ -122,34 +125,39 @@ class Reading:
                     raise Fault("invalid_input")
                 missing = value["code"] == "not_found" and value["execution_state"] == "not_started"
 
-        try:
-            response = await self.core.knowledge_client.call(
-                "/internal/v1/knowledge/content/" + operation,
-                request,
-                uncertain_write=uncertain,
-                error_response=owner_error,
-            )
-        except Fault as error:
-            if missing:
-                raise Fault("not_found", cause=error.cause) from None
-            raise
-        self.core.contracts.check("knowledge-content#" + operation + "_response", response)
-        if (
-            response["request_id"] != request_id
-            or epoch(response["available_until"]) <= self.core.clock()
+        with (
+            obs.trace_stage(self.core.events, "turn.knowledge")
+            if operation == "read"
+            else nullcontext()
         ):
-            raise Fault("scope_changed")
-        if operation == "read" and response["content_ref"] != request["content_ref"]:
-            raise Fault("version_conflict")
-        if operation == "read":
-            for representation in response["representations"]:
-                data = base64.b64decode(representation["data_base64"], validate=True)
-                if (
-                    hashlib.sha256(data).hexdigest() != representation["sha256"]
-                    or representation["source_sha256"] != request["content_ref"]["sha256"]
-                ):
-                    raise Fault("invalid_input")
-        return response
+            try:
+                response = await self.core.knowledge_client.call(
+                    "/internal/v1/knowledge/content/" + operation,
+                    request,
+                    uncertain_write=uncertain,
+                    error_response=owner_error,
+                )
+            except Fault as error:
+                if missing:
+                    raise Fault("not_found", cause=error.cause) from None
+                raise
+            self.core.contracts.check("knowledge-content#" + operation + "_response", response)
+            if (
+                response["request_id"] != request_id
+                or epoch(response["available_until"]) <= self.core.clock()
+            ):
+                raise Fault("scope_changed")
+            if operation == "read" and response["content_ref"] != request["content_ref"]:
+                raise Fault("version_conflict")
+            if operation == "read":
+                for representation in response["representations"]:
+                    data = base64.b64decode(representation["data_base64"], validate=True)
+                    if (
+                        hashlib.sha256(data).hexdigest() != representation["sha256"]
+                        or representation["source_sha256"] != request["content_ref"]["sha256"]
+                    ):
+                        raise Fault("invalid_input")
+            return response
 
     async def action(
         self, service, request, *, internal_scope=None, operation_ref=None, return_content=False
@@ -523,36 +531,41 @@ class Reading:
             if not allow_unregistered or scope is None or reference["owner"] != "memory":
                 raise
             stored = dict(scope=scope, id=reference["object_id"])
-        if reference["owner"] == "companion" and reference["kind"] == "image":
-            data, media = self.core.life.album.read(actor, reference["object_id"], scope)
-            media_type = media["media_type"]
-        elif reference["owner"] == "companion" and reference["kind"] == "text":
-            revision = self.core.writing._get("revisions", reference["object_id"])
-            data, media_type = revision["content"].encode("utf-8"), "text/plain"
-        elif reference["owner"] == "memory":
-            if stored.get("scope") is None and actor_owned:
-                principal = self.principal(actor, None, None, stored["operation_ref"])
-            elif query:
-                principal = self.principal(actor, scope, query, stored["id"])
+        with (
+            obs.trace_stage(self.core.events, "turn.knowledge")
+            if reference["owner"] == "memory"
+            else nullcontext()
+        ):
+            if reference["owner"] == "companion" and reference["kind"] == "image":
+                data, media = self.core.life.album.read(actor, reference["object_id"], scope)
+                media_type = media["media_type"]
+            elif reference["owner"] == "companion" and reference["kind"] == "text":
+                revision = self.core.writing._get("revisions", reference["object_id"])
+                data, media_type = revision["content"].encode("utf-8"), "text/plain"
+            elif reference["owner"] == "memory":
+                if stored.get("scope") is None and actor_owned:
+                    principal = self.principal(actor, None, None, stored["operation_ref"])
+                elif query:
+                    principal = self.principal(actor, scope, query, stored["id"])
+                else:
+                    raise Fault("forbidden")
+                request = dict(principal=principal, content_ref=reference, range=None)
+                self.core.contracts.check("knowledge-content#original_request", request)
+                if self.core.knowledge_client is None:
+                    raise Fault("dependency_unavailable")
+                data, headers = await self.core.knowledge_client.binary(
+                    "/internal/v1/knowledge/content/original", request
+                )
+                if headers.get("x-content-sha256") != reference["sha256"] or headers.get(
+                    "x-content-version"
+                ) != str(reference["version"]):
+                    raise Fault("version_conflict")
+                media_type = headers.get("content-type", "").split(";")[0].strip()
             else:
-                raise Fault("forbidden")
-            request = dict(principal=principal, content_ref=reference, range=None)
-            self.core.contracts.check("knowledge-content#original_request", request)
-            if self.core.knowledge_client is None:
                 raise Fault("dependency_unavailable")
-            data, headers = await self.core.knowledge_client.binary(
-                "/internal/v1/knowledge/content/original", request
-            )
-            if headers.get("x-content-sha256") != reference["sha256"] or headers.get(
-                "x-content-version"
-            ) != str(reference["version"]):
+            if hashlib.sha256(data).hexdigest() != reference["sha256"]:
                 raise Fault("version_conflict")
-            media_type = headers.get("content-type", "").split(";")[0].strip()
-        else:
-            raise Fault("dependency_unavailable")
-        if hashlib.sha256(data).hexdigest() != reference["sha256"]:
-            raise Fault("version_conflict")
-        return data, media_type
+            return data, media_type
 
     async def materialize(self, actor, scope, references, origin=None, *, actor_owned=False):
         from .clients import query

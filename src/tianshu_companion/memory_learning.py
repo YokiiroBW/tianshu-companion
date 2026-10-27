@@ -520,6 +520,7 @@ class MemoryLearning:
                 # A quiet opportunity must not also bank an extra busy grant.
                 self._foreground_finished = 0
         phase["started"] = True
+        obs.emit(self.core.events, "memory.phase.started", "started")
         return True
 
     def _phase_page(self, family, states):
@@ -530,10 +531,16 @@ class MemoryLearning:
         table = "metadata" if family in {"observation", "processing_learning"} else "outbox"
         predicate = "conversation_id=? AND " if table == "metadata" else ""
         args = [QUEUE] if table == "metadata" else []
+        predecessors = (
+            "('pending','unknown','submitting','blocked_scope','relationship_pending','relationship_submitting') "
+            if family == "relationship"
+            else "('pending','unknown','submitting','blocked_scope') "
+        )
         predecessor = (
             "AND NOT EXISTS (SELECT 1 FROM outbox p WHERE p.conversation_id=outbox.conversation_id "
-            "AND p.status IN ('pending','unknown','submitting','blocked_scope') "
-            "AND json_extract(p.body,'$.event.scope.actor_id')=json_extract(outbox.body,'$.event.scope.actor_id') "
+            "AND p.status IN "
+            + predecessors
+            + "AND json_extract(p.body,'$.event.scope.actor_id')=json_extract(outbox.body,'$.event.scope.actor_id') "
             "AND (p.position,p.id)<(outbox.position,outbox.id)) "
             if table == "outbox"
             else ""
@@ -593,13 +600,9 @@ class MemoryLearning:
                     if family == "relationship"
                     else ["blocked_scope", "pending", "unknown"]
                 )
-                rows = (
-                    self._phase_page(family, states)
-                    if family == "outbox"
-                    else core.store.due("outbox", states, now, limit=64)
-                )
+                rows = self._phase_page(family, states)
                 item = (
-                    (rows[0] if rows else None)
+                    next((row for row in rows if not core.group_processing.paused(row)), None)
                     if family == "relationship"
                     else next(
                         (
@@ -651,6 +654,7 @@ class MemoryLearning:
     async def _run_phase(self, phase):
         self._phase = phase
         core, item = self.core, phase["item"]
+        failure = None
         try:
             if phase["family"] != "participation" and not await core.group_processing.start(item):
                 return
@@ -668,9 +672,29 @@ class MemoryLearning:
                         elif phase["family"] == "actor_memory":
                             await core.actor_memory.flush(item)
                         else:
-                            await core.relationships.flush(core)
+                            await core.relationships.flush(core, selected=item)
                 core.counted("memory.work")
+        except BaseException as error:
+            failure = error
+            raise
         finally:
+            if phase["started"]:
+                state = item.get("state")
+                if state in {"unknown", "relationship_unknown"}:
+                    outcome = "unknown"
+                elif isinstance(failure, asyncio.CancelledError):
+                    outcome = "cancelled"
+                elif failure is not None or state == "blocked" or item.get("last_error"):
+                    outcome = "failed"
+                elif state in {"completed", "delivered"}:
+                    outcome = "succeeded"
+                elif state in {"invalidated", "discarded_source", "relationship_rejected"}:
+                    outcome = "cancelled"
+                else:
+                    # A completed local phase can leave a real job pending.
+                    # It is progress, not proof of a committed memory or send.
+                    outcome = "degraded"
+                obs.emit(core.events, "memory.phase.finished", outcome)
             self._phase = None
             if not self._automatic_due():
                 self._foreground_finished = 0
@@ -719,7 +743,10 @@ class MemoryLearning:
                 phase = self._select_phase(outbox_only=outbox_only)
                 if phase is None:
                     return
-                self.jobs[phase["item"]["id"]] = asyncio.create_task(self._run_phase(phase))
+                # This is new asynchronous work. It has its own execution ID,
+                # not the already completed HTTP or chat request's lifetime.
+                with obs.correlation_scope(obs.new_correlation_id()):
+                    self.jobs[phase["item"]["id"]] = asyncio.create_task(self._run_phase(phase))
                 selected = list(self.jobs.values())
         if wait and selected:
             try:

@@ -7,6 +7,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from . import observability as obs
 from .contracts import Fault, canonical, digest
 
 CONTROLS = {"window", "sheer", "curtain", "desk_light", "ceiling_light"}
@@ -732,7 +733,10 @@ class Life:
                 if len(self._jobs) >= self._background_limit:
                     break
                 if actor not in self._jobs:
-                    self._jobs[actor] = asyncio.create_task(self._actor_work(actor))
+                    # A background actor phase is independent of the request
+                    # that originally changed its schedule or saved material.
+                    with obs.correlation_scope(obs.new_correlation_id()):
+                        self._jobs[actor] = asyncio.create_task(self._actor_work(actor))
                     self._actor_cursor = actor
             jobs = list(self._jobs.values())
         if wait and jobs:

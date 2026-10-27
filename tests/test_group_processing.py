@@ -86,15 +86,21 @@ class GroupProcessingTests(unittest.IsolatedAsyncioTestCase):
         await self.chat("group:20002")
         self.h.core.group_processing.client = self.client
         self.disabled.add("group:20001")
+        conversations = {
+            turn["bundle"]["collection_key"]["channel"]["channel_conversation_id"]: turn[
+                "conversation_id"
+            ]
+            for turn in self.h.turns()
+        }
         before = [
             copy.deepcopy(row)
             for row in self.h.core.store.list("outbox")
-            if row["event"]["scope"]["conversation_id"] == self.h.turns()[0]["conversation_id"]
+            if row["event"]["scope"]["conversation_id"] == conversations["group:20001"]
         ]
         await self.worker.work()
         self.assertEqual(1, len(self.peer.accepted))
         self.assertEqual(
-            self.h.turns()[-1]["conversation_id"],
+            conversations["group:20002"],
             self.peer.accepted[0]["event"]["scope"]["conversation_id"],
         )
         after = [

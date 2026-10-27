@@ -5,6 +5,8 @@ import json
 import re
 from datetime import datetime, time, timedelta, timezone
 
+from . import observability as obs
+
 from .clients import uid, utc
 from .contracts import Fault, digest
 from .life import expected_version, text, timestamp, zone
@@ -128,6 +130,7 @@ class Proactive:
         *,
         dispatcher=None,
         expression=None,
+        events=None,
         timeout=20,
         max_subjects=200,
         max_candidates=500,
@@ -139,6 +142,7 @@ class Proactive:
         self.store, self.clock, self.guard = store, clock, guard
         self.dispatcher = dispatcher
         self.expression = expression
+        self.events = events
         for name, value, ceiling in (
             ("timeout", timeout, 600),
             ("max_subjects", max_subjects, 2000),
@@ -1042,70 +1046,108 @@ class Proactive:
         if self.lock.locked():
             return
         async with self.lock:
-            if getattr(self.dispatcher, "native_delivery", False):
-                self.dispatcher.offer_pending_events()
-                self.dispatcher.feedback_for_contacts()
-            self.tick(force=True)
-            if getattr(self.dispatcher, "native_delivery", False):
-                rows = self.store.db.execute(
-                    "SELECT body FROM proactive_attempts WHERE (status IN ('queued','sending','unknown') OR (status='partial' AND json_extract(body,'$.unresolved')=1)) AND json_extract(body,'$.delivery') IS NOT NULL ORDER BY position,id LIMIT 4"
-                ).fetchall()
-                for row in rows:
-                    attempt = json.loads(row[0])
-                    try:
-                        result = await self.dispatcher.reconcile_proactive(attempt)
-                        if result:
-                            self.settle(attempt["id"], result)
-                    except (Fault, OSError):
-                        pass
-            if not self._dispatcher_available():
-                return
-            if hasattr(self.dispatcher, "pending_photos"):
-                await self.dispatcher.pending_photos()
-            row = self.store.db.execute(
-                "SELECT id FROM proactive_candidates WHERE status='ready' AND COALESCE(json_extract(body,'$.photo_state'),'') NOT IN ('waiting','decided') "
-                "ORDER BY json_extract(body,'$.weight') DESC,deadline,position,id LIMIT 1"
-            ).fetchone()
-            if row is None:
-                return
-            candidate = self.store.get("proactive_candidates", row[0])
-            if candidate["kind"] == "motive" and candidate.get("expression_state") != "completed":
-                if self.expression is None:
+            with obs.correlation_scope(obs.new_correlation_id()):
+                if getattr(self.dispatcher, "native_delivery", False):
+                    self.dispatcher.offer_pending_events()
+                    self.dispatcher.feedback_for_contacts()
+                self.tick(force=True)
+                if getattr(self.dispatcher, "native_delivery", False):
+                    await self._reconcile_pending()
+                if not self._dispatcher_available():
                     return
-                candidate.update(
-                    expression_state="generating",
-                    expression_attempts=candidate["expression_attempts"] + 1,
-                )
-                self._save("candidates", candidate)
-                try:
-                    content, receipt = await self.expression(candidate)
-                except Exception:
+                if hasattr(self.dispatcher, "pending_photos"):
+                    await self.dispatcher.pending_photos()
+                row = self.store.db.execute(
+                    "SELECT id FROM proactive_candidates WHERE status='ready' AND COALESCE(json_extract(body,'$.photo_state'),'') NOT IN ('waiting','decided') "
+                    "ORDER BY json_extract(body,'$.weight') DESC,deadline,position,id LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    return
+                candidate = self.store.get("proactive_candidates", row[0])
+                if (
+                    candidate["kind"] == "motive"
+                    and candidate.get("expression_state") != "completed"
+                ):
+                    if self.expression is None:
+                        return
                     candidate.update(
-                        expression_state="unknown", state="unknown", decision="expression_unknown"
+                        expression_state="generating",
+                        expression_attempts=candidate["expression_attempts"] + 1,
                     )
                     self._save("candidates", candidate)
-                    return
-                fresh = self.store.get("proactive_candidates", candidate["id"])
-                if (
-                    fresh["state"] != "ready"
-                    or fresh["subject_version"] != candidate["subject_version"]
-                ):
-                    return
-                if content is None:
-                    self._apply(fresh, "cancelled", None, "expression_declined", self.clock())
-                    return
-                fresh.update(
-                    content=text(content, 4000),
-                    content_version=digest([content, receipt]),
-                    expression_state="completed",
-                    expression_receipt=receipt,
-                )
-                self._save("candidates", fresh)
-            candidate = self.store.get("proactive_candidates", row[0])
-            if candidate.get("photo") and hasattr(self.dispatcher, "prepare_photo"):
-                if not await self.dispatcher.prepare_photo(candidate):
-                    return
-            await self.dispatch(row[0])
+                    try:
+                        content, receipt = await self.expression(candidate)
+                    except Exception:
+                        candidate.update(
+                            expression_state="unknown",
+                            state="unknown",
+                            decision="expression_unknown",
+                        )
+                        self._save("candidates", candidate)
+                        return
+                    fresh = self.store.get("proactive_candidates", candidate["id"])
+                    if (
+                        fresh["state"] != "ready"
+                        or fresh["subject_version"] != candidate["subject_version"]
+                    ):
+                        return
+                    if content is None:
+                        self._apply(fresh, "cancelled", None, "expression_declined", self.clock())
+                        return
+                    fresh.update(
+                        content=text(content, 4000),
+                        content_version=digest([content, receipt]),
+                        expression_state="completed",
+                        expression_receipt=receipt,
+                    )
+                    self._save("candidates", fresh)
+                candidate = self.store.get("proactive_candidates", row[0])
+                if candidate.get("photo") and hasattr(self.dispatcher, "prepare_photo"):
+                    if not await self.dispatcher.prepare_photo(candidate):
+                        return
+                await self.dispatch(row[0])
+
+    async def _reconcile_pending(self):
+        """Rotate four existing receipts; unresolved heads cannot starve later ones.
+
+        Each expression has its own receipt identity and Platform owns its send
+        ordering. Reads can overlap, but all finish before this pass rechecks
+        subscriptions, quota and cooldown for any new contact.
+        """
+        from .context_checks import read_parallel
+
+        identities = self._rotating_scan(
+            "receipts",
+            "FROM proactive_attempts WHERE "
+            "(status IN ('queued','sending','unknown') OR "
+            "(status='partial' AND json_extract(body,'$.unresolved')=1)) "
+            "AND json_extract(body,'$.delivery') IS NOT NULL",
+            (),
+            4,
+        )
+        attempts = self.store.get_many("proactive_attempts", identities)
+
+        async def reconcile(attempt):
+            with obs.correlation_scope(obs.new_correlation_id()):
+                obs.emit(self.events, "proactive.reconcile.started", "started")
+                outcome, code = "unknown", None
+                try:
+                    result = await self.dispatcher.reconcile_proactive(attempt)
+                    if result:
+                        self.settle(attempt["id"], result)
+                        outcome = obs.runtime_outcome(result["state"]) or "unknown"
+                except asyncio.CancelledError:
+                    # Ending this receipt read does not cancel or undo its send.
+                    code = "cancelled"
+                    raise
+                except (Fault, OSError, TimeoutError) as error:
+                    # The original send remains unresolved. Never resend it to
+                    # compensate for an unavailable or abandoned receipt read.
+                    code = error.code if isinstance(error, Fault) else obs.failure_class(error)
+                finally:
+                    obs.emit(self.events, "proactive.reconcile.finished", outcome, error_code=code)
+
+        await read_parallel([lambda item=attempts[key]: reconcile(item) for key in identities])
 
     async def dispatch(self, candidate_id):
         """Submit one ready candidate. Does nothing without an available dispatcher."""
@@ -1200,9 +1242,13 @@ class Proactive:
                 closed_at=None,
             )
             self._save("candidates", candidate)
+        obs.emit(self.events, "proactive.delivery.started", "started")
         try:
             result = await asyncio.wait_for(self.dispatcher.dispatch(request), timeout=self.timeout)
             self._check_result(request, result)
+        except asyncio.CancelledError:
+            obs.emit(self.events, "proactive.delivery.finished", "unknown", error_code="cancelled")
+            raise
         except Exception as exc:
             attempt = self.store.get("proactive_attempts", request_id)
             # Source/permission checks precede the persisted native envelope. Only
@@ -1222,6 +1268,11 @@ class Proactive:
                 observed_at=utc(self.clock()),
             )
         self.settle(request_id, result)
+        obs.emit(
+            self.events,
+            "proactive.delivery.finished",
+            obs.runtime_outcome(result["state"]) or "unknown",
+        )
         # Refresh the other open candidates so their decision reflects this contact's
         # cooldown, quota and unanswered accounting.
         self.tick(force=True)

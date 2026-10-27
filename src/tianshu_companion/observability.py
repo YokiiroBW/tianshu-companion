@@ -125,7 +125,17 @@ EVENTS = frozenset(
         "turn.cancelled",
         "turn.delivery.started",
         "turn.delivery.finished",
+        "turn.memory.started",
+        "turn.memory.finished",
+        "turn.knowledge.started",
+        "turn.knowledge.finished",
         "outbox.flush",
+        "memory.phase.started",
+        "memory.phase.finished",
+        "proactive.reconcile.started",
+        "proactive.reconcile.finished",
+        "proactive.delivery.started",
+        "proactive.delivery.finished",
         # explicit functional commands
         "direct.request.queued",
         "direct.request.cancelled",
@@ -177,7 +187,12 @@ TERMINAL_EVENTS = frozenset(
         "turn.generation.finished",
         "turn.cancelled",
         "turn.delivery.finished",
+        "turn.memory.finished",
+        "turn.knowledge.finished",
         "outbox.flush",
+        "memory.phase.finished",
+        "proactive.reconcile.finished",
+        "proactive.delivery.finished",
         # explicit functional commands
         "direct.request.cancelled",
         "direct.attempt.finished",
@@ -383,6 +398,36 @@ def correlation_scope(value=None):
         yield resolved
     finally:
         _correlation.reset(token)
+
+
+@contextmanager
+def trace_stage(port, stage, *, uncertain=False):
+    """Observe the three actual call boundaries, using only the closed event shape.
+
+    The caller can project an authoritative receipt onto outcome/error_code;
+    returning a queued expression must never be logged as a confirmed send.
+    This context records facts only and never catches or retries the operation.
+    """
+    if stage not in {"turn.memory", "turn.knowledge", "turn.delivery"}:
+        raise ValueError("Unregistered traced stage")
+    result = dict(outcome="succeeded", error_code=None)
+    started = time.perf_counter()
+    emit(port, stage + ".started", "started")
+    try:
+        yield result
+    except asyncio.CancelledError:
+        result.update(outcome="unknown" if uncertain else "cancelled", error_code="cancelled")
+        raise
+    except Exception as error:
+        result.update(
+            outcome="unknown" if uncertain else "failed",
+            error_code=error_code(getattr(error, "code", failure_class(error))),
+        )
+        raise
+    finally:
+        emit(
+            port, stage + ".finished", **result, duration_ms=(time.perf_counter() - started) * 1000
+        )
 
 
 def failure_type(error):

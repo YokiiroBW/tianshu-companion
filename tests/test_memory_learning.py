@@ -11,6 +11,7 @@ from unittest.mock import patch
 import httpx
 
 from support import Harness
+from tianshu_companion import observability as obs
 from tianshu_companion.clients import Gateway, JsonService, Memory
 from tianshu_companion.contracts import Fault
 from tianshu_companion.model_selection import ModelSelection
@@ -144,6 +145,64 @@ class MemoryLearningTests(unittest.IsolatedAsyncioTestCase):
         status = read_capabilities(self.h.core)["automatic_memory_candidates"]
         self.assertTrue(status["retained_learning"]["completed"])
         self.assertFalse(status["retained_learning"]["pending"])
+
+    async def test_background_learning_has_one_new_phase_correlation_without_ending_parent_request(
+        self,
+    ):
+        records, calls = [], []
+        original = self.h.memory.process_candidate
+
+        class Events:
+            def emit(self, event, outcome, **fields):
+                records.append(dict(event=event, outcome=outcome, **fields))
+                return True
+
+        async def process(job, output):
+            calls.append(obs.current_correlation_id())
+            return await original(job, output)
+
+        self.h.core._events = Events()
+        self.h.memory.process_candidate = process
+        parent = "a" * 32
+        with obs.correlation_scope(parent):
+            await self.chat()
+            await self.flush()
+            self.assertEqual(parent, obs.current_correlation_id())
+        self.assertEqual("completed", self.task()["state"])
+        self.assertTrue(calls)
+        self.assertTrue(all(obs.valid_correlation_id(value) and value != parent for value in calls))
+        self.assertEqual(1, len(set(calls)))
+        phases = [record for record in records if record["event"].startswith("memory.phase.")]
+        self.assertTrue(phases)
+        self.assertTrue(all(record["correlation_id"] != parent for record in phases))
+        self.assertEqual(
+            ["started", "succeeded"],
+            [record["outcome"] for record in phases if record["correlation_id"] == calls[0]],
+        )
+        self.assertFalse(any(record["event"] == "service.request.finished" for record in records))
+
+    async def test_uncertain_outbox_event_remains_unknown_in_phase_observation(self):
+        records = []
+
+        class Events:
+            def emit(self, event, outcome, **fields):
+                records.append((event, outcome))
+                return True
+
+        async def lost(event):
+            raise Fault("result_unknown", unknown=True)
+
+        self.h.core._events = Events()
+        self.h.memory.commit = lost
+        await self.chat()
+        await self.h.core.flush_outbox()
+        item = self.h.core.store.list("outbox")[0]
+        self.assertEqual("unknown", item["state"])
+        self.assertEqual("result_unknown", item["last_error"])
+        self.assertEqual(
+            [("memory.phase.finished", "unknown")],
+            [record for record in records if record[0] == "memory.phase.finished"],
+        )
 
     async def test_empty_mixed_extraction_reviews_once_and_reconciles_uncertain_write(self):
         await self.chat()

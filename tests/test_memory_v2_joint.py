@@ -343,7 +343,7 @@ def test_candidate_owner_defers_real_episode_capture_until_dialogue_boundary(syn
             role=h.core.roles[scope["actor_id"]],
             phase="sent",
             cancelled=False,
-            bundle=dict(messages=[message]),
+            bundle=dict(messages=[message], collection_revision=1),
             config_version=1,
         )
         h.core.store.put("turns", turn)

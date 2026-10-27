@@ -23,8 +23,8 @@ class Relationships:
     def recover(self, core):
         outbox.recover(core)
 
-    async def flush(self, core):
-        await outbox.flush(self, core)
+    async def flush(self, core, *, selected=None):
+        await outbox.flush(self, core, selected=selected)
 
 
 def assemble(config, memory_service):

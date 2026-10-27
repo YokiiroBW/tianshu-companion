@@ -290,6 +290,67 @@ class RelationshipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(self.settlements))
         self.assertEqual(1, len(self.seen))
 
+    async def test_paused_relationship_page_does_not_starve_or_replace_selected_other_room(self):
+        for channel, account in (("private:a", "a"), ("private:b", "b")):
+            await self.h.core.ingest("nonebot", self.h.request(channel=channel, account=account))
+            await self.h.cycles(100)
+            await self.h.core._flush_outbox()
+        pending = self.h.core.store.list("outbox", states=["relationship_pending"])
+        self.assertEqual(2, len(pending))
+        first = next(
+            item for item in pending if item["event"]["aggregate_id"] == self.h.turns()[0]["id"]
+        )
+        live = next(item for item in pending if item["id"] != first["id"])
+        paused = {first["id"]}
+        # More paused rows than one bounded scan must not hide an unrelated
+        # recipient forever. Every copy keeps the original immutable event ID.
+        for index in range(70):
+            item = copy.deepcopy(first)
+            item.update(id=f"paused-relationship:{index:02}", deadline=0)
+            self.h.core.store.put("outbox", item)
+            paused.add(item["id"])
+        before = {key: self.h.core.store.get("outbox", key) for key in paused}
+        self.h.core.group_processing.paused = lambda item: item["id"] in paused
+
+        async def start(item):
+            return not self.h.core.group_processing.paused(item)
+
+        self.h.core.group_processing.start = start
+        for _ in range(3):
+            await self.h.core.memory_learning.work(outbox_only=True)
+            if self.settlements:
+                break
+        self.assertEqual([live["relationship_candidate"]], self.settlements)
+        self.assertEqual("delivered", self.h.core.store.get("outbox", live["id"])["state"])
+        self.assertEqual(before, {key: self.h.core.store.get("outbox", key) for key in paused})
+
+    async def test_rotating_relationship_reads_do_not_overtake_same_room_predecessor(self):
+        for index in range(3):
+            await self.h.core.ingest("nonebot", self.h.request(text=f"当前第{index}条明确原话"))
+            await self.h.cycles(100)
+            await self.h.core._flush_outbox()
+        pending = sorted(
+            self.h.core.store.list("outbox", states=["relationship_pending"]),
+            key=lambda item: item["event"]["turn_sequence"],
+        )
+        self.assertEqual(3, len(pending))
+        for index, item in enumerate(pending, 1):
+            item["deadline"] = index
+            self.h.core.store.put("outbox", item)
+        # A cursor left by another room cannot authorize a newer event in this
+        # room to pass an older pending event, even when it is the next due row.
+        worker = self.h.core.memory_learning
+        worker._phase_cursor_relationship = (1, pending[0]["id"])
+        for _ in range(3):
+            await worker.work(outbox_only=True)
+            if self.settlements:
+                break
+        self.assertEqual([pending[0]["relationship_candidate"]], self.settlements)
+        self.assertEqual(
+            ["relationship_pending", "relationship_pending"],
+            [self.h.core.store.get("outbox", item["id"])["state"] for item in pending[1:]],
+        )
+
     async def test_failed_send_does_not_submit_candidate(self):
         self.h.sender.states = ["failed"]
         await self.finish()

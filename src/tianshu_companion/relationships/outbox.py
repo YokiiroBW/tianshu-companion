@@ -78,8 +78,21 @@ def recover(core):
         core.store.put("outbox", item)
 
 
-async def flush(runtime, core):
-    for item in core.store.due("outbox", ["relationship_pending"], core.clock(), limit=1):
+async def flush(runtime, core, *, selected=None):
+    if selected is None:
+        items = core.store.due("outbox", ["relationship_pending"], core.clock(), limit=1)
+    else:
+        # Group-processing eligibility belongs to the exact selected row. A
+        # second global head read could execute another paused room instead.
+        item = core.store.get("outbox", selected["id"])
+        items = (
+            [item]
+            if item is not None
+            and item["state"] == "relationship_pending"
+            and item["deadline"] <= core.clock()
+            else []
+        )
+    for item in items:
         turn = core.store.get("turns", item["event"]["aggregate_id"])
         attempts = item.get("relationship_attempts", 0) + 1
         outcome, code = "succeeded", None

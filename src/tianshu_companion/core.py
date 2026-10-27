@@ -253,6 +253,7 @@ class Core(Delivery):
                 clock,
                 self._proactive_guard,
                 dispatcher=proactive_dispatcher,
+                events=self.events,
                 **(proactive_options or {}),
             )
             self._counting = (
@@ -1524,22 +1525,23 @@ class Core(Delivery):
                 recall = self._turn_allows(turn, "memory.read")
                 budget = dict(tokens=8192 if recall else 0, bytes=8192 if recall else 0)
                 try:
-                    memory_context = None
-                    if hasattr(self.memory, "query_context"):
-                        from .memory_context import selection as project_selection
+                    with obs.trace_stage(self.events, "turn.memory"):
+                        memory_context = None
+                        if hasattr(self.memory, "query_context"):
+                            from .memory_context import selection as project_selection
 
-                        memory_context = await self.memory.query_context(
-                            turn["origin"],
-                            turn["scope"],
-                            text or "media",
-                            budget,
-                            retrieval_mode="context",
-                        )
-                        selection = project_selection(memory_context)
-                    else:
-                        selection = await self.memory.select(
-                            turn["origin"], turn["scope"], text or "media", budget
-                        )
+                            memory_context = await self.memory.query_context(
+                                turn["origin"],
+                                turn["scope"],
+                                text or "media",
+                                budget,
+                                retrieval_mode="context",
+                            )
+                            selection = project_selection(memory_context)
+                        else:
+                            selection = await self.memory.select(
+                                turn["origin"], turn["scope"], text or "media", budget
+                            )
                 except Fault as error:
                     if error.retryable_read:
                         # Durable preparation recovery handles explicit peer congestion;
@@ -2743,7 +2745,9 @@ class Core(Delivery):
             turn = self.store.get("turns", item["event"]["aggregate_id"])
             if not self._turn_allows(turn, "memory.write"):
                 continue
-            with obs.correlation_scope(self._turn_correlation(turn)):
+            with obs.correlation_scope(
+                obs.current_correlation_id() or self._turn_correlation(turn)
+            ):
                 outcome, error_code = "succeeded", None
                 attempts = item["attempts"] + 1
                 try:

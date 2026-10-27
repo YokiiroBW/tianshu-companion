@@ -161,28 +161,40 @@ class Delivery:
             turn["stream_open"] = True
             turn.setdefault("expression_started_at", self.clock())
             self._save_turn(turn)
-        try:
-            receipt = await sender.send_expression(request)
-        except Exception as error:
-            with self.store.transaction():
-                reply = self.store.get("replies", segment_id)
-                reply.update(state="unknown", unknown_since=self.clock())
-                self.store.put("replies", reply)
-            diagnostic = obs.failure_diagnostic(
-                error, code="result_unknown", attempt=1, stage="delivery", observed_at=self.clock()
-            )
-            failure = Fault(
-                "result_unknown",
-                unknown=True,
-                cause={
-                    key: diagnostic[key]
-                    for key in ("category", "peer", "operation", "http_status", "exception_type")
-                    if key in diagnostic
-                },
-            )
-            failure.companion_failure_stage = "delivery"
-            raise failure from None
-        self.record_expression(turn_id, receipt)
+        with obs.trace_stage(self.events, "turn.delivery", uncertain=True) as observed:
+            try:
+                receipt = await sender.send_expression(request)
+            except Exception as error:
+                with self.store.transaction():
+                    reply = self.store.get("replies", segment_id)
+                    reply.update(state="unknown", unknown_since=self.clock())
+                    self.store.put("replies", reply)
+                diagnostic = obs.failure_diagnostic(
+                    error,
+                    code="result_unknown",
+                    attempt=1,
+                    stage="delivery",
+                    observed_at=self.clock(),
+                )
+                failure = Fault(
+                    "result_unknown",
+                    unknown=True,
+                    cause={
+                        key: diagnostic[key]
+                        for key in (
+                            "category",
+                            "peer",
+                            "operation",
+                            "http_status",
+                            "exception_type",
+                        )
+                        if key in diagnostic
+                    },
+                )
+                failure.companion_failure_stage = "delivery"
+                raise failure from None
+            self.record_expression(turn_id, receipt)
+            observed["outcome"] = obs.runtime_outcome(receipt["state"]) or "unknown"
 
     def record_contact(
         self, expression_id, scope, receipt, *, kind="response", subscription_id=None
@@ -522,34 +534,29 @@ class Delivery:
             self._save_turn(turn)
         # The intent is durable before the transport call, so an event recorded here can
         # never be the only evidence that a send was attempted.
-        obs.emit(self.events, "turn.delivery.started", "started")
-        try:
-            receipt = await asyncio.wait_for(sender.send(request), timeout=20)
-            self._check_receipt(request, receipt)
-        except Exception:
-            receipt = dict(
-                schema_version=1,
-                request_id=request["command"]["request_id"],
-                reply_id=reply["id"],
-                segment_sequence=reply["segment_sequence"],
-                attempt_id=uid("unknown"),
-                state="unknown",
-                channel_message_ids=[],
-                observed_at=utc(self.clock()),
-                retry_safe=False,
+        with obs.trace_stage(self.events, "turn.delivery", uncertain=True) as observed:
+            try:
+                receipt = await asyncio.wait_for(sender.send(request), timeout=20)
+                self._check_receipt(request, receipt)
+            except Exception:
+                receipt = dict(
+                    schema_version=1,
+                    request_id=request["command"]["request_id"],
+                    reply_id=reply["id"],
+                    segment_sequence=reply["segment_sequence"],
+                    attempt_id=uid("unknown"),
+                    state="unknown",
+                    channel_message_ids=[],
+                    observed_at=utc(self.clock()),
+                    retry_safe=False,
+                )
+            # Only the actual receipt decides a confirmed send. The trace is
+            # observational and never retries an unknown transport outcome.
+            self.record_receipt(reply["id"], receipt)
+            observed.update(
+                outcome=obs.runtime_outcome(receipt["state"]) or "unknown",
+                error_code=None if receipt["state"] == "sent" else "result_unknown",
             )
-        # One reply, one outcome. An `unknown` verdict is recorded as unknown and never
-        # becomes a retry: the log repeats the receipt, it never decides a new one. The
-        # receipt's own state is a *domain* verdict (`sent`, `failed`, `unknown`); the adapter
-        # maps it onto the frozen runtime outcome, so a successful send is reported as
-        # `succeeded` instead of being refused for not being a runtime word.
-        obs.emit(
-            self.events,
-            "turn.delivery.finished",
-            receipt["state"],
-            error_code=None if receipt["state"] == "sent" else "result_unknown",
-        )
-        self.record_receipt(reply["id"], receipt)
 
     def _check_receipt(self, request, receipt):
         self.contracts.check("conversation#send_receipt", receipt)
