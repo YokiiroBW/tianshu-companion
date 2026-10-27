@@ -27,6 +27,10 @@ def harness(tmp_path, request):
         h = Harness(tmp_path / "receipts.sqlite")
     schema = h.core.store.database.schema if h.core.store.backend == "postgresql" else None
     try:
+        if request.param == "postgresql":
+            assert h.core.store.backend == "postgresql", (
+                "isolated PG configuration fell back to SQLite"
+            )
         yield h
     finally:
         h.core.store.close()

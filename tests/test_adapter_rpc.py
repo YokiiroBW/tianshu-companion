@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -17,9 +18,19 @@ class AdapterRpcTests(unittest.TestCase):
         from jsonschema import Draft202012Validator, FormatChecker
         from referencing import Registry, Resource
 
-        contracts = next((parent / "contracts" for parent in Path(__file__).resolve().parents
-                          if (parent / "contracts" / "bot-connection" / "v1" / "schemas" /
-                              "bot-connection.json").is_file()), None)
+        configured = os.environ.get("TIANSHU_CONTRACTS")
+        if configured:
+            contracts = Path(configured).resolve().parents[1]
+        else:
+            contracts = next(
+                (
+                    parent / "contracts"
+                    for parent in Path(__file__).resolve().parents
+                    if (parent / "contracts" / "bot-connection" / "v1" / "schemas" /
+                        "bot-connection.json").is_file()
+                ),
+                None,
+            )
         self.assertIsNotNone(contracts, "published bot-connection contract is missing")
         bot_schema = json.loads((contracts / "bot-connection" / "v1" / "schemas" /
                                  "bot-connection.json").read_text(encoding="utf-8"))

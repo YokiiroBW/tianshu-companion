@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 from datetime import datetime
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -13,6 +14,7 @@ from support import Harness
 from test_daily_life import Model
 from test_delivery_v2 import source_turn
 from test_life_background import activity_core, ActivityModel
+from tianshu_companion import observability as obs
 from tianshu_companion.actor_memory import ActorMemory, OUTBOX_PENDING, SOURCE_PREFIX
 from tianshu_companion.app import create_app
 from tianshu_companion.clients import JsonService, utc
@@ -480,9 +482,15 @@ def test_actor_outbox_uses_authoritative_version_receipt_first_and_survives_lost
         try:
             await read(h)
             owners.lost_ack = True
-            await h.core.flush_outbox()
+            with patch.object(obs, "emit", wraps=obs.emit) as events:
+                await h.core.flush_outbox()
             item = h.core.store.list("outbox")[0]
             assert item["state"] == "actor_memory_unknown"
+            assert [
+                call.args[2]
+                for call in events.call_args_list
+                if call.args[1] == "memory.phase.finished"
+            ] == ["unknown"]
             original = copy.deepcopy(item["request"])
             assert original["role_version"] == 7 and h.core.roles["actor:a"]["version"] == 19
             await h.core.close()
@@ -490,7 +498,8 @@ def test_actor_outbox_uses_authoritative_version_receipt_first_and_survives_lost
             h.core.recover()
             owners.version = 8
             h.clock.advance(60)
-            await h.core.flush_outbox()
+            with patch.object(obs, "emit", wraps=obs.emit) as events:
+                await h.core.flush_outbox()
             final = h.core.store.get("outbox", item["id"])
             assert final["state"] == "actor_memory_delivered"
             assert final["request"] == original
@@ -501,6 +510,11 @@ def test_actor_outbox_uses_authoritative_version_receipt_first_and_survives_lost
             assert owners.memory_calls[-1]["role_version"] == 8
             assert final["receipt"]["request_id"] == original["request_id"]
             assert final["receipt"]["domain_version"] == 23
+            assert [
+                call.args[2]
+                for call in events.call_args_list
+                if call.args[1] == "memory.phase.finished"
+            ] == ["succeeded"]
         finally:
             await close(h, services)
 

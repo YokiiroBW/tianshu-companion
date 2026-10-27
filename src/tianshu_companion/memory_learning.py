@@ -651,6 +651,59 @@ class MemoryLearning:
             return dict(family=family, item=item, started=False)
         return None
 
+    def _phase_outcome(self, phase, failure):
+        family = phase["family"]
+        if family == "participation":
+            item = phase["item"]
+        else:
+            table = "metadata" if family in {"learning", "observation"} else "outbox"
+            try:
+                # A family can re-read and update its own JSON object. The
+                # selected object is not proof of the durable phase result.
+                item = self.core.store.get(table, phase["item"]["id"])
+            except Exception:
+                # Observation must not turn a settled write into a retry or
+                # hide the original exception if the diagnostic read fails.
+                return "unknown"
+            if item is None:
+                return "unknown"
+        terminal = {
+            "learning": {"completed": "succeeded", "invalidated": "cancelled"},
+            "observation": {"material_accepted": "succeeded", "material_rejected": "cancelled"},
+            "outbox": {
+                "delivered": "succeeded",
+                "discarded_source": "cancelled",
+                "unknown": "unknown",
+                "submitting": "unknown",
+            },
+            "relationship": {
+                "delivered": "succeeded",
+                "relationship_rejected": "cancelled",
+                "relationship_unknown": "unknown",
+                "relationship_submitting": "unknown",
+            },
+            "actor_memory": {
+                "actor_memory_delivered": "succeeded",
+                "actor_memory_unknown": "unknown",
+                "actor_memory_submitting": "unknown",
+            },
+        }.get(family, {})
+        state = item.get("state")
+        if state in terminal:
+            return terminal[state]
+        if isinstance(failure, asyncio.CancelledError):
+            return "cancelled"
+        if (
+            failure is not None
+            or state == "blocked"
+            or item.get("last_error")
+            or item.get("relationship_error")
+        ):
+            return "failed"
+        # A completed local phase can leave a real job pending. It is progress,
+        # not proof of a committed memory, relationship settlement or send.
+        return "degraded"
+
     async def _run_phase(self, phase):
         self._phase = phase
         core, item = self.core, phase["item"]
@@ -679,22 +732,7 @@ class MemoryLearning:
             raise
         finally:
             if phase["started"]:
-                state = item.get("state")
-                if state in {"unknown", "relationship_unknown"}:
-                    outcome = "unknown"
-                elif isinstance(failure, asyncio.CancelledError):
-                    outcome = "cancelled"
-                elif failure is not None or state == "blocked" or item.get("last_error"):
-                    outcome = "failed"
-                elif state in {"completed", "delivered"}:
-                    outcome = "succeeded"
-                elif state in {"invalidated", "discarded_source", "relationship_rejected"}:
-                    outcome = "cancelled"
-                else:
-                    # A completed local phase can leave a real job pending.
-                    # It is progress, not proof of a committed memory or send.
-                    outcome = "degraded"
-                obs.emit(core.events, "memory.phase.finished", outcome)
+                obs.emit(core.events, "memory.phase.finished", self._phase_outcome(phase, failure))
             self._phase = None
             if not self._automatic_due():
                 self._foreground_finished = 0

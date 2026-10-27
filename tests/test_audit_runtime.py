@@ -202,7 +202,9 @@ class RuntimeFixTests(unittest.IsolatedAsyncioTestCase):
                     )
             self.assertFalse(app.state.health.workers.healthy())
 
-    async def test_debounce_restart_delivery_and_failed_commit_share_correlation(self):
+    async def test_debounce_restart_preserves_turn_correlation_and_background_commit_is_separate(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "core.db"
             h = Harness(path)
@@ -223,20 +225,31 @@ class RuntimeFixTests(unittest.IsolatedAsyncioTestCase):
                 await h.cycles(80)
                 await h.core.flush_outbox()
                 self.assertEqual("a" * 32, h.turns()[0]["correlation_id"])
-                relevant = [
-                    (e, o, f)
-                    for e, o, f in capture.events
-                    if e.startswith("turn.") or e == "outbox.flush"
-                ]
+                relevant = [(e, o, f) for e, o, f in capture.events if e.startswith("turn.")]
                 self.assertTrue(
                     any(e == "turn.delivery.finished" and o == "sent" for e, o, f in relevant)
                     or any(
                         e == "turn.delivery.finished" and o == "succeeded" for e, o, f in relevant
                     )
                 )
-                self.assertTrue(any(e == "outbox.flush" and o == "failed" for e, o, f in relevant))
                 self.assertTrue(
                     all(f.get("correlation_id") == "a" * 32 for e, o, f in relevant), relevant
+                )
+                background = [(e, o, f) for e, o, f in capture.events if e == "outbox.flush"]
+                self.assertTrue(any(o == "failed" for e, o, f in background))
+                phases = {
+                    f.get("correlation_id")
+                    for e, o, f in capture.events
+                    if e == "memory.phase.started"
+                }
+                self.assertTrue(
+                    all(
+                        obs.valid_correlation_id(f.get("correlation_id"))
+                        and f["correlation_id"] not in {"a" * 32, "b" * 32}
+                        and f["correlation_id"] in phases
+                        for e, o, f in background
+                    ),
+                    background,
                 )
                 self.assertEqual(
                     {"a" * 32, "b" * 32}, {i["correlation_id"] for i in h.core.store.list("inbox")}

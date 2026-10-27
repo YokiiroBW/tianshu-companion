@@ -18,6 +18,7 @@ import httpx
 from jsonschema import Draft202012Validator
 
 from support import Harness, contracts
+from tianshu_companion import observability as obs
 from tianshu_companion.app import create_app
 from tianshu_companion.clients import JsonService, Memory
 from tianshu_companion.contracts import Fault, canonical, digest
@@ -823,7 +824,8 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
         )
         before = self.tasks()[0]
         await self.restart()
-        await self.drain()
+        with patch.object(obs, "emit", wraps=obs.emit) as events:
+            await self.drain()
         self.assertEqual(1, len(self.tasks()))
         self.assertEqual(original["deadline"], self.tasks()[0]["deadline"])
         self.assertEqual(before["materials"], self.tasks()[0]["materials"])
@@ -833,6 +835,38 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
             self.h.core.store.get(
                 "metadata", "memory-observation:" + digest("observation:duplicate")
             )["state"],
+        )
+        self.assertEqual(
+            ["succeeded"],
+            [
+                call.args[2]
+                for call in events.call_args_list
+                if call.args[1] == "memory.phase.finished"
+            ],
+        )
+
+    async def test_rejected_observation_phase_preserves_terminal_source_result(self):
+        await self.h.core.memory_learning.observation_archived(
+            dict(source_ref="observation:rejected"), dict(archive_state="archived")
+        )
+
+        async def rejected(request):
+            raise Fault("forbidden")
+
+        self.h.memory.accept_materials = rejected
+        with patch.object(obs, "emit", wraps=obs.emit) as events:
+            await self.h.core.memory_learning.work()
+        item = self.h.core.store.get(
+            "metadata", "memory-observation:" + digest("observation:rejected")
+        )
+        self.assertEqual(("material_rejected", "forbidden"), (item["state"], item["last_error"]))
+        self.assertEqual(
+            ["cancelled"],
+            [
+                call.args[2]
+                for call in events.call_args_list
+                if call.args[1] == "memory.phase.finished"
+            ],
         )
 
     async def test_real_archive_callback_persists_handoff_before_marking_transferred(self):
@@ -905,11 +939,20 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
         await self.chat()
         self.peer.invalidated = True
         self.h.clock.advance(120)
-        await self.drain()
+        with patch.object(obs, "emit", wraps=obs.emit) as events:
+            await self.drain()
         task = self.tasks()[0]
         self.assertEqual("invalidated", task["state"])
         self.assertIsNone(task["receipt"])
         self.assertEqual([], self.peer.generated)
+        self.assertEqual(
+            "cancelled",
+            [
+                call.args[2]
+                for call in events.call_args_list
+                if call.args[1] == "memory.phase.finished"
+            ][-1],
+        )
 
     async def assert_preseal_negative_uses_real_client_and_original_request(self, *, lose_ack):
         await self.chat()
