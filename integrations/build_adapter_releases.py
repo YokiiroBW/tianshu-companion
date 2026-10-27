@@ -47,6 +47,7 @@ def main() -> None:
         "rpc.py": "tianshu_adapter_rpc.py",
         "participation.py": "participation.py",
         "participation_protocol.py": "participation_protocol.py",
+        "group_policy.py": "group_policy.py",
     }
     astr = ROOT / "astrbot" / "astrbot_plugin_tianshu"
     none = ROOT / "nonebot" / "tianshu_nonebot"

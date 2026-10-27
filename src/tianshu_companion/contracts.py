@@ -113,6 +113,7 @@ class Contracts:
                 raise ValueError("Unsupported contract dependency")
 
         aliases = {
+            "observation-participation/candidate-v1": "observation-participation",
             "actor-capabilities/candidate-v1": "actor-capabilities",
             "actor-self-memory/candidate-v1": "actor-self-memory",
             "chat-history/candidate-v1": "chat-history",
@@ -132,6 +133,7 @@ class Contracts:
             "reading-state/v1": "reading-state",
         }
         candidates = {
+            "observation-participation/candidate-v1": "1.0.0-candidate.1",
             "actor-capabilities/candidate-v1": "1.0.0-candidate.1",
             "actor-self-memory/candidate-v1": "1.0.0-candidate.2",
             "chat-history/candidate-v1": "1.0.0-candidate.1",

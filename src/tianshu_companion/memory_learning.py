@@ -63,11 +63,15 @@ class MemoryLearning:
         # Persisted barriers survive restart. Waiting in one room must neither
         # hold the commit lock nor prevent extraction in independent rooms.
         return any(
-            memory_scopes_overlap(json.loads(row[0]), scope)
-            for row in self.core.store.db.execute(
-                "SELECT CAST(json_extract(body,'$.scope') AS TEXT) FROM metadata WHERE conversation_id=? "
-                "AND status='pending' AND json_extract(body,'$.stage') IN ('capture_wait','commit_wait')",
-                (QUEUE,),
+            memory_scopes_overlap(item["scope"], scope)
+            and not self.core.group_processing.paused(item)
+            for item in (
+                json.loads(row[0])
+                for row in self.core.store.db.execute(
+                    "SELECT body FROM metadata WHERE conversation_id=? AND status='pending' "
+                    "AND json_extract(body,'$.stage') IN ('capture_wait','commit_wait')",
+                    (QUEUE,),
+                )
             )
         )
 
@@ -77,6 +81,7 @@ class MemoryLearning:
             self._offer_materials(
                 receipt,
                 context_windows=item.get("material_request", {}).get("context_windows", []),
+                processing_frames=self.core.group_processing.frames(item) or [],
             )
             return
         job = receipt.get("candidate_job_ref")
@@ -119,7 +124,7 @@ class MemoryLearning:
             ),
         )
 
-    def _offer_materials(self, response, *, context_windows=()):
+    def _offer_materials(self, response, *, context_windows=(), processing_frames=()):
         grouped = {}
         for material in response["materials"]:
             frame = material["frame"]
@@ -137,7 +142,13 @@ class MemoryLearning:
                     if all(window["manifest"]["scope"][key] == frame[key] for key in frame)
                 ]
                 self.segments.offer(
-                    frame, materials, context_windows=windows, omitted_context=not windows
+                    frame,
+                    materials,
+                    context_windows=windows,
+                    omitted_context=not windows,
+                    processing_frames=[
+                        dict(value, actor_id=frame["actor_id"]) for value in processing_frames
+                    ],
                 )
 
     async def observation_archived(self, request, response):
@@ -165,7 +176,9 @@ class MemoryLearning:
                 dict(schema_version=1, observation_refs=[item["source_ref"]])
             )
             with self.core.store.transaction():
-                self._offer_materials(response)
+                self._offer_materials(
+                    response, processing_frames=self.core.group_processing.frames(item) or []
+                )
                 item.update(state="material_accepted", deadline=0, last_error=None)
                 self.core.store.put("metadata", item)
         except (Fault, OSError, TimeoutError) as error:
@@ -272,6 +285,8 @@ class MemoryLearning:
             ).fetchone()
             if row:
                 item = json.loads(row[0])
+                if self.core.group_processing.paused(item):
+                    continue
                 if (
                     item.get("stage") not in MUTATION_WAIT
                     and self._candidate_mutates(item, None)
@@ -421,10 +436,12 @@ class MemoryLearning:
         actor_due = self.core.actor_memory.available and store.due(
             "outbox", OUTBOX_PENDING, now, limit=1
         )
+        participation_due = self.core.participation.due()
         if not self.core.automatic_memory_candidates:
-            return bool(actor_due)
+            return bool(actor_due or participation_due)
         return bool(
             actor_due
+            or participation_due
             or store.db.execute(
                 "SELECT 1 FROM metadata WHERE conversation_id=? "
                 "AND status IN ('pending','material_pending') AND deadline<=? LIMIT 1",
@@ -444,7 +461,11 @@ class MemoryLearning:
         Credit is bounded, and idle foreground traffic cannot bank future work.
         This counter belongs to automatic I/O, independently of model-slot fairness.
         """
-        if not self.core.automatic_memory_candidates and not self.core.actor_memory.available:
+        if (
+            not self.core.automatic_memory_candidates
+            and not self.core.actor_memory.available
+            and not self.core.participation.available
+        ):
             return
         self._foreground_finished = (
             min(3, self._foreground_finished + 1) if self._automatic_due() else 0
@@ -452,7 +473,9 @@ class MemoryLearning:
 
     def _unblocks_foreground(self, family, item):
         if family == "learning":
-            return item.get("stage") in MUTATION_WAIT
+            return item.get("stage") in MUTATION_WAIT and not self.core.group_processing.paused(
+                item
+            )
         if family != "outbox":
             return False
         scope = item["event"]["scope"]
@@ -473,6 +496,8 @@ class MemoryLearning:
         # existing semantics. Only the automatic dispatcher owns this decision.
         if phase is None or (item is not None and phase["item"]["id"] != item["id"]):
             return True
+        if phase["family"] != "participation" and self.core.group_processing.paused(phase["item"]):
+            return False
         if phase["started"]:
             return True
         if not self._unblocks_foreground(phase["family"], phase["item"]):
@@ -485,6 +510,37 @@ class MemoryLearning:
                 self._foreground_finished = 0
         phase["started"] = True
         return True
+
+    def _phase_page(self, family, states):
+        """Rotate bounded paused pages without overtaking an original room predecessor."""
+        core = self.core
+        cursor_name = "_phase_cursor_" + family
+        cursor = getattr(self, cursor_name, (-1, ""))
+        table = "metadata" if family in {"observation", "processing_learning"} else "outbox"
+        predicate = "conversation_id=? AND " if table == "metadata" else ""
+        args = [QUEUE] if table == "metadata" else []
+        predecessor = (
+            "AND NOT EXISTS (SELECT 1 FROM outbox p WHERE p.conversation_id=outbox.conversation_id "
+            "AND p.status IN ('pending','unknown','submitting','blocked_scope') "
+            "AND json_extract(p.body,'$.event.scope.actor_id')=json_extract(outbox.body,'$.event.scope.actor_id') "
+            "AND (p.position,p.id)<(outbox.position,outbox.id)) "
+            if table == "outbox"
+            else ""
+        )
+        rows = core.store.db.execute(
+            f"SELECT id,deadline FROM {table} WHERE "
+            + predicate
+            + "status IN ("
+            + ",".join("?" for _ in states)
+            + ") AND deadline<=? "
+            + "AND (deadline,id)>(?,?) "
+            + predecessor
+            + "ORDER BY deadline,id LIMIT 64",
+            (*args, *states, core.clock(), *cursor),
+        ).fetchall()
+        setattr(self, cursor_name, (rows[-1][1], rows[-1][0]) if len(rows) == 64 else (-1, ""))
+        items = core.store.get_many(table, [row[0] for row in rows])
+        return [items[row[0]] for row in rows]
 
     def _select_phase(self, *, outbox_only):
         core, now = self.core, self.core.clock()
@@ -503,13 +559,17 @@ class MemoryLearning:
             families = ()
         if core.actor_memory.available:
             families += ("actor_memory",)
+        if not outbox_only and core.participation.available:
+            families += ("participation",)
         if not families:
             return None
         busy = core.automatic_memory_foreground_demand()
         for offset in range(len(families)):
             index = (self._family + offset) % len(families)
             family = families[index]
-            if family == "actor_memory":
+            if family == "participation":
+                item = dict(id="participation:poll") if core.participation.due() else None
+            elif family == "actor_memory":
                 from .actor_memory import OUTBOX_PENDING
 
                 rows = core.store.due("outbox", OUTBOX_PENDING, now, limit=1)
@@ -522,7 +582,11 @@ class MemoryLearning:
                     if family == "relationship"
                     else ["blocked_scope", "pending", "unknown"]
                 )
-                rows = core.store.due("outbox", states, now, limit=64)
+                rows = (
+                    self._phase_page(family, states)
+                    if family == "outbox"
+                    else core.store.due("outbox", states, now, limit=64)
+                )
                 item = (
                     (rows[0] if rows else None)
                     if family == "relationship"
@@ -534,6 +598,7 @@ class MemoryLearning:
                                 core.store.get("turns", row["event"]["aggregate_id"]),
                                 "memory.write",
                             )
+                            and not core.group_processing.paused(row)
                             and (
                                 not busy
                                 or self._foreground_finished >= 3
@@ -546,12 +611,14 @@ class MemoryLearning:
             elif family == "observation":
                 if getattr(core.memory, "extraction_schema", 5) != 6:
                     continue
-                row = core.store.db.execute(
-                    "SELECT body FROM metadata WHERE conversation_id=? AND status='material_pending' "
-                    "AND deadline<=? ORDER BY deadline,position,id LIMIT 1",
-                    (QUEUE, now),
-                ).fetchone()
-                item = json.loads(row[0]) if row else None
+                item = next(
+                    (
+                        row
+                        for row in self._phase_page("observation", ["material_pending"])
+                        if not core.group_processing.paused(row)
+                    ),
+                    None,
+                )
             else:
                 item = (
                     self._next(drain_only=busy and self._foreground_finished < 3)
@@ -574,10 +641,14 @@ class MemoryLearning:
         self._phase = phase
         core, item = self.core, phase["item"]
         try:
+            if phase["family"] != "participation" and not await core.group_processing.start(item):
+                return
             if phase["family"] == "learning":
                 await self._work(item)
             elif self._start_phase():
-                if phase["family"] == "observation":
+                if phase["family"] == "participation":
+                    await core.participation.work()
+                elif phase["family"] == "observation":
                     await self._flush_observation_material(item)
                 else:
                     async with core._outbox_lock:
@@ -604,7 +675,19 @@ class MemoryLearning:
                     del self.jobs[key]
                     if not job.cancelled():
                         job.result()
-            if not core.automatic_memory_candidates and not core.actor_memory.available:
+            if not self.jobs and core.group_processing.available:
+                await core.group_processing.refresh(
+                    self._phase_page("processing_learning", ["pending", "material_pending"])
+                    + self._phase_page(
+                        "processing_outbox",
+                        ["blocked_scope", "pending", "unknown", "relationship_pending"],
+                    )
+                )
+            if (
+                not core.automatic_memory_candidates
+                and not core.actor_memory.available
+                and not core.participation.available
+            ):
                 return
             changed = self.backfill() if core.automatic_memory_candidates else False
             if (
@@ -674,6 +757,8 @@ class MemoryLearning:
         async with asyncio.timeout(45):
             async with self.lock:
                 try:
+                    if not reconcile and not await self.core.group_processing.start(item):
+                        return None
                     turn = self._source_turn(item)
                     mutates = self._candidate_mutates(item, output)
                     if mutates and self.core.has_active_dialogue(turn["scope"]):
@@ -970,6 +1055,8 @@ class MemoryLearning:
                 )
                 generation["config_version"] = selected.config_version
             self._source_turn(item)
+            if not await self.core.group_processing.start(item):
+                return None
             if item["extraction_schema"] == 6:
                 # The observation part has no local Core admission. Refresh the
                 # complete real Memory/Platform proof after both awaited gates.
@@ -982,6 +1069,8 @@ class MemoryLearning:
                     self._finish_segment(item, response)
                     return None
                 self._pin_segment_window(item, response)
+                if not await self.core.group_processing.start(item):
+                    return None
                 supplied = segment_messages(self.core.contracts, item["segment_window"])
             else:
                 self._check_summary_window(item)
@@ -1229,6 +1318,8 @@ class MemoryLearning:
                                 )
                                 generation["config_version"] = selected.config_version
                             self._source_turn(item)
+                            if not await core.group_processing.start(item):
+                                return
                             hints = (
                                 []
                                 if schema4

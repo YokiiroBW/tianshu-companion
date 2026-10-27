@@ -20,7 +20,7 @@ from nonebot.plugin import PluginMetadata
 from pydantic import BaseModel
 
 from .rpc import PREFIX, AdapterService, onebot_media, request_limit
-from .sdk import UnsupportedEvent, observation_event, text_event
+from .sdk import UnsupportedEvent, event_enabled, observation_event, text_event
 from .participation_host import execution, install as install_participation_host
 
 
@@ -163,7 +163,7 @@ async def _observe(bot: BaseBot, event: BaseEvent, state) -> bool:
     if not isinstance(bot, OneBotBot):
         return False
     try:
-        value = observation_event(bot, event)
+        value = observation_event(bot, event, enabled=service.input_enabled)
     except (UnsupportedEvent, ValueError, KeyError, OverflowError, OSError):
         return False
     if proof:
@@ -204,8 +204,10 @@ async def _claim_observation_reply(bot: BaseBot, event: BaseEvent, state) -> boo
     proof = execution(state)
     if not isinstance(bot, OneBotBot):
         return False
+    if not event_enabled(bot, event, service.input_enabled, reply=True):
+        return False
     try:
-        value = observation_event(bot, event)
+        value = observation_event(bot, event, enabled=service.input_enabled)
     except (UnsupportedEvent, ValueError, KeyError, OverflowError, OSError):
         return False
     try:
@@ -235,7 +237,7 @@ async def _scope(bot: BaseBot, event: BaseEvent, state) -> bool:
     if not isinstance(bot, OneBotBot):
         return False
     try:
-        value = text_event(bot, event)
+        value = text_event(bot, event, enabled=service.input_enabled)
     except (UnsupportedEvent, ValueError, KeyError):
         return False
     try:

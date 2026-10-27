@@ -81,13 +81,28 @@ def conversation_id(event) -> str:
     raise UnsupportedEvent("Only OneBot v11 private and group messages are supported")
 
 
-def text_event(bot, event) -> TextEvent:
+def event_enabled(bot, event, enabled, *, reply=False):
+    """Typed physical routing only; do not touch or normalize the message body."""
+    from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
+
+    if not isinstance(bot, Bot) or not isinstance(event, (GroupMessageEvent, PrivateMessageEvent)):
+        return False
+    try:
+        verified_sender(bot, event)
+        return enabled(qq_id(bot.self_id), conversation_id(event), reply=reply)
+    except (UnsupportedEvent, ValueError, KeyError):
+        return False
+
+
+def text_event(bot, event, *, enabled=None) -> TextEvent:
     """Read typed SDK fields; reject media instead of losing segments or trusting CQ text."""
     from nonebot.adapters.onebot.v11 import GroupMessageEvent, PrivateMessageEvent
 
     if not isinstance(event, (GroupMessageEvent, PrivateMessageEvent)):
         raise UnsupportedEvent("Only OneBot v11 message events are supported")
     sender, _ = verified_sender(bot, event)
+    if enabled is not None and not enabled(qq_id(bot.self_id), conversation_id(event), reply=True):
+        raise UnsupportedEvent("group reply disabled")
     if getattr(event, "sub_type", None) == "anonymous":
         raise UnsupportedEvent("Anonymous messages have no stable account owner")
     # OneBot's event preprocessor removes reply and @bot segments from message.
@@ -126,13 +141,15 @@ def text_event(bot, event) -> TextEvent:
     )
 
 
-def observation_event(bot, event) -> dict:
+def observation_event(bot, event, *, enabled=None) -> dict:
     """Normalize a real inbound SDK event, including unsupported content metadata."""
     from nonebot.adapters.onebot.v11 import GroupMessageEvent, PrivateMessageEvent
 
     if not isinstance(event, (GroupMessageEvent, PrivateMessageEvent)):
         raise UnsupportedEvent("not a OneBot message")
     sender, self_id = verified_sender(bot, event)
+    if enabled is not None and not enabled(self_id, conversation_id(event)):
+        raise UnsupportedEvent("group disabled")
     if getattr(event, "sub_type", None) == "anonymous":
         raise UnsupportedEvent("no stable sender")
     from .rpc import RpcError, onebot_input

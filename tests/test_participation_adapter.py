@@ -51,7 +51,19 @@ class Fixture:
                 account_id="10001",
                 revision=revision,
                 enabled=True,
-                group_policy=dict(observe=True, mode=mode, list=["20001"]),
+                group_policy=dict(
+                    version=2,
+                    default=dict(mode="observe", actor_id="actor:a", keywords=[]),
+                    groups={
+                        "20001": dict(
+                            mode="observe" if mode == "observe_only" else "active",
+                            actor_id="actor:a",
+                            keywords=[],
+                        )
+                    },
+                ),
+                group_revisions={"20001": revision},
+                group_default_revision=1,
                 private_policy=dict(observe=True, mode="observe_only", list=[]),
             ),
         )

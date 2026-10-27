@@ -1,6 +1,7 @@
 """The dependency-free released checker agrees with the exact candidate examples."""
 
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -13,7 +14,13 @@ import participation_protocol as wire  # noqa: E402
 
 def package():
     context = json.loads((ROOT / ".runtime" / "workspace-context.json").read_text(encoding="utf-8"))
-    path = Path(context["contract_root"]) / "observation-participation" / "candidate-v1"
+    contracts = os.environ.get("TIANSHU_CONTRACTS")
+    base = (
+        Path(contracts).resolve().parents[1]
+        if contracts
+        else Path(context.get("contract_root", str(Path(context["workspace"]) / "contracts")))
+    )
+    path = base / "observation-participation" / "candidate-v1"
     return path
 
 

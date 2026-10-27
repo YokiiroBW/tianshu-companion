@@ -19,6 +19,7 @@ import nonebot.message as dispatch
 
 from . import participation_protocol as wire
 from .rpc import transaction
+from .sdk import event_enabled
 
 STATE_KEY = "_tianshu_participation_execution"
 
@@ -31,8 +32,11 @@ class Execution:
     pre_completed: bool = False
     post_completed: bool = False
     failed: bool = False
+    eligible: bool = True
 
     def captured_value(self, value):
+        if not self.eligible:
+            return
         service = self.owner.host.service
         self.native = service.participation.native(
             dict(
@@ -157,7 +161,8 @@ class ControlledHost:
 
     def install(self):
         async def lifetime(bot: Bot, event: Event):
-            proof = Execution(self, self.graph())
+            eligible = event_enabled(bot, event, self.host.service.participation_enabled)
+            proof = Execution(self, self.graph() if eligible else None, eligible=eligible)
             try:
                 yield proof
             except BaseException:

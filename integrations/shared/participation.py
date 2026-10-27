@@ -11,8 +11,10 @@ import time
 import uuid
 
 try:
+    from . import group_policy
     from . import participation_protocol as wire
 except ImportError:  # canonical standalone module used by SDK-independent tests
+    import group_policy
     import participation_protocol as wire
 
 EVENT_TABLES = (
@@ -160,9 +162,11 @@ class Participation:
             (account,),
         ).fetchone()
 
-    @staticmethod
-    def generation(account):
-        return "observation-policy:" + str(account[0])
+    def generation(self, account, account_id=None, group=None):
+        revision = (
+            self.service.group_revision(account_id, group, account[0]) if group else account[0]
+        )
+        return "observation-policy:" + str(revision)
 
     def capture(self, event):
         native = self.native(event)
@@ -195,7 +199,7 @@ class Participation:
         doc = dict(
             native=native,
             host_epoch=self.epoch,
-            host_generation=self.generation(account),
+            host_generation=self.generation(account, event["self_id"], native["group_id"]),
             owner_revision=1,
             state=state,
             basis="event_processing" if state == "processing" else "no_completion_proof",
@@ -324,15 +328,12 @@ class Participation:
         if not account or not account[1] or time.time() - account[3] > 30:
             return False
         policy = json.loads(account[2])
-        group = doc["native"]["group_id"]
+        conversation = "group:" + doc["native"]["group_id"]
         return bool(
             doc["host_epoch"] == self.epoch
-            and doc["host_generation"] == self.generation(account)
-            and policy["observe"]
-            and (
-                (policy["mode"] == "whitelist" and group in policy["list"])
-                or (policy["mode"] == "blacklist" and group not in policy["list"])
-            )
+            and doc["host_generation"]
+            == self.generation(account, doc["native"]["self_id"], doc["native"]["group_id"])
+            and group_policy.decision(policy, conversation)["active"]
         )
 
     def _current(self, event_id):
@@ -408,13 +409,18 @@ class Participation:
         )
 
     def capabilities(self, request):
-        wire.obj(request, dict(account_id=wire.qq))
+        wire.obj(
+            request,
+            dict(account_id=wire.qq, **({"group_id": wire.qq} if "group_id" in request else {})),
+        )
         account = self.account(request["account_id"])
         return dict(
             available=bool(account and self.framework),
             framework=self.framework,
             host_epoch=self.epoch,
-            host_generation=self.generation(account) if account else None,
+            host_generation=self.generation(account, request["account_id"], request.get("group_id"))
+            if account
+            else None,
             manifest_sha256=wire.MANIFEST_SHA256,
             claim_supported=bool(self.claim_supported()),
         )
@@ -458,7 +464,10 @@ class Participation:
         )
         self.check(
             request["configuration"]["host_generation"] == state["host_generation"]
-            and request["configuration"]["reply_policy_revision"] == event["scope_revision"]
+            and request["configuration"]["reply_policy_revision"]
+            == self.service.group_revision(
+                event["self_id"], request["native"]["group_id"], event["scope_revision"]
+            )
         )
         expires = wire.stamp(request["expires_at"])
         self.check(wire.stamp(request["created_at"]) < expires and expires > time.time())

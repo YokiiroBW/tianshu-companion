@@ -211,6 +211,8 @@ class AstrAdapter:
             return False
         if raw_author != author or (group and raw_group != group):
             return False
+        if not self.service.input_enabled(self_id, f"{kind}:{group or author}"):
+            return False
         native_id = str(raw.get("message_id"))
         if native_id != str(event.message_obj.message_id) or not native_id.isdecimal():
             return False

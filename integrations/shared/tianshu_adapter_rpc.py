@@ -24,12 +24,14 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 try:
+    from . import group_policy
     from .participation import (
         Participation,
         SCHEMA as PARTICIPATION_SCHEMA,
         TABLES as PARTICIPATION_TABLES,
     )
 except ImportError:
+    import group_policy
     from participation import (
         Participation,
         SCHEMA as PARTICIPATION_SCHEMA,
@@ -326,6 +328,8 @@ class AdapterService:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(schema_sql)
+        for row in self.db.execute("SELECT group_policy FROM observation_accounts"):
+            group_policy.normalize(json.loads(row[0]))
         try:
             if os.name != "nt":
                 os.chmod(path, 0o600)
@@ -369,6 +373,80 @@ class AdapterService:
             (connection_id,),
         ).fetchone()
 
+    def input_enabled(self, account_id, conversation, *, reply=False):
+        """Cheap SDK entry gate before reading or normalizing the message body."""
+        row = self.db.execute(
+            "SELECT enabled,group_policy,private_policy,last_poll FROM observation_accounts WHERE account_id=?",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            # Original unmanaged exact bindings have their own live enabled
+            # state; absent routes must not start SDK body processing either.
+            return (
+                self.db.execute(
+                    "SELECT 1 FROM bindings WHERE account_id=? AND conversation=? AND enabled=1 LIMIT 1",
+                    (account_id, conversation),
+                ).fetchone()
+                is not None
+            )
+        if not row[0] or time.time() - row[3] > OBSERVATION_LEASE_SECONDS:
+            return False
+        policy = json.loads(row[1 if conversation.startswith("group:") else 2])
+        verdict = group_policy.decision(policy, conversation)
+        return bool(verdict["reply_permitted" if reply else "observe"])
+
+    def group_revision(self, account_id, group, fallback):
+        row = self.db.execute(
+            "SELECT value FROM meta WHERE key=?", ("observation-groups:" + account_id,)
+        ).fetchone()
+        if row is None:
+            return fallback
+        value = json.loads(row[0])
+        return value["group_revisions"].get(group, value["group_default_revision"])
+
+    def participation_enabled(self, account_id, conversation, **_):
+        if not conversation.startswith("group:") or not self.input_enabled(
+            account_id, conversation
+        ):
+            return False
+        row = self.db.execute(
+            "SELECT group_policy FROM observation_accounts WHERE account_id=?", (account_id,)
+        ).fetchone()
+        return bool(row and group_policy.decision(json.loads(row[0]), conversation)["active"])
+
+    @staticmethod
+    def _capture_control_key(account_id, conversation, author, native_id):
+        return "observation-control:" + _digest([account_id, conversation, author, native_id])
+
+    def _prune_observations(self, query, parameters):
+        rows = self.db.execute(
+            "SELECT id,account_id,conversation,author,native_id FROM observations WHERE " + query,
+            parameters,
+        ).fetchall()
+        for row in rows:
+            self.db.execute(
+                "DELETE FROM meta WHERE key=?",
+                (self._capture_control_key(row[1], row[2], row[3], row[4]),),
+            )
+            self.db.execute("DELETE FROM observations WHERE id=?", (row[0],))
+
+    def _group_reply(self, account_id, conversation, text, context=None):
+        row = self.db.execute(
+            "SELECT enabled,group_policy,private_policy,last_poll FROM observation_accounts WHERE account_id=?",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return True
+        if not row[0] or time.time() - row[3] > OBSERVATION_LEASE_SECONDS:
+            return False
+        verdict = group_policy.decision(
+            json.loads(row[1 if conversation.startswith("group:") else 2]),
+            conversation,
+            mentioned=account_id in (context or {}).get("mentioned_accounts", []),
+            text=text,
+        )
+        return bool(verdict["reply_triggered"])
+
     async def capture(self, *args, **kwargs) -> bool:
         return await self.capture_result(*args, **kwargs) == "captured"
 
@@ -400,6 +478,8 @@ class AdapterService:
         if not isinstance(sent_at, str) or len(sent_at) > 40:
             return "invalid"
         async with self.lock:
+            if not self._group_reply(account_id, conversation, text, context):
+                return "no_route"
             rows = self.db.execute(
                 "SELECT connection_id,authors FROM bindings "
                 "WHERE account_id=? AND conversation=? AND enabled=1",
@@ -503,11 +583,18 @@ class AdapterService:
                     "FROM observation_accounts WHERE account_id=?",
                     (account_id,),
                 ).fetchone()
-                if not enrolled or not enrolled[0]:
+                if (
+                    not enrolled
+                    or not enrolled[0]
+                    or time.time() - enrolled[4] > OBSERVATION_LEASE_SECONDS
+                ):
                     return "unavailable"
                 kind, target = conversation.split(":", 1)
                 policy = json.loads(enrolled[2 if kind == "group" else 3])
-                if not policy["observe"]:
+                verdict = group_policy.decision(
+                    policy, conversation, mentioned=mentioned, text=text
+                )
+                if not verdict["observe"]:
                     return "unavailable"
                 old = self.db.execute(
                     "SELECT payload FROM observations WHERE account_id=? AND conversation=? "
@@ -515,7 +602,8 @@ class AdapterService:
                     (account_id, conversation, author, native_id),
                 ).fetchone()
                 if old:
-                    self.participation.capture(json.loads(old[0]))
+                    if verdict["active"] and not verdict["reply_triggered"]:
+                        self.participation.capture(json.loads(old[0]))
                     return "captured"
                 if (
                     self.db.execute("SELECT COUNT(*) FROM observations WHERE acked=0").fetchone()[0]
@@ -524,14 +612,14 @@ class AdapterService:
                     self._observation_drop(account_id, "pending_capacity")
                     return "unavailable"
                 # Acknowledged host rows are transport history, not the authoritative archive.
-                self.db.execute(
-                    "DELETE FROM observations WHERE acked=1 AND created<?",
+                self._prune_observations(
+                    "acked=1 AND created<?",
                     (time.time() - 30 * 86400,),
                 )
                 history = self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
                 if history >= MAX_HISTORY:
-                    self.db.execute(
-                        "DELETE FROM observations WHERE id IN (SELECT id FROM observations "
+                    self._prune_observations(
+                        "id IN (SELECT id FROM observations "
                         "WHERE acked=1 ORDER BY created,id LIMIT ?)",
                         (history - MAX_HISTORY + 1,),
                     )
@@ -566,17 +654,11 @@ class AdapterService:
                         group_card=group_card,
                         message_context=context,
                     )
-                matched = target in policy["list"]
-                permitted = (policy["mode"] == "whitelist" and matched) or (
-                    policy["mode"] == "blacklist" and not matched
-                )
                 eligible = bool(
                     time.time() - enrolled[4] <= OBSERVATION_LEASE_SECONDS
-                    and policy["observe"]
-                    and permitted
+                    and verdict["reply_triggered"]
                     and content_state == "text"
                     and text.strip()
-                    and (kind == "private" or mentioned)
                 )
                 self.db.execute(
                     "INSERT INTO observations(id,account_id,conversation,author,native_id,payload,"
@@ -594,7 +676,16 @@ class AdapterService:
                         time.time(),
                     ),
                 )
-                self.participation.capture(payload)
+                if kind == "group":
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)",
+                        (
+                            self._capture_control_key(account_id, conversation, author, native_id),
+                            str(self.group_revision(account_id, target, enrolled[1])),
+                        ),
+                    )
+                if verdict["active"] and not verdict["reply_triggered"]:
+                    self.participation.capture(payload)
                 return "captured"
 
     def _observation_drop(self, account_id: str, code: str) -> None:
@@ -649,7 +740,19 @@ class AdapterService:
                 self._resolve_observation_claim(account_id, conversation, author, native_id, False)
                 return "unavailable"
             event = json.loads(row[2])
-            if event["scope_revision"] != current[1]:
+            captured_revision = event["scope_revision"]
+            current_revision = current[1]
+            if conversation.startswith("group:"):
+                saved = self.db.execute(
+                    "SELECT value FROM meta WHERE key=?",
+                    (self._capture_control_key(account_id, conversation, author, native_id),),
+                ).fetchone()
+                if saved is not None:
+                    captured_revision = int(saved[0])
+                current_revision = self.group_revision(
+                    account_id, conversation.split(":", 1)[1], current[1]
+                )
+            if captured_revision != current_revision:
                 self._resolve_observation_claim(account_id, conversation, author, native_id, False)
                 return "unavailable"
             if time.time() - current[4] > OBSERVATION_LEASE_SECONDS:
@@ -657,14 +760,9 @@ class AdapterService:
                 return "unavailable"
             kind, target = conversation.split(":", 1)
             policy = json.loads(current[2 if kind == "group" else 3])
-            matched = target in policy["list"]
-            permitted = bool(
-                policy["observe"]
-                and (
-                    (policy["mode"] == "whitelist" and matched)
-                    or (policy["mode"] == "blacklist" and not matched)
-                )
-            )
+            permitted = group_policy.decision(
+                policy, conversation, mentioned=event["mentioned"], text=event["text"]
+            )["reply_triggered"]
             self._resolve_observation_claim(account_id, conversation, author, native_id, permitted)
             return "claimed" if permitted else "unavailable"
 
@@ -853,17 +951,21 @@ class AdapterService:
             "accounts": result["accounts"],
             "content": ["text", "unsupported"],
             "reply_policy": "platform_owned",
+            "group_policy_version": 2,
+            "ordinary_claim_available": bool(self.participation.claim_supported()),
         }
 
     async def _observation_apply(self, request: dict) -> dict:
-        if set(request) != {
+        base = {
             "request_id",
             "account_id",
             "revision",
             "enabled",
             "group_policy",
             "private_policy",
-        }:
+        }
+        extra = {"group_revisions", "group_default_revision"}
+        if set(request) not in (base, base | extra):
             _bad()
         request_id = _ident(request["request_id"])
         account_id = _qq_account(request["account_id"])
@@ -874,6 +976,10 @@ class AdapterService:
         policies = {}
         for kind in ("group", "private"):
             policy = request[kind + "_policy"]
+            if kind == "group":
+                group_policy.normalize(policy)
+                policies[kind + "_policy"] = policy
+                continue
             if (
                 not isinstance(policy, dict)
                 or set(policy) != {"observe", "mode", "list"}
@@ -889,6 +995,27 @@ class AdapterService:
                     _bad()
             policies[kind + "_policy"] = policy
         semantic = {"account_id": account_id, "revision": revision, "enabled": enabled, **policies}
+        if policies["group_policy"].get("version") == 2:
+            if not extra <= set(request):
+                _bad()
+            revisions, default = request["group_revisions"], request["group_default_revision"]
+            if (
+                not isinstance(revisions, dict)
+                or type(default) is not int
+                or not 1 <= default <= revision
+            ):
+                _bad()
+            if any(
+                not isinstance(key, str)
+                or not QQ_ID.fullmatch(key)
+                or type(value) is not int
+                or not 1 <= value <= revision
+                for key, value in revisions.items()
+            ):
+                _bad()
+            semantic.update(group_revisions=revisions, group_default_revision=default)
+        elif set(request) != base:
+            _bad()
         digest = _digest(semantic)
         prior = self.db.execute(
             "SELECT digest,response FROM observation_requests WHERE request_id=?", (request_id,)
@@ -934,6 +1061,14 @@ class AdapterService:
                 "INSERT INTO observation_requests VALUES(?,?,?)",
                 (request_id, digest, _json(response)),
             )
+            if "group_revisions" in semantic:
+                self.db.execute(
+                    "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (
+                        "observation-groups:" + account_id,
+                        _json({key: semantic[key] for key in extra}),
+                    ),
+                )
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
@@ -1069,19 +1204,21 @@ class AdapterService:
             "WHERE account_id=?",
             (account_id,),
         ).fetchone()
-        if not row or not row[0] or row[1] != revision:
+        if not row or not row[0]:
             raise RpcError(403, "forbidden")
         target = _qq(delivery.get("conversation_id"))
         kind, number = target.split(":", 1)
-        policy = json.loads(row[2 if kind == "group" else 3])
-        permitted = (policy["mode"] == "whitelist" and number in policy["list"]) or (
-            policy["mode"] == "blacklist" and number not in policy["list"]
+        current_revision = (
+            self.group_revision(account_id, number, row[1]) if kind == "group" else row[1]
         )
+        if current_revision != revision:
+            raise RpcError(403, "forbidden")
+        policy = json.loads(row[2 if kind == "group" else 3])
+        verdict = group_policy.decision(policy, target)
         text = delivery.get("text")
         media = media_parts(delivery)
         if (
-            not policy["observe"]
-            or not permitted
+            not verdict["reply_permitted"]
             or delivery.get("namespace") != "qq"
             or delivery.get("thread_id") is not None
             or not isinstance(text, str)
@@ -1212,6 +1349,8 @@ class AdapterService:
         binding = self._binding(connection_id)
         if not binding or not binding[4]:
             raise RpcError(403, "forbidden")
+        if not self.input_enabled(binding[1], binding[2], reply=True):
+            raise RpcError(403, "forbidden")
         self.participation.authorize_send(connection_id, delivery, binding[1])
         receipt = {
             "reply_id": reply_id,
@@ -1238,6 +1377,8 @@ class AdapterService:
         receipt["state"] = "inflight"
         self.db.execute("INSERT INTO deliveries VALUES(?,?,?,?,?)", (*key, digest, _json(receipt)))
         try:
+            if not self.input_enabled(binding[1], binding[2], reply=True):
+                raise RpcError(403, "forbidden")
             self.participation.authorize_send(connection_id, delivery, binding[1])
             action = (
                 self.send_media(binding[1], target, text, media)

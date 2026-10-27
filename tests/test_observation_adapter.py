@@ -239,12 +239,15 @@ def test_claim_requires_current_policy_and_live_platform_lease(tmp_path):
         assert not await service.observation_claimed("10001", "group:20002", "30003", "44b")
         await rpc("apply", {**request, "request_id": "allow-again", "revision": 3})
         service.db.execute("UPDATE observation_accounts SET last_poll=0 WHERE account_id='10001'")
-        assert await service.capture_observation(
+        assert not await service.capture_observation(
             "10001", "group:20002", "30003", "45", "2026-09-29T00:00:01Z", "hello", True
+        )
+        assert (
+            service.db.execute("SELECT 1 FROM observations WHERE native_id='45'").fetchone() is None
         )
         assert not await service.observation_claimed("10001", "group:20002", "30003", "45")
         polled = await rpc("poll", {"account_id": "10001", "limit": 20})
-        assert [item["reply_claimed"] for item in polled["events"]] == [True, False, False]
+        assert [item["reply_claimed"] for item in polled["events"]] == [True, False]
         assert not await service.observation_claimed("10001", "group:20002", "30003", "45")
 
     run(scenario())

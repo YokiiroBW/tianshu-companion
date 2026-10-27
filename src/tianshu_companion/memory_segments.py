@@ -68,7 +68,9 @@ class MemorySegments:
             and sum(material["text_bytes"] for material in materials) <= MAX_TEXT_BYTES
         )
 
-    def offer(self, frame, materials, *, context_windows=(), omitted_context=False):
+    def offer(
+        self, frame, materials, *, context_windows=(), omitted_context=False, processing_frames=()
+    ):
         """Assign authoritative refs once, without claiming a job or a model slot.
 
         Material refs must be normalized by Memory across dialogue and passive
@@ -126,6 +128,13 @@ class MemorySegments:
                     segment = None
                 if segment is None:
                     segment = self._new(frame, now)
+                known_frames = {
+                    canonical(value): value for value in segment.get("processing_frames", [])
+                }
+                for value in processing_frames:
+                    known_frames[canonical(value)] = copy.deepcopy(value)
+                if known_frames:
+                    segment["processing_frames"] = list(known_frames.values())
                 segment["materials"].append(copy.deepcopy(material))
                 segment["omitted_context"] |= omitted_context
                 segment["last_new_at"] = now

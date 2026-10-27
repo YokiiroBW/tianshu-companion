@@ -289,8 +289,11 @@ def test_context_projection_and_batch_queries_preserve_types_and_latest_revision
         assert store.active_scopes(["generating"], "other-actor") == []
         from types import SimpleNamespace
         from tianshu_companion.memory_learning import MemoryLearning
+        from tianshu_companion.group_processing import GroupProcessing
 
-        learning = MemoryLearning(SimpleNamespace(store=store, automatic_memory_candidates=True))
+        core = SimpleNamespace(store=store, automatic_memory_candidates=True)
+        core.group_processing = GroupProcessing(core)
+        learning = MemoryLearning(core)
         barrier = dict(
             id="waiting",
             conversation_id="memory:learning",

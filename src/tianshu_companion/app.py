@@ -504,6 +504,7 @@ def build_runtime(config):
                 if "provider_selector_background" in config.get("services", {})
                 else None
             ),
+            participation_client=platform_client,
             default_model_selector=provider_selector,
             qq_admin=qq_admin,
             qq_identity_required=qq_admission,
@@ -567,6 +568,7 @@ def build_runtime(config):
                 core.memory.client,
                 storage_runtime=storage,
                 on_archived=core.memory_learning.observation_archived,
+                can_process=core.group_processing.archive_start,
             )
         for spec in (routing or {}).get("commands", []):
             core.direct.register_command(**spec)
@@ -913,6 +915,12 @@ def create_app(core=None, tokens=None, life_readers=None):
                 if service != "platform":
                     raise Fault("forbidden")
                 return core.summary_windows.learning_frame(service, body)
+            if operation == "participation-status":
+                if service != "platform":
+                    raise Fault("forbidden")
+                if body != {}:
+                    raise Fault("invalid_input")
+                return core.participation.status()
             if operation == "observation-ingest":
                 if not hasattr(core, "observations"):
                     raise Fault("dependency_unavailable")
@@ -954,6 +962,10 @@ def create_app(core=None, tokens=None, life_readers=None):
     @app.post("/internal/v1/bot-bindings/learning-frame")
     async def bot_learning_frame(request: Request):
         return await dispatch(request, "bot-learning-frame")
+
+    @app.post("/internal/v1/bot-bindings/participation-status")
+    async def participation_status(request: Request):
+        return await dispatch(request, "participation-status")
 
     @app.post("/internal/v2/observations/ingest")
     async def observation_ingest(request: Request):

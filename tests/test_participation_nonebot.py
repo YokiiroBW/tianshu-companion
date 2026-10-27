@@ -24,7 +24,7 @@ def test_owned_entry_receipts_unknown_graph_and_swallowed_rule_failure(tmp_path)
         import time
 
         import nonebot
-        from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent
+        from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, PrivateMessageEvent
         from nonebot.message import handle_event
         from tianshu_nonebot.onebot import create_host
 
@@ -47,7 +47,9 @@ def test_owned_entry_receipts_unknown_graph_and_swallowed_rule_failure(tmp_path)
                 assert status == 200, (status, result)
                 return result
             await call("observation/apply", dict(request_id="apply:one", account_id="10001", revision=1, enabled=True,
-                group_policy=dict(observe=True, mode="whitelist", list=["20001"]),
+                group_policy=dict(version=2, default=dict(mode="observe", actor_id="actor:a", keywords=[]),
+                    groups={"20001":dict(mode="active", actor_id="actor:a", keywords=[])}),
+                group_revisions={"20001":1}, group_default_revision=1,
                 private_policy=dict(observe=True, mode="observe_only", list=[])))
             def event(number, mention=False):
                 segments = [{"type":"text", "data":{"text":"Synthetic ordinary message"}}]
@@ -103,15 +105,51 @@ def test_owned_entry_receipts_unknown_graph_and_swallowed_rule_failure(tmp_path)
             assert state(4)[0]["state"] != "free"
             service.capture_result = original
 
-            # Our old exact connection wins without changing its input or queue.
+            # An old exact binding cannot bypass the new explicit-trigger policy.
             await call("bindings/apply", dict(request_id="exact:one", connection_id="connection:legacy", revision=1,
                 account_id="10001", conversation={"kind":"group", "id":"20001"}, allowed_authors=["10002"], enabled=True))
             await handle_event(bot, event(5))
-            assert state(5)[0]["state"] == "handled_elsewhere"
-            assert len((await call("events/poll", {"connection_id":"connection:legacy", "limit":20}))["events"]) == 1
+            assert state(5)[0]["state"] == "free"
+            assert len((await call("events/poll", {"connection_id":"connection:legacy", "limit":20}))["events"]) == 0
             await handle_event(bot, event(6, True))
             original_row = service.db.execute("SELECT claimed FROM observations WHERE native_id='6'").fetchone()
             assert original_row[0] == 1
+
+            # Non-active modes never traverse the ordinary ownership graph.
+            # Disabled also avoids our message normalization and still lets
+            # unrelated host plugins receive the original event.
+            graph_calls = []
+            def forbidden_graph():
+                graph_calls.append(True)
+                raise AssertionError("non-active event traversed participation graph")
+            host.participation_host.graph = forbidden_graph
+            import tianshu_nonebot.rpc as rpc_module
+            original_normalize = rpc_module.onebot_input
+            normalizations = []
+            def counted(*args, **kwargs):
+                normalizations.append(True)
+                return original_normalize(*args, **kwargs)
+            rpc_module.onebot_input = counted
+            await call("observation/apply", dict(request_id="observe:two", account_id="10001", revision=2, enabled=True,
+                group_policy=dict(version=2, default=dict(mode="observe", actor_id="actor:a", keywords=[]), groups={}),
+                group_revisions={"20001":2}, group_default_revision=2,
+                private_policy=dict(observe=False, mode="blacklist", list=[])))
+            await handle_event(bot, event(30))
+            assert len(normalizations) == 1 and graph_calls == []
+            await call("observation/apply", dict(request_id="disabled:three", account_id="10001", revision=3, enabled=True,
+                group_policy=dict(version=2, default=dict(mode="disabled", actor_id="actor:a", keywords=[]), groups={}),
+                group_revisions={"20001":3}, group_default_revision=3,
+                private_policy=dict(observe=False, mode="blacklist", list=[])))
+            normalizations.clear()
+            await handle_event(bot, event(31))
+            await handle_event(bot, PrivateMessageEvent(time=int(time.time()), self_id=10001, post_type="message", sub_type="friend",
+                message_type="private", user_id=10002, message_id=32,
+                message=[{"type":"text", "data":{"text":"disabled private"}}],
+                raw_message="disabled private", font=0, sender={"user_id":10002}))
+            assert normalizations == [] and graph_calls == []
+            assert service.db.execute("SELECT 1 FROM observations WHERE native_id='31'").fetchone() is None
+            assert service.db.execute("SELECT 1 FROM events WHERE native_id='31'").fetchone() is None
+            assert service.db.execute("SELECT 1 FROM observations WHERE native_id='32'").fetchone() is None
             host.unregister()
             print("actual-nonebot-owned-and-negative-paths-passed")
         asyncio.run(main())

@@ -150,6 +150,7 @@ class Core(Delivery):
         chat_history_client=None,
         chat_history_mappings=(),
         actor_memory_authority=None,
+        participation_client=None,
     ):
         self._automatic_memory_candidates = candidates_enabled(automatic_memory_candidates)
         self.default_model_selector = default_model_selector
@@ -162,7 +163,9 @@ class Core(Delivery):
         self.book_reading = BookReading(origins, clock)
         from .memory_learning import MemoryLearning
         from .summary_windows import SummaryWindows
+        from .group_processing import GroupProcessing
 
+        self.group_processing = GroupProcessing(self, participation_client)
         self.summary_windows = SummaryWindows(self)
         self.memory_learning = MemoryLearning(self)
         self.knowledge_client = knowledge_client or getattr(memory, "client", None)
@@ -234,6 +237,9 @@ class Core(Delivery):
             self.life.default_config_version = (
                 config_version if background_gateway is None else None
             )
+            from .participation import Participation
+
+            self.participation = Participation(self, participation_client)
             self.images = Images(self.life, **(image_options or {}))
             from .life_album import Album
 

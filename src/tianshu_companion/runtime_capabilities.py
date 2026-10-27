@@ -23,6 +23,8 @@ def read_capabilities(core):
     return {
         "schema_version": 1,
         "service": "companion",
+        "participation": core.participation.status(),
+        "group_processing": core.group_processing.status(),
         "automatic_memory_candidates": {
             "enabled": enabled,
             "generation": "enabled" if enabled else "disabled",

@@ -20,7 +20,7 @@ MINIMUM_LEASE = 65.0  # Existing generation timeout (60s), with dispatch allowan
 class SelectionRequest:
     turn_id: str
     actor_id: str
-    person_id: str
+    person_id: str | None
     audience: str
     conversation_id: str
     caller_service: str = "companion"

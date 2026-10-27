@@ -120,7 +120,9 @@ def validate(request):
 
 
 class Observations:
-    def __init__(self, path, memory_client, *, storage_runtime=None, on_archived=None):
+    def __init__(
+        self, path, memory_client, *, storage_runtime=None, on_archived=None, can_process=None
+    ):
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.memory = memory_client
@@ -128,6 +130,7 @@ class Observations:
         # runs before the local transfer is marked archived, so a crash retries
         # the same source instead of losing the handoff between databases.
         self.on_archived = on_archived
+        self.can_process = can_process
         self.database = None
         if storage_runtime is not None:
             from .observation_postgres import prepare
@@ -164,6 +167,17 @@ class Observations:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")
         return db
+
+    def processing_frames(self, source_ref):
+        """Use the accepted physical frame, never decode an opaque source identifier."""
+        with closing(self._db()) as db:
+            row = db.execute(
+                "SELECT instance_id,self_id,conversation FROM inbox WHERE source_ref=?",
+                (source_ref,),
+            ).fetchone()
+        if row is None:
+            return None
+        return [dict(instance_id=row[0], self_id=row[1], conversation_id=row[2], actor_id=None)]
 
     def ingest(self, service, request):
         if service != "platform":
@@ -230,6 +244,10 @@ class Observations:
             ).fetchall()
         worked = False
         for row in rows:
+            if self.can_process is not None and not await self.can_process(
+                dict(source_ref=row["source_ref"])
+            ):
+                continue
             worked = True
             try:
                 payload = json.loads(row["payload"])
