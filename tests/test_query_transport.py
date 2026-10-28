@@ -13,12 +13,11 @@ from unittest import mock
 
 import httpx
 import uvicorn
-
-from support import contracts, Harness
+from support import Harness, contracts
 from test_source_https import CERT_PROGRAM
+
 from tianshu_companion.clients import JsonService, Memory, Sender
 from tianshu_companion.contracts import Fault
-
 
 SELECT = "/internal/v1/memory/select"
 IDENTITY = "/internal/v1/identity/resolve"
@@ -31,13 +30,15 @@ QUERIES = [
     ("/internal/v1/memory/profiles/select", {}),
     ("/internal/v1/memory/source-sync/check", {}),
     ("/internal/v2/bot-delivery/context", {}),
-    ("/internal/v1/memory/candidates/process", {"job_id": "candidate:fixture", "output": None}),
+    (
+        "/internal/v1/memory/candidates/process",
+        {"extraction_schema": 6, "job_id": "candidate:fixture", "batch_ref": None, "output": None},
+    ),
     ("/internal/v1/model-requests/model:" + "a" * 32, None),
 ]
 WRITES = [
     "/internal/v1/source-access/read",
     "/internal/v1/identity/register",
-    "/internal/v1/memory/turn-commits",
     "/internal/v1/memory/revise",
     "/internal/v1/conversation/ingest",
     "/internal/v1/conversation/ingest-actors",
@@ -575,7 +576,15 @@ class QueryTransportTests(unittest.IsolatedAsyncioTestCase):
         reads = [
             (SELECT, {}),
             ("/internal/v2/memory/context/verify", {}),
-            ("/internal/v1/memory/candidates/process", {"job_id": "job:fixture", "output": None}),
+            (
+                "/internal/v1/memory/candidates/process",
+                {
+                    "extraction_schema": 6,
+                    "job_id": "job:fixture",
+                    "batch_ref": None,
+                    "output": None,
+                },
+            ),
         ]
         try:
             tasks.extend(asyncio.create_task(service.call(path, body)) for path, body in reads)

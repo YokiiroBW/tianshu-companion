@@ -16,8 +16,8 @@ from unittest.mock import patch
 
 import httpx
 from jsonschema import Draft202012Validator
-
 from support import Harness, contracts
+
 from tianshu_companion import observability as obs
 from tianshu_companion.app import create_app
 from tianshu_companion.clients import JsonService, Memory
@@ -31,6 +31,7 @@ from tianshu_companion.memory_summaries import (
     parse_segment,
     segment_messages,
 )
+from tianshu_companion.runtime_capabilities import read_capabilities
 
 
 def member(identity, person, *, frame=None, text="原话", role="human"):
@@ -680,6 +681,51 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(task["output"], output_for(task["segment_window"]))
 
+    async def test_obsolete_jobs_retire_in_bounded_pages_without_blocking_current_segment(self):
+        await self.chat()
+        current = self.tasks()[0]
+        for index in range(65):
+            item = dict(
+                id=f"obsolete:{index:03}",
+                conversation_id=QUEUE,
+                scope=current["scope"],
+                scope_key=current["scope_key"],
+                sequence=-1,
+                state="blocked" if index % 2 else "pending",
+                stage="commit_wait",
+                deadline=0,
+                output={"memories": []},
+                attempts=2,
+            )
+            if index % 4:
+                item["extraction_schema"] = 2 + index % 4
+            self.h.core.store.put("metadata", item)
+        await self.restart()
+        self.h.clock.advance(120)
+        worker = self.h.core.memory_learning
+        worker.segments.seal_due()
+        # Use the current scope to ensure even the unretired page tail cannot
+        # act as a predecessor or a foreground exclusion barrier.
+        state = read_capabilities(self.h.core)["automatic_memory_candidates"]["retained_learning"]
+        self.assertTrue(state["pending"])
+        self.assertFalse(state["blocked"])
+        self.assertTrue(worker._retire_unused())
+        old = [self.h.core.store.get("metadata", f"obsolete:{i:03}") for i in range(65)]
+        self.assertEqual(64, sum(row["state"] == "retired" for row in old))
+        self.assertTrue(
+            all(row["output"] == {"memories": []} and row["attempts"] == 2 for row in old)
+        )
+        self.assertEqual(current["id"], worker._next()["id"])
+        self.assertFalse(worker.admission_blocked(current["scope"]))
+        self.assertEqual([], self.peer.processed)
+        self.assertEqual([], self.peer.generated)
+        await self.drain()
+        self.assertEqual("completed", self.tasks()[0]["state"])
+        self.assertEqual(1, len(self.peer.generated))
+        self.assertTrue(
+            all(self.h.core.store.get("metadata", row["id"])["state"] == "retired" for row in old)
+        )
+
     async def test_new_speech_extends_quiet_but_duplicate_receipt_does_not(self):
         await self.chat()
         start = self.tasks()[0]
@@ -1324,18 +1370,13 @@ class SegmentLearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("binding:passive", self.h.core.bindings)
         self.assertEqual([], self.h.turns())
 
-    async def test_segment_context_uses_group_authors_but_legacy_capture_stays_owner_only(self):
+    async def test_segment_context_uses_actual_group_authors(self):
         await self.chat("A提出问题", "a")
         first = self.h.turns()[-1]
         await self.chat("B回答问题", "b")
         last = self.h.turns()[-1]
         windows = self.h.core.summary_windows
-        legacy = windows.read([last["id"]])
-        shared = windows.read([last["id"]], include_dialogue=True)
-        self.assertEqual(
-            {last["scope"]["person_id"]},
-            {row["speaker"]["person_id"] for row in legacy["manifest"]["members"]},
-        )
+        shared = windows.read([last["id"]])
         self.assertEqual(
             {first["scope"]["person_id"], last["scope"]["person_id"]},
             {
@@ -1613,5 +1654,9 @@ class SegmentProtocolTests(unittest.IsolatedAsyncioTestCase):
                 "job:test", output, extraction_schema=6, batch_ref="batch:test"
             )
         self.assertTrue(failed.exception.unknown)
-        with self.assertRaises(Fault):
-            await memory.process_candidate("job:test", None, extraction_schema=6.0)
+        before = len(calls)
+        for version in (None, 2, 3, 4, 5, True, 6.0):
+            with self.subTest(version=version), self.assertRaises(Fault) as rejected:
+                await memory.process_candidate("job:test", None, extraction_schema=version)
+            self.assertEqual("unsupported_version", rejected.exception.code)
+        self.assertEqual(before, len(calls))

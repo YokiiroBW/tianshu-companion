@@ -5,8 +5,9 @@ import copy
 import json
 import os
 import time
-import httpx
 from pathlib import Path
+
+import httpx
 
 from tianshu_companion.clients import command, uid, utc
 from tianshu_companion.contracts import Contracts, Fault
@@ -88,9 +89,7 @@ class FakeOrigins:
 
 
 class FakeMemory:
-    # These long-standing scenarios exercise retained protocol3 jobs. New
-    # consolidation tests explicitly use schema5 and its real envelope.
-    extraction_schema = 3
+    extraction_schema = 6
 
     def __init__(self, clock):
         self.clock, self.accounts = clock, {}
@@ -242,19 +241,17 @@ class FakeMemory:
             for r in requests
         ]
 
-    async def commit(self, event):
+    async def accept_materials(self, request):
         if self.fail_commit:
             raise Fault("dependency_unavailable")
-        duplicate = any(e["event_id"] == event["event_id"] for e in self.commits)
+        event = request["event"]
         self.commits.append(copy.deepcopy(event))
+        # General dialogue fixtures only record the source handoff. SegmentPeer
+        # supplies actual bounded material descriptors for organization tests.
         return dict(
             schema_version=1,
-            event_id=event["event_id"],
-            turn_id=event["aggregate_id"],
-            input_revision=event["input_revision"],
-            state="duplicate" if duplicate else "accepted",
-            candidate_job_ref="candidate:fixture",
-            confirmed_memory_written=False,
+            candidate_job_ref=None,
+            materials=[],
         )
 
     async def check_sources(self, turn, sources):

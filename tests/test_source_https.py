@@ -19,11 +19,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
-
 from support import contracts
+
 from tianshu_companion.clients import command, uid, utc
 from tianshu_companion.contracts import digest
-
 
 CERT_PROGRAM = """
 import datetime, ipaddress, pathlib, sys
@@ -245,18 +244,6 @@ class HttpsSourceTests(unittest.TestCase):
                                 )
                                 for source in event["sources"]
                             ],
-                        )
-                    elif self.path == "/internal/v1/memory/turn-commits":
-                        contract.check("conversation#committed_event", body)
-                        state["commits"].append(body)
-                        response = dict(
-                            schema_version=1,
-                            event_id=body["event_id"],
-                            turn_id=body["aggregate_id"],
-                            input_revision=body["input_revision"],
-                            state="accepted",
-                            candidate_job_ref=None,
-                            confirmed_memory_written=False,
                         )
                     else:
                         # No model or private-memory success is fabricated. This

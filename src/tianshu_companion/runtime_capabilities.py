@@ -36,7 +36,8 @@ def read_capabilities(core):
                 state: core.store.db.execute(
                     "SELECT 1 FROM metadata WHERE conversation_id=? AND status IN ("
                     + ("'pending','collecting','material_pending'" if state == "pending" else "?")
-                    + ") LIMIT 1",
+                    + ") AND (json_extract(body,'$.extraction_schema')=6 "
+                    "OR status='material_pending') LIMIT 1",
                     ("memory:learning",) if state == "pending" else ("memory:learning", state),
                 ).fetchone()
                 is not None
@@ -45,7 +46,7 @@ def read_capabilities(core):
             "consolidation_receipts": {
                 label: core.store.db.execute(
                     "SELECT 1 FROM metadata WHERE conversation_id=? "
-                    "AND json_extract(body,'$.extraction_schema') IN (5,6) "
+                    "AND json_extract(body,'$.extraction_schema')=6 "
                     f"AND json_extract(body,'{path}')=? LIMIT 1",
                     ("memory:learning", value),
                 ).fetchone()

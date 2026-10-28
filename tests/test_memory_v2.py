@@ -6,14 +6,13 @@ import time
 import unittest
 
 import httpx
-from jsonschema import Draft202012Validator
-
 from support import Harness, contracts
+from test_memory_segments import member, output_for, window_for
+
 from tianshu_companion.clients import JsonService, Memory, epoch, utc
 from tianshu_companion.context import TurnContext, merge_checks, scope_check
 from tianshu_companion.contracts import Fault, canonical, digest
 from tianshu_companion.memory_context import selection, validate_response
-from tianshu_companion.memory_extraction import output_schema
 
 
 def example(package, name):
@@ -219,18 +218,8 @@ class EvidenceProtocolTests(unittest.IsolatedAsyncioTestCase):
                     getattr(failure, "read_execution", None),
                 )
 
-    def test_prompt_schema_resolves_published_external_refs_without_copying_rules(self):
-        schema = output_schema(self.contracts)
-        self.assertNotIn('"$ref"', canonical(schema))
-        validator = Draft202012Validator(schema)
-        fixture = example("memory-extraction/v1", "extraction-positive")
-        self.assertTrue(validator.is_valid(fixture["submit_request"]["output"]))
-        invalid = copy.deepcopy(fixture["submit_request"]["output"])
-        invalid["memories"][0]["fact"].pop("modality")
-        self.assertFalse(validator.is_valid(invalid))
 
-
-class ExtractionNegotiationTests(unittest.IsolatedAsyncioTestCase):
+class MemoryWriteOutcomeTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_memory_write_stays_unknown_when_receipt_read_fails(self):
         request = example("memory-context/v2", "context-forget-positive")["forget_request"]
         for path in ("/internal/v1/memory/context/propose", "/internal/v2/memory/context/forget"):
@@ -274,38 +263,10 @@ class ExtractionNegotiationTests(unittest.IsolatedAsyncioTestCase):
             await memory.forget_episode(request)
         self.assertTrue(uncertain.exception.unknown)
 
-    async def test_negotiated_legacy_read_and_submit_are_explicit(self):
-        fixture = example("memory-extraction/v1", "extraction-positive-legacy-negotiation")
-        response = fixture["legacy_pending_response"]
-        calls = []
-
-        async def handler(request):
-            calls.append(json.loads(request.content))
-            return httpx.Response(200, json=response)
-
-        client = JsonService(
-            "https://synthetic.invalid", "synthetic-token", transport=httpx.MockTransport(handler)
-        )
-        self.addAsyncCleanup(client.close)
-        memory = Memory(contracts(), client)
-        read = await memory.process_candidate("job:legacy", None, extraction_schema=4)
-        self.assertEqual(3, read["extraction_schema"])
-        self.assertEqual([3, 4], calls[0]["supported_extraction_schemas"])
-        response = dict(
-            state="completed",
-            extraction_schema=3,
-            content=[],
-            result=dict(state="skipped", record_ids=[], group_ids=[]),
-        )
-        output = example("memory-extraction/v1", "extraction-positive-legacy-empty-time")[
-            "legacy_submit_request"
-        ]["output"]
-        await memory.process_candidate("job:legacy", output, extraction_schema=3)
-        self.assertEqual(dict(job_id="job:legacy", output=output, extraction_schema=3), calls[1])
-
     async def test_read_malformed_and_write_lost_response_keep_distinct_outcomes(self):
         calls = []
-        fixture = example("memory-extraction/v1", "extraction-positive")
+        frame = dict(actor_id="actor:a", audience="group", conversation_id="conv:test")
+        window = window_for("segment:synthetic", frame, [member("material:a", "person:a")])
 
         async def handler(request):
             calls.append(json.loads(request.content))
@@ -319,44 +280,14 @@ class ExtractionNegotiationTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(client.close)
         memory = Memory(contracts(), client)
         with self.assertRaises(Fault) as rejected:
-            await memory.process_candidate("job:synthetic", None, extraction_schema=4)
+            await memory.process_candidate("job:synthetic", None)
         self.assertFalse(rejected.exception.unknown)
         with self.assertRaises(Fault) as uncertain:
             await memory.process_candidate(
-                "job:synthetic", fixture["submit_request"]["output"], extraction_schema=4
+                "job:synthetic", output_for(window), batch_ref="batch:synthetic"
             )
         self.assertTrue(uncertain.exception.unknown)
         self.assertEqual(2, len(calls))
-
-    async def test_learning_persists_negotiated_schema_before_generating_and_old_jobs_keep_wire(
-        self,
-    ):
-        h = Harness(silence_ms=0)
-        self.addAsyncCleanup(h.core.close)
-        calls = []
-
-        async def process(job, output, **kwargs):
-            calls.append((job, output, kwargs))
-            return dict(
-                state="pending", content=[], result=None, extraction_schema=3, known_facts=[]
-            )
-
-        h.memory.process_candidate = process
-        item = dict(
-            id="memory:learning:negotiated",
-            kind="memory:learning",
-            job_id="job:legacy-ack",
-            extraction_schema=4,
-        )
-        await h.core.memory_learning._candidate_request(item, None)
-        saved = h.core.store.get("metadata", item["id"])
-        self.assertEqual(3, saved["extraction_schema"])
-        self.assertTrue(saved["extraction_negotiated"])
-        await h.core.memory_learning._candidate_request(saved, {"memories": []})
-        self.assertEqual(dict(extraction_schema=3), calls[-1][2])
-        old = dict(id="memory:learning:retained", job_id="job:old")
-        await h.core.memory_learning._candidate_request(old, {"memories": []})
-        self.assertEqual({}, calls[-1][2])
 
 
 class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
@@ -706,6 +637,7 @@ class CoreEvidenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_renewed_history_lease_gets_fresh_memory_proof_inside_preparation(self):
         from test_delivery_v2 import NativeQueue
+
         from tianshu_companion.context_checks import VerificationCheckpoint
 
         for text in ("第一条合成人话。", "另一条合成人话。"):

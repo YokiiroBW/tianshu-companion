@@ -8,62 +8,63 @@ import re
 import time
 from dataclasses import asdict, dataclass
 
-from .clients import command, epoch, query, uid, utc
 from . import clients
-from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
-from .direct import Direct
-from .life import Life
-from .images import Images
-from .personas import PersonaError, Personas
-from .proactive import Proactive
-from .web_snapshot import snapshot as read_web_snapshot
 from . import observability as obs
+from .book_reading import INSTRUCTION as BOOK_READING_INSTRUCTION
+from .book_reading import BookReading
+from .clients import command, epoch, query, uid, utc
 from .context import (
+    ACTOR_MEMORY_DOMAIN,
+    CHAT_HISTORY_DOMAIN,
+    MEMORY_CONTEXT_DOMAIN,
     TEXT_DOMAIN,
     TEXT_INPUT_DOMAIN,
-    MEMORY_CONTEXT_DOMAIN,
-    CHAT_HISTORY_DOMAIN,
-    ACTOR_MEMORY_DOMAIN,
     TOOL_READ_DOMAINS,
-    tool_input_checks,
     TurnContext,
     inherited_checks,
     merge_checks,
-    record_model_dispatch,
     model_input_checks,
+    record_model_dispatch,
+    tool_input_checks,
 )
 from .context_checks import VerificationCheckpoint, verify_checks
-from .short_context import (
-    ShortContextPolicy,
-    current_revision,
-    sources_current,
-    message_current,
-)
-from .source_sync import ingest as ingest_sources, migrate_legacy, read_facts
-from .source_sync import ensure_channel
-from .source_sync import invalidate_physical
-from .relationships.contract import DOMAIN as RELATIONSHIP_DOMAIN
-from .relationships.projection import verify as verify_relationship
-from .writing import Writing
-from .runtime_capabilities import candidates_enabled
+from .contracts import PROFILE_DOMAIN, Fault, canonical, digest
+from .delivery import SOURCE_RENEWAL_MARGIN_SECONDS, TERMINAL, Delivery
+from .direct import Direct
+from .images import Images
+from .life import Life
 from .model_selection import verify_lease
 from .model_slots import ModelSlots
+from .personas import PersonaError, Personas
 from .preparation_retry import (
     read_retry,
     recovery_deadline,
     retry_preparation,
 )
+from .proactive import Proactive
 from .qq_identity import (
     SOURCE_INSTRUCTION,
-    material_provenance,
     dialogue_sources,
-    projection as qq_projection,
+    material_provenance,
     validate_account,
     validate_channel,
 )
-
-from .delivery import Delivery, SOURCE_RENEWAL_MARGIN_SECONDS, TERMINAL
-from .book_reading import BookReading, INSTRUCTION as BOOK_READING_INSTRUCTION
+from .qq_identity import (
+    projection as qq_projection,
+)
+from .relationships.contract import DOMAIN as RELATIONSHIP_DOMAIN
+from .relationships.projection import verify as verify_relationship
+from .runtime_capabilities import candidates_enabled
+from .short_context import (
+    ShortContextPolicy,
+    current_revision,
+    message_current,
+    sources_current,
+)
+from .source_sync import ensure_channel, invalidate_physical, migrate_legacy, read_facts
+from .source_sync import ingest as ingest_sources
+from .web_snapshot import snapshot as read_web_snapshot
+from .writing import Writing
 
 ACTIVE = {
     "preparing",
@@ -162,9 +163,9 @@ class Core(Delivery):
         self.store, self.contracts = store, contracts
         self.origins, self.memory, self.gateway, self.sender = origins, memory, gateway, sender
         self.book_reading = BookReading(origins, clock)
+        from .group_processing import GroupProcessing
         from .memory_learning import MemoryLearning
         from .summary_windows import SummaryWindows
-        from .group_processing import GroupProcessing
 
         self.group_processing = GroupProcessing(self, participation_client)
         self.summary_windows = SummaryWindows(self)
@@ -2796,17 +2797,10 @@ class Core(Delivery):
                             outcome = "cancelled"
                         else:
                             self.contracts.check("conversation#committed_event", item["event"])
-                            contextual = getattr(
-                                self.memory, "extraction_schema", 5
-                            ) == 6 and hasattr(self.memory, "accept_materials")
-                            if contextual and "material_request" not in item:
+                            if "material_request" not in item:
                                 windows = []
                                 try:
-                                    windows = [
-                                        self.summary_windows.read(
-                                            [turn["id"]], include_dialogue=True
-                                        )
-                                    ]
+                                    windows = [self.summary_windows.read([turn["id"]])]
                                 except Fault as error:
                                     # Context is optional; the actual new event's
                                     # complete sources still go to Memory and are
@@ -2830,10 +2824,8 @@ class Core(Delivery):
                             item["attempts"] = attempts
                             self.store.put("outbox", item)
                             try:
-                                receipt = await (
-                                    self.memory.accept_materials(item["material_request"])
-                                    if contextual
-                                    else self.memory.commit(item["event"])
+                                receipt = await self.memory.accept_materials(
+                                    item["material_request"]
                                 )
                             except BaseException:
                                 # Cancellation or an unclassified adapter failure is also

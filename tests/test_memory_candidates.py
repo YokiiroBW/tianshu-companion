@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest import mock
 
 import httpx
-
 from support import Harness, contracts
+
 from tianshu_companion.app import build_runtime, create_app
 from tianshu_companion.clients import JsonService, Memory
 from tianshu_companion.contracts import Fault
@@ -67,7 +67,8 @@ class CandidatePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, len(self.h.memory.commits))
         self.assertTrue(all(row[3] == "delivered" for row in self.rows()))
         for item in self.h.core.store.list("outbox"):
-            self.assertFalse(item["receipt"]["confirmed_memory_written"])
+            self.assertIsNone(item["receipt"]["candidate_job_ref"])
+            self.assertEqual([], item["receipt"]["materials"])
         self.assertEqual(
             "not_verified",
             read_capabilities(self.h.core)["automatic_memory_candidates"][
@@ -119,7 +120,7 @@ class CandidatePolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("submitting", h.core.store.list("outbox")[0]["state"])
             raise Fault("result_unknown", unknown=True)
 
-        h.memory.commit = uncertain
+        h.memory.accept_materials = uncertain
         await h.core.flush_outbox()
         self.assertEqual("unknown", h.core.store.list("outbox")[0]["state"])
         await self.restart(False)
@@ -139,7 +140,7 @@ class CandidatePolicyTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await asyncio.Event().wait()
 
-        self.h.memory.commit = wait_forever
+        self.h.memory.accept_materials = wait_forever
         first = asyncio.create_task(self.h.core.flush_outbox())
         await asyncio.wait_for(entered.wait(), 2)
         second = asyncio.create_task(self.h.core.flush_outbox())
@@ -239,56 +240,13 @@ class CandidatePolicyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MemoryWriteOutcomeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_candidate_read_accepts_supported_versions_with_matching_context(self):
-        for version in (2, 3, 4, True, 3.0):
-            with self.subTest(version=version):
-                response = dict(
-                    state="pending",
-                    result=None,
-                    content=[
-                        dict(index=0, text="第一支钢笔用蓝墨水", sent_at="2026-10-14T00:00:00Z")
-                    ],
-                    extraction_schema=version,
-                    known_facts=[
-                        dict(
-                            key="pen.ink",
-                            value="蓝色",
-                            entity=dict(id="entity:" + "a" * 64, kind="pen", mention="第一支钢笔"),
-                        )
-                    ],
-                )
-
-                async def handler(request):
-                    self.assertEqual(
-                        json.loads(request.content), dict(job_id="candidate:quality", output=None)
-                    )
-                    return httpx.Response(200, json=response)
-
-                client = JsonService(
-                    "https://synthetic.invalid",
-                    "synthetic-token",
-                    transport=httpx.MockTransport(handler),
-                )
-                self.addAsyncCleanup(client.close)
-                if type(version) is int and version in (2, 3):
-                    self.assertEqual(
-                        await Memory(contracts(), client).process_candidate(
-                            "candidate:quality", None
-                        ),
-                        response,
-                    )
-                else:
-                    with self.assertRaises(Fault):
-                        await Memory(contracts(), client).process_candidate(
-                            "candidate:quality", None
-                        )
-
     async def test_real_client_never_treats_lost_or_invalid_receipt_as_not_started(self):
         h = Harness(silence_ms=0)
         self.addAsyncCleanup(h.core.close)
         await h.ingest()
         await h.cycles()
         event = h.core.store.list("outbox")[0]["event"]
+        material = dict(schema_version=1, event=event, context_windows=[])
         for response in (
             httpx.ReadError("synthetic lost response"),
             httpx.Response(200, content=b"invalid JSON"),
@@ -311,9 +269,9 @@ class MemoryWriteOutcomeTests(unittest.IsolatedAsyncioTestCase):
             )
             self.addAsyncCleanup(client.close)
             with self.assertRaises(Fault) as raised:
-                await Memory(contracts(), client).commit(event)
+                await Memory(contracts(), client).accept_materials(material)
             self.assertTrue(raised.exception.unknown)
-            self.assertEqual([event], calls)
+            self.assertEqual([material], calls)
 
     async def test_explicit_not_started_or_missing_configuration_retains_retry_semantics(self):
         async def handler(request):
@@ -325,5 +283,7 @@ class MemoryWriteOutcomeTests(unittest.IsolatedAsyncioTestCase):
             client = JsonService(url, "synthetic-token", transport=httpx.MockTransport(handler))
             self.addAsyncCleanup(client.close)
             with self.assertRaises(Fault) as raised:
-                await Memory(contracts(), client).commit({})
+                await Memory(contracts(), client).accept_materials(
+                    dict(schema_version=1, observation_refs=["observation:fixture"])
+                )
             self.assertFalse(raised.exception.unknown)

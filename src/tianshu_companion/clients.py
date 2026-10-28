@@ -1,22 +1,22 @@
 """Fixed service endpoints, bounded calls, and published wire documents."""
 
 import asyncio
+import math
 import re
+import ssl
 import time
 import uuid
-import ssl
-import math
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 import httpx
 
+from . import observability as obs
 from .contracts import Fault, canonical, digest, strict_json
 from .memory_context import group_context_owners
-from . import observability as obs
 
 # The process-wide runtime event port. The host assembles it once, at the same place the
 # clients are built; nothing here creates a destination of its own, and an unassembled port
@@ -412,22 +412,9 @@ class JsonService:
             # without spending another extraction attempt or replaying a write.
             return (
                 type(body) is dict
-                and (
-                    set(body) == {"job_id", "output"}
-                    or (
-                        set(body) == {"job_id", "output", "supported_extraction_schemas"}
-                        and body["supported_extraction_schemas"] in ([3], [4], [3, 4])
-                    )
-                    or (
-                        set(body)
-                        == {"job_id", "job_ids", "output", "supported_extraction_schemas", "window"}
-                        and body["supported_extraction_schemas"] == [5]
-                    )
-                    or (
-                        set(body) == {"extraction_schema", "job_id", "batch_ref", "output"}
-                        and body["extraction_schema"] == 6
-                    )
-                )
+                and set(body) == {"extraction_schema", "job_id", "batch_ref", "output"}
+                and type(body["extraction_schema"]) is int
+                and body["extraction_schema"] == 6
                 and isinstance(body["job_id"], str)
                 and bool(body["job_id"])
                 and body["output"] is None
@@ -1180,22 +1167,6 @@ class Memory:
             raise Fault("budget_exceeded")
         return response
 
-    async def commit(self, event):
-        value = await self.client.call(
-            "/internal/v1/memory/turn-commits", event, uncertain_write=True
-        )
-        try:
-            self.contracts.check("identity-memory#consume_receipt", value)
-        except Fault as error:
-            raise Fault(error.code, unknown=True) from None
-        if (
-            value["event_id"] != event["event_id"]
-            or value["turn_id"] != event["aggregate_id"]
-            or value["input_revision"] != event["input_revision"]
-        ):
-            raise Fault("invalid_input", unknown=True)
-        return value
-
     async def accept_materials(self, request):
         """Accept source material without creating a per-turn model job."""
         self.contracts.check("memory-extraction#segment_material_request", request)
@@ -1207,34 +1178,20 @@ class Memory:
         try:
             if not isinstance(value, dict):
                 raise Fault("invalid_input")
-            if value.get("candidate_job_ref") is not None and "event" in request:
-                # A retained pre-schema6 event can only return its original
-                # acceptance receipt. It is never converted into new material.
-                self.contracts.check("identity-memory#consume_receipt", value)
-                event = request["event"]
-                if (
-                    value["event_id"] != event["event_id"]
-                    or value["turn_id"] != event["aggregate_id"]
-                    or value["input_revision"] != event["input_revision"]
+            self.contracts.check("memory-extraction#segment_material_response", value)
+            if value["candidate_job_ref"] is not None:
+                raise Fault("invalid_input")
+            refs = [material["material_ref"] for material in value["materials"]]
+            if len(set(refs)) != len(refs):
+                raise Fault("invalid_input")
+            if "event" in request:
+                scope = request["event"]["scope"]
+                expected = {key: scope[key] for key in ("actor_id", "audience", "conversation_id")}
+                if any(
+                    material["frame"] != expected or material["person_id"] != scope["person_id"]
+                    for material in value["materials"]
                 ):
                     raise Fault("invalid_input")
-            else:
-                self.contracts.check("memory-extraction#segment_material_response", value)
-                if value["candidate_job_ref"] is not None:
-                    raise Fault("invalid_input")
-                refs = [material["material_ref"] for material in value["materials"]]
-                if len(set(refs)) != len(refs):
-                    raise Fault("invalid_input")
-                if "event" in request:
-                    scope = request["event"]["scope"]
-                    expected = {
-                        key: scope[key] for key in ("actor_id", "audience", "conversation_id")
-                    }
-                    if any(
-                        material["frame"] != expected or material["person_id"] != scope["person_id"]
-                        for material in value["materials"]
-                    ):
-                        raise Fault("invalid_input")
         except (Fault, KeyError, TypeError):
             raise Fault("invalid_input", unknown=True) from None
         return value
@@ -1257,7 +1214,9 @@ class Memory:
             raise Fault("invalid_input", unknown=True) from None
         return response
 
-    async def _process_segment(self, job_id, batch_ref, output):
+    async def process_candidate(self, job_id, output, *, extraction_schema=6, batch_ref=None):
+        if type(extraction_schema) is not int or extraction_schema != 6:
+            raise Fault("unsupported_version")
         request = dict(extraction_schema=6, job_id=job_id, batch_ref=batch_ref, output=output)
         self.contracts.check(
             "memory-extraction#segment_read_request"
@@ -1292,185 +1251,6 @@ class Memory:
         except (Fault, KeyError, TypeError):
             raise Fault("invalid_input", unknown=output is not None) from None
         return response
-
-    async def process_candidate(
-        self,
-        job_id,
-        output,
-        *,
-        extraction_schema=None,
-        job_ids=None,
-        window=None,
-        batch_ref=None,
-        subject_person_id=None,
-    ):
-        if type(extraction_schema) is int and extraction_schema == 6:
-            return await self._process_segment(job_id, batch_ref, output)
-        if extraction_schema is not None and (
-            type(extraction_schema) is not int or extraction_schema not in (3, 4, 5)
-        ):
-            raise Fault("invalid_input")
-        request = dict(job_id=job_id, output=output)
-        if extraction_schema == 5:
-            from .memory_summaries import check_response_subject
-
-            if window is not None:
-                owner = window["manifest"]["scope"]["person_id"]
-                if subject_person_id is not None and subject_person_id != owner:
-                    raise Fault("invalid_input")
-                subject_person_id = owner
-            if output is not None:
-                owner = output.get("subject_person_id")
-                if (
-                    owner is not None
-                    and subject_person_id is not None
-                    and owner != subject_person_id
-                ):
-                    raise Fault("invalid_input")
-                if owner is not None:
-                    subject_person_id = owner
-                # An exact retained, unbound proposal can only replay its old
-                # ledger in Memory. Never add a subject to that frozen output;
-                # normal new model output uses the required subject schema.
-            mutates = output is not None or window is not None
-            request["job_ids"] = list(job_ids or [job_id])
-            if output is None:
-                request.update(supported_extraction_schemas=[5], window=window)
-            else:
-                request.update(extraction_schema=5, batch_ref=batch_ref)
-            self.contracts.check("memory-extraction#process_request", request)
-            if len(canonical(request).encode()) > 262144:
-                raise Fault("budget_exceeded")
-            response = await self.client.call(
-                "/internal/v1/memory/candidates/process",
-                request,
-                # A new window can capture episodes/claim a batch even before
-                # model output exists. Receipt-only lookups create no batch.
-                uncertain_write=mutates,
-            )
-            try:
-                self.contracts.check("memory-extraction#process_response", response)
-            except Fault:
-                raise Fault("invalid_input", unknown=mutates) from None
-            if response["extraction_schema"] != 5 or job_id not in response["job_ids"]:
-                raise Fault("invalid_input", unknown=mutates)
-            if response["job_ids"] != request["job_ids"]:
-                raise Fault("invalid_input", unknown=mutates)
-            owner = subject_person_id
-            if owner is None and response["state"] == "pending":
-                owner = response["subject_person_id"]
-            if owner is not None:
-                check_response_subject(response, owner, unknown=mutates)
-            if batch_ref is not None and response.get("batch_ref", batch_ref) != batch_ref:
-                raise Fault("invalid_input", unknown=mutates)
-            if response["state"] == "completed":
-                result = response["result"]
-                if (
-                    result["covered_job_ids"] != response["job_ids"]
-                    or result["cursor"]["job_ids"] != response["job_ids"]
-                ):
-                    raise Fault("invalid_input", unknown=mutates)
-                if (
-                    window is not None
-                    and result["cursor"]["window_id"] != window["manifest"]["window_id"]
-                ):
-                    raise Fault("invalid_input", unknown=mutates)
-            if (
-                response["state"] == "pending"
-                and window is not None
-                and response["window_id"] != window["manifest"]["window_id"]
-            ):
-                raise Fault("invalid_input", unknown=mutates)
-            if response["state"] == "context_changed":
-                if (
-                    output is not None
-                    or window is None
-                    or response["window_id"] != window["manifest"]["window_id"]
-                ):
-                    raise Fault("invalid_input", unknown=mutates)
-                members = {member["member_id"]: member for member in window["manifest"]["members"]}
-                invalid = response["invalid_context_member_ids"]
-                if len(set(invalid)) != len(invalid) or any(
-                    identity not in members or members[identity]["purpose"] != "context"
-                    for identity in invalid
-                ):
-                    raise Fault("invalid_input", unknown=mutates)
-            if response["state"] == "unclaimed" and (
-                output is not None or window is not None or batch_ref is not None
-            ):
-                raise Fault("invalid_input", unknown=mutates)
-            return response
-        if extraction_schema is not None:
-            if output is None:
-                request["supported_extraction_schemas"] = [3, 4] if extraction_schema == 4 else [3]
-            else:
-                request["extraction_schema"] = extraction_schema
-            self.contracts.check("memory-extraction#process_request", request)
-        value = await self.client.call(
-            "/internal/v1/memory/candidates/process",
-            request,
-            uncertain_write=output is not None,
-        )
-        if extraction_schema is not None:
-            try:
-                self.contracts.check("memory-extraction#process_response", value)
-            except Fault:
-                raise Fault("invalid_input", unknown=output is not None) from None
-            supported = request.get("supported_extraction_schemas", [extraction_schema])
-            if (
-                type(value["extraction_schema"]) is not int
-                or value["extraction_schema"] not in supported
-            ):
-                raise Fault("invalid_input", unknown=output is not None)
-            for index, source in enumerate(value["content"]):
-                if source["index"] != index:
-                    raise Fault("invalid_input", unknown=output is not None)
-            return value
-        if (
-            not isinstance(value, dict)
-            or set(value)
-            not in (
-                {"state", "result", "content"},
-                {"state", "result", "content", "extraction_schema", "known_facts"},
-            )
-            or value["state"] not in {"pending", "completed", "invalidated", "rejected"}
-            or not isinstance(value["content"], list)
-        ):
-            raise Fault("invalid_input", unknown=output is not None)
-        if value["state"] == "rejected":
-            if value["result"] == {"error_code": "invalid_input"} and not value["content"]:
-                return value
-            raise Fault("invalid_input", unknown=output is not None)
-        if value["state"] == "completed":
-            try:
-                self.contracts.check("workflow#candidate_result", value["result"])
-            except Fault:
-                raise Fault("invalid_input", unknown=output is not None) from None
-        elif value["result"] is not None:
-            raise Fault("invalid_input", unknown=output is not None)
-        if value["state"] != "pending" and value["content"]:
-            raise Fault("invalid_input", unknown=output is not None)
-        if "extraction_schema" in value:
-            if (
-                value["state"] != "pending"
-                or type(value["extraction_schema"]) is not int
-                or value["extraction_schema"] not in {2, 3}
-                or type(value["known_facts"]) is not list
-                or len(value["known_facts"]) > 128
-                or len(canonical(value["known_facts"]).encode()) > 32768
-            ):
-                raise Fault("invalid_input", unknown=output is not None)
-        for index, source in enumerate(value["content"]):
-            if (
-                type(source) is not dict
-                or set(source) != {"index", "text", "sent_at"}
-                or type(source["index"]) is not int
-                or source["index"] != index
-                or type(source["text"]) is not str
-                or type(source["sent_at"]) is not str
-            ):
-                raise Fault("invalid_input", unknown=output is not None)
-        return value
 
 
 class Gateway:

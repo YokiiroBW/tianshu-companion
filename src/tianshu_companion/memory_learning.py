@@ -1,18 +1,15 @@
-"""Contextual background learning and receipt-first recovery of retained fact jobs."""
+"""One-pass conversation organization and receipt-first recovery on the existing queue."""
 
 import asyncio
 import copy
 import json
 
-from .contracts import Fault, canonical, digest
-from .model_selection import SelectionRequest, pin_generation
-from .memory_extraction import ProposalStructureError, parse_proposal, legacy_messages
-from .short_context import sources_current
-from .memory_segments import MemorySegments
 from . import observability as obs
+from .contracts import Fault, canonical, digest
+from .memory_segments import MemorySegments
+from .model_selection import SelectionRequest, pin_generation
 
 QUEUE = "memory:learning"
-MODEL_ROUTE_BOUNDARY = "memory-learning-generation-route-boundary"
 MAX_ATTEMPTS = 3
 MAX_RECOVERY_ATTEMPTS = 6
 MAX_TOTAL_ATTEMPTS = 3 * MAX_RECOVERY_ATTEMPTS
@@ -43,28 +40,9 @@ class MemoryLearning:
         self._phase = None
         self._family = 0
         self._foreground_finished = 0
+        self._retirement_pending = True
         self.mutation_scopes = {}
         self.segments = MemorySegments(core, QUEUE)
-        boundary = core.store.get("metadata", "memory-learning-schema5-boundary")
-        if boundary is None:
-            boundary = dict(
-                id="memory-learning-schema5-boundary",
-                outbox_rowid=core.store.db.execute(
-                    "SELECT COALESCE(MAX(rowid),0) FROM outbox"
-                ).fetchone()[0],
-            )
-            core.store.put("metadata", boundary)
-        self.legacy_outbox_rowid = boundary["outbox_rowid"]
-        model_boundary = core.store.get("metadata", MODEL_ROUTE_BOUNDARY)
-        if model_boundary is None:
-            model_boundary = dict(
-                id=MODEL_ROUTE_BOUNDARY,
-                metadata_rowid=core.store.db.execute(
-                    "SELECT COALESCE(MAX(rowid),0) FROM metadata"
-                ).fetchone()[0],
-            )
-            core.store.put("metadata", model_boundary)
-        self.legacy_model_rowid = model_boundary["metadata_rowid"]
 
     def admission_blocked(self, scope):
         if not self.core.automatic_memory_candidates:
@@ -80,6 +58,7 @@ class MemoryLearning:
                 json.loads(row[0])
                 for row in self.core.store.db.execute(
                     "SELECT body FROM metadata WHERE conversation_id=? AND status='pending' "
+                    "AND json_extract(body,'$.extraction_schema')=6 "
                     "AND json_extract(body,'$.stage') IN ('capture_wait','commit_wait')",
                     (QUEUE,),
                 )
@@ -95,45 +74,6 @@ class MemoryLearning:
                 processing_frames=self.core.group_processing.frames(item) or [],
             )
             return
-        job = receipt.get("candidate_job_ref")
-        if not job:
-            return
-        key = "memory-learn:" + digest(job)
-        if self.core.store.get("metadata", key):
-            return
-        schema = getattr(self.core.memory, "extraction_schema", 5)
-        if schema == 6:
-            # This is an original singleton acceptance, not a new segment.
-            schema = 5
-        row = self.core.store.db.execute(
-            "SELECT rowid FROM outbox WHERE id=?", (item["id"],)
-        ).fetchone()
-        if schema == 5 and row is not None and row[0] <= self.legacy_outbox_rowid:
-            # Before schema5 activation Memory may already have locked this
-            # retained event to3/4. Use the original explicit negotiation once;
-            # new events never pay this remote compatibility step.
-            schema = 4
-        self.core.store.put(
-            "metadata",
-            dict(
-                id=key,
-                conversation_id=QUEUE,
-                state="pending",
-                deadline=0,
-                attempts=0,
-                recovery_failures={},
-                turn_id=item["event"]["aggregate_id"],
-                input_revision=item["event"]["input_revision"],
-                job_id=job,
-                output=None,
-                receipt=None,
-                proposal_failures=0,
-                scope=item["event"]["scope"],
-                scope_key=digest(item["event"]["scope"]),
-                sequence=item["event"]["turn_sequence"],
-                extraction_schema=schema,
-            ),
-        )
 
     def _offer_materials(self, response, *, context_windows=(), processing_frames=()):
         grouped = {}
@@ -164,7 +104,7 @@ class MemoryLearning:
 
     async def observation_archived(self, request, response):
         """Persist the archive handoff without waiting for semantic processing."""
-        if getattr(self.core.memory, "extraction_schema", 5) != 6:
+        if getattr(self.core.memory, "extraction_schema", None) != 6:
             return
         key = "memory-observation:" + digest(request["source_ref"])
         with self.core.store.transaction():
@@ -218,33 +158,30 @@ class MemoryLearning:
             self.core.store.put("metadata", item)
         return True
 
-    def _order_pending(self):
-        """Upgrade retained jobs in bounded pages without changing retry evidence."""
-        if getattr(self, "_ordered", False):
+    def _retire_unused(self):
+        """Drop obsolete automatic jobs from scheduling without remote I/O or model calls."""
+        if not self._retirement_pending:
             return False
         store = self.core.store
         rows = store.db.execute(
-            "SELECT body FROM metadata WHERE conversation_id=? AND status='pending' "
-            "AND json_extract(body,'$.scope_key') IS NULL LIMIT 64",
+            "SELECT body FROM metadata WHERE conversation_id=? AND status IN ('pending','blocked') "
+            "AND COALESCE(json_extract(body,'$.extraction_schema'),0)!=6 LIMIT 64",
             (QUEUE,),
         ).fetchall()
         with store.transaction():
             for row in rows:
                 item = json.loads(row[0])
-                turn = store.get("turns", item["turn_id"])
-                # A missing source is still handled by the existing forbidden path.
-                scope = turn["scope"] if turn else {"missing_turn": item["turn_id"]}
-                item.update(
-                    scope=scope, scope_key=digest(scope), sequence=turn["sequence"] if turn else 0
-                )
+                item.update(state="retired", deadline=0, last_error="legacy_learning_retired")
                 store.put("metadata", item)
-        self._ordered = len(rows) < 64
+        # Current producers can only create schema 6. Stop probing after this
+        # bounded startup cleanup has drained the obsolete local rows.
+        self._retirement_pending = len(rows) == 64
         return bool(rows)
 
     def _next(self, *, retry_only=False, drain_only=False):
-        # A delayed extraction must not be overtaken by its own correction:
-        # Memory's known_facts would otherwise omit the original. Other scopes
-        # can progress during its cooldown. Both predecessor probes are indexed.
+        # A delayed segment must not be overtaken by its own correction.
+        # Other scopes can progress during its cooldown. Both predecessor probes
+        # are indexed; retired protocols are excluded from current ordering.
         store = self.core.store
         # New jobs have deadline=0. An endless stream of them must not keep an
         # already-due retry at the end of the queue. Grant it at least every
@@ -268,6 +205,7 @@ class MemoryLearning:
         rows = store.db.execute(
             "SELECT deadline,position,id FROM metadata WHERE conversation_id=? "
             "AND status='pending' AND deadline<=? "
+            "AND json_extract(body,'$.extraction_schema')=6 "
             + retry_clause
             + drain_clause
             + "AND (deadline,position,id)>(?,?,?) "
@@ -284,6 +222,7 @@ class MemoryLearning:
                 "SELECT m.body FROM metadata m WHERE m.id=? AND NOT EXISTS ("
                 "SELECT 1 FROM metadata p WHERE p.conversation_id=m.conversation_id "
                 "AND p.status='pending' "
+                "AND json_extract(p.body,'$.extraction_schema')=6 "
                 "AND json_extract(p.body,'$.scope_key')=json_extract(m.body,'$.scope_key') "
                 "AND (p.position,p.id)<(m.position,m.id)) AND NOT EXISTS ("
                 "SELECT 1 FROM outbox o WHERE o.conversation_id=json_extract(m.body,'$.scope.conversation_id') "
@@ -362,10 +301,8 @@ class MemoryLearning:
             "automatic_extraction_after_delivery": "enabled" if enabled else "disabled",
             "automatic_learning_mode": (
                 "conversation_segment_multi_person"
-                if getattr(core.memory, "extraction_schema", 3) == 6
-                else "context_window_summary_and_optional_portrait"
-                if getattr(core.memory, "extraction_schema", 3) == 5
-                else "retained_fact_extraction"
+                if getattr(core.memory, "extraction_schema", None) == 6
+                else "unavailable"
             ),
             "automatic_recall_before_reply": "completed" if recall else "unavailable",
             "recalled_units": len(preparation.get("selected_units", [])) if recall else 0,
@@ -413,31 +350,13 @@ class MemoryLearning:
         item = self.core.store.get("metadata", key)
         if not item:
             raise Fault("not_found")
-        if item.get("extraction_schema") == 6:
-            if not item.get("job_id"):
-                raise Fault("result_unknown", unknown=True)
-            response = await self._candidate(item, None, reconcile=True)
-            if response["state"] in {"completed", "invalidated"}:
-                self._finish_segment(item, response)
-            return response
-        turn = self.core.store.get("turns", item["turn_id"])
-        if not turn or not self.core._turn_allows(turn, "memory.write"):
-            raise Fault("forbidden")
-        self.core._check_role(turn)
+        if item.get("extraction_schema") != 6:
+            raise Fault("unsupported_version")
+        if not item.get("job_id"):
+            raise Fault("result_unknown", unknown=True)
         response = await self._candidate(item, None, reconcile=True)
-        if item.get("extraction_schema") == 5:
-            if response["state"] in {"completed", "invalidated"}:
-                self._finish_summary(item, response)
-            return response
         if response["state"] in {"completed", "invalidated"}:
-            item.update(
-                state=response["state"],
-                receipt=response["result"],
-                last_error=None,
-                output=None,
-                deadline=0,
-            )
-            self.core.store.put("metadata", item)
+            self._finish_segment(item, response)
         return response
 
     def _automatic_due(self):
@@ -574,7 +493,7 @@ class MemoryLearning:
 
     def _select_phase(self, *, outbox_only):
         core, now = self.core, self.core.clock()
-        if core.automatic_memory_candidates and not outbox_only and self._ordered:
+        if core.automatic_memory_candidates and not outbox_only:
             drain = self._next(drain_only=True)
             if drain is not None:
                 # These real persisted exclusion barriers are holding queued
@@ -639,7 +558,7 @@ class MemoryLearning:
                     )
                 )
             elif family == "observation":
-                if getattr(core.memory, "extraction_schema", 5) != 6:
+                if getattr(core.memory, "extraction_schema", None) != 6:
                     continue
                 item = next(
                     (
@@ -652,7 +571,7 @@ class MemoryLearning:
             else:
                 item = (
                     self._next(drain_only=busy and self._foreground_finished < 3)
-                    if self._ordered and hasattr(core.memory, "process_candidate")
+                    if hasattr(core.memory, "process_candidate")
                     else None
                 )
             if item is None:
@@ -808,12 +727,11 @@ class MemoryLearning:
             changed = self.backfill() if core.automatic_memory_candidates else False
             if (
                 core.automatic_memory_candidates
-                and getattr(core.memory, "extraction_schema", 5) == 6
+                and getattr(core.memory, "extraction_schema", None) == 6
             ):
                 changed = self.segments.seal_due() or changed
             if core.automatic_memory_candidates:
-                changed = self._recover_legacy() or changed
-                changed = self._order_pending() or changed
+                changed = self._retire_unused() or changed
             if changed:
                 core.counted("memory.work")
             if self.jobs:
@@ -854,13 +772,10 @@ class MemoryLearning:
 
     @staticmethod
     def _candidate_mutates(item, output):
-        return output != {"memories": []} and not (
-            item.get("extraction_schema") == 6 and item.get("job_id") is not None and output is None
-        )
+        return output is not None or item.get("job_id") is None
 
     async def _candidate(self, item, output, *, reserve_attempt=False, reconcile=False):
-        # Retained protocols can capture an episode on a null lookup. Schema6
-        # claims at seal: a known job's null-output window/receipt read creates
+        # Segment creation claims at seal. A known job's window/receipt read creates
         # no learned content and must not install a foreground mutation gate.
         # Serial source I/O leaves the shared peer read slots available to live
         # dialogue. Models remain outside this lock; waiting spends no attempt
@@ -915,183 +830,39 @@ class MemoryLearning:
 
     def _source_turn(self, item):
         core = self.core
-        if item.get("extraction_schema") == 6:
-            frame = item["scope"]
-            if (
-                not core.automatic_memory_candidates
-                or frame["actor_id"] not in core.roles
-                or not core._role_allows(frame["actor_id"], "memory.write")
-            ):
-                raise Fault("forbidden")
-            # Routing and live role control only, never a fabricated Core turn
-            # or a substitute for Memory's complete all-author source proof.
-            return dict(id=item["segment_id"], scope=frame)
-        turn = core.store.get("turns", item["turn_id"])
+        if item.get("extraction_schema") != 6:
+            raise Fault("unsupported_version")
+        frame = item["scope"]
         if (
             not core.automatic_memory_candidates
-            or turn is None
-            or turn["scope"]["actor_id"] not in core.roles
-            or not core._turn_allows(turn, "memory.write")
+            or frame["actor_id"] not in core.roles
+            or not core._role_allows(frame["actor_id"], "memory.write")
         ):
             raise Fault("forbidden")
-        if (
-            turn["cancelled"]
-            or item.get("scope", turn["scope"]) != turn["scope"]
-            or item.get("input_revision", turn["bundle"]["collection_revision"])
-            != turn["bundle"]["collection_revision"]
-            or not sources_current(core.store, turn)
-        ):
-            raise Fault("scope_changed")
-        core._check_role(turn)
-        return turn
-
-    def _summary_subject(self, item):
-        # Metadata scope is the job's original owner; a frozen window must
-        # agree with it. Receipt-only recovery need not create a new window.
-        scope = item.get("scope")
-        if scope is None:
-            scope = self._source_turn(item)["scope"]
-        if item.get("window") is not None and item["window"]["manifest"]["scope"] != scope:
-            raise Fault("scope_changed")
-        return scope["person_id"]
+        return dict(id=item["segment_id"], scope=frame)
 
     async def _candidate_request(self, item, output):
-        # Missing pins belong to retained pre-upgrade proposals/jobs. Never infer
-        # a version from their JSON, and never regenerate an uncertain proposal.
-        schema = item.get("extraction_schema", 3)
-        if schema == 6:
-            if not item.get("job_id"):
-                response = await self.core.memory.create_segment(item["create_request"])
-                item.update(
-                    job_id=response["job_id"],
-                    stage="receipt",
-                    last_error=None,
-                    recovery_reason=None,
-                )
-                with self.core.store.transaction():
-                    self.core.store.put("metadata", item)
-                    self.core.store.put(
-                        "metadata",
-                        dict(id="memory-job:" + digest(item["job_id"]), learning_id=item["id"]),
-                    )
-                # Creation has its own durable identity and uncertain replay.
-                # The next phase can read this same job without creating again.
-                return None
-            return await self.core.memory.process_candidate(
-                item["job_id"], output, extraction_schema=6, batch_ref=item.get("batch_ref")
-            )
-        if schema == 5:
-            from .memory_summaries import check_response_subject
-
-            subject = self._summary_subject(item)
-            if (
-                output is not None
-                and "subject_person_id" in output
-                and output["subject_person_id"] != subject
-            ):
-                raise Fault("invalid_input")
-            response = await self.core.memory.process_candidate(
-                item["job_id"],
-                output,
-                extraction_schema=5,
-                job_ids=item.get("job_ids", [item["job_id"]]),
-                window=None
-                if item.get("batch_ref") or item.get("capture_uncertain")
-                else item.get("window"),
-                batch_ref=item.get("batch_ref"),
-                subject_person_id=subject,
-            )
-            check_response_subject(
-                response,
-                subject,
-                unknown=output is not None
-                or not (item.get("batch_ref") or item.get("capture_uncertain")),
-            )
-            return response
-        if schema == 4 or item.get("extraction_negotiated"):
-            response = await self.core.memory.process_candidate(
-                item["job_id"], output, extraction_schema=schema
-            )
-            if output is None:
-                item["extraction_schema"] = response["extraction_schema"]
-                item["extraction_negotiated"] = True
-                self.core.store.put("metadata", item)
-            return response
-        if schema != 3:
-            raise Fault("invalid_input")
-        return await self.core.memory.process_candidate(item["job_id"], output)
-
-    def _capture_window(self, item):
-        """Freeze this job's complete new input and bounded conversation context."""
-        if item.get("window") is not None:
-            return
-        turn = self._source_turn(item)
-        pending = dict(
-            job_id=item["job_id"],
-            job_ids=[item["job_id"]],
-            output=None,
-            supported_extraction_schemas=[5],
-            window=None,
-        )
-        overhead = len(canonical(pending).encode("utf-8")) - len("null")
-        item.update(
-            job_ids=[item["job_id"]],
-            window=self.core.summary_windows.read([turn["id"]], max_bytes=262144 - overhead),
-        )
-        self.core.store.put("metadata", item)
-
-    def _check_summary_window(self, item):
-        window = item.get("window")
-        if window is None:
-            raise Fault("scope_changed")
-        checked = self.core.summary_windows.check(
-            "memory",
-            dict(
-                schema_version=1,
-                request_id="summary-check:" + digest(item["job_id"]),
-                manifest=window["manifest"],
-            ),
-        )
-        if checked["state"] != "valid":
-            raise Fault("scope_changed")
-
-    def _finish_summary(self, item, response):
-        from .memory_summaries import check_response_subject
-
-        check_response_subject(response, self._summary_subject(item), unknown=True)
-        receipt = response["result"]
-        if response["job_ids"] != [item["job_id"]]:
-            raise Fault("invalid_input", unknown=True)
-        if (
-            item.get("batch_ref")
-            and response.get("batch_ref", item["batch_ref"]) != item["batch_ref"]
-        ):
-            raise Fault("invalid_input", unknown=True)
-        if response["state"] == "completed":
-            if (
-                response["job_ids"] != item["job_ids"]
-                or receipt["covered_job_ids"] != item["job_ids"]
-                or receipt["cursor"]["job_ids"] != item["job_ids"]
-                or receipt["cursor"]["window_id"] != item["window"]["manifest"]["window_id"]
-            ):
-                raise Fault("invalid_input", unknown=True)
-        item.update(
-            state=response["state"],
-            receipt=receipt,
-            output=None,
-            deadline=0,
-            last_error=None,
-            recovery_reason=None,
-            batch_ref=response.get("batch_ref"),
-        )
-        if receipt is not None:
+        self._source_turn(item)
+        if not item.get("job_id"):
+            response = await self.core.memory.create_segment(item["create_request"])
             item.update(
-                cursor=receipt["cursor"],
-                experience_state=receipt["experience_state"],
-                summary_state=receipt["summary_state"],
-                portrait_state=receipt["portrait"]["state"],
+                job_id=response["job_id"],
+                stage="receipt",
+                last_error=None,
+                recovery_reason=None,
             )
-        self.core.store.put("metadata", item)
+            with self.core.store.transaction():
+                self.core.store.put("metadata", item)
+                self.core.store.put(
+                    "metadata",
+                    dict(id="memory-job:" + digest(item["job_id"]), learning_id=item["id"]),
+                )
+            # Creation has its own durable identity and uncertain replay.
+            # The next phase can read this same job without creating again.
+            return None
+        return await self.core.memory.process_candidate(
+            item["job_id"], output, extraction_schema=6, batch_ref=item.get("batch_ref")
+        )
 
     def _pin_segment_window(self, item, response):
         from .memory_summaries import check_segment_window
@@ -1161,11 +932,7 @@ class MemoryLearning:
         life = self.core.life
         route = item.get("model_route")
         if route is None:
-            row = self.core.store.db.execute(
-                "SELECT rowid FROM metadata WHERE id=?", (item["id"],)
-            ).fetchone()
-            retained = row is not None and row[0] <= self.legacy_model_rowid
-            caller = "companion" if retained else life.generation_caller_service
+            caller = life.generation_caller_service
             route = dict(
                 caller_service=caller,
                 turn_id=generation["id"]
@@ -1197,40 +964,34 @@ class MemoryLearning:
         )
         return life.gateway if independent else self.core.gateway
 
-    async def _summary_model(self, item, generation):
+    async def _segment_model(self, item, generation):
         """Shared model-slot, selection and timeout owner for contextual protocols."""
-        from .memory_summaries import messages, segment_messages
+        from .memory_summaries import segment_messages
 
         item["stage"] = "model"
         self.core.store.put("metadata", item)
         async with self.core.models.background:
             self._source_turn(item)
-            if item["extraction_schema"] == 5:
-                self._check_summary_window(item)
             if not self._start_phase(item):
                 return None
             gateway = await self._pin_model(item, generation, generation["scope"])
             self._source_turn(item)
             if not await self.core.group_processing.start(item):
                 return None
-            if item["extraction_schema"] == 6:
-                # The observation part has no local Core admission. Refresh the
-                # complete real Memory/Platform proof after both awaited gates.
-                response = await self._candidate(
-                    item, None, reserve_attempt=item.get("last_error") is not None
-                )
-                if response is None:
-                    return None
-                if response["state"] in {"completed", "invalidated"}:
-                    self._finish_segment(item, response)
-                    return None
-                self._pin_segment_window(item, response)
-                if not await self.core.group_processing.start(item):
-                    return None
-                supplied = segment_messages(self.core.contracts, item["segment_window"])
-            else:
-                self._check_summary_window(item)
-                supplied = messages(self.core.contracts, item["window"], item["portrait_input"])
+            # The observation part has no local Core admission. Refresh the
+            # complete real Memory/Platform proof after both awaited gates.
+            response = await self._candidate(
+                item, None, reserve_attempt=item.get("last_error") is not None
+            )
+            if response is None:
+                return None
+            if response["state"] in {"completed", "invalidated"}:
+                self._finish_segment(item, response)
+                return None
+            self._pin_segment_window(item, response)
+            if not await self.core.group_processing.start(item):
+                return None
+            supplied = segment_messages(self.core.contracts, item["segment_window"])
             item["stage"] = "model"
             self.core.store.put("metadata", item)
             segments, _ = await asyncio.wait_for(
@@ -1275,7 +1036,7 @@ class MemoryLearning:
                 config_version=self.core.config_version,
                 generation_budget=dict(max_tokens=8192, reasoning_effort="none"),
             )
-            raw = await self._summary_model(item, generation)
+            raw = await self._segment_model(item, generation)
             if raw is None:
                 return
             item["stage"] = "proposal"
@@ -1293,101 +1054,6 @@ class MemoryLearning:
             raise Fault("dependency_unavailable", unknown=True)
         self._finish_segment(item, response)
 
-    async def _summary_work(self, item):
-        from .memory_summaries import parse
-
-        self._capture_window(item)
-        response = await self._candidate(
-            item,
-            None,
-            reserve_attempt=item.get("stage") != "commit_wait",
-        )
-        if response is None:
-            return
-        if response["state"] == "unclaimed":
-            if (
-                not item.get("capture_uncertain")
-                or item.get("batch_ref")
-                or item["output"] is not None
-                or response["job_ids"] != item["job_ids"]
-            ):
-                raise Fault("invalid_input")
-            # Memory proved the receipt lookup found no claim. Resend only the
-            # frozen original window, never select or trim a replacement.
-            item.update(capture_uncertain=False, capture_replayed=True, stage="receipt")
-            self.core.store.put("metadata", item)
-            self._check_summary_window(item)
-            response = await self._candidate(item, None)
-            if response is None:
-                return
-        if response["state"] == "context_changed":
-            if (
-                item.get("batch_ref")
-                or item.get("capture_uncertain")
-                or item.get("capture_replayed")
-                or item.get("context_recaptured")
-                or item["output"] is not None
-                or response["job_ids"] != item["job_ids"]
-                or response["window_id"] != item["window"]["manifest"]["window_id"]
-            ):
-                raise Fault("scope_changed")
-            item.update(
-                window=self.core.summary_windows.without_context(
-                    item["window"], response["invalid_context_member_ids"]
-                ),
-                context_recaptured=True,
-                stage="receipt",
-            )
-            self.core.store.put("metadata", item)
-            self._check_summary_window(item)
-            response = await self._candidate(item, None)
-            if response is None:
-                return
-            if response["state"] == "context_changed":
-                raise Fault("scope_changed")
-        if response["state"] in {"completed", "invalidated"}:
-            self._finish_summary(item, response)
-            return
-        if response["state"] != "pending" or response["job_ids"] != item["job_ids"]:
-            raise Fault("invalid_input")
-        if item.get("batch_ref") and response["batch_ref"] != item["batch_ref"]:
-            raise Fault("invalid_input")
-        if response["window_id"] != item["window"]["manifest"]["window_id"]:
-            raise Fault("scope_changed")
-        item.update(
-            batch_ref=response["batch_ref"],
-            portrait_input=response["portrait_input"],
-            stage="receipt",
-            capture_uncertain=False,
-        )
-        self.core.store.put("metadata", item)
-        self._check_summary_window(item)
-        if item["output"] is None:
-            turn = self._source_turn(item)
-            generation = copy.deepcopy(turn)
-            generation["id"] = "memory-generation:" + digest(item["job_id"])
-            generation["conversation_id"] = generation["id"]
-            generation["generation_budget"] = dict(max_tokens=8192, reasoning_effort="none")
-            raw = await self._summary_model(item, generation)
-            if raw is None:
-                return
-            item["stage"] = "proposal"
-            item["output"] = parse(
-                self.core.contracts,
-                raw,
-                subject_person_id=self._summary_subject(item),
-            )
-            item["stage"] = "commit"
-            self.core.store.put("metadata", item)
-        self._source_turn(item)
-        self._check_summary_window(item)
-        response = await self._candidate(item, item["output"])
-        if response is None:
-            return
-        if response["state"] not in {"completed", "invalidated"}:
-            raise Fault("dependency_unavailable", unknown=True)
-        self._finish_summary(item, response)
-
     async def _work(self, item):
         core = self.core
         # Old retained jobs lack category evidence. Keep their spent attempts
@@ -1403,139 +1069,13 @@ class MemoryLearning:
             core.store.put("metadata", item)
             return
         try:
-            turn = self._source_turn(item)
+            self._source_turn(item)
             if item.get("stage") == "proposal":
                 # A previous proposal failure is not a new model attempt.
                 # Recovery first reads Memory, retaining any parsed output.
                 item["stage"] = "commit" if item["output"] is not None else "receipt"
                 core.store.put("metadata", item)
-            if item.get("extraction_schema") == 6:
-                await self._segment_work(item)
-                core.store.put("metadata", item)
-                core.counted("memory.work")
-                return
-            if item.get("extraction_schema") == 5:
-                await self._summary_work(item)
-                core.store.put("metadata", item)
-                core.counted("memory.work")
-                return
-            response = await self._candidate(item, None, reserve_attempt=not resuming_commit)
-            if response is None:
-                return
-            item["stage"] = "receipt"
-            if not resuming_commit:
-                core.store.put("metadata", item)
-            turn = self._source_turn(item)
-            if response["state"] not in {"pending", "completed", "invalidated"}:
-                raise Fault("invalid_input")
-            if response["state"] == "pending":
-                if item["output"] is None:
-                    from .memory_admission import empty_extraction_reason, extraction_review_hints
-
-                    content = response["content"]
-                    schema4 = item.get("extraction_schema") == 4
-                    skip_reason = None if schema4 else empty_extraction_reason(content)
-                    if (
-                        core._event_reality(turn) not in {"real", "fictional"}
-                        or not any(c["text"].strip() for c in content)
-                        or skip_reason
-                    ):
-                        item["output"] = {"memories": []}
-                        item["admission_reason"] = skip_reason or "ineligible_reality"
-                    else:
-                        generation = copy.deepcopy(turn)
-                        generation["id"] = "memory-generation:" + digest(item["job_id"])
-                        # A separate provider session prevents extraction instructions or JSON
-                        # from becoming the next chat turn's hidden provider history.
-                        generation["conversation_id"] = generation["id"]
-                        # Automatic extraction is a bounded JSON task. Its own
-                        # first request disables reasoning. A rejected/invalid
-                        # proposal uses low effort to repair grounding rather
-                        # than repeating an ineffective fast attempt. Chat is unchanged.
-                        generation["generation_budget"] = dict(
-                            max_tokens=8192,
-                            reasoning_effort="low"
-                            if item.get("proposal_failures") or item.get("empty_review")
-                            else "none",
-                        )
-                        item["stage"] = "model"
-                        core.store.put("metadata", item)
-                        async with core.models.background:
-                            turn = self._source_turn(item)
-                            gateway = await self._pin_model(item, generation, turn["scope"])
-                            self._source_turn(item)
-                            if not await core.group_processing.start(item):
-                                return
-                            hints = (
-                                []
-                                if schema4
-                                else extraction_review_hints(
-                                    content, response.get("known_facts", [])
-                                )
-                            )
-                            messages = legacy_messages(
-                                core.contracts,
-                                response,
-                                hints=hints,
-                                rejected=bool(item.get("proposal_rejected")),
-                                empty_review=item.get("empty_review"),
-                                diagnostics=item.get("proposal_diagnostics"),
-                            )
-                            segments, _ = await asyncio.wait_for(
-                                gateway.generate(generation, messages), MODEL_TIMEOUT_SECONDS
-                            )
-                        raw = "\n".join(segments)
-                        item["stage"] = "proposal"
-                        try:
-                            output = parse_proposal(core.contracts, raw, schema4=schema4)
-                        except ProposalStructureError as error:
-                            # This call only parses the new model result. It has
-                            # not cached or sent a proposal; use the existing
-                            # bounded correction path, never commit recovery.
-                            item.update(
-                                output=None,
-                                proposal_rejected=True,
-                                proposal_diagnostics=error.diagnostics,
-                            )
-                            raise
-                        item["output"] = output
-                        item.pop("proposal_diagnostics", None)
-                        if item["output"] == {"memories": []} and not item.get("empty_review"):
-                            if hints:
-                                # Yield the background slot and durably reserve one review.
-                                # A restart resumes it within the existing job retry budget;
-                                # it cannot submit an empty receipt prematurely. This path
-                                # is never entered after an uncertain Memory commit.
-                                item.update(output=None, empty_review=hints, stage="empty_review")
-                                core.store.put("metadata", item)
-                                core.counted("memory.work")
-                                return
-                    # Persist exact proposal before the uncertain remote commit; on restart
-                    # read its receipt first. Only a valid Memory-owned pending
-                    # response permits the same job/exact output retry: Memory's
-                    # atomic job ledger consumes it once, including a lost ack.
-                    item["stage"] = "commit"
-                    core.store.put("metadata", item)
-                response = await self._candidate(item, item["output"])
-                if response is None:
-                    return
-                if response["state"] == "rejected":
-                    # Only this explicit Memory-owned rejection proves the proposal did
-                    # not commit. Transport/schema failures retain the original proposal.
-                    item["output"] = None
-                    item["proposal_rejected"] = True
-                    item["stage"] = "proposal"
-                    raise Fault("invalid_input")
-            if response["state"] not in {"completed", "invalidated"}:
-                raise Fault("dependency_unavailable")
-            item.update(
-                state=response["state"],
-                receipt=response["result"],
-                last_error=None,
-                output=None,
-                deadline=0,
-                recovery_reason=None,
-            )
+            await self._segment_work(item)
         except asyncio.CancelledError as error:
             failed_stage = item.get("stage")
             self._failed(item, "cancelled", error, failed_stage=failed_stage)
@@ -1561,13 +1101,6 @@ class MemoryLearning:
         if stage in MUTATION_WAIT:
             failed_stage = failed_stage or stage
             item["stage"] = stage = "receipt"
-        if (
-            item.get("extraction_schema") == 5
-            and stage == "receipt"
-            and getattr(error, "unknown", False)
-            and not item.get("batch_ref")
-        ):
-            item["capture_uncertain"] = True
         diagnostic = obs.failure_diagnostic(
             error,
             code=code,
@@ -1631,60 +1164,3 @@ class MemoryLearning:
                 else "temporary_failure_cooldown"
             ),
         )
-
-    def _recover_legacy(self):
-        """One bounded pass over retained pre-upgrade failures, never reset attempts."""
-        store = self.core.store
-        if getattr(self, "_legacy_complete", False):
-            return False
-        if (
-            store.db.execute(
-                "SELECT 1 FROM metadata WHERE conversation_id=? AND status='blocked' LIMIT 1",
-                (QUEUE,),
-            ).fetchone()
-            is None
-        ):
-            self._legacy_complete = True
-            return False
-        cursor = store.get("metadata", "memory-learning-recovery") or {
-            "id": "memory-learning-recovery",
-            "cursor": 0,
-        }
-        rows = store.db.execute(
-            "SELECT rowid,body FROM metadata WHERE rowid>? ORDER BY rowid LIMIT 64",
-            (cursor["cursor"],),
-        ).fetchall()
-        if not rows:
-            self._legacy_complete = True
-            return False
-        with store.transaction():
-            for row in rows:
-                item = json.loads(row[1])
-                if (
-                    item.get("conversation_id") == QUEUE
-                    and item.get("extraction_schema") != 6
-                    and item.get("state") == "blocked"
-                    and item.get("attempts", MAX_RECOVERY_ATTEMPTS) < MAX_RECOVERY_ATTEMPTS
-                    and item.get("last_error")
-                    in {
-                        "dependency_unavailable",
-                        "timeout",
-                        "queue_full",
-                        "cancelled",
-                        "result_unknown",
-                    }
-                ):
-                    item.update(
-                        state="pending",
-                        deadline=self.core.clock() + 60,
-                        recovery_reason="temporary_failure_cooldown",
-                    )
-                    # Recovery can encounter an old blocked row on a later page,
-                    # after the initial pending-order upgrade already finished.
-                    if "scope_key" not in item:
-                        self._ordered = False
-                    store.put("metadata", item)
-                cursor["cursor"] = row[0]
-            if rows:
-                store.put("metadata", cursor)
-        return bool(rows)

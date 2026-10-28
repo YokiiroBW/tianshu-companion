@@ -4,11 +4,10 @@ import copy
 import hashlib
 
 from .clients import utc
+from .context import MEMORY_CONTEXT_DOMAIN, reply_provenance_checks
 from .contracts import Fault, canonical, digest
 from .short_context import sources_current
-from .context import MEMORY_CONTEXT_DOMAIN, reply_provenance_checks
 from .source_sync import ensure_channel, link_learning_channel, selector
-
 
 MAX_NEW_TURNS = 1
 MAX_TURNS = 12
@@ -117,7 +116,7 @@ class SummaryWindows:
             return None
         return result
 
-    def _reply_dependencies(self, turn, turns, visiting=None, *, blocked_replies=()):
+    def _reply_dependencies(self, turn, turns, visiting=None):
         """Only replies whose complete captured Memory/input closure fits here."""
         visiting = set() if visiting is None else visiting
         if turn is None or turn["id"] in visiting or turn.get("profile_checks"):
@@ -168,18 +167,12 @@ class SummaryWindows:
                 for key in DEPENDENCIES:
                     dependencies[key].extend(selected[key])
             if check["version_domain"] == "text-dialogue/v1" and identity != turn["id"]:
-                if identity in blocked_replies:
-                    return None
                 inherited.append(identity)
         inherited.extend(dependency["turn_id"] for dependency in turn["bundle"]["dependencies"])
         for identity in dict.fromkeys(inherited):
             if identity not in turns:
                 return None
-            if identity in blocked_replies:
-                return None
-            previous = self._reply_dependencies(
-                turns[identity], turns, visiting, blocked_replies=blocked_replies
-            )
+            previous = self._reply_dependencies(turns[identity], turns, visiting)
             if previous is None:
                 return None
             for key in DEPENDENCIES:
@@ -267,13 +260,12 @@ class SummaryWindows:
             )
         return values
 
-    def read(self, new_turn_ids, *, max_bytes=MAX_REQUEST_BYTES, include_dialogue=False):
+    def read(self, new_turn_ids, *, max_bytes=MAX_REQUEST_BYTES):
         """Capture full new human inputs and bounded owner-proved context.
 
-        Retained singleton jobs keep their original owner-only default. New
-        segments explicitly request shared same-group dialogue; private context
-        remains exact-scope. Optional sent replies require their existing full
-        provenance and never replace a new human member.
+        Group segments include shared same-room dialogue; private context remains
+        exact-scope. Optional sent replies require their existing full provenance
+        and never replace a new human member.
         """
         if not 1 <= len(new_turn_ids) <= MAX_NEW_TURNS or len(set(new_turn_ids)) != len(
             new_turn_ids
@@ -295,7 +287,7 @@ class SummaryWindows:
             anchor["conversation_id"],
             anchor["sequence"] + 1,
             MAX_TURNS + 1,
-            scope=None if include_dialogue and scope["audience"] == "group" else scope,
+            scope=None if scope["audience"] == "group" else scope,
         )
         selected = {turn["id"]: turn for turn in fresh}
         omitted = len(recent) > MAX_TURNS
@@ -311,11 +303,6 @@ class SummaryWindows:
             except Fault as error:
                 if error.code not in {"scope_changed", "forbidden", "not_found"}:
                     raise
-                omitted = True
-                continue
-            if not include_dialogue and self.core._event_reality(turn) != self.core._event_reality(
-                anchor
-            ):
                 omitted = True
                 continue
             selected[turn["id"]] = turn
@@ -342,8 +329,6 @@ class SummaryWindows:
         def replies():
             """Rebuild optional BOT text only against the humans actually kept."""
             nonlocal omitted
-            if not include_dialogue:
-                return {}
             turns = {identity: selected[identity] for identity in groups}
             result, used, text_size = {}, count, size
             for turn in ordered:
@@ -418,67 +403,6 @@ class SummaryWindows:
             window = package()
         self.core.contracts.check("memory-extraction#summary_window", window)
         return window
-
-    def without_context(self, window, invalid_ids):
-        """A proved unclaimed batch may discard optional context once, never refill."""
-        manifest = copy.deepcopy(window["manifest"])
-        by_id = {member["member_id"]: member for member in manifest["members"]}
-        if (
-            not invalid_ids
-            or len(set(invalid_ids)) != len(invalid_ids)
-            or any(
-                identity not in by_id or by_id[identity]["purpose"] != "context"
-                for identity in invalid_ids
-            )
-        ):
-            raise Fault("invalid_input")
-        new_ids = {turn["turn_id"] for turn in manifest["new_turns"]}
-        removed = {
-            by_id[identity]["turn_id"]
-            for identity in invalid_ids
-            if by_id[identity]["turn_id"] not in new_ids
-        }
-        blocked_replies = {
-            by_id[identity]["turn_id"]
-            for identity in invalid_ids
-            if by_id[identity]["role"] == "assistant"
-        }
-        members = [
-            member
-            for member in manifest["members"]
-            if member["turn_id"] not in removed
-            and not (member["role"] == "assistant" and member["turn_id"] in blocked_replies)
-        ]
-        turns = {
-            member["turn_id"]: self.store.get("turns", member["turn_id"]) for member in members
-        }
-        members = [
-            member
-            for member in members
-            if member["role"] != "assistant"
-            or self._reply_dependencies(
-                turns[member["turn_id"]], turns, blocked_replies=blocked_replies
-            )
-            is not None
-        ]
-        manifest["members"] = members
-        manifest["coverage"] = dict(
-            complete=False, omitted_before=True, omitted_after=manifest["coverage"]["omitted_after"]
-        )
-        manifest["window_id"] = digest(
-            {key: value for key, value in manifest.items() if key != "window_id"}
-        )
-        retained = {member["member_id"] for member in members}
-        result = dict(
-            manifest=manifest,
-            members=[
-                copy.deepcopy(member)
-                for member in window["members"]
-                if member["member_id"] in retained
-            ],
-        )
-        self.core.contracts.check("memory-extraction#summary_window", result)
-        return result
 
     def learning_frame(self, service, request):
         """Prove Core's channel identity, not observation or reply permission.
