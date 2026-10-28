@@ -337,7 +337,9 @@ async def recent(core, turn, context, checks):
         core.short_context_policy,
         max_bytes=min(core.short_context_policy.max_bytes, context.remaining),
     )
-    selected, metadata = select_recent(core.store, turn, policy, core.clock())
+    window = core.conversation_windows.state(turn)
+    floor = window["covered"] if context.data.get("conversation_summary") else window["floor"]
+    selected, metadata = select_recent(core.store, turn, policy, core.clock(), after_sequence=floor)
     if not core._turn_allows(turn, "memory.read"):
         selected = []
     linked = {key: ids for ids in metadata.get("linked_turn_ids", []) for key in ids}

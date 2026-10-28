@@ -791,6 +791,25 @@ class Store:
         )
         return [json.loads(row[0])["source"] for row in rows][::-1]
 
+    def window_rows(self, prefix, *, after="", limit=32):
+        """Primary-key range pages for window state; no metadata-wide body scan."""
+        rows = self.db.execute(
+            "SELECT body FROM metadata WHERE id>=? AND id<? AND id>? ORDER BY id LIMIT ?",
+            (prefix, prefix + "\uffff", after, limit),
+        )
+        return [json.loads(row[0]) for row in rows]
+
+    def window_turns(self, scope, after, limit):
+        keys = ("actor_id", "audience") + (() if scope["audience"] == "group" else ("person_id",))
+        predicate = " AND ".join("json_extract(body,'$.scope." + k + "')=?" for k in keys)
+        rows = self.db.execute(
+            "SELECT body FROM turns WHERE conversation_id=? AND position>? AND "
+            + predicate
+            + " ORDER BY position LIMIT ?",
+            (scope["conversation_id"], after, *(scope[k] for k in keys), limit),
+        )
+        return [self.payloads.restore("turns", json.loads(row[0])) for row in rows]
+
     def recent_turns(self, conversation_id, before_sequence, limit, *, scope=None):
         # This is the short-context reader, not a full turn export. A completed
         # row also contains provider/checkpoint/retry material which no history

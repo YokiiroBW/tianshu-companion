@@ -51,7 +51,7 @@ def _source_matches(scope, message, latest, row):
     )
 
 
-def select_recent(store, turn, policy, now):
+def select_recent(store, turn, policy, now, *, after_sequence=0):
     """Keep adjacency and retrieve older relevant inputs within the same boundary.
 
     Ordinary adjacency includes confirmed replies. Retrieved human inputs keep nearby
@@ -71,6 +71,8 @@ def select_recent(store, turn, policy, now):
         return [], metadata
     eligible = []
     for previous in store.recent_turns(turn["conversation_id"], turn["sequence"], 128):
+        if previous["sequence"] <= after_sequence:
+            break
         recover_input = (
             previous["phase"] == "failed"
             and previous.get("failure") == "dependency_unavailable"

@@ -37,6 +37,7 @@ from .life_read_queries import LifeReadQueries
 from .store import Store
 from .images import ComfyUI, Workflow
 from .short_context import ShortContextPolicy
+from .conversation_windows import WindowPolicy
 from .model_selection import HttpDefaultModelSelector
 from .worker_health import WorkerHealth
 from . import runtime_capabilities
@@ -565,6 +566,7 @@ def build_runtime(config, *, internal_clients=None, environ=None, log_adapter=No
             ),
             policy=Policy(**config.get("policy", {})),
             short_context_policy=ShortContextPolicy(**config.get("short_context", {})),
+            conversation_window_policy=WindowPolicy(**config.get("conversation_window", {})),
             life_writing=config.get("life_writing"),
             automatic_memory_candidates=automatic_memory_candidates,
             life_config_version=config.get("life_config_version"),
@@ -749,6 +751,11 @@ def create_app(
                     [
                         loop("core.tick", core.tick, 0.05, _counter(core, "core.tick")),
                         loop(
+                            "conversation_window.work",
+                            lambda: core.conversation_windows.work(wait=False),
+                            2,
+                        ),
+                        loop(
                             "memory.work",
                             lambda: core.memory_learning.work(wait=False),
                             1,
@@ -914,6 +921,8 @@ def create_app(
                 return JSONResponse(result, background=BackgroundTask(release))
             if operation == "web-snapshot":
                 return await core.web_snapshot(service, body)
+            if operation == "conversation-window":
+                return core.conversation_windows.manage(service, body)
             if operation == "facts":
                 return core.source_facts(service, body)
             if operation == "actor-memory-source":
@@ -1046,6 +1055,10 @@ def create_app(
     @app.post("/internal/v1/conversation/web-snapshot")
     async def web_snapshot(request: Request):
         return await dispatch(request, "web-snapshot")
+
+    @app.post("/internal/v1/conversation/window")
+    async def conversation_window(request: Request):
+        return await dispatch(request, "conversation-window")
 
     @app.post("/internal/v1/source-facts/read")
     async def source_facts(request: Request):

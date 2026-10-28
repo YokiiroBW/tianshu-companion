@@ -127,6 +127,7 @@ class Core(Delivery):
         clock=time.time,
         model_slots=4,
         short_context_policy=None,
+        conversation_window_policy=None,
         life_writing=None,
         life_config_version=None,
         life_timezone="+08:00",
@@ -210,6 +211,9 @@ class Core(Delivery):
         # restart, and losing them changes nothing except that one idle pass is reported.
         self.pass_counters = {name: 0 for name in WORK_COUNTERS}
         self.short_context_policy = short_context_policy or ShortContextPolicy()
+        from .conversation_windows import ConversationWindows
+
+        self.conversation_windows = ConversationWindows(self, conversation_window_policy)
         try:
             self.life = Life(
                 store,
@@ -333,6 +337,7 @@ class Core(Delivery):
         turn["version"] += 1
         turn["updated_at"] = utc(self.clock())
         self.store.put("turns", turn)
+        self.conversation_windows.observe(turn)
 
     def pass_count(self, name):
         """How many changes this kind of background work has observed, or None if unknown."""
@@ -1052,6 +1057,7 @@ class Core(Delivery):
 
     def recover(self):
         """Invoke once after acquiring the database owner lock, before accepting traffic."""
+        self.conversation_windows.recover()
         for actor in self.store.list("life_actors"):
             if actor.get("autonomous") and actor["id"] not in self.roles:
                 self.life.synchronize_role(
@@ -1676,6 +1682,7 @@ class Core(Delivery):
             turn = self.store.get("turns", turn_id)
             if turn["cancelled"] or turn["phase"] in TERMINAL:
                 return
+            await self.conversation_windows.before_turn(turn)
             (
                 context,
                 context_metadata,
@@ -1699,6 +1706,8 @@ class Core(Delivery):
                     history_snapshot=history_snapshot,
                     input_history_snapshot=input_history_snapshot,
                 )
+                if context.data.get("conversation_summary"):
+                    turn["conversation_window"] = context_metadata["conversation_window"]
                 # Never reuse the preparation checkpoint after waiting for a slot.
                 await self._preflight(turn)
                 prompt = json.loads(messages[1]["content"])
@@ -2153,6 +2162,7 @@ class Core(Delivery):
             raise Fault("scope_changed")
 
     def _check_input_versions(self, turn):
+        self.conversation_windows.verify_local(turn)
         for dependency in turn["bundle"]["dependencies"]:
             self._check_dependency(turn, dependency, self.store.get("turns", dependency["turn_id"]))
         inputs = turn["bundle"]["messages"] + self._continuation_messages(turn)
@@ -2538,7 +2548,10 @@ class Core(Delivery):
             checks = merge_checks(checks, inherited_checks(self.store.get("turns", dep["turn_id"])))
         from . import context_preparation
 
+        checks = merge_checks(checks, await self.conversation_windows.prepare(turn, context))
         accepted, metadata, checks = await context_preparation.recent(self, turn, context, checks)
+        if context.data.get("conversation_summary"):
+            metadata["conversation_window"] = turn["conversation_window"]
         profiles = await context_preparation.profiles(self, turn, context, accepted)
         summary = self.life.summary(turn["scope"]["actor_id"], turn["scope"])
         if summary is not None:
@@ -2909,6 +2922,7 @@ class Core(Delivery):
             *tuple(self.send_jobs.values()),
             self.memory_learning.drain(),
             self.life.drain(),
+            self.conversation_windows.drain(),
             return_exceptions=True,
         )
 
@@ -2920,6 +2934,7 @@ class Core(Delivery):
         await asyncio.gather(*jobs, return_exceptions=True)
         await self.memory_learning.close()
         await self.life.close()
+        await self.conversation_windows.close()
 
     async def close(self):
         await self.stop_work()
