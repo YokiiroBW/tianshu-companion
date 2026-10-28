@@ -310,20 +310,26 @@ class ActorMemory:
                     # not run. Preserve it; never mint a new key or change its body.
                     raise Fault("result_unknown", unknown=True)
             else:
+                if item.get("observer_task_id"):
+                    await self.core.actor_observation.validate_outbox(item)
                 request = dict(
                     schema_version=1,
                     request_id=uid("actor-append"),
                     actor_id=actor,
                     role_version=version,
                     operation="append_episode",
-                    idempotency_key="reading:" + digest(item["source"]),
+                    idempotency_key=("observation:" + digest([actor, item["source"]]))
+                    if item.get("observer_task_id")
+                    else "reading:" + digest(item["source"]),
                     source=copy.deepcopy(item["source"]),
-                    perspective="participant",
+                    perspective="observer" if item.get("observer_task_id") else "participant",
                 )
                 item["request"] = request
             if receipt is None:
                 if "append_episode" not in authority["allowed_operations"]:
                     raise Fault("forbidden")
+                if item.get("observer_task_id"):
+                    await self.core.actor_observation.validate_outbox(item)
                 item.update(state="actor_memory_submitting", attempts=attempts)
                 self.store.put("outbox", item)
                 try:
@@ -340,6 +346,12 @@ class ActorMemory:
                 or item["state"] in {"actor_memory_unknown", "actor_memory_submitting"}
             ):
                 item["state"] = "actor_memory_unknown"
+            elif (
+                item.get("observer_task_id")
+                and isinstance(error, Fault)
+                and error.code in {"scope_changed", "not_found"}
+            ):
+                item["state"] = "actor_memory_invalidated"
             else:
                 item["state"] = "actor_memory_pending"
             item.update(
@@ -647,7 +659,10 @@ class ActorMemory:
         import json
 
         for row in rows:
-            await self.flush(json.loads(row[0]))
+            async with self.core._outbox_lock:
+                current = self.store.get("outbox", json.loads(row[0])["id"])
+                if current["state"] in OUTBOX_PENDING:
+                    await self.flush(current)
         actions.check(context)
         material = await self.query(
             context["actor_id"],
@@ -729,6 +744,16 @@ class ActorMemory:
                         for item in result.get("items", [])
                         for reference in item["episode_refs"]
                     )
+        return await self.append_validated_derived(
+            actor, operation_id, call_id, value, known, validate
+        )
+
+    async def append_validated_derived(self, actor, operation_id, call_id, value, known, validate):
+        """Reliable actor command shared by actual tool recall and owner-verified observation.
+
+        Callers supply exact episode references obtained from an actual Memory response;
+        delayed authority/source validation remains caller-specific.
+        """
         if (
             not isinstance(value["episode_refs"], list)
             or not value["episode_refs"]

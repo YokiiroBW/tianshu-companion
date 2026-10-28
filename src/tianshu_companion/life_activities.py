@@ -70,7 +70,12 @@ class Activities:
                 updated_at=self.life.clock(),
                 runtime_epoch=actor.get("life_runtime_epoch", 0),
             )
-            for field in ("autonomous_goal_id", "actor_only", "autonomy_basis"):
+            for field in (
+                "autonomous_goal_id",
+                "actor_only",
+                "autonomy_basis",
+                "public_exploration_topic",
+            ):
                 if old and field in old:
                     item[field] = old[field]
             if old and old.get("step_operation"):

@@ -299,6 +299,9 @@ class Core(Delivery):
             from .actor_memory import ActorMemory
 
             self.actor_memory = ActorMemory(self, actor_memory_authority)
+            from .actor_observation import ActorObservation
+
+            self.actor_observation = ActorObservation(self)
             self.life.actor_memory = self.actor_memory
             self.images.original_reader = self.reading.original
             self.image_backend.runtime = self.life_runtime
@@ -1041,6 +1044,11 @@ class Core(Delivery):
             ),
         )
 
+    async def observation_archived(self, request, response):
+        # Original user-memory handoff remains its own owner and algorithm.
+        await self.memory_learning.observation_archived(request, response)
+        await self.actor_observation.archived(request, response)
+
     def recover(self):
         """Invoke once after acquiring the database owner lock, before accepting traffic."""
         for actor in self.store.list("life_actors"):
@@ -1079,6 +1087,7 @@ class Core(Delivery):
             self.persona_problems = self.personas.recover()
         with self.store.transaction():
             self.actor_memory.recover()
+            self.actor_observation.recover()
             if self.automatic_memory_candidates:
                 # A persisted intent cannot prove whether Memory accepted it before exit.
                 # Disabled startup preserves even these rows byte-for-byte.

@@ -64,8 +64,11 @@ class AutonomousGoals:
 
     def snapshot(self, actor, window):
         activity = self.current(actor)
-        concerns, _ = self.life.concerns.page(actor["id"], scope=None, open_only=True)
-        concerns = [item for item in concerns if item["scope"] is None]
+        concerns = self.life.concerns.planning(
+            actor["id"],
+            current_id=(activity or {}).get("autonomous_goal_id"),
+            available_until=window["available_until"],
+        )
         return dict(
             actor_epoch=actor.get("life_runtime_epoch", 0),
             personality_version=actor["personality_version"],
@@ -75,6 +78,7 @@ class AutonomousGoals:
             concerns=concerns,
             routine=window,
             ephemeral_attention=actor.get("life_interests", []),
+            observation_hint=actor.get("autonomy_observation_hint"),
         )
 
     def check(self, actor_id, captured):
@@ -97,6 +101,7 @@ class AutonomousGoals:
             "activity",
             "concerns",
             "ephemeral_attention",
+            "observation_hint",
         ):
             if current[field] != captured[field]:
                 raise Fault("scope_changed")
@@ -122,6 +127,20 @@ class AutonomousGoals:
         window = self.window(actor)
         if window is None or not self.life.generation_available():
             return False
+        hint = actor.get("autonomy_observation_hint")
+        if hint:
+            try:
+                await self.core.actor_memory.check(hint["material"])
+            except Fault as error:
+                if getattr(error, "context_dependency_invalid", False) or error.code in {
+                    "not_found",
+                    "forbidden",
+                    "version_conflict",
+                }:
+                    actor.pop("autonomy_observation_hint", None)
+                    actor["autonomy_due_at"] = now
+                    self.life._save("actors", actor)
+                return False
         current = self.current(actor)
         if current and current.get("step_operation"):
             progress = self.store.get("metadata", current["step_operation"])
@@ -157,6 +176,10 @@ class AutonomousGoals:
                     "life_activities", actor.get("autonomy_last_activity", "")
                 )
                 memory_query = "自身兴趣、未完成的探索和需要修正的认识"
+                hint = actor.get("autonomy_observation_hint")
+                if hint:
+                    await self.core.actor_memory.check(hint["material"])
+                    memory_query += "；最近旁听形成的问题：" + hint["topic"]
                 if previous and previous["actor_id"] == actor_id:
                     memory_query += "；最近实际活动：" + previous["title"]
                 memory = await self.core.actor_memory.query(
@@ -188,6 +211,10 @@ class AutonomousGoals:
                 self.check(actor_id, captured)
                 if memory:
                     await self.core.actor_memory.check(memory)
+                if actor.get("autonomy_observation_hint"):
+                    await self.core.actor_memory.check(
+                        actor["autonomy_observation_hint"]["material"]
+                    )
                 self.life.verify_generation_lease(lease)
                 marker.update(state="submitted", messages=messages, memory=memory)
                 self.store.put("metadata", marker)
@@ -197,6 +224,8 @@ class AutonomousGoals:
             self.life.verify_generation_lease(lease)
             if memory:
                 await self.core.actor_memory.check(memory)
+            if actor.get("autonomy_observation_hint"):
+                await self.core.actor_memory.check(actor["autonomy_observation_hint"]["material"])
             self.check(actor_id, captured)
             choice = strict_json("\n".join(output))
             self.validate_choice(choice, captured)
@@ -267,12 +296,24 @@ class AutonomousGoals:
 
     def apply(self, actor, choice, captured, memory):
         now, decision = self.core.clock(), choice["decision"]
+        if decision == "new" and actor.get("autonomy_observation_hint"):
+            proof = actor["autonomy_observation_hint"]["material"]
+            memory = copy.deepcopy(memory or proof)
+            known = {canonical(item["ref"]) for item in memory["items"]}
+            memory["items"].extend(
+                copy.deepcopy(item)
+                for item in proof["items"]
+                if canonical(item["ref"]) not in known
+            )
         current = self.current(actor)
         goal_id = choice["concern_id"]
         if current and current["state"] in {"running", "paused"}:
             if (
-                decision in {"new", "rest", "abandon", "defer"}
-                or current.get("autonomous_goal_id") != goal_id
+                decision in {"new", "rest"}
+                or decision in {"abandon", "defer"}
+                and current.get("autonomous_goal_id") == goal_id
+                or decision == "continue"
+                and current.get("autonomous_goal_id") != goal_id
             ):
                 state = "cancelled" if decision == "abandon" else "paused"
                 if current["state"] != state:
@@ -330,11 +371,21 @@ class AutonomousGoals:
                 expected=0,
             )
             concern.update(actor_only=True, autonomy_basis=memory)
+            if actor.get("autonomy_observation_hint"):
+                concern["public_exploration_topic"] = actor["autonomy_observation_hint"]["topic"]
             self.store.put("life_concerns", concern)
         else:
             concern = self.life.concerns.get(actor["id"], goal_id)
             if concern["next_due_at"] is not None and concern["next_due_at"] > now:
                 return
+        if concern.get("autonomy_basis"):
+            basis = copy.deepcopy(concern["autonomy_basis"])
+            if memory and basis["role_version"] == memory["role_version"]:
+                known = {canonical(item["ref"]) for item in basis["items"]}
+                basis["items"].extend(
+                    item for item in memory["items"] if canonical(item["ref"]) not in known
+                )
+            memory = basis
         activity_id = "goal-activity:" + digest([goal_id, actor.get("life_runtime_epoch", 0)])
         prior = self.store.get("life_activities", activity_id)
         if prior and prior["state"] in {"completed", "cancelled"}:
@@ -362,4 +413,6 @@ class AutonomousGoals:
             expected=(prior or {}).get("version", 0),
         )
         activity.update(autonomous_goal_id=goal_id, actor_only=True, autonomy_basis=memory)
+        if concern.get("public_exploration_topic"):
+            activity["public_exploration_topic"] = concern["public_exploration_topic"]
         self.store.put("life_activities", activity)

@@ -448,11 +448,13 @@ class MemoryLearning:
             "outbox", OUTBOX_PENDING, now, limit=1
         )
         participation_due = self.core.participation.due()
+        observer_due = self.core.actor_observation.due()
         if not self.core.automatic_memory_candidates:
-            return bool(actor_due or participation_due)
+            return bool(actor_due or participation_due or observer_due)
         return bool(
             actor_due
             or participation_due
+            or observer_due
             or store.db.execute(
                 "SELECT 1 FROM metadata WHERE conversation_id=? "
                 "AND status IN ('pending','material_pending') AND deadline<=? LIMIT 1",
@@ -476,6 +478,7 @@ class MemoryLearning:
             not self.core.automatic_memory_candidates
             and not self.core.actor_memory.available
             and not self.core.participation.available
+            and not self.core.actor_observation.available
         ):
             return
         self._foreground_finished = (
@@ -507,7 +510,16 @@ class MemoryLearning:
         # existing semantics. Only the automatic dispatcher owns this decision.
         if phase is None or (item is not None and phase["item"]["id"] != item["id"]):
             return True
-        if phase["family"] != "participation" and self.core.group_processing.paused(phase["item"]):
+        observer = (
+            phase["family"] == "actor_observation"
+            or phase["family"] == "actor_memory"
+            and phase["item"].get("observer_task_id")
+        )
+        if (
+            phase["family"] != "participation"
+            and not observer
+            and self.core.group_processing.paused(phase["item"])
+        ):
             return False
         if phase["started"]:
             return True
@@ -579,6 +591,8 @@ class MemoryLearning:
             families += ("actor_memory",)
         if not outbox_only and core.participation.available:
             families += ("participation",)
+        if not outbox_only and core.actor_observation.available:
+            families += ("actor_observation",)
         if not families:
             return None
         busy = core.automatic_memory_foreground_demand()
@@ -587,6 +601,8 @@ class MemoryLearning:
             family = families[index]
             if family == "participation":
                 item = dict(id="participation:poll") if core.participation.due() else None
+            elif family == "actor_observation":
+                item = core.actor_observation.select()
             elif family == "actor_memory":
                 from .actor_memory import OUTBOX_PENDING
 
@@ -656,7 +672,11 @@ class MemoryLearning:
         if family == "participation":
             item = phase["item"]
         else:
-            table = "metadata" if family in {"learning", "observation"} else "outbox"
+            table = (
+                "metadata"
+                if family in {"learning", "observation", "actor_observation"}
+                else "outbox"
+            )
             try:
                 # A family can re-read and update its own JSON object. The
                 # selected object is not proof of the durable phase result.
@@ -684,8 +704,15 @@ class MemoryLearning:
             },
             "actor_memory": {
                 "actor_memory_delivered": "succeeded",
+                "actor_memory_invalidated": "cancelled",
                 "actor_memory_unknown": "unknown",
                 "actor_memory_submitting": "unknown",
+            },
+            "actor_observation": {
+                "completed": "succeeded",
+                "ignored": "succeeded",
+                "invalidated": "cancelled",
+                "unknown": "unknown",
             },
         }.get(family, {})
         state = item.get("state")
@@ -709,13 +736,24 @@ class MemoryLearning:
         core, item = self.core, phase["item"]
         failure = None
         try:
-            if phase["family"] != "participation" and not await core.group_processing.start(item):
+            observer = (
+                phase["family"] == "actor_observation"
+                or phase["family"] == "actor_memory"
+                and item.get("observer_task_id")
+            )
+            if (
+                phase["family"] != "participation"
+                and not observer
+                and not await core.group_processing.start(item)
+            ):
                 return
             if phase["family"] == "learning":
                 await self._work(item)
             elif self._start_phase():
                 if phase["family"] == "participation":
                     await core.participation.work()
+                elif phase["family"] == "actor_observation":
+                    await core.actor_observation.work(item)
                 elif phase["family"] == "observation":
                     await self._flush_observation_material(item)
                 else:
@@ -723,7 +761,11 @@ class MemoryLearning:
                         if phase["family"] == "outbox":
                             await core._flush_outbox(item)
                         elif phase["family"] == "actor_memory":
-                            await core.actor_memory.flush(item)
+                            fresh = core.store.get("outbox", item["id"])
+                            from .actor_memory import OUTBOX_PENDING
+
+                            if fresh["state"] in OUTBOX_PENDING:
+                                await core.actor_memory.flush(fresh)
                         else:
                             await core.relationships.flush(core, selected=item)
                 core.counted("memory.work")
@@ -760,6 +802,7 @@ class MemoryLearning:
                 not core.automatic_memory_candidates
                 and not core.actor_memory.available
                 and not core.participation.available
+                and not core.actor_observation.available
             ):
                 return
             changed = self.backfill() if core.automatic_memory_candidates else False

@@ -603,7 +603,7 @@ def build_runtime(config, *, internal_clients=None, environ=None, log_adapter=No
                 config["database_path"] + ".observations.sqlite",
                 core.memory.client,
                 storage_runtime=storage,
-                on_archived=core.memory_learning.observation_archived,
+                on_archived=core.observation_archived,
                 can_process=core.group_processing.archive_start,
             )
         for spec in (routing or {}).get("commands", []):

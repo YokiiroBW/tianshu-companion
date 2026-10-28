@@ -97,6 +97,9 @@ class LifeWork:
             )
             if old and old.get("actor_only"):
                 item["actor_only"] = True
+            for field in ("autonomy_basis", "public_exploration_topic"):
+                if old and field in old:
+                    item[field] = old[field]
             self.store.put("life_concerns", item)
             return item
 
@@ -141,6 +144,42 @@ class LifeWork:
             ]
             items.append(item)
         return items, next_cursor
+
+    def planning(self, actor_id, *, current_id=None, available_until=None, limit=20):
+        """Bounded open intentions, with due promises and the exact current goal retained.
+
+        Ordinary UI paging keeps its stable id cursor. A planner instead selects open,
+        unscoped records before LIMIT so historical/hidden rows cannot consume its page.
+        """
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise Fault("invalid_input")
+        now = self.life.clock()
+        rows = self.store.db.execute(
+            "SELECT body FROM life_concerns WHERE conversation_id=? AND status='open' "
+            "AND json_extract(body,'$.scope') IS NULL "
+            "AND (json_extract(body,'$.expires_at') IS NULL OR json_extract(body,'$.expires_at')>?) "
+            "ORDER BY CASE WHEN deadline IS NOT NULL AND deadline<=? THEN CASE WHEN substr(id,1,9)='autonomy:' THEN 1 ELSE 0 END WHEN deadline IS NOT NULL THEN 2 ELSE 3 END,deadline,id LIMIT ?",
+            (actor_id, now, available_until if available_until is not None else now, limit),
+        ).fetchall()
+        result = [json.loads(row[0]) for row in rows]
+        if current_id and all(item["id"] != current_id for item in result):
+            current = self.store.get("life_concerns", current_id)
+            if (
+                current
+                and current["actor_id"] == actor_id
+                and current["state"] == "open"
+                and current["scope"] is None
+                and (current["expires_at"] is None or current["expires_at"] > now)
+            ):
+                result.append(current)
+        for item in result:
+            item["fragments"] = [
+                part
+                for part in item["fragments"]
+                if part.get("valid", True)
+                and (part["expires_at"] is None or part["expires_at"] > now)
+            ]
+        return result
 
     def invalidate(self, owner, object_id, version=None):
         """A withdrawn observation cannot erase a separately established intention."""

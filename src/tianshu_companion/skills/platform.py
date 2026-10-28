@@ -129,6 +129,7 @@ class PlatformSkill:
             tool,
             validate,
             read_only=bool(activity.get("actor_only")),
+            public_topic=activity.get("public_exploration_topic"),
         ), []
 
     async def wire(self, core, body):
@@ -165,7 +166,9 @@ class PlatformSkill:
             raise Fault("budget_exceeded")
         return result
 
-    async def _execute(self, actions, actor, execution_id, tool, validate, *, read_only=False):
+    async def _execute(
+        self, actions, actor, execution_id, tool, validate, *, read_only=False, public_topic=None
+    ):
         core, store = actions.core, actions.core.store
         operation = tool["function"]["name"].removeprefix("platform_")
         value = strict_json(tool["function"]["arguments"])
@@ -215,6 +218,14 @@ class PlatformSkill:
             )
             if capability is None or capability["availability"] != "ready":
                 raise Fault("forbidden")
+            if (
+                public_topic
+                and isinstance(value.get("arguments"), dict)
+                and "query" in capability["input_schema"].get("properties", {})
+            ):
+                # The semantic observer stage already supplied the public topic.
+                # Never assemble an external discovery query from private source facts.
+                value["arguments"]["query"] = public_topic
             try:
                 jsonschema.Draft202012Validator(capability["input_schema"]).validate(
                     value["arguments"]

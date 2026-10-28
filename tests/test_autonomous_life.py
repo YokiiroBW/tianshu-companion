@@ -13,6 +13,131 @@ from tianshu_companion.actor_memory import ActorMemory
 from tianshu_companion.clients import JsonService, utc
 from tianshu_companion.contracts import canonical
 
+
+def save_goal(h, identity, *, state="open", due=None):
+    return h.core.life.concerns.save(
+        "actor:a",
+        dict(
+            id=identity,
+            title="具体目标" + identity,
+            goal="依真实资料继续了解",
+            state=state,
+            scope=None,
+            sources=[],
+            fragments=[],
+            next_due_at=due,
+            expires_at=None,
+            result_refs=[],
+        ),
+        expected=0,
+    )
+
+
+def test_planner_selects_open_due_and_exact_current_after_historical_pages():
+    async def run():
+        h, _, services, _ = await autonomy_setup()
+        try:
+            for index in range(30):
+                save_goal(h, f"a-history:{index:03}", state="completed")
+            for index in range(25):
+                save_goal(h, f"autonomy:open:{index:03}", due=h.clock() - 60)
+            save_goal(h, "z-promise", due=h.clock())
+            save_goal(h, "z-current")
+            rows = h.core.life.concerns.planning(
+                "actor:a", current_id="z-current", available_until=h.clock() + 3600
+            )
+            assert rows[0]["id"] == "z-promise" and len(rows) == 21
+            assert any(row["id"] == "z-current" for row in rows)
+            assert all(row["state"] == "open" for row in rows)
+            assert len(h.core.life.concerns.planning("actor:a", current_id="missing")) == 20
+            captured = dict(concerns=rows, routine=dict(available_until=h.clock() + 3600))
+            h.core.life.autonomy.validate_choice(
+                dict(
+                    decision="continue",
+                    concern_id="z-promise",
+                    title="先完成约定",
+                    goal="完成约定",
+                    reason="有明确到期事项",
+                    delay_seconds=60,
+                ),
+                captured,
+            )
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+def test_abandoning_other_goal_keeps_current_activity_resumable_in_same_epoch():
+    async def run():
+        h, _, services, _ = await autonomy_setup()
+        try:
+            await h.core.life.autonomy.work(actor_id="actor:a")
+            current = copy.deepcopy(h.core.life.activities.current("actor:a"))
+            save_goal(h, "autonomy:other")
+            actor = h.core.store.get("life_actors", "actor:a")
+            choice = dict(
+                decision="abandon",
+                concern_id="autonomy:other",
+                title="放下另一个想法",
+                goal="整理待办",
+                reason="当下不需要",
+                delay_seconds=60,
+            )
+            h.core.life.autonomy.apply(actor, choice, {}, None)
+            assert h.core.life.activities.current("actor:a") == current
+            assert h.core.life.concerns.get("actor:a", "autonomy:other")["state"] == "cancelled"
+            actor = h.core.store.get("life_actors", "actor:a")
+            choice.update(decision="continue", concern_id=current["autonomous_goal_id"])
+            h.core.life.autonomy.apply(actor, choice, {}, None)
+            assert h.core.life.activities.current("actor:a")["id"] == current["id"]
+            assert h.core.life.activities.current("actor:a")["state"] == "running"
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+def test_activity_recall_and_dispatcher_share_one_outbox_delivery_lock():
+    async def run():
+        h, owners, services, _ = await autonomy_setup()
+        try:
+            await h.core.life.autonomy.work(actor_id="actor:a")
+            for _ in range(5):
+                await h.core.life.activities.work(actor_id="actor:a")
+            activity = h.core.life.activities.current("actor:a")
+            context = h.core.runtime_execution.actions.context(activity, activity["step_operation"])
+            flush = h.core.actor_memory.flush
+            entered, release = asyncio.Event(), asyncio.Event()
+            calls = []
+
+            async def held(item):
+                calls.append(item["id"])
+                entered.set()
+                await release.wait()
+                return await flush(item)
+
+            h.core.actor_memory.flush = held
+            first = asyncio.create_task(h.core.flush_outbox())
+            await asyncio.wait_for(entered.wait(), 2)
+            second = asyncio.create_task(
+                h.core.actor_memory.activity_recall(context, dict(text="刚才实际读到的内容"))
+            )
+            await asyncio.sleep(0)
+            assert len(calls) == 1
+            release.set()
+            await asyncio.gather(first, second)
+            assert len(calls) == 1
+            assert (
+                len([row for row in owners.memory_calls if row["operation"] == "append_episode"])
+                == 1
+            )
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
 BINDING = dict(
     binding_id="00000000-0000-4000-8000-000000000001",
     binding_revision=3,

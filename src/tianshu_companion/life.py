@@ -321,6 +321,7 @@ class Life:
                         "autonomy_sequence",
                         "autonomy_epoch",
                         "autonomy_last_activity",
+                        "autonomy_observation_hint",
                     )
                     if old and k in old
                 },
