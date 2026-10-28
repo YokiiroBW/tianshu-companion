@@ -46,6 +46,72 @@ def media_reply():
     ), data
 
 
+def test_postgres_planning_epoch_expiry_is_numeric_without_casting_nested_iso_expiry():
+    from tianshu_companion.storage_postgres import translate
+
+    sql = "SELECT json_extract(body,'$.proof.expires_at') FROM life_concerns WHERE json_extract(body,'$.expires_at') IS NULL OR json_extract(body,'$.expires_at')>?"
+    native = translate(sql)
+    assert native.count("((body::jsonb #>> '{expires_at}')::double precision)") == 2
+    assert "SELECT (body::jsonb #>> '{proof,expires_at}') FROM life_concerns" in native
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_life_planning_filters_epoch_expiry_and_keeps_current_goal(tmp_path, backend):
+    from test_life import setup
+
+    settings = None
+    if backend == "postgresql":
+        url = os.environ.get("TS233_POSTGRES_URL")
+        if not url:
+            pytest.skip("TS233_POSTGRES_URL is required for isolated real PostgreSQL")
+        settings = {
+            "storage_backends": {
+                "postgresql_url": url,
+                "namespace": "alplanning_" + uuid.uuid4().hex,
+            }
+        }
+    store = Store(tmp_path / "planning.sqlite", settings=settings)
+    try:
+        life, clock, _ = setup(store)
+
+        def save(identity, *, expires=None, scope=None, due=None, state="open"):
+            return life.concerns.save(
+                "a",
+                dict(
+                    id=identity,
+                    title=identity,
+                    goal="按真实到期事项探索",
+                    state=state,
+                    scope=scope,
+                    sources=[],
+                    fragments=[],
+                    next_due_at=due,
+                    expires_at=expires,
+                    result_refs=[],
+                ),
+                expected=0,
+            )
+
+        save("expired", expires=clock() - 0.5, due=clock() - 20)
+        save("history", state="completed")
+        save("private", scope=dict(actor_id="a"), due=clock() - 30)
+        save("promise", expires=clock() + 0.5, due=clock() + 30)
+        save("autonomy:due", due=clock() - 10)
+        save("z-current")
+        selected = life.concerns.planning(
+            "a", current_id="z-current", available_until=clock() + 60, limit=2
+        )
+        assert [item["id"] for item in selected] == ["promise", "autonomy:due", "z-current"]
+        clock.advance(1)
+        selected = life.concerns.planning(
+            "a", current_id="z-current", available_until=clock() + 60, limit=2
+        )
+        assert [item["id"] for item in selected] == ["autonomy:due", "z-current"]
+        assert store.backend == backend
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
 def test_receipt_lookup_is_exact_indexed_and_preserves_unreleased_barrier(tmp_path, backend):
     settings = None

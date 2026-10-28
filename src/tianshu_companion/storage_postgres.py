@@ -44,7 +44,9 @@ def json_expression(match):
     value = f"({column}::jsonb #>> '{native_path}')"
     if path in OBJECTS:
         return f"NULLIF(({column}::jsonb #> '{native_path}'),'null'::jsonb)"
-    if path.rsplit(".", 1)[-1] in NUMBERS:
+    # Root LifeWork expiry is an epoch number. Nested authority/source material
+    # may instead use ISO expires_at strings, so do not classify that suffix globally.
+    if path == "expires_at" or path.rsplit(".", 1)[-1] in NUMBERS:
         kind = (
             "bigint"
             if path.rsplit(".", 1)[-1]
