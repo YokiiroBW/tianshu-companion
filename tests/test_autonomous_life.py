@@ -34,6 +34,72 @@ def save_goal(h, identity, *, state="open", due=None):
     )
 
 
+@pytest.mark.parametrize("decision", ["new", "continue"])
+def test_successful_goal_choice_applies_requested_review_delay(decision):
+    async def run():
+        h, _, services, model = await autonomy_setup()
+        try:
+            if decision == "continue":
+                await h.core.life.autonomy.work(actor_id="actor:a")
+                actor = h.core.store.get("life_actors", "actor:a")
+                actor["autonomy_due_at"] = h.clock()
+                h.core.life._save("actors", actor)
+            calls = []
+
+            async def choose(generation, messages):
+                calls.append(generation)
+                current = h.core.life.activities.current("actor:a")
+                return [
+                    canonical(
+                        dict(
+                            decision=decision,
+                            concern_id=current["autonomous_goal_id"]
+                            if decision == "continue"
+                            else None,
+                            title="按实际进展安排下一次复盘",
+                            goal="有界探索后重新考虑",
+                            reason="一分钟后检查方向",
+                            delay_seconds=60,
+                        )
+                    )
+                ], dict(recorded=True)
+
+            model.generate = choose
+            now = h.clock()
+            assert await h.core.life.autonomy.work(actor_id="actor:a")
+            assert h.core.store.get("life_actors", "actor:a")["autonomy_due_at"] == now + 60
+            h.clock.advance(59)
+            assert not await h.core.life.autonomy.work(actor_id="actor:a")
+            assert len(calls) == 1
+            h.clock.advance(1)
+            assert await h.core.life.autonomy.work(actor_id="actor:a")
+            assert len(calls) == 2
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+def test_unknown_goal_model_keeps_preparation_backoff():
+    async def run():
+        h, _, services, model = await autonomy_setup()
+        try:
+
+            async def unavailable(generation, messages):
+                raise TimeoutError("recorded unknown model result")
+
+            model.generate = unavailable
+            now = h.clock()
+            assert await h.core.life.autonomy.work(actor_id="actor:a")
+            actor = h.core.store.get("life_actors", "actor:a")
+            assert actor["autonomy_due_at"] == now + 1800
+            assert h.core.store.get("metadata", actor["autonomy_operation"])["state"] == "unknown"
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
 def test_planner_selects_open_due_and_exact_current_after_historical_pages():
     async def run():
         h, _, services, _ = await autonomy_setup()
@@ -635,6 +701,7 @@ def test_zero_user_input_goal_discover_actual_read_episode_understanding_and_nex
                 if call["operation"] in {"append_episode", "append_derived"}
             ] == ["append_episode", "append_derived"]
             assert owners.derived and owners.reads
+            assert h.core.store.get("life_actors", "actor:a")["autonomy_due_at"] == h.clock()
             reading = h.core.store.get("life_reading", "reading:autonomous")
             assert reading["coverage"] == [dict(unit="characters", start=0, end=4)]
             assert (

@@ -307,7 +307,9 @@ class AutonomousGoals:
     def apply(self, actor, choice, captured, memory):
         now, decision = self.core.clock(), choice["decision"]
         hint = actor.pop("autonomy_observation_hint", None)
-        if hint:
+        if decision in {"new", "continue"}:
+            actor["autonomy_due_at"] = now + choice["delay_seconds"]
+        if hint or decision in {"new", "continue"}:
             # Applied choices consume this opportunity atomically. Existing goals
             # retain their own cause; later unrelated choices get no stale query override.
             self.life._save("actors", actor)
