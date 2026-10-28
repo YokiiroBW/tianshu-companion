@@ -375,7 +375,17 @@ class RuntimeExecution:
         ]
         messages = copy.deepcopy(marker.get("messages", messages))
         memory_input = marker.get("actor_memory_input")
-        if "messages" not in marker and self.core.actor_memory.available:
+        if (
+            activity["scope"] is not None
+            and memory_input is not None
+            and memory_input["context"]["audience"]["kind"] == "actor_only"
+        ):
+            raise Fault("scope_changed")
+        if (
+            "messages" not in marker
+            and self.core.actor_memory.available
+            and activity["scope"] is None
+        ):
             memory_input = await self.core.actor_memory.planning_query(
                 actor,
                 dict(purpose="plan", audience=dict(kind="actor_only")),
@@ -489,7 +499,9 @@ class RuntimeExecution:
                 # The complete model/tool round is durable before yielding. An
                 # interrupted submitted round is never silently reissued.
                 marker.update(
-                    state="pending",
+                    state="completed"
+                    if current["state"] in {"completed", "cancelled"}
+                    else "pending",
                     messages=messages,
                     receipts=receipts,
                     reads=reads,
@@ -618,7 +630,7 @@ class RuntimeExecution:
                 [
                     dict(
                         role="system",
-                        content="Decide whether this sourced actor motive warrants contacting the person now. Use the actor's ordinary voice. Return JSON {send:boolean,text:string,photo?:null|{intent:object,parameters:object}}. A photo is optional only when photo_available=true and the actor wants to share a fictional outfit or scene illustration. intent keys: outfit,pose,background,camera,positive,negative with string values; parameters keys width,height,seed,steps. Preserve identity/style; no URL/workflow/credential fields. A photo request is an intention: never claim it has already been generated. If declining, send=false and text empty. Do not invent recipient circumstances. Actual originals include exact observed coverage and gaps: do not claim anything outside them was read. No model grants or template prose.",
+                        content="Decide whether this sourced actor motive warrants contacting the person now. Use the actor's ordinary voice. A short reaction may include a grounded feeling and concrete reason shaped by persona; do not add a compulsory life update, catchphrase or invented experience. Return JSON {send:boolean,text:string,photo?:null|{intent:object,parameters:object}}. A photo is optional only when photo_available=true and the actor wants to share a fictional outfit or scene illustration. intent keys: outfit,pose,background,camera,positive,negative with string values; parameters keys width,height,seed,steps. Preserve identity/style; no URL/workflow/credential fields. A photo request is an intention: never claim it has already been generated. If declining, send=false and text empty. Do not invent recipient circumstances. Actual originals include exact observed coverage and gaps: do not claim anything outside them was read. No model grants or template prose.",
                     ),
                     dict(role="user", content=canonical(material)),
                 ]

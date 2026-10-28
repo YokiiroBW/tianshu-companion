@@ -38,6 +38,7 @@ class Owners:
         self.wrong_receipt_request = False
         self.derived_failure = None
         self.material = []
+        self.interests = []
         self.policy = "p" * 64
         self.prose = "原件🍋：真正读到这一段，但并未读完后文。"
         self.reference = dict(
@@ -194,17 +195,34 @@ class Owners:
             if self.lost_ack:
                 self.lost_ack = False
                 raise httpx.ReadError("synthetic lost ACK")
-        elif body["operation"] == "query":
+        elif body["operation"] == "maintain":
+            value = dict(
+                schema_version=1,
+                request_id=body["request_id"],
+                actor_id=body["actor_id"],
+                command="maintain",
+                idempotency_key=body["idempotency_key"],
+                state="accepted",
+                domain_version=23,
+                expired_count=1,
+                compressed_count=0,
+                remaining=False,
+            )
+            self.receipts[body["idempotency_key"]] = value
+            if self.lost_ack:
+                self.lost_ack = False
+                raise httpx.ReadError("synthetic lost maintenance ACK")
+        elif body["operation"] in {"query", "interests"}:
             value = dict(
                 schema_version=1,
                 request_id=body["request_id"],
                 actor_id=body["actor_id"],
                 role_version=body["role_version"],
-                operation="query",
+                operation=body["operation"],
                 context=body["context"],
                 domain_version=23,
                 checked_at=utc(self.h.clock()),
-                items=self.material,
+                items=self.interests if body["operation"] == "interests" else self.material,
                 omitted=False,
             )
         elif body["operation"] == "check_memory":

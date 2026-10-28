@@ -43,7 +43,7 @@ class ActorMemorySkill:
             "interval is not completing or understanding a whole work. With actor_memory_remember, "
             "derive a concise understanding, interest or reflection only from actual episode references "
             "returned by recall. These interpretations are not new physical experiences. Use actual "
-            "receipts. For yesterday or a civil date use recall day; continue with its returned fixed "
+            "receipts. Preferences may include interest={topic,stance}, using like/dislike/mixed/curious only when supported by the actual episode. For yesterday or a civil date use recall day; continue with its returned fixed "
             "window and next_cursor. Omitted or incomplete results never prove no experiences. Keep "
             "user evidence and actor evidence separate, including conflicting preferences. An unknown "
             "command must be reconciled rather than submitted under another key."
@@ -108,7 +108,9 @@ class ActorMemorySkill:
                         description="Save this actor's revisable interpretation based only on real episode references returned by actor_memory_recall. Does not create a new experience or write user memory.",
                         parameters=dict(
                             type="object",
-                            properties={key: derived[key] for key in keys},
+                            properties={
+                                key: derived[key] for key in (*keys, "interest") if key in derived
+                            },
                             required=list(keys),
                             additionalProperties=False,
                         ),

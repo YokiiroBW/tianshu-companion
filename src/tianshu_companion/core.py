@@ -303,6 +303,7 @@ class Core(Delivery):
 
             self.actor_observation = ActorObservation(self)
             self.life.actor_memory = self.actor_memory
+            self.proactive.actor_memory = self.actor_memory
             self.images.original_reader = self.reading.original
             self.image_backend.runtime = self.life_runtime
             self.runtime_execution = RuntimeExecution(self)

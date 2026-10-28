@@ -121,10 +121,9 @@ class ActivityActions:
                 if activity.get("actor_only") and operation in {"activity.save", "concern.save"}
                 else value
             )
-            result = self.core.life.concerns.operation(
-                "actor:" + actor,
-                request,
-                lambda: self.core.life_runtime._execute(
+
+            def execute():
+                result = self.core.life_runtime._execute(
                     actor,
                     operation,
                     runtime_value,
@@ -132,8 +131,23 @@ class ActivityActions:
                     request["request_id"],
                     actor,
                     prepared=prepared,
-                ),
-            )
+                )
+                if (
+                    operation == "activity.save"
+                    and value.get("id") == activity["id"]
+                    and value.get("state") == "completed"
+                ):
+                    completed = self.core.life.activities.get(actor, activity["id"])
+                    completed["completion_evidence"] = dict(
+                        receipt_id="life-operation:"
+                        + digest(["actor:" + actor, request["request_id"]]),
+                        result_digest=digest(result),
+                    )
+                    self.store.put("life_activities", completed)
+                    self.core.actor_memory.actions.activity(completed)
+                return result
+
+            result = self.core.life.concerns.operation("actor:" + actor, request, execute)
         actual = result.pop("actual_content", None)
         if activity.get("actor_only"):
             table = (

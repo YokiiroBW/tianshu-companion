@@ -60,6 +60,7 @@ class DiaryMaterials:
                         kind=kind,
                         provenance=fact["provenance"],
                         relation=fact["relation"],
+                        outcome=fact["outcome"],
                         summary=fact["summary"],
                         occurred_at=fact["occurred_at"],
                         learned_at=fact["learned_at"],
@@ -221,9 +222,16 @@ class DiaryMaterials:
             canonical(ref) for page in pages for row in page["items"] for ref in row["episode_refs"]
         }
         for value in result["reflections"]:
+            if isinstance(value, dict) and "interest" in value:
+                if value.get("kind") != "preference":
+                    raise Fault("invalid_input")
+                self.life.actor_memory.core.contracts.check(
+                    "actor-self-memory#interest", value["interest"]
+                )
             if (
                 not isinstance(value, dict)
-                or set(value) != {"kind", "text", "episode_refs", "importance", "retention"}
+                or set(value) - {"interest"}
+                != {"kind", "text", "episode_refs", "importance", "retention"}
                 or value["kind"] not in {"reflection", "understanding", "preference"}
                 or not isinstance(value["text"], str)
                 or not 1 <= len(value["text"]) <= 4000

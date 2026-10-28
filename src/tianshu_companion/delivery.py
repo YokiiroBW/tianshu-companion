@@ -206,26 +206,43 @@ class Delivery:
         ):
             return False
         key = "contact:" + digest(expression_id)
-        if self.store.get("delivery_contacts", key):
+        if prior := self.store.get("delivery_contacts", key):
+            if getattr(self, "actor_memory", None) is not None and any(
+                segment["state"] == "sent" and segment["channel_message_ids"]
+                for segment in receipt["segments"]
+            ):
+                with self.store.transaction():
+                    prior["confirmed_sent"] = True
+                    self.store.put("delivery_contacts", prior)
+                    self.actor_memory.actions.contact(prior)
             return False
-        self.store.put(
-            "delivery_contacts",
-            dict(
-                id=key,
-                conversation_id=scope["conversation_id"],
-                actor_id=scope["actor_id"],
-                person_id=scope["person_id"],
-                scope=scope,
-                expression_id=expression_id,
-                observed_at=receipt["observed_at"],
-                state="sent",
-                version=1,
-                kind=kind,
-                subscription_id=subscription_id,
-                feedback_state="waiting" if kind == "proactive" else "not_required",
-                response_deadline=self.clock() + 3600 if kind == "proactive" else None,
-            ),
-        )
+        with self.store.transaction():
+            self.store.put(
+                "delivery_contacts",
+                dict(
+                    id=key,
+                    conversation_id=scope["conversation_id"],
+                    actor_id=scope["actor_id"],
+                    person_id=scope["person_id"],
+                    scope=scope,
+                    expression_id=expression_id,
+                    observed_at=receipt["observed_at"],
+                    state="sent",
+                    version=1,
+                    kind=kind,
+                    subscription_id=subscription_id,
+                    feedback_state="waiting" if kind == "proactive" else "not_required",
+                    response_deadline=self.clock() + 3600 if kind == "proactive" else None,
+                ),
+            )
+            if getattr(self, "actor_memory", None) is not None and any(
+                segment["state"] == "sent" and segment["channel_message_ids"]
+                for segment in receipt["segments"]
+            ):
+                contact = self.store.get("delivery_contacts", key)
+                contact["confirmed_sent"] = True
+                self.store.put("delivery_contacts", contact)
+                self.actor_memory.actions.contact(contact)
         return True
 
     def record_expression(self, turn_id, receipt):
@@ -323,6 +340,11 @@ class Delivery:
                     self._save_turn(turn)
             else:
                 self._save_turn(turn)
+
+            if getattr(self, "actor_memory", None) is not None:
+                self.actor_memory.actions.delivery_result(
+                    "turns", turn, turn["scope"], receipt, field="expression_receipt"
+                )
 
     async def finalize_stream(self, turn_id):
         turn = self.store.get("turns", turn_id)

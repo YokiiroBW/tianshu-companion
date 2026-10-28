@@ -28,6 +28,7 @@ class Memory:
                 source={},
                 relation="participant",
                 provenance="digital_action",
+                outcome="observed",
                 summary="Actually read pages 2 to 3, with a missing figure",
                 occurred_at="2026-09-13T10:00:00Z",
                 learned_at="2026-09-14T11:00:00Z",

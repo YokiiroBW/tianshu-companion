@@ -402,14 +402,15 @@ class Images:
 
     async def _complete(self, item, descriptors):
         await self._artifacts(item, descriptors)
-        item["state"] = "completed"
-        item["failure"] = None
-        item["completed_at"] = self.life.clock()
-        for artifact in item["artifacts"]:
-            self._record_original(item, artifact)
-        self._save_job(item)
-        if hasattr(self.life, "album"):
-            self.life.album.reconcile_job(item)
+        with self.store.transaction():
+            item["state"] = "completed"
+            item["failure"] = None
+            item["completed_at"] = self.life.clock()
+            for artifact in item["artifacts"]:
+                self._record_original(item, artifact)
+            self._save_job(item)
+            if hasattr(self.life, "album"):
+                self.life.album.reconcile_job(item)
         # Running GPU work is not interrupted. Intent remains visible until completion.
 
     async def _artifacts(self, item, descriptors):
@@ -538,7 +539,10 @@ class Images:
             item["version"] = previous.get("version", 1) + int(
                 any(previous.get(field) != item.get(field) for field in fields)
             )
-        self.store.put("image_jobs", item)
+        with self.store.transaction():
+            self.store.put("image_jobs", item)
+            if self.life.actor_memory is not None:
+                self.life.actor_memory.actions.image(item)
 
     def reconcile_originals(self):
         """Adopt only persisted completed descriptors and verified existing files, four jobs per pass."""

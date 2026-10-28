@@ -984,6 +984,8 @@ class Writing:
         import hashlib
 
         work = self._work(item["work_id"])
+        if self.life.actor_memory is not None:
+            self.life.actor_memory.actions.writing(work, record)
         reference = dict(
             owner="companion",
             object_id=record["id"],

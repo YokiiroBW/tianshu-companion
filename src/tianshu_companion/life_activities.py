@@ -83,6 +83,8 @@ class Activities:
                 if uncertain and uncertain["state"] in {"unknown", "submitted", "tools_pending"}:
                     item["step_operation"] = old["step_operation"]
             self.store.put("life_activities", item)
+            if self.life.actor_memory is not None:
+                self.life.actor_memory.actions.activity(item)
             if value["state"] in {"running", "paused"}:
                 actor.update(
                     activity_id=item["id"],
@@ -240,7 +242,14 @@ class Activities:
                 return True
             marker = self.store.get("metadata", operation)
             marker.update(state="completed", settled_at=self.life.clock())
-            self.store.put("metadata", marker)
+            with self.store.transaction():
+                self.store.put("metadata", marker)
+                current = self.get(item["actor_id"], item["id"])
+                if current["state"] == "completed":
+                    current["step_operation"] = operation
+                    self.store.put("life_activities", current)
+                if self.life.actor_memory is not None:
+                    self.life.actor_memory.actions.activity(current)
         except asyncio.CancelledError:
             marker = self.store.get("metadata", operation)
             if marker and marker["state"] != "pending":
@@ -254,7 +263,31 @@ class Activities:
 
     def _interrupt(self, item, reason):
         current = self.get(item["actor_id"], item["id"])
-        if current["state"] == "running" and current["version"] == item["version"]:
-            self.transition(
-                item["actor_id"], item["id"], "paused", expected=item["version"], reason=reason
-            )
+        operation = item.get("step_operation") or "activity-step:" + digest(
+            [item["id"], item["version"]]
+        )
+        marker = self.store.get("metadata", operation)
+        uncertain = bool(marker and marker["state"] in {"submitted", "tools_pending", "unknown"})
+        with self.store.transaction():
+            if marker:
+                marker.update(
+                    state="unknown" if uncertain else "failed",
+                    error=reason,
+                    settled_at=self.life.clock(),
+                )
+                self.store.put("metadata", marker)
+            if current["state"] == "running" and current["version"] == item["version"]:
+                if uncertain:
+                    current["step_operation"] = operation
+                    self.store.put("life_activities", current)
+                paused = self.transition(
+                    item["actor_id"], item["id"], "paused", expected=item["version"], reason=reason
+                )
+                if not uncertain:
+                    # No submitted model/tool exists. Retry from the real checkpoint
+                    # after a bounded delay, leaving other actors free to proceed.
+                    paused.update(
+                        next_due_at=self.life.clock() + 60, deadline=self.life.clock() + 60
+                    )
+                    paused.pop("step_operation", None)
+                    self.store.put("life_activities", paused)

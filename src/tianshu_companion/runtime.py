@@ -166,6 +166,10 @@ class LifeRuntime:
     def _execute(
         self, actor_id, operation, value, expected, request_id, operator, *, prepared=None
     ):
+        if operation == "actor-memory.import":
+            if expected != 0:
+                raise Fault("invalid_input")
+            return self.core.actor_memory.actions.import_history(actor_id, value, request_id)
         if operation == "concern.save":
             result = self.life.concerns.save(actor_id, value, expected=expected)
         elif operation == "concern.close":
@@ -529,6 +533,76 @@ class LifeRuntime:
         items = [json.loads(row[0]) for row in rows]
         return items[:limit], items[limit - 1]["id"] if len(items) > limit else None
 
+    async def autonomy_projection(self, actor, scope):
+        activity = self.life.activities.current(actor["id"], scope)
+        if activity is None:
+            previous = self.store.get("life_activities", actor.get("autonomy_last_activity", ""))
+            if previous and visible(previous, scope):
+                activity = previous
+        choice = (
+            self.store.get("metadata", actor.get("autonomy_operation", ""))
+            if scope is None
+            else None
+        )
+        if activity and activity.get("autonomy_basis"):
+            try:
+                await self.core.actor_memory.check(activity["autonomy_basis"])
+            except Fault as error:
+                if error.code not in {
+                    "scope_changed",
+                    "not_found",
+                    "forbidden",
+                    "version_conflict",
+                }:
+                    raise
+                activity = None
+                choice = None
+        if choice and choice.get("memory"):
+            try:
+                await self.core.actor_memory.check(choice["memory"])
+            except Fault as error:
+                if error.code not in {
+                    "scope_changed",
+                    "not_found",
+                    "forbidden",
+                    "version_conflict",
+                }:
+                    raise
+                choice = None
+        step = None
+        if activity:
+            operation = activity.get("step_operation") or "activity-step:" + digest(
+                [activity["id"], activity["version"]]
+            )
+            step = self.store.get("metadata", operation)
+        item, plan, marker = activity or {}, choice or {}, step or {}
+        decision = plan.get("choice") or {}
+        step_state = marker.get("state")
+        state = item.get("state", plan.get("state", "idle"))
+        if step_state in {"unknown", "failed"}:
+            state = step_state
+        enabled = bool(actor.get("life_enabled", True) and actor.get("autonomous"))
+        if not enabled:
+            state = "disabled"
+        return dict(
+            id=actor["id"],
+            actor_id=actor["id"],
+            version=actor["version"],
+            enabled=enabled,
+            goal_id=item.get("autonomous_goal_id"),
+            title=item.get("title", decision.get("title")),
+            reason=item.get("resume_condition", decision.get("reason")),
+            state=state,
+            next_due_at=item.get(
+                "next_due_at", actor.get("autonomy_due_at") if scope is None else None
+            ),
+            current_step=item.get("checkpoint"),
+            step_state=step_state,
+            error_code=marker.get("error", plan.get("error")),
+            updated_at=item.get("updated_at", plan.get("completed_at", plan.get("created_at"))),
+            sources=item.get("sources", []),
+        )
+
     async def read(self, service, request):
         self.core.contracts.check("life-runtime#read_request", request)
         entry, scope = await self.authorize_read(service, request)
@@ -536,7 +610,9 @@ class LifeRuntime:
         actor = self._actor(actor_id)
         limit, after = request["limit"], request["after"]
         next_cursor = None
-        if resource == "state":
+        if resource == "autonomy":
+            items = [await self.autonomy_projection(actor, scope)]
+        elif resource == "state":
             summary = self.life.summary(actor_id, scope)
             items = [
                 dict(
@@ -571,6 +647,7 @@ class LifeRuntime:
                 "started_at",
                 "updated_at",
             )
+            items = await self.core.runtime_execution.autonomy.verified_records(items)
             items = [{key: item[key] for key in keys} for item in items]
         elif resource == "open_work":
             items, next_cursor = self.life.concerns.page(
@@ -592,6 +669,7 @@ class LifeRuntime:
                 "intent_valid",
                 "updated_at",
             )
+            items = await self.core.runtime_execution.autonomy.verified_records(items)
             items = [{key: item[key] for key in keys} for item in items]
         elif resource == "affect":
             items = [self.life.affect.snapshot(actor_id, scope)]

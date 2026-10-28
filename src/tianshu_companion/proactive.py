@@ -1311,6 +1311,17 @@ class Proactive:
                 ),
             )
             self._save("attempts", attempt)
+            if (
+                getattr(self, "actor_memory", None) is not None
+                and result["adapter"] == VERIFYING_ADAPTER
+            ):
+                scope = {
+                    key: attempt["request"][key]
+                    for key in ("actor_id", "person_id", "audience", "conversation_id")
+                }
+                self.actor_memory.actions.delivery_result(
+                    "proactive_attempts", attempt, scope, result, field="receipt"
+                )
             if not owns:
                 # A late result for a superseded attempt settles on that attempt only: it
                 # never rewrites the candidate or the newer attempt.

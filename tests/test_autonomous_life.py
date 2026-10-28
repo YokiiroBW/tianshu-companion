@@ -12,7 +12,7 @@ from test_actor_memory import Owners, close, setup
 
 from tianshu_companion.actor_memory import ActorMemory
 from tianshu_companion.clients import JsonService, utc
-from tianshu_companion.contracts import canonical
+from tianshu_companion.contracts import canonical, digest
 
 
 def save_goal(h, identity, *, state="open", due=None):
@@ -475,6 +475,7 @@ class RecordedOwners(Owners):
                 row["source"]
                 for row in self.h.core.store.list("outbox")
                 if row.get("actor_id") == "actor:a"
+                and row.get("event", {}).get("kind") == "actor_read_observed"
             )
             row = dict(
                 ref=dict(kind="episode", id="episode:actual", revision=1),
@@ -691,6 +692,17 @@ def test_zero_user_input_goal_discover_actual_read_episode_understanding_and_nex
                 await h.core.life.activities.work(actor_id="actor:a")
             final = h.core.life.activities.get("actor:a", initial["id"])
             assert final["state"] == "completed"
+            action_rows = [
+                row
+                for row in h.core.store.list("outbox")
+                if row.get("event", {}).get("kind") == "actor_action_observed"
+            ]
+            assert len(action_rows) == 1
+            action_source = h.core.store.get(
+                "metadata", "actor-memory-source:" + digest(action_rows[0]["source"])
+            )
+            assert action_source["action_owner"]["table"] == "life_activities"
+            await h.core.actor_memory.actions.check(action_source)
             assert (
                 h.core.life.concerns.get("actor:a", initial["autonomous_goal_id"])["state"]
                 == "completed"
@@ -751,7 +763,8 @@ def test_goal_late_model_cannot_override_manual_hold_or_write_any_user_memory():
                 if item["id"].startswith("autonomy:")
             ]
             assert not owners.memory_calls or all(
-                item["operation"] in {"query", "check_memory"} for item in owners.memory_calls
+                item["operation"] in {"query", "interests", "check_memory"}
+                for item in owners.memory_calls
             )
             assert not h.memory.commits
         finally:

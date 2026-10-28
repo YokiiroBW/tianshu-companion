@@ -342,3 +342,60 @@ def test_consumer_status_is_authenticated_pure_read_and_reports_actual_missing_b
             await h.core.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("withdraw_after_model", [False, True])
+def test_long_term_material_only_in_internal_decision_and_rechecked_before_submit(
+    tmp_path, withdraw_after_model
+):
+    async def run():
+        from types import SimpleNamespace
+
+        h, model, selector, peers, client = await setup(tmp_path)
+        proof = dict(
+            actor_id="actor:a",
+            role_version=1,
+            context=dict(purpose="plan", audience=dict(kind="actor_only")),
+            items=[
+                dict(
+                    text="Private grounded preference",
+                    ref=dict(kind="derived", id="interest:one", revision=1),
+                )
+            ],
+        )
+        revoked = False
+        checks = []
+
+        async def query(actor, context, text, *, limit):
+            assert actor == "actor:a" and context["audience"]["kind"] == "actor_only"
+            return copy.deepcopy(proof)
+
+        async def check(value):
+            checks.append(value)
+            if revoked:
+                raise Fault("scope_changed")
+
+        def after():
+            nonlocal revoked
+            revoked = withdraw_after_model
+
+        h.core.actor_memory = SimpleNamespace(available=True, planning_query=query, check=check)
+        model.after = after
+        try:
+            await h.core.participation._judge(peers.items[0], "")
+            assert len(model.calls) == 1 and len(checks) == 2
+            assert "Private grounded preference" in str(model.calls[0][1])
+            if withdraw_after_model:
+                assert peers.decisions == []
+                marker = h.core.store.get(
+                    "metadata", MARKER + digest(candidate_ref(peers.items[0]))
+                )
+                assert marker["state"] == "source_invalidated"
+            else:
+                assert peers.decisions[0]["outcome"] == "engage"
+                assert "Private grounded preference" not in str(peers.decisions)
+        finally:
+            await h.core.close()
+            await client.close()
+
+    asyncio.run(run())

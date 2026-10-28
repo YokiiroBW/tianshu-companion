@@ -135,7 +135,7 @@ class Contracts:
         candidates = {
             "observation-participation/candidate-v1": "1.0.0-candidate.1",
             "actor-capabilities/candidate-v1": "1.0.0-candidate.1",
-            "actor-self-memory/candidate-v1": "1.0.0-candidate.3",
+            "actor-self-memory/candidate-v1": "1.0.0-candidate.4",
             "chat-history/candidate-v1": "1.0.0-candidate.1",
             "archive-memory-check/candidate-v1": "1.0.0-candidate.1",
         }
@@ -174,7 +174,7 @@ class Contracts:
                 "1.1.0"
                 if package in {"memory-context/v1", "context-history/v1"}
                 else "2.1.0"
-                if package.endswith("/v2.1")
+                if package.endswith("/v2.1") or package == "life-runtime/v2"
                 else "2.0.0"
                 if package.endswith("/v2")
                 else "1.0.0"

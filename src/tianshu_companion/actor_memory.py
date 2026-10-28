@@ -33,6 +33,9 @@ def audience_context(turn, purpose="dialogue"):
 class ActorMemory:
     def __init__(self, core, authority=None):
         self.core, self.store, self.authority = core, core.store, authority
+        from .actor_actions import ActorActions
+
+        self.actions = ActorActions(self)
         if authority is not None and not all(
             name in core.contracts.schemas for name in ("actor-self-memory", "actor-capabilities")
         ):
@@ -107,7 +110,7 @@ class ActorMemory:
             if value["request_id"] != body["request_id"]:
                 raise Fault(
                     "invalid_input",
-                    unknown=body["operation"] in {"append_episode", "append_derived"},
+                    unknown=body["operation"] in {"append_episode", "append_derived", "maintain"},
                 )
             observed.update(value)
 
@@ -115,7 +118,8 @@ class ActorMemory:
             value = await self.core.memory.client.call(
                 "/internal/v1/actor-self-memory/operate",
                 body,
-                uncertain_write=body["operation"] in {"append_episode", "append_derived"},
+                uncertain_write=body["operation"]
+                in {"append_episode", "append_derived", "maintain"},
                 error_response=error_response,
             )
         except Fault as error:
@@ -131,7 +135,7 @@ class ActorMemory:
         self.core.contracts.check("actor-self-memory#response", value)
         if value["actor_id"] != body["actor_id"]:
             raise Fault("invalid_input")
-        if body["operation"] in {"append_episode", "get_receipt", "append_derived"}:
+        if body["operation"] in {"append_episode", "get_receipt", "append_derived", "maintain"}:
             command = body.get("command", body["operation"])
             if value["command"] != command or value["idempotency_key"] != body["idempotency_key"]:
                 raise Fault("invalid_input", unknown=True)
@@ -298,7 +302,11 @@ class ActorMemory:
         """Same immutable command after unknown; a current-role receipt lookup comes first."""
         actor = item["actor_id"]
         attempts = item["attempts"] + 1
+        source_row = self.store.get("metadata", SOURCE_PREFIX + digest(item["source"]))
+        action_source = source_row is not None and "action_owner" in source_row
         try:
+            if action_source and not item.get("request"):
+                await self.actions.check(source_row)
             version = await self.role_version(actor)
             authority = await self._authority(actor, version, requested_operation="append_episode")
             request = item.get("request")
@@ -341,6 +349,16 @@ class ActorMemory:
             item.update(state="actor_memory_delivered", receipt=receipt, last_error=None)
         except (Fault, OSError, TimeoutError) as error:
             if (
+                action_source
+                and isinstance(error, Fault)
+                and error.code in {"not_found", "scope_changed", "forbidden", "version_conflict"}
+                and (
+                    not item.get("request")
+                    or getattr(error, "actor_memory_execution", None) == "not_started"
+                )
+            ):
+                item["state"] = "actor_memory_invalidated"
+            elif (
                 isinstance(error, Fault)
                 and error.unknown
                 or item["state"] in {"actor_memory_unknown", "actor_memory_submitting"}
@@ -361,6 +379,63 @@ class ActorMemory:
         item["attempts"] = attempts
         self.store.put("outbox", item)
 
+    async def maintain(self, actor):
+        """One bounded owner-maintenance request in the existing Life actor cycle."""
+        if (
+            not self.available
+            or "maintain" not in self.core.contracts.schemas["actor-self-memory"]["$defs"]
+        ):
+            return False
+        key = "actor-maintenance:" + actor
+        marker = self.store.get("metadata", key)
+        if marker and marker.get("due_at", 0) > self.core.clock():
+            return False
+        try:
+            version = await self.role_version(actor)
+            if not marker or marker["state"] == "completed":
+                marker = dict(
+                    id=key,
+                    actor_id=actor,
+                    state="pending",
+                    request=dict(
+                        schema_version=1,
+                        request_id=uid("actor-maintain"),
+                        actor_id=actor,
+                        role_version=version,
+                        operation="maintain",
+                        idempotency_key=uid("maintenance"),
+                        limit=32,
+                    ),
+                )
+                self.store.put("metadata", marker)
+            request = marker["request"]
+            receipt = (
+                await self._receipt(request, version) if marker["state"] == "unknown" else None
+            )
+            if receipt is None:
+                if request["role_version"] != version:
+                    raise Fault("result_unknown", unknown=True)
+                marker.update(state="unknown", due_at=self.core.clock() + 60)
+                self.store.put("metadata", marker)
+                receipt = await self._memory(request)
+            marker.update(
+                state="completed",
+                receipt=receipt,
+                error=None,
+                due_at=self.core.clock() + (60 if receipt["remaining"] else 3600),
+            )
+            self.store.put("metadata", marker)
+        except (Fault, OSError, TimeoutError) as error:
+            if marker is None:
+                marker = dict(id=key, actor_id=actor, state="completed")
+            if marker:
+                marker.update(
+                    error=error.code if isinstance(error, Fault) else "dependency_unavailable",
+                    due_at=self.core.clock() + 60,
+                )
+                self.store.put("metadata", marker)
+        return True
+
     async def _current_source(self, actor, version, reference, role, context):
         state = self.store.get("metadata", STATE_PREFIX + actor) or dict(
             generation="missing", sequence=1
@@ -371,7 +446,10 @@ class ActorMemory:
         source_state = row["state"] if known else "missing"
         if readable and source_state == "current":
             try:
-                await self.core.reading.check_read(actor, row["observed"])
+                if "action_owner" in row:
+                    await self.actions.check(row)
+                else:
+                    await self.core.reading.check_read(actor, row["observed"])
                 if "disclosure_version" in row:
                     from .diary_disclosure import DiaryDisclosure
 
@@ -470,6 +548,15 @@ class ActorMemory:
                 or final_context["access_version"] != allowed["access_version"]
             ):
                 raise Fault("forbidden")
+        # Local owner grants may change while remote authority is awaited.
+        for reference, value in zip(request["refs"], values, strict=True):
+            row = self.store.get("metadata", SOURCE_PREFIX + digest(reference))
+            if (
+                row
+                and "action_owner" in row
+                and (operation == "source_facts" or value["read_allowed"])
+            ):
+                self.actions.check_local(row)
         response = dict(
             schema_version=1,
             request_id=request["request_id"],
@@ -516,6 +603,27 @@ class ActorMemory:
         understanding and preference indefinitely. Empty derived recall falls back
         to actual episodes; ordinary dialogue/explicit recall keep their own choices.
         """
+        interests = []
+        if "interests" in self.core.contracts.schemas["actor-self-memory"]["$defs"]:
+            version = await self.role_version(actor)
+            response = await self._memory(
+                dict(
+                    schema_version=1,
+                    request_id=uid("actor-interests"),
+                    actor_id=actor,
+                    role_version=version,
+                    operation="interests",
+                    context=context,
+                    limit=max(1, limit // 2),
+                    budget_bytes=4096,
+                )
+            )
+            if (
+                len(response["items"]) > max(1, limit // 2)
+                or len(canonical(response["items"]).encode()) > 4096
+            ):
+                raise Fault("invalid_input")
+            interests = (await self._hydrate(response, 4096))["items"]
         material = await self.query(
             actor,
             context,
@@ -524,16 +632,23 @@ class ActorMemory:
             limit=limit,
             budget_bytes=8192,
         )
-        if material["items"]:
-            return material
-        return await self.query(
-            actor,
-            context,
-            text,
-            kinds=["episode"],
-            limit=limit,
-            budget_bytes=8192,
-        )
+        if not material["items"] and not interests:
+            return await self.query(
+                actor, context, text, kinds=["episode"], limit=limit, budget_bytes=8192
+            )
+        merged, known = [], set()
+        for item in [*interests, *material["items"]]:
+            key = canonical(item["ref"])
+            if key in known:
+                continue
+            if len(merged) >= limit or len(canonical([*merged, item]).encode()) > 8192:
+                material["omitted"] = True
+                continue
+            merged.append(item)
+            known.add(key)
+        material["items"] = merged
+        await self.check(material)
+        return material
 
     async def _query(
         self, actor, context, text, *, kinds, limit, budget_bytes, window=None, cursor=None
@@ -570,6 +685,10 @@ class ActorMemory:
             or len(response["items"]) > limit
         ):
             raise Fault("invalid_input")
+        return await self._hydrate(response, budget_bytes)
+
+    async def _hydrate(self, response, budget_bytes):
+        actor, version, context = (response[key] for key in ("actor_id", "role_version", "context"))
         items, episodes = [], {}
         for item in response["items"]:
             basis = []
@@ -592,7 +711,7 @@ class ActorMemory:
             whole = dict(item, basis=basis)
             if len(canonical([*items, whole]).encode()) > budget_bytes:
                 response["omitted"] = True
-                if window is not None:
+                if "window" in response:
                     response["complete"] = False
                 continue
             items.append(whole)
@@ -710,7 +829,7 @@ class ActorMemory:
         turn = self.store.get("turns", turn_id)
         if not self.core._turn_allows(turn, "memory.write"):
             raise Fault("forbidden")
-        if not isinstance(value, dict) or set(value) != {
+        if not isinstance(value, dict) or set(value) - {"interest"} != {
             "kind",
             "text",
             "episode_refs",
@@ -799,7 +918,7 @@ class ActorMemory:
         activity, marker = actions.check(context)
         if activity["scope"] is not None or not actions.allows(context, "memory.write"):
             raise Fault("forbidden")
-        if not isinstance(value, dict) or set(value) != {
+        if not isinstance(value, dict) or set(value) - {"interest"} != {
             "kind",
             "text",
             "episode_refs",
