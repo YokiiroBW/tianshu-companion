@@ -182,12 +182,11 @@ class AutonomousGoals:
                     memory_query += "；最近旁听形成的问题：" + hint["topic"]
                 if previous and previous["actor_id"] == actor_id:
                     memory_query += "；最近实际活动：" + previous["title"]
-                memory = await self.core.actor_memory.query(
+                memory = await self.core.actor_memory.planning_query(
                     actor_id,
                     dict(purpose="plan", audience=dict(kind="actor_only")),
                     memory_query,
                     limit=6,
-                    budget_bytes=4096,
                 )
             generation, lease = await self.execution.generation(actor_id, operation)
             material = dict(
@@ -202,7 +201,7 @@ class AutonomousGoals:
                 dict(
                     role="system",
                     content=(
-                        "Choose one concrete next personal goal from persona, actual long-term interests, today's temporary attention, unfinished concerns, actual reading and available time. The routine is a boundary; preserve meals/sleep and explicit promises. You can continue, defer, abandon/reconsider or start a new goal. Never invent offline progress or user actions. Actual reading occurs later through tools. Return only JSON {decision:new|continue|defer|abandon|rest, concern_id:null|string, title:string, goal:string, reason:string, delay_seconds:integer}. New requires a specific attainable title/goal. Continue/defer/abandon names an existing concern_id. Delay is 60..86400 seconds; rest is a valid choice. A new question from actual reading can become a goal; preferences require grounded actor-memory receipts, not this choice."
+                        "Choose one concrete next personal goal from persona, actual long-term interests, today's temporary attention, unfinished concerns, actual reading and available time. The routine is a boundary; preserve meals/sleep and explicit promises. You can continue, defer, abandon/reconsider or start a new goal. Never invent offline progress or user actions. Actual reading occurs later through tools. Return only JSON {decision:new|continue|defer|abandon|rest, concern_id:null|string, title:string, goal:string, reason:string, delay_seconds:integer}. Optionally include observation_inspired:boolean, true only when decision=new actually chooses the current observation_hint topic; otherwise false or omit. This hint is a one-time opportunity, not a standing instruction for unrelated goals. New requires a specific attainable title/goal. Continue/defer/abandon names an existing concern_id. Delay is 60..86400 seconds; rest is a valid choice. A new question from actual reading can become a goal; preferences require grounded actor-memory receipts, not this choice."
                     ),
                 ),
                 dict(role="user", content=canonical(material)),
@@ -255,14 +254,25 @@ class AutonomousGoals:
 
     @staticmethod
     def validate_choice(choice, captured):
-        if not isinstance(choice, dict) or set(choice) != {
+        required = {
             "decision",
             "concern_id",
             "title",
             "goal",
             "reason",
             "delay_seconds",
-        }:
+        }
+        if (
+            not isinstance(choice, dict)
+            or not required <= set(choice)
+            or set(choice) - required - {"observation_inspired"}
+        ):
+            raise Fault("invalid_input")
+        if "observation_inspired" in choice and (
+            type(choice["observation_inspired"]) is not bool
+            or choice["observation_inspired"]
+            and (choice["decision"] != "new" or not captured.get("observation_hint"))
+        ):
             raise Fault("invalid_input")
         if (
             choice["decision"] not in {"new", "continue", "defer", "abandon", "rest"}
@@ -296,8 +306,14 @@ class AutonomousGoals:
 
     def apply(self, actor, choice, captured, memory):
         now, decision = self.core.clock(), choice["decision"]
-        if decision == "new" and actor.get("autonomy_observation_hint"):
-            proof = actor["autonomy_observation_hint"]["material"]
+        hint = actor.pop("autonomy_observation_hint", None)
+        if hint:
+            # Applied choices consume this opportunity atomically. Existing goals
+            # retain their own cause; later unrelated choices get no stale query override.
+            self.life._save("actors", actor)
+        inspired = decision == "new" and choice.get("observation_inspired", False) and hint
+        if inspired:
+            proof = hint["material"]
             memory = copy.deepcopy(memory or proof)
             known = {canonical(item["ref"]) for item in memory["items"]}
             memory["items"].extend(
@@ -371,8 +387,8 @@ class AutonomousGoals:
                 expected=0,
             )
             concern.update(actor_only=True, autonomy_basis=memory)
-            if actor.get("autonomy_observation_hint"):
-                concern["public_exploration_topic"] = actor["autonomy_observation_hint"]["topic"]
+            if inspired:
+                concern["public_exploration_topic"] = hint["topic"]
             self.store.put("life_concerns", concern)
         else:
             concern = self.life.concerns.get(actor["id"], goal_id)

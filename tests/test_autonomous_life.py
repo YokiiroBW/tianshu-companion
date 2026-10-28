@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -132,6 +133,152 @@ def test_activity_recall_and_dispatcher_share_one_outbox_delivery_lock():
                 len([row for row in owners.memory_calls if row["operation"] == "append_episode"])
                 == 1
             )
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+def test_next_planner_prefers_actual_understanding_and_preference_with_long_episode_basis():
+    async def run():
+        h, owners, services, model = await autonomy_setup()
+        derived_items = []
+        try:
+            owners.prose = "恒星演化和光谱观测需要依据实际资料继续比较。" * 12
+            owners.reference.update(
+                sha256=hashlib.sha256(owners.prose.encode()).hexdigest(),
+                coverage=dict(
+                    unit="characters", start=0, end=len(owners.prose), total=len(owners.prose)
+                ),
+            )
+            memory = owners.memory
+
+            async def ranked_owner(request):
+                body = json.loads(request.content)
+                response = await memory(request)
+                if response.status_code != 200:
+                    return response
+                value = response.json()
+                if body["operation"] == "append_derived":
+                    if body["kind"] == "preference":
+                        value["ref"]["id"] = "preference:actual"
+                        owners.receipts[body["idempotency_key"]] = value
+                    source = next(
+                        row["source"]
+                        for row in h.core.store.list("outbox")
+                        if row.get("actor_id") == "actor:a"
+                    )
+                    derived_items.append(
+                        dict(
+                            ref=value["ref"],
+                            kind=body["kind"],
+                            text=body["text"],
+                            episode_refs=body["episode_refs"],
+                            source_refs=[source],
+                            recorded_at=utc(h.clock()),
+                            expires_at=None,
+                        )
+                    )
+                elif body["operation"] == "query" and derived_items:
+                    source = derived_items[0]["source_refs"][0]
+                    facts = await h.core.actor_memory.source(
+                        "memory",
+                        dict(
+                            schema_version=1,
+                            request_id="long-fact:actual",
+                            actor_id="actor:a",
+                            role_version=owners.version,
+                            operation="source_facts",
+                            refs=[source],
+                        ),
+                    )
+                    episode = dict(
+                        derived_items[0],
+                        ref=dict(kind="episode", id="episode:actual", revision=1),
+                        kind="episode",
+                        text=facts["facts"][0]["summary"],
+                    )
+                    selected, used = [], 0
+                    for item in [episode, *derived_items]:
+                        size = len(canonical(item).encode())
+                        if (
+                            item["kind"] in body["kinds"]
+                            and used + size <= body["budget_bytes"]
+                            and len(selected) < body["limit"]
+                        ):
+                            selected.append(item)
+                            used += size
+                    value["items"] = selected
+                return httpx.Response(200, json=value)
+
+            service = JsonService(
+                "https://memory.fixture.invalid",
+                "memory",
+                transport=httpx.MockTransport(ranked_owner),
+            )
+            services.append(service)
+            h.memory.client = service
+            complete = model.complete
+
+            async def long_read(generation, messages, *, tools):
+                output, receipt = await complete(generation, messages, tools=tools)
+                for call in output.get("tool_calls", []):
+                    name = call["function"]["name"]
+                    if name in {"life_reading_read", "life_activity_save"}:
+                        value = json.loads(call["function"]["arguments"])
+                        if name == "life_reading_read":
+                            value["value"]["range"]["end"] = 120
+                        else:
+                            value["value"]["checkpoint"].update(
+                                position=120, note="依据实际120字符区间形成认识，整篇未读完"
+                            )
+                        call["function"]["arguments"] = canonical(value)
+                return output, receipt
+
+            model.complete = long_read
+            await h.core.life.autonomy.work(actor_id="actor:a")
+            for _ in range(8):
+                await h.core.life.activities.work(actor_id="actor:a")
+            assert h.core.life.activities.current("actor:a") is None
+            assert [row["kind"] for row in derived_items] == ["understanding"]
+            basis = await h.core.actor_memory.query(
+                "actor:a", dict(purpose="plan", audience=dict(kind="actor_only")), "恒星演化"
+            )
+
+            async def validate():
+                await h.core.actor_memory.check(basis)
+
+            references = derived_items[0]["episode_refs"]
+            await h.core.actor_memory.append_validated_derived(
+                "actor:a",
+                "preference-after-actual-read",
+                "actual-preference",
+                dict(
+                    kind="preference",
+                    text="实际阅读后仍想研究恒星演化；这份兴趣可以继续修正。",
+                    episode_refs=references,
+                    importance="normal",
+                    retention="medium",
+                ),
+                {canonical(ref) for ref in references},
+                validate,
+            )
+            mixed = await h.core.actor_memory.query(
+                "actor:a",
+                dict(purpose="plan", audience=dict(kind="actor_only")),
+                "恒星演化",
+                budget_bytes=4096,
+                limit=6,
+            )
+            assert "episode" in {item["kind"] for item in mixed["items"]}
+            assert not {"understanding", "preference"} <= {item["kind"] for item in mixed["items"]}
+            assert await h.core.life.autonomy.work(actor_id="actor:a")
+            chosen = model.goals[-1]["actor_self_memory"]
+            assert {item["kind"] for item in chosen} == {"understanding", "preference"}
+            assert all(item["basis"][0]["episode_ref"] == references[0] for item in chosen)
+            assert len(canonical(chosen).encode()) <= 8192
+            assert h.core.life.activities.current("actor:a")["title"] == "继续研究恒星演化"
+            assert not h.core.store.list("turns") and not h.memory.commits
         finally:
             await close(h, services)
 
@@ -278,7 +425,7 @@ class RecordedOwners(Owners):
                     kind="understanding",
                     text="现在想继续研究恒星演化，依据实际阅读而非标题。",
                 )
-            self.material = [row]
+            self.material = [row] if row["kind"] in body["kinds"] else []
         result = await super().memory(request)
         if body["operation"] == "append_derived":
             self.derived = True

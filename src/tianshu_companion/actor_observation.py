@@ -303,12 +303,11 @@ class ActorObservation:
                 raise Fault("scope_changed")
             if checks != await self.source(item):
                 raise Fault("scope_changed")
-            interests = await core.actor_memory.query(
+            interests = await core.actor_memory.planning_query(
                 item["actor_id"],
                 copy.deepcopy(CONTEXT),
                 "自身长期兴趣、最近关注和想探索的问题",
                 limit=4,
-                budget_bytes=4096,
             )
             role = await self.current(item)
             fresh = self.store.get("metadata", item["id"])

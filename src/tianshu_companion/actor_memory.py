@@ -486,6 +486,33 @@ class ActorMemory:
             error.origin_read_unavailable = True
             raise error from None
 
+    async def planning_query(self, actor, context, text, *, limit=6):
+        """Prefer actual conclusions to repeated raw episodes within one bounded plan input.
+
+        Derived material already carries its verified episode basis. Spending the
+        whole input budget on the same raw episode can otherwise hide the actor's
+        understanding and preference indefinitely. Empty derived recall falls back
+        to actual episodes; ordinary dialogue/explicit recall keep their own choices.
+        """
+        material = await self.query(
+            actor,
+            context,
+            text,
+            kinds=["understanding", "preference", "reflection"],
+            limit=limit,
+            budget_bytes=8192,
+        )
+        if material["items"]:
+            return material
+        return await self.query(
+            actor,
+            context,
+            text,
+            kinds=["episode"],
+            limit=limit,
+            budget_bytes=8192,
+        )
+
     async def _query(self, actor, context, text, *, kinds, limit, budget_bytes):
         version = await self.role_version(actor)
         response = await self._memory(

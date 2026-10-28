@@ -182,6 +182,7 @@ class ObserverOwners(RecordedOwners):
                         expires_at=None,
                     )
                 ]
+                self.material = [row for row in self.material if row["kind"] in body["kinds"]]
             return httpx.Response(
                 200,
                 json=dict(
@@ -208,7 +209,12 @@ class ObserverModel(RecordedModel):
 
     async def generate(self, generation, messages):
         if "actually archived same-group" not in messages[0]["content"]:
-            return await super().generate(generation, messages)
+            output, receipt = await super().generate(generation, messages)
+            if json.loads(messages[1]["content"]).get("observation_hint"):
+                choice = json.loads(output[0])
+                choice["observation_inspired"] = True
+                output = [canonical(choice)]
+            return output, receipt
         value = json.loads(messages[1]["content"])
         self.observed.append(value)
         if self.observation_gate:
@@ -229,8 +235,8 @@ class ObserverModel(RecordedModel):
         ], dict(provider="recorded-observation")
 
 
-async def observer_setup():
-    h, _, old_services, _ = await autonomy_setup()
+async def observer_setup(path=":memory:"):
+    h, _, old_services, _ = await autonomy_setup(path)
     await asyncio.gather(*(service.close() for service in old_services))
     owners = ObserverOwners(h)
     services = [
@@ -462,9 +468,9 @@ def test_no_fresh_observer_write_after_capture_boundary_changes(boundary):
     asyncio.run(run())
 
 
-def test_source_forget_after_completion_invalidates_hint_and_execution_basis():
+def test_source_forget_after_completion_invalidates_execution_basis():
     async def run():
-        h, owners, services, _ = await observer_setup()
+        h, owners, services, model = await observer_setup()
         try:
             await offer(h, owners)
             await h.core.actor_observation.work(job(h))
@@ -476,10 +482,8 @@ def test_source_forget_after_completion_invalidates_hint_and_execution_basis():
             owners.withdrawn = True
             with pytest.raises(Fault):
                 await h.core.actor_memory.check(current["autonomy_basis"])
-            actor = h.core.store.get("life_actors", "actor:a")
-            actor["autonomy_due_at"] = h.clock()
-            h.core.life._save("actors", actor)
-            assert not await h.core.life.autonomy.work(actor_id="actor:a")
+            await h.core.life.activities.work(actor_id="actor:a")
+            assert not model.rounds  # A consumed hint is gone; the goal keeps its own source check.
             assert "autonomy_observation_hint" not in h.core.store.get("life_actors", "actor:a")
         finally:
             await close(h, services)
@@ -577,6 +581,84 @@ def test_observation_external_discovery_receives_public_topic_projection():
             invoke = next(row for row in owners.platform_calls if row["operation"] == "invoke")
             assert invoke["arguments"] == dict(query="恒星演化")
             assert "讨论" not in canonical(invoke) and "group:20001" not in canonical(invoke)
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+def test_observation_hint_is_consumed_once_and_restart_preserves_later_goal_query(tmp_path):
+    async def run():
+        path = tmp_path / "life.sqlite"
+        h, owners, services, model = await observer_setup(path)
+        try:
+            await offer(h, owners)
+            await h.core.actor_observation.work(job(h))
+            await h.core.flush_outbox()
+            await h.core.actor_observation.work(job(h))
+            await h.core.life.autonomy.work(actor_id="actor:a")
+            first = h.core.life.activities.current("actor:a")
+            assert first["public_exploration_topic"] == "恒星演化"
+            assert "autonomy_observation_hint" not in h.core.store.get("life_actors", "actor:a")
+            for _ in range(2):
+                await h.core.life.activities.work(actor_id="actor:a")
+            assert next(row for row in owners.platform_calls if row["operation"] == "invoke")[
+                "arguments"
+            ] == dict(query="恒星演化")
+            persisted = {
+                name: copy.deepcopy(getattr(owners, name))
+                for name in ("originals", "episodes", "receipts", "derived")
+            }
+        finally:
+            await close(h, services)
+
+        h, owners, services, model = await observer_setup(path)
+        try:
+            for name, value in persisted.items():
+                setattr(owners, name, value)
+            assert "autonomy_observation_hint" not in h.core.store.get("life_actors", "actor:a")
+            prior = h.core.life.activities.get("actor:a", first["id"])
+            assert prior["public_exploration_topic"] == "恒星演化" and prior["autonomy_basis"]
+            actor = h.core.store.get("life_actors", "actor:a")
+            actor["autonomy_due_at"] = h.clock()
+            h.core.life._save("actors", actor)
+
+            async def choose_music(generation, messages):
+                assert json.loads(messages[1]["content"])["observation_hint"] is None
+                return [
+                    canonical(
+                        dict(
+                            decision="new",
+                            concern_id=None,
+                            title="研究配乐结构",
+                            goal="查找配乐结构公开资料",
+                            reason="自主改换兴趣",
+                            delay_seconds=600,
+                        )
+                    )
+                ], dict(recorded=True)
+
+            model.generate = choose_music
+            complete = model.complete
+
+            async def music_tools(generation, messages, *, tools):
+                output, receipt = await complete(generation, messages, tools=tools)
+                for call in output.get("tool_calls", []):
+                    if call["function"]["name"] == "platform_invoke":
+                        args = json.loads(call["function"]["arguments"])
+                        args["arguments"]["query"] = "配乐结构"
+                        call["function"]["arguments"] = canonical(args)
+                return output, receipt
+
+            model.complete = music_tools
+            assert await h.core.life.autonomy.work(actor_id="actor:a")
+            current = h.core.life.activities.current("actor:a")
+            assert current["title"] == "研究配乐结构" and "public_exploration_topic" not in current
+            for _ in range(2):
+                await h.core.life.activities.work(actor_id="actor:a")
+            invoke = next(row for row in owners.platform_calls if row["operation"] == "invoke")
+            assert invoke["arguments"] == dict(query="配乐结构")
+            assert "autonomy_observation_hint" not in h.core.store.get("life_actors", "actor:a")
         finally:
             await close(h, services)
 

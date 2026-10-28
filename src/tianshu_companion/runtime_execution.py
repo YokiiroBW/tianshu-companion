@@ -363,12 +363,11 @@ class RuntimeExecution:
         messages = copy.deepcopy(marker.get("messages", messages))
         memory_input = marker.get("actor_memory_input")
         if "messages" not in marker and self.core.actor_memory.available:
-            memory_input = await self.core.actor_memory.query(
+            memory_input = await self.core.actor_memory.planning_query(
                 actor,
                 dict(purpose="plan", audience=dict(kind="actor_only")),
                 activity["title"],
                 limit=6,
-                budget_bytes=4096,
             )
             messages.append(
                 dict(

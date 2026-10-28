@@ -23,3 +23,5 @@ TS-386 / AL12 在原 `Observations.flush` 收到真正归档回执后组合交�
 每群任务保存原精确 policy_version，A→B→A 和停用→启用都不能复活旧包；别群策略更新不使当前群重发。已完成经历仍按原 Memory source / archive / binding / forget 检查，不因暂停新自动工作删除历史。撤回材料不能用于后续目标或活动。旁听派生目标与其公开探索主题保留自身记忆依据；公开 UI、虚构日记和主动事件继续受 actor_only 隔离。外部发现存在标准 query 字段时只投影已由语义筛选给出的公共主题，不组装原群原话、native 元数据或内部 scope；其他能力继续服从实际 owner schema，没有字符串关键词审批门槛。
 
 旁听验证入口 `tests/test_actor_observation.py`。真实群策略代际回归额外需要实际 Platform `services.platform.group_policy` 包；普通仅安装 Companion 的测试环境会明确跳过这一联合节点，根单容器联合环境应启用它。Memory 生产者需同时使用 TS-388 `9453e5e3fd43c80a41f9bd4601f0181e2e7c6db5` 或后继；未发布该窄口时如实保留依赖不可用，不冒称已经记住。
+
+旁听 hint 是一次决策机会，在成功 apply 的原事务中消费。规划器的本地可选 `observation_inspired:true` 只为确由当前 hint 启发的新目标保留该公共主题与来源证明；省略/false 不给无关目标强制附加旧主题。已有 concern/activity 自己的因果与主题继续保存，暂停或重启不把消费过的 hint 再次注入。规划、活动准备和旁听兴趣判断的自身召回共用 ActorMemory.planning_query：有限 8192 字节中先取真实 understanding/preference/reflection 及完整可核的 episode basis，确无可用 derived 时回退 episode。普通对话及显式自身召回的类型选择保持原逻辑。
