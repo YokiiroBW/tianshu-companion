@@ -1491,10 +1491,11 @@ class Gateway:
     def available(self):
         return bool(self.client.url and self.client.token)
 
-    async def complete(self, turn, messages, *, tools=None, on_delta=None):
+    async def complete(self, turn, messages, *, tools=None, on_delta=None, request_id=None):
         from .model_native import Completion
 
-        request_id = uid("model")
+        request_id = request_id or uid("model")
+        self.contracts.check("common#id", request_id)
         headers = {
             "X-Request-ID": request_id,
             "X-Tianshu-Config-Version": str(turn["config_version"]),
@@ -1605,6 +1606,10 @@ class Gateway:
         ):
             raise Fault("dependency_unavailable")
         return receipt
+
+    async def receipt(self, turn, request_id):
+        """Read execution evidence; a receipt is not recoverable completion text."""
+        return await self._route_receipt(turn, request_id)
 
     async def _settle_request(self, turn, request_id):
         """Request owned cancellation and briefly confirm local execution closure."""

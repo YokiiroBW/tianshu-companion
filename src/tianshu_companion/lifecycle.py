@@ -23,6 +23,7 @@ ROOT_COMMANDS = frozenset(
         "image-backend-manage",
         "image-backend-compile",
         "bot-binding-apply",
+        "conversation-window",
         "observation-ingest",
     }
 )
