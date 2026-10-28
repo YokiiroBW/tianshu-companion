@@ -49,7 +49,7 @@ def test_group_private_modes_and_restart(tmp_path):
             "account_id": "10001",
             "revision": 1,
             "enabled": True,
-            "group_policy": policy(names=["20002"]),
+            "group_policy": policy("blacklist", ["20002"]),
             "private_policy": policy(),
         }
         assert (await rpc("apply", request))["revision"] == 1

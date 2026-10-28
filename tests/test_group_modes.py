@@ -45,7 +45,7 @@ async def apply(fixture, value, revision=1, group_revisions=None, private=None, 
     [
         (policy(observe=False), "disabled", "disabled"),
         (policy(), "disabled", "disabled"),
-        (policy(names=["20001"]), "disabled", "observe"),
+        (policy(names=["20001"]), "disabled", "disabled"),
         (policy("whitelist", ["20001"]), "disabled", "reply"),
         (policy("blacklist", ["20001"]), "disabled", "observe"),
     ],
@@ -56,6 +56,21 @@ def test_legacy_migration_is_deterministic_and_never_active(old, default, overri
     assert value["groups"].get("20001", value["default"])["mode"] == override
     assert "active" not in json.dumps(value)
     assert normalize(value) == value
+
+
+def test_legacy_observe_only_list_never_enables_groups_or_changes_private_observation():
+    old = {**policy(names=["20001"]), "actor_id": "actor:old"}
+    original = copy.deepcopy(old)
+    normalized = normalize(old)
+    assert normalized["groups"] == {}
+    assert normalized["default"] == rule("disabled", "actor:old")
+    for value in (old, normalized):
+        for group in ("20001", "99999"):
+            verdict = decision(value, "group:" + group, mentioned=True)
+            assert not verdict["observe"] and not verdict["reply_permitted"]
+    private = decision(old, "private:20001")
+    assert private["observe"] and not private["reply_permitted"]
+    assert old == original
 
 
 @pytest.mark.parametrize(

@@ -62,7 +62,9 @@ def normalize(value):
         version=2,
         default=rule(dict(mode="disabled", actor_id=actor, keywords=[])),
         groups={
-            key: rule(dict(mode=override, actor_id=actor, keywords=[])) for key in value["list"]
+            key: rule(dict(mode=override, actor_id=actor, keywords=[]))
+            for key in value["list"]
+            if value["mode"] != "observe_only"
         },
     )
 
@@ -75,7 +77,7 @@ def effective(policy, group):
             return policy["groups"][group]
         return {**policy["default"], "mode": "disabled"}
     mode = "disabled"
-    if policy["observe"] and group in policy["list"]:
+    if policy["observe"] and policy["mode"] != "observe_only" and group in policy["list"]:
         mode = "reply" if policy["mode"] == "whitelist" else "observe"
     return dict(mode=mode, actor_id=policy.get("actor_id"), keywords=[])
 
