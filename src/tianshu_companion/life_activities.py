@@ -1,7 +1,7 @@
 """Continuous actor activities. A calendar intention never certifies execution."""
 
-import json
 import asyncio
+import json
 
 from .contracts import Fault, digest
 from .life import text, timestamp
@@ -70,12 +70,19 @@ class Activities:
                 updated_at=self.life.clock(),
                 runtime_epoch=actor.get("life_runtime_epoch", 0),
             )
+            for field in ("autonomous_goal_id", "actor_only", "autonomy_basis"):
+                if old and field in old:
+                    item[field] = old[field]
+            if old and old.get("step_operation"):
+                uncertain = self.store.get("metadata", old["step_operation"])
+                if uncertain and uncertain["state"] in {"unknown", "submitted", "tools_pending"}:
+                    item["step_operation"] = old["step_operation"]
             self.store.put("life_activities", item)
             if value["state"] in {"running", "paused"}:
                 actor.update(
                     activity_id=item["id"],
                     activity_scope=item["scope"],
-                    activity=item["title"],
+                    activity="自主探索" if item.get("actor_only") else item["title"],
                     changed_at=self.life.clock(),
                 )
                 self.life._save("actors", actor)
@@ -102,6 +109,7 @@ class Activities:
                     activity_id=item["id"],
                     activity_version=item["version"],
                     scope=item["scope"],
+                    actor_only=item.get("actor_only", False),
                 )
                 self.life._event(event)
             return item

@@ -217,7 +217,11 @@ class DailyLife:
                 entry["generation_state"] = task["state"]
         process = self.life.activities.current(actor["id"], actor.get("activity_scope"))
         if current and not (process and process["state"] in {"running", "paused"}):
-            if (
+            if self.life.autonomy is not None and hasattr(self.life.gateway, "complete"):
+                # Routine entries remain intentions. The existing activity owner starts
+                # actual work only after the rolling goal decision, within this window.
+                current["generation_state"] = task["state"]
+            elif (
                 hasattr(self.life.gateway, "complete")
                 and self.life.activities.executor is not None
                 and actor.get("manual") is None
@@ -457,7 +461,14 @@ class DailyLife:
                         if one:
                             return True
                         continue
-                    if self.life.actor_memory is not None and self.life.actor_memory.available:
+                    if (
+                        self.life.actor_memory is not None
+                        and self.life.actor_memory.available
+                        and not (
+                            self.life.autonomy is not None
+                            and hasattr(self.life.gateway, "complete")
+                        )
+                    ):
                         task["actor_memory_input"] = await self.life.actor_memory.query(
                             task["actor_id"],
                             dict(

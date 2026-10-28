@@ -32,6 +32,8 @@ def source_refs(values):
 
 def visible(record, scope):
     """Actor-owned life or the exact original private scope; caller grants are checked outside."""
+    if record.get("actor_only") and scope is not None:
+        return False
     return record.get("scope") is None or record["scope"] == scope
 
 
@@ -93,6 +95,8 @@ class LifeWork:
                 updated_at=self.life.clock(),
                 intent_valid=True,
             )
+            if old and old.get("actor_only"):
+                item["actor_only"] = True
             self.store.put("life_concerns", item)
             return item
 

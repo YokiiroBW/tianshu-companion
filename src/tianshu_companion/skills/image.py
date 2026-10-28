@@ -48,6 +48,17 @@ class ImageSkill:
     def tools(self, actions, turn, definition):
         if not actions.core._turn_allows(turn, "dialogue"):
             return []
+        return self._tools(actions)
+
+    def activity_tools(self, actions, context, definition):
+        activity, _ = actions.core.runtime_execution.actions.check(context)
+        if activity.get("actor_only") or not actions.core.runtime_execution.actions.allows(
+            context, "dialogue"
+        ):
+            return []
+        return self._tools(actions)
+
+    def _tools(self, actions):
         schema = actions.core.contracts.schemas["life-runtime"]
         value = actions._expand(schema["$defs"]["image_request_value"], schema)
         fields = value["properties"]
@@ -115,6 +126,11 @@ class ImageSkill:
 
     async def execute(self, actions, turn_id, tool, *, model_slot_held=False):
         return await actions.execute_domain(turn_id, tool, model_slot_held=model_slot_held)
+
+    async def activity_execute(self, actions, context, tool, *, model_slot_held=False):
+        return await actions.core.runtime_execution.actions.execute(
+            context, tool, model_slot_held=model_slot_held
+        )
 
     def normalize(self, turn_id, tool_id, supplied):
         if set(supplied) - {"expected_version", "value"}:

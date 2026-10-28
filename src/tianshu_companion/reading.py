@@ -1,16 +1,14 @@
 """References and reading progress. Knowledge remains the authority for original bytes."""
 
-import json
-import copy
 import base64
+import copy
 import hashlib
+import json
 from contextlib import nullcontext
 
 from . import observability as obs
-
 from .clients import epoch
-
-from .contracts import Fault, digest, canonical
+from .contracts import Fault, canonical, digest
 from .life_work import require_version, visible
 
 
@@ -286,7 +284,9 @@ class Reading:
             elif operation == "reading.read":
                 item = self.get(actor, value["id"], scope)
                 require_version(item, expected)
-                self._advance(item, prepared, actor_observed=return_content)
+                self._advance(
+                    item, prepared, actor_observed=return_content, requested_range=value["range"]
+                )
             else:
                 item = self.get(actor, value["id"], scope)
                 require_version(item, expected)
@@ -404,7 +404,7 @@ class Reading:
             actor,
             observed["scope"],
             observed["content_ref"],
-            observed["coverage"],
+            observed.get("requested_range", observed["coverage"]),
             None,
             observed["operation_ref"],
         )
@@ -415,7 +415,7 @@ class Reading:
             raise Fault("scope_changed")
         return result.get("available_until")
 
-    def _advance(self, item, result, *, actor_observed=False):
+    def _advance(self, item, result, *, actor_observed=False, requested_range=None):
         actual = result["coverage"]
         coverage = item["content_ref"]["coverage"]
         if (
@@ -472,12 +472,13 @@ class Reading:
                 coverage=actual,
                 complete=result["complete"],
                 gaps=result.get("gaps", []),
+                actor_only=item.get("actor_only", False),
             )
         )
         if actor_observed:
             # Only actual BOT tool execution received this original. A human's
             # browser read may advance the same UI progress, but is not the BOT's experience.
-            self.core.actor_memory.record_read(item, result)
+            self.core.actor_memory.record_read(item, result, requested_range=requested_range)
 
     async def read_content(self, request):
         actor, scope, reading_id = request["actor_id"], request["scope"], request["reading_id"]

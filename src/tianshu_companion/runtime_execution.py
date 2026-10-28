@@ -3,9 +3,9 @@
 import copy
 import json
 
-from .clients import utc, epoch, query
+from .clients import epoch, query, utc
 from .contracts import Fault, canonical, digest, strict_json
-from .role_actions import OPERATIONS
+from .life_work import visible
 from .short_context import sources_current
 
 
@@ -15,12 +15,18 @@ class RuntimeExecution:
 
     def __init__(self, core):
         self.core, self.store = core, core.store
+        from .activity_actions import ActivityActions
+        from .life_goals import AutonomousGoals
         from .runtime_photo import RuntimePhotos
 
+        self.actions = ActivityActions(core)
+        self.autonomy = AutonomousGoals(self)
         self.photos = RuntimePhotos(self)
         self.core.images.submission_guard = self.photos.before_submission
 
     def offer_event(self, event):
+        if event.get("actor_only"):
+            return
         if event.get("kind") not in {
             "reading_progress",
             "writing_completed",
@@ -288,35 +294,20 @@ class RuntimeExecution:
         """Resume a real persisted checkpoint. Tools, original reads and receipts share chat owners."""
         actor = activity["actor_id"]
         self.core.reading.actor_operation(actor, activity["id"])
-        schema = self.core.contracts.schemas["life-runtime"]
-        operations = [
-            name
-            for name in OPERATIONS
-            if name not in {"affect.feedback", "reading.pause", "reading.resume", "reading.close"}
-        ]
-        tools = [
-            dict(
-                type="function",
-                function=dict(
-                    name="life_" + name.replace(".", "_"),
-                    description="Actual actor action "
-                    + name
-                    + "; use current CAS and original references. Sources/scope are supplied by runtime.",
-                    parameters=dict(
-                        type="object",
-                        properties=dict(
-                            expected_version=dict(type="integer", minimum=0),
-                            value=self.core.role_actions._expand(
-                                schema["$defs"][name.replace(".", "_") + "_value"], schema
-                            ),
-                        ),
-                        required=["expected_version", "value"],
-                        additionalProperties=False,
-                    ),
-                ),
-            )
-            for name in operations
-        ]
+        if (
+            activity.get("autonomous_goal_id") or activity["id"].startswith("routine:")
+        ) and self.autonomy.window(self.store.get("life_actors", actor)) is None:
+            if activity["state"] == "running":
+                self.core.life.activities.transition(
+                    actor,
+                    activity["id"],
+                    "paused",
+                    expected=activity["version"],
+                    reason="为作息或已约定事项保留时间",
+                )
+            return False
+        context = self.actions.context(activity, operation)
+        tools = self.core.skills.activity_tools(context)
         marker = self.store.get("metadata", operation)
         round_ = marker.get("round", 0)
         if round_ >= 8:
@@ -344,7 +335,7 @@ class RuntimeExecution:
         messages = [
             dict(
                 role="system",
-                content="Continue this actor's independent activity from its actual checkpoint. Calendar plans are intentions. Only successful tool receipts and original content are completed work. Never invent offline progress. Read original content before claiming understanding. Update activity.save checkpoint and next_due_at for continuation; finish or pause explicitly. No real user memory writes or permission grants.",
+                content="Continue this actor's independent activity from its actual checkpoint. Calendar plans are intentions. Only successful tool receipts and original content are completed work. Never invent offline progress. Read original content before claiming understanding. Update activity.save checkpoint and next_due_at for continuation; finish or pause explicitly. No real user memory writes or permission grants. Discover installed platform capabilities before choosing a source; search snippets are not original reads. After an actual read, recall the committed actor episode, then remember only grounded understanding, preference, reflection or a question. Persist a concrete checkpoint and next action or pause; do not complete a reading solely because the model knows its title.",
             ),
             dict(
                 role="user",
@@ -353,6 +344,17 @@ class RuntimeExecution:
                         persona=persona,
                         activity=activity,
                         concerns=concerns,
+                        reading_sessions=[
+                            item
+                            for item in (
+                                json.loads(row[0])
+                                for row in self.store.db.execute(
+                                    "SELECT body FROM life_reading WHERE conversation_id=? ORDER BY id LIMIT 8",
+                                    (actor,),
+                                ).fetchall()
+                            )
+                            if visible(item, activity["scope"])
+                        ],
                         now=utc(self.core.clock()),
                     )
                 ),
@@ -386,6 +388,10 @@ class RuntimeExecution:
         async with self.core.life.model_slots:
             if memory_input is not None:
                 await self.core.actor_memory.check(memory_input)
+            if activity.get("autonomy_basis") is not None:
+                await self.core.actor_memory.check(activity["autonomy_basis"])
+            for material in marker.get("actor_memory_checks", []):
+                await self.core.actor_memory.check(material)
             self.current_sources(source_inputs)
             if any(source["owner"] != "companion" for source in source_inputs):
                 if activity["scope"] is None:
@@ -428,105 +434,11 @@ class RuntimeExecution:
             for call in calls:
                 unknown_tool = False
                 try:
-                    value = strict_json(call["function"]["arguments"])
-                    name = next(
-                        name
-                        for name in operations
-                        if "life_" + name.replace(".", "_") == call["function"]["name"]
+                    result, attachments = await self.core.skills.execute_activity(
+                        context, call, model_slot_held=True
                     )
-                    supplied = copy.deepcopy(value["value"])
-                    properties = schema["$defs"][name.replace(".", "_") + "_value"]["properties"]
-                    sources = [
-                        dict(
-                            owner="companion",
-                            object_id=activity["id"],
-                            version=activity["version"],
-                        )
-                    ]
-                    if "sources" in properties:
-                        supplied["sources"] = sources
-                    if "scope" in properties:
-                        supplied["scope"] = activity["scope"]
-                    if "query" in properties:
-                        if activity["scope"] is not None:
-                            raise Fault("dependency_unavailable")
-                        # Null-scope actor principal uses its actual activity instead of an origin.
-                        supplied["query"] = None
-                    for fragment in supplied.get("fragments", []):
-                        fragment["sources"] = sources
-                    request = dict(
-                        schema_version=2,
-                        request_id="activity-action:" + digest([operation, call["id"]]),
-                        actor_id=actor,
-                        operation=name,
-                        expected_version=value["expected_version"],
-                        value=supplied,
-                    )
-                    marker["active_request"] = copy.deepcopy(request)
-                    self.store.put("metadata", marker)
-                    if name.startswith("reading.") or name == "content.acquire":
-                        result = await self.core.reading.action(
-                            "actor:" + actor,
-                            request,
-                            operation_ref=activity["id"],
-                            return_content=True,
-                        )
-                    else:
-                        self.core.contracts.check("life-runtime#manage_request", request)
-                        prepared = await self.core.life_runtime.prepare_action(
-                            actor,
-                            name,
-                            supplied,
-                            value["expected_version"],
-                            model_slot_held=True,
-                            background=True,
-                        )
-                        result = self.core.life.concerns.operation(
-                            "actor:" + actor,
-                            request,
-                            lambda: self.core.life_runtime._execute(
-                                actor,
-                                name,
-                                supplied,
-                                value["expected_version"],
-                                request["request_id"],
-                                actor,
-                                prepared=prepared,
-                            ),
-                        )
-                    actual = result.pop("actual_content", None)
                     unknown_tool = result.get("state") == "unknown"
-                    if name == "content.acquire" and result.get("content_ref"):
-                        reference = result["content_ref"]
-                        coverage = reference["coverage"]
-                        reads.append(
-                            dict(
-                                operation_ref=activity["id"],
-                                scope=activity["scope"],
-                                content_ref=reference,
-                                coverage=dict(
-                                    unit=coverage["unit"],
-                                    start=coverage["start"],
-                                    end=min(coverage["start"] + 1, coverage["end"]),
-                                ),
-                                content_digest=None,
-                            )
-                        )
-                    attachments = self.core.role_actions.content_messages(actual) if actual else []
-                    if actual:
-                        session = self.core.reading.get(actor, supplied["id"], activity["scope"])
-                        observed = dict(
-                            operation_ref=session["id"],
-                            scope=session["scope"],
-                            content_ref=session["content_ref"],
-                            coverage=actual["coverage"],
-                            content_digest=self.core.reading.read_signature(actual),
-                        )
-                        if observed not in reads:
-                            reads.append(observed)
-                        result["actual_content"] = {
-                            key: actual[key] for key in ("text", "coverage", "complete", "gaps")
-                        }
+                    reads = copy.deepcopy(self.store.get("metadata", operation).get("reads", []))
                     result = dict(state="completed", result=result)
                 except (Fault, ValueError, KeyError, StopIteration) as error:
                     unknown_tool = isinstance(error, Fault) and error.unknown
@@ -540,6 +452,7 @@ class RuntimeExecution:
                 )
                 messages.extend(attachments)
                 # Preserve each received tool result before any further awaited action.
+                marker = self.store.get("metadata", operation)
                 marker.update(messages=messages, receipts=receipts, reads=reads)
                 self.store.put("metadata", marker)
                 if unknown_tool:

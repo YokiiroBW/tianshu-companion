@@ -4,14 +4,14 @@ The original content owner is still read on every source checkpoint. These leave
 prove this actor's observed reading interval, never ownership of the whole book.
 """
 
-import copy
 import asyncio
+import copy
 import uuid
 
 from .clients import JsonService, uid, utc
-from .contracts import Fault, canonical, digest
-from .context_checks import dependency_changed
 from .context import ACTOR_MEMORY_DOMAIN, merge_checks, scope_check
+from .context_checks import dependency_changed
+from .contracts import Fault, canonical, digest
 
 OUTBOX_PENDING = ("actor_memory_pending", "actor_memory_unknown")
 SOURCE_PREFIX = "actor-memory-source:"
@@ -174,7 +174,7 @@ class ActorMemory:
             raise Fault("invalid_input", unknown=True)
         return receipt
 
-    def record_read(self, reading, result):
+    def record_read(self, reading, result, *, requested_range=None):
         """Called inside Reading's existing fact+operation transaction only."""
         if not self.available:
             return
@@ -190,6 +190,8 @@ class ActorMemory:
             coverage=copy.deepcopy(result["coverage"]),
             content_digest=self.core.reading.read_signature(result),
         )
+        if requested_range is not None:
+            original["requested_range"] = copy.deepcopy(requested_range)
         basis = dict(
             actor_id=actor, reading_id=reading["id"], revision=reading["version"], observed=original
         )
@@ -612,10 +614,108 @@ class ActorMemory:
             "retention",
         }:
             raise Fault("invalid_input")
-        # A model can interpret only episode references actually returned in this
-        # actor's recall tool, not invent IDs or write another actor's experiences.
+
+        async def validate():
+            await self.core._preflight(self.store.get("turns", turn_id))
+            self.core.skills.check_selected(
+                self.store.get("turns", turn_id), "actor_memory_remember"
+            )
+
+        return await self._derive(
+            turn["scope"]["actor_id"],
+            turn_id,
+            call_id,
+            value,
+            (turn.get("native_execution") or {}).get("messages", []),
+            validate,
+        ), []
+
+    async def activity_recall(self, context, value):
+        actions = self.core.runtime_execution.actions
+        activity, marker = actions.check(context)
+        if not actions.allows(context, "memory.read"):
+            raise Fault("forbidden")
+        if not isinstance(value, dict) or set(value) - {"text", "kinds", "limit"}:
+            raise Fault("invalid_input")
+        if activity["scope"] is not None:
+            # A private/group activity is not an actor-only authority assertion.
+            raise Fault("forbidden")
+        rows = self.store.db.execute(
+            "SELECT body FROM outbox WHERE conversation_id=? AND status IN ('actor_memory_pending','actor_memory_unknown') AND deadline<=? ORDER BY position,id LIMIT 4",
+            (context["actor_id"], self.core.clock()),
+        ).fetchall()
+        import json
+
+        for row in rows:
+            await self.flush(json.loads(row[0]))
+        actions.check(context)
+        material = await self.query(
+            context["actor_id"],
+            dict(purpose="plan", audience=dict(kind="actor_only")),
+            value.get("text"),
+            kinds=value.get("kinds"),
+            limit=value.get("limit", 8),
+        )
+        actions.check(context)
+        self.core.skills.check_activity_selected(context, "actor_memory_recall")
+        marker = self.store.get("metadata", context["operation_id"])
+        checks = marker.get("actor_memory_checks", [])
+        checks.append(material)
+        if len(checks) > 16:
+            raise Fault("budget_exceeded")
+        marker["actor_memory_checks"] = checks
+        self.store.put("metadata", marker)
+        pending = (
+            self.store.db.execute(
+                "SELECT 1 FROM outbox WHERE conversation_id=? AND status IN ('actor_memory_pending','actor_memory_unknown','actor_memory_submitting') LIMIT 1",
+                (context["actor_id"],),
+            ).fetchone()
+            is not None
+        )
+        return dict(
+            state="completed",
+            source="actor_self_memory",
+            actor_id=context["actor_id"],
+            items=material["items"],
+            omitted=material["omitted"],
+            pending_experiences=pending,
+        ), []
+
+    async def activity_derive(self, context, call_id, value):
+        actions = self.core.runtime_execution.actions
+        activity, marker = actions.check(context)
+        if activity["scope"] is not None or not actions.allows(context, "memory.write"):
+            raise Fault("forbidden")
+        if not isinstance(value, dict) or set(value) != {
+            "kind",
+            "text",
+            "episode_refs",
+            "importance",
+            "retention",
+        }:
+            raise Fault("invalid_input")
+
+        async def validate():
+            actions.check(context)
+            self.core.skills.check_activity_selected(context, "actor_memory_remember")
+            current = self.store.get("metadata", context["operation_id"])
+            for material in current.get("actor_memory_checks", []):
+                await self.check(material)
+
+        return await self._derive(
+            context["actor_id"],
+            context["operation_id"],
+            call_id,
+            value,
+            marker.get("messages", []),
+            validate,
+        ), []
+
+    async def _derive(self, actor, operation_id, call_id, value, messages, validate):
+        # Shared dialogue/activity implementation. Only actual recall tool receipts
+        # supply episode references; each caller supplies its own real authority check.
         known, pending = set(), {}
-        for message in (turn.get("native_execution") or {}).get("messages", []):
+        for message in messages:
             if message.get("role") == "assistant":
                 for call in message.get("tool_calls", []):
                     pending[call["id"]] = call["function"]["name"]
@@ -623,10 +723,7 @@ class ActorMemory:
                 if pending.pop(message.get("tool_call_id"), None) != "actor_memory_recall":
                     continue
                 result = json_result(message.get("content", ""))
-                if (
-                    result.get("source") == "actor_self_memory"
-                    and result.get("actor_id") == turn["scope"]["actor_id"]
-                ):
+                if result.get("source") == "actor_self_memory" and result.get("actor_id") == actor:
                     known.update(
                         canonical(reference)
                         for item in result.get("items", [])
@@ -638,10 +735,9 @@ class ActorMemory:
             or any(canonical(ref) not in known for ref in value["episode_refs"])
         ):
             raise Fault("invalid_input")
-        await self.core._preflight(turn)
-        actor = turn["scope"]["actor_id"]
+        await validate()
         version = await self.role_version(actor)
-        key = "actor-derived:" + digest([turn_id, value])
+        key = "actor-derived:" + digest([operation_id, value])
         marker = self.store.get("metadata", key)
         receipt = None
         if marker is not None:
@@ -657,17 +753,14 @@ class ActorMemory:
                 actor_id=actor,
                 role_version=version,
                 operation="append_derived",
-                idempotency_key=digest([turn_id, value]),
+                idempotency_key=digest([operation_id, value]),
                 replaces=[],
                 **value,
             )
             self.core.contracts.check("actor-self-memory#append_derived", body)
             marker = dict(id=key, request=body, state="not_started", tool_call_id=call_id)
         if receipt is None:
-            await self.core._preflight(self.store.get("turns", turn_id))
-            self.core.skills.check_selected(
-                self.store.get("turns", turn_id), "actor_memory_remember"
-            )
+            await validate()
             marker["state"] = "unknown"
             self.store.put("metadata", marker)
             try:
@@ -679,8 +772,8 @@ class ActorMemory:
                 raise
         marker.update(state="completed", receipt=receipt)
         self.store.put("metadata", marker)
-        await self.core._preflight(self.store.get("turns", turn_id))
-        return receipt, []
+        await validate()
+        return receipt
 
 
 def json_result(content):

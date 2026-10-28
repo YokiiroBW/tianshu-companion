@@ -7,7 +7,6 @@ from .clients import command, query
 from .contracts import Fault, canonical, digest, strict_json
 from .life_work import visible
 
-
 OPERATIONS = (
     "concern.save",
     "concern.close",
@@ -75,6 +74,33 @@ class RoleActions:
 
         self.registry = SkillRegistry(self)
 
+    def life_tools(self, operations=OPERATIONS):
+        """One schema renderer shared by dialogue and actual actor activities."""
+        schema = self.core.contracts.schemas["life-runtime"]
+        return [
+            dict(
+                type="function",
+                function=dict(
+                    name="life_" + operation.replace(".", "_"),
+                    description="Execute "
+                    + operation
+                    + "; actual receipts determine success. Read current versions before edits; 0 creates.",
+                    parameters=dict(
+                        type="object",
+                        properties=dict(
+                            expected_version=dict(type="integer", minimum=0),
+                            value=self._expand(
+                                schema["$defs"][operation.replace(".", "_") + "_value"], schema
+                            ),
+                        ),
+                        required=["expected_version", "value"],
+                        additionalProperties=False,
+                    ),
+                ),
+            )
+            for operation in operations
+        ]
+
     def _expand(self, shape, schema):
         if isinstance(shape, list):
             return [self._expand(item, schema) for item in shape]
@@ -124,31 +150,7 @@ class RoleActions:
         schema = self.core.contracts.schemas["life-runtime"]
         tools = []
         if self.core._turn_allows(turn, "dialogue"):
-            for operation in OPERATIONS:
-                if operation == "image.request":
-                    continue
-                value = schema["$defs"][operation.replace(".", "_") + "_value"]
-                parameters = dict(
-                    type="object",
-                    properties=dict(
-                        expected_version={"type": "integer", "minimum": 0},
-                        value=self._expand(value, schema),
-                    ),
-                    required=["expected_version", "value"],
-                    additionalProperties=False,
-                )
-                tools.append(
-                    dict(
-                        type="function",
-                        function=dict(
-                            name="life_" + operation.replace(".", "_"),
-                            description="Execute "
-                            + operation
-                            + " for this actor. Read current version before edits; 0 creates. Actual receipts determine success.",
-                            parameters=parameters,
-                        ),
-                    )
-                )
+            tools.extend(self.life_tools(op for op in OPERATIONS if op != "image.request"))
             tools.append(
                 dict(
                     type="function",

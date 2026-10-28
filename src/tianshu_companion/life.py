@@ -92,6 +92,7 @@ class Life:
         self.model_selector = None
         self.generation_caller_service = "companion"
         self.actor_memory = None
+        self.autonomy = None
         self.default_config_version = None
         from .life_daily import DailyLife
         from .life_influences import LifeInfluences
@@ -99,8 +100,8 @@ class Life:
         self.daily = DailyLife(self, timezone_name)
         self.influences = LifeInfluences(self)
         from .life_activities import Activities
-        from .life_work import LifeWork
         from .life_affect import Affect
+        from .life_work import LifeWork
 
         self.activities = Activities(self)
         self.concerns = LifeWork(self)
@@ -315,6 +316,11 @@ class Life:
                         "experience_event_id",
                         "activity_id",
                         "activity_scope",
+                        "autonomy_due_at",
+                        "autonomy_operation",
+                        "autonomy_sequence",
+                        "autonomy_epoch",
+                        "autonomy_last_activity",
                     )
                     if old and k in old
                 },
@@ -484,6 +490,9 @@ class Life:
         self.store.put("life_events", event)
         if getattr(self, "event_observer", None):
             self.event_observer(event)
+        if event.get("actor_only"):
+            # The fictional public timeline is not an actor-memory disclosure grant.
+            return
         for actor_id in sorted(set(event["participants"] + event["visible_to"])):
             via = "participated" if actor_id in event["participants"] else "witnessed"
             self._learn(event, actor_id, via, None)
@@ -542,7 +551,11 @@ class Life:
 
         activity = (
             actor["activity"]
-            if visible({"scope": actor.get("activity_scope")}, scope)
+            if visible(
+                self.store.get("life_activities", actor.get("activity_id", ""))
+                or {"scope": actor.get("activity_scope")},
+                scope,
+            )
             else "处理个人事项"
         )
         return dict(
@@ -607,7 +620,7 @@ class Life:
         for row in rows:
             known = json.loads(row[0])
             event = self._get("events", known["event_id"])
-            if event.get("scope") is not None:
+            if event.get("scope") is not None or event.get("actor_only"):
                 # Published fictional diaries cannot disclose a person's private process.
                 continue
             material.append(
@@ -678,6 +691,8 @@ class Life:
 
     def recover(self):
         self.activities.recover()
+        if self.autonomy is not None:
+            self.autonomy.recover()
         for item in self.store.list("life_diaries", states=["generating"]):
             item.update(state="interrupted")
             self._save("diaries", item)
@@ -746,6 +761,9 @@ class Life:
         phases = (
             lambda: self.influences.work(actor_id=actor),
             lambda: self.daily.work(actor_id=actor, one=True),
+            lambda: (
+                self.autonomy.work(actor_id=actor) if self.autonomy is not None else self._no_work()
+            ),
             lambda: self.activities.work(actor_id=actor),
             lambda: self._diary_work(actor),
         )
@@ -755,6 +773,9 @@ class Life:
             if await phases[index]():
                 self._phase_cursor[actor] = (index + 1) % len(phases)
                 return
+
+    async def _no_work(self):
+        return False
 
     async def drain(self):
         await asyncio.gather(*tuple(self._jobs.values()), return_exceptions=True)

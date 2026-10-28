@@ -32,6 +32,38 @@ class NativeSkill:
     async def execute(self, actions, turn_id, tool, *, model_slot_held=False):
         return await actions.execute_domain(turn_id, tool, model_slot_held=model_slot_held)
 
+    def activity_tools(self, actions, context, definition):
+        activity, _ = actions.core.runtime_execution.actions.check(context)
+        if self.domain != "life" or not actions.core.runtime_execution.actions.allows(
+            context, self.permission
+        ):
+            return []
+        # User-memory native handlers deliberately have no actor-activity surface.
+        prefixes = (
+            ("concern.", "activity.", "reading.", "content.")
+            if activity.get("actor_only")
+            else (
+                "concern.",
+                "activity.",
+                "reading.",
+                "content.",
+                "writing.",
+                "chapter.",
+                "outfit.",
+                "album.",
+            )
+        )
+        return actions.life_tools(
+            op
+            for op in definition["operations"]
+            if op in self.operations and op.startswith(prefixes)
+        )
+
+    async def activity_execute(self, actions, context, tool, *, model_slot_held=False):
+        return await actions.core.runtime_execution.actions.execute(
+            context, tool, model_slot_held=model_slot_held
+        )
+
 
 def definition(skill_id, title, description, domain, operations, handler_id=None):
     return dict(
@@ -46,11 +78,12 @@ def definition(skill_id, title, description, domain, operations, handler_id=None
 
 
 def install(registry):
-    from .image import ImageSkill
-    from .gscore import GSCoreSkill
-    from .chat import ChatHistorySkill
-    from .actor_memory import ActorMemorySkill
     from ..role_actions import OPERATIONS
+    from .actor_memory import ActorMemorySkill
+    from .chat import ChatHistorySkill
+    from .gscore import GSCoreSkill
+    from .image import ImageSkill
+    from .platform import PlatformSkill
 
     life = {
         operation: "life_" + operation.replace(".", "_")
@@ -58,6 +91,16 @@ def install(registry):
         if operation != "image.request"
     }
     life.update({"life.read": "life_read", "life.send_content": "life_send_content"})
+    registry.register(
+        definition(
+            "platform.actions",
+            "角色平台能力",
+            "发现和调用已绑定的真实平台能力，沿用原执行回执。",
+            "life",
+            PlatformSkill.operations,
+        ),
+        PlatformSkill(),
+    )
     registry.register(
         definition(
             "actor-memory",

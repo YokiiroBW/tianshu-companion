@@ -5,7 +5,6 @@ import copy
 from ..contracts import Fault, canonical, digest, strict_json
 from ..life_work import require_version
 
-
 EMPTY_CONFIG = dict(provider=None, base_url=None, credential_ref=None, options={})
 
 
@@ -124,7 +123,14 @@ class SkillRegistry:
         )
 
     def tools(self, turn):
-        actor = turn["scope"]["actor_id"]
+        return self._tools(turn, activity=False)
+
+    def activity_tools(self, context):
+        self.core.runtime_execution.actions.check(context)
+        return self._tools(context, activity=True)
+
+    def _tools(self, turn, *, activity):
+        actor = turn["actor_id"] if activity else turn["scope"]["actor_id"]
         pins, tools, names = dict(turn.get("skill_pins", {})), [], set()
         owners = dict(turn.get("skill_tool_owners", {}))
         for definition in self.definitions(actor).values():
@@ -134,7 +140,10 @@ class SkillRegistry:
             if skill["id"] in pins and pins[skill["id"]] != skill["revision"]:
                 continue
             handler = self.handlers[definition["handler_id"]]
-            rendered = handler.tools(self.actions, turn, skill["definition"])
+            renderer = getattr(handler, "activity_tools", None) if activity else handler.tools
+            if renderer is None:
+                continue
+            rendered = renderer(self.actions, turn, skill["definition"])
             for tool in rendered:
                 name = tool["function"]["name"]
                 if name in owners and owners[name] != skill["id"]:
@@ -155,13 +164,50 @@ class SkillRegistry:
                 pins[skill["id"]] = skill["revision"]
         if pins != turn.get("skill_pins") or owners != turn.get("skill_tool_owners"):
             with self.store.transaction():
-                fresh = self.store.get("turns", turn["id"])
+                table, key = (
+                    ("metadata", turn["operation_id"]) if activity else ("turns", turn["id"])
+                )
+                fresh = self.store.get(table, key)
                 fresh["skill_pins"] = pins
                 fresh["skill_tool_owners"] = owners
-                self.store.put("turns", fresh)
+                self.store.put(table, fresh)
             turn["skill_pins"] = pins
             turn["skill_tool_owners"] = owners
         return tools
+
+    async def execute_activity(self, context, tool, *, model_slot_held=False):
+        self.core.runtime_execution.actions.check(context)
+        name = tool["function"]["name"]
+        definition = self.check_activity_selected(context, name)
+        handler = self.handlers[definition["handler_id"]]
+        if name not in {
+            item["function"]["name"]
+            for item in handler.activity_tools(self.actions, context, definition)
+        }:
+            raise Fault("forbidden")
+        if hasattr(handler, "normalize"):
+            tool = copy.deepcopy(tool)
+            tool["function"]["arguments"] = canonical(
+                handler.normalize(
+                    context["operation_id"], tool["id"], strict_json(tool["function"]["arguments"])
+                )
+            )
+        return await handler.activity_execute(
+            self.actions, context, tool, model_slot_held=model_slot_held
+        )
+
+    def check_activity_selected(self, context, name):
+        self.core.runtime_execution.actions.check(context)
+        owner = context.get("skill_tool_owners", {}).get(name)
+        definition = self.definitions(context["actor_id"]).get(owner)
+        if definition is None:
+            raise Fault("scope_changed")
+        skill = self.project(context["actor_id"], definition)
+        if not skill["availability"]["can_execute"]:
+            raise Fault("dependency_unavailable")
+        if context.get("skill_pins", {}).get(owner) != skill["revision"]:
+            raise Fault("scope_changed")
+        return definition
 
     def instructions(self, turn):
         actor = turn["scope"]["actor_id"]

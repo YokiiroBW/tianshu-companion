@@ -303,6 +303,7 @@ class Core(Delivery):
             self.images.original_reader = self.reading.original
             self.image_backend.runtime = self.life_runtime
             self.runtime_execution = RuntimeExecution(self)
+            self.life.autonomy = self.runtime_execution.autonomy
             self.life.activities.executor = self.runtime_execution.activity_step
             self.proactive.expression = self.runtime_execution.proactive_expression
             if proactive_dispatcher is None:

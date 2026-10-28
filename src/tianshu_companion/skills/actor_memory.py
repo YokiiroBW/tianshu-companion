@@ -47,9 +47,21 @@ class ActorMemorySkill:
         )
 
     def tools(self, actions, turn, definition):
+        return self._tools(actions, lambda permission: actions.core._turn_allows(turn, permission))
+
+    def activity_tools(self, actions, context, definition):
+        activity, _ = actions.core.runtime_execution.actions.check(context)
+        if activity["scope"] is not None:
+            return []
+        return self._tools(
+            actions,
+            lambda permission: actions.core.runtime_execution.actions.allows(context, permission),
+        )
+
+    def _tools(self, actions, allows):
         tools = []
         schema = actions.core.contracts.schemas["actor-self-memory"]
-        if actions.core._turn_allows(turn, "memory.read"):
+        if allows("memory.read"):
             query = actions._expand(schema["$defs"]["query"], schema)["properties"]
             tools.append(
                 dict(
@@ -66,7 +78,7 @@ class ActorMemorySkill:
                     ),
                 )
             )
-        if actions.core._turn_allows(turn, "memory.write"):
+        if allows("memory.write"):
             derived = actions._expand(schema["$defs"]["append_derived"], schema)["properties"]
             keys = ("kind", "text", "episode_refs", "importance", "retention")
             tools.append(
@@ -85,6 +97,12 @@ class ActorMemorySkill:
                 )
             )
         return tools
+
+    async def activity_execute(self, actions, context, tool, *, model_slot_held=False):
+        value = strict_json(tool["function"]["arguments"])
+        if tool["function"]["name"] == "actor_memory_recall":
+            return await actions.core.actor_memory.activity_recall(context, value)
+        return await actions.core.actor_memory.activity_derive(context, tool["id"], value)
 
     async def execute(self, actions, turn_id, tool, *, model_slot_held=False):
         value = strict_json(tool["function"]["arguments"])
