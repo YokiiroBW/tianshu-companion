@@ -5,10 +5,10 @@ JSON paths become typed native jsonb expressions; rowid scans have a real identi
 sequence. No business query, predicate or partial-index condition is discarded.
 """
 
-import re
-import json
-import hashlib
 import copy
+import hashlib
+import json
+import re
 import uuid
 
 from tianshu_storage import MemoryCursor
@@ -21,6 +21,7 @@ NUMBERS = {
     "record_version",
     "version",
     "attempt",
+    "extraction_schema",
     "started",
     "occurrence",
     "due_at",
@@ -50,7 +51,14 @@ def json_expression(match):
         kind = (
             "bigint"
             if path.rsplit(".", 1)[-1]
-            in {"revision", "command_version", "record_version", "version", "attempt"}
+            in {
+                "revision",
+                "command_version",
+                "record_version",
+                "version",
+                "attempt",
+                "extraction_schema",
+            }
             else "double precision"
         )
         return f"({value}::{kind})"

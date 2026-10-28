@@ -4,13 +4,14 @@ import asyncio
 import base64
 import json
 import os
-import sqlite3
 import shutil
+import sqlite3
 import subprocess
 import sys
+import uuid
 from contextlib import closing
 from pathlib import Path
-import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,6 +54,84 @@ def test_postgres_planning_epoch_expiry_is_numeric_without_casting_nested_iso_ex
     native = translate(sql)
     assert native.count("((body::jsonb #>> '{expires_at}')::double precision)") == 2
     assert "SELECT (body::jsonb #>> '{proof,expires_at}') FROM life_concerns" in native
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_obsolete_learning_retirement_and_capabilities_keep_current_protocol(tmp_path, backend):
+    from tianshu_companion.memory_learning import QUEUE, MemoryLearning
+    from tianshu_companion.runtime_capabilities import read_capabilities
+
+    namespace = "retirement_" + uuid.uuid4().hex
+    settings = None
+    url = os.environ.get("TS233_POSTGRES_URL")
+    if backend == "postgresql":
+        if not url:
+            pytest.skip("TS233_POSTGRES_URL is required for isolated real PostgreSQL")
+        settings = {"storage_backends": {"postgresql_url": url, "namespace": namespace}}
+    store = Store(tmp_path / "retirement.sqlite", settings=settings)
+    schema = store.database.schema if backend == "postgresql" else None
+    core = SimpleNamespace(
+        store=store,
+        automatic_memory_candidates=True,
+        participation=SimpleNamespace(status=lambda: {}),
+        group_processing=SimpleNamespace(status=lambda: {}),
+        chat_history=SimpleNamespace(available=False),
+    )
+    try:
+        with store.transaction():
+            for number in range(65):
+                store.put(
+                    "metadata",
+                    dict(
+                        id=f"obsolete-{number}",
+                        conversation_id=QUEUE,
+                        state="pending",
+                        extraction_schema=5,
+                    ),
+                )
+            store.put("metadata", dict(id="missing-schema", conversation_id=QUEUE, state="blocked"))
+            store.put(
+                "metadata",
+                dict(id="current", conversation_id=QUEUE, state="pending", extraction_schema=6),
+            )
+            store.put(
+                "metadata",
+                dict(
+                    id="old-completed",
+                    conversation_id=QUEUE,
+                    state="completed",
+                    extraction_schema=5,
+                ),
+            )
+        learning = MemoryLearning(core)
+        assert learning._retire_unused()
+        assert sum(
+            store.get("metadata", f"obsolete-{number}")["state"] == "retired"
+            for number in range(65)
+        ) in {63, 64}
+        assert learning._retire_unused()
+        assert not learning._retire_unused()
+        assert all(
+            store.get("metadata", f"obsolete-{number}")["state"] == "retired"
+            for number in range(65)
+        )
+        assert store.get("metadata", "missing-schema")["state"] == "retired"
+        assert store.get("metadata", "current")["state"] == "pending"
+        assert store.get("metadata", "old-completed")["state"] == "completed"
+        capabilities = read_capabilities(core)["automatic_memory_candidates"]
+        assert capabilities["retained_learning"]["pending"] is True
+        assert capabilities["retained_learning"]["completed"] is False
+        assert capabilities["retained_learning"]["blocked"] is False
+        assert store.backend == backend
+    finally:
+        store.close()
+        if schema:
+            import psycopg
+            from psycopg import sql
+
+            assert namespace in schema
+            with psycopg.connect(url, autocommit=True) as db:
+                db.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgresql"])

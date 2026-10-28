@@ -1,3 +1,11 @@
+# 生产 PostgreSQL 类型返修（2026-10-29）
+
+联合 R18 启动检查发现后台整理未就绪。真实 PG 纯合成查询复现 `COALESCE(extraction_schema,0)` 的 DatatypeMismatch / 42804：现有 JSON SQL 适配缺少该整型字段。修复在原 `storage_postgres` 数字字段适配中统一将协议版本映射为 bigint，覆盖退休、当前任务选择及能力展示，不改变业务归属或放宽健康要求。
+
+新增现有存储测试的行为用例：旧任务分两页退休、缺版本待办退休、schema6 当前任务和历史 completed 保留、能力展示只计当前协议。SQLite 定向 1 passed；同一用例函数在隔离真实 PG 随机 schema 中通过并清理，无生产数据读写与模型请求。原失败和 R18 升级成功结果保留；部署修正版不再迁移已为2的 Memory 域。
+
+---
+
 # Companion 自动记忆退役收口（2026-10-28）
 
 状态：当前分支 `codex/memory-streamlining-20261028` 的本地 diff，未提交、未推送、未部署。起点为保全原群 SDK 改动并合入当前 main 会话窗口的 `da0cd33`；本块没有修改 SDK、`conversation_windows.py` 或压缩模块。用户明确不需要旧自动提取协议或旧数据兼容。
