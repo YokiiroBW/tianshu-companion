@@ -61,6 +61,8 @@ MAX_PENDING = 10000
 MAX_HISTORY = 20000
 OBSERVATION_LEASE_SECONDS = 30
 CLAIM_DECISION_SECONDS = 5
+GROUP_REFRESH_SECONDS = 300
+MAX_GROUP_REFRESHES = 4
 IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 QQ = re.compile(r"^(group|private):([1-9][0-9]*)$")
 QQ_ID = re.compile(r"^[1-9][0-9]*$")
@@ -351,6 +353,8 @@ class AdapterService:
             self.adapter, self.accounts, self.send = adapter, accounts, send
             self.send_media = send_media
             self.lock = asyncio.Lock()
+            self._group_refreshes = {}
+            self._group_closing = False
             self.participation = Participation(self, RpcError)
         except BaseException:
             self.close()
@@ -365,12 +369,94 @@ class AdapterService:
         return value
 
     def close(self) -> None:
+        if any(not task.done() for task in getattr(self, "_group_refreshes", {}).values()):
+            raise RuntimeError("Drain group metadata refreshes before closing the adapter")
         if self.storage_runtime is not None:
             from tianshu_nonebot.storage import close_database
 
             close_database(self.storage_runtime, self.db)
         else:
             self.db.close()
+
+    async def note_group(self, account_id, group_id, fetch=None):
+        """Record only a real SDK group's identity, independently of content policy."""
+        account_id, group_id = _qq_account(account_id), _qq_account(group_id)
+        key = f"group-directory:{account_id}:{group_id}"
+        async with self.lock:
+            if self._group_closing:
+                return
+            now = time.time()
+            row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            value = (
+                json.loads(row[0])
+                if row
+                else dict(
+                    group_id=group_id,
+                    name=None,
+                    member_count=None,
+                    max_member_count=None,
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    updated_at=None,
+                    refresh_after=0,
+                )
+            )
+            value["last_seen_at"] = max(now, value["last_seen_at"])
+            refresh = (
+                fetch is not None
+                and now >= value["refresh_after"]
+                and key not in self._group_refreshes
+                and len(self._group_refreshes) < MAX_GROUP_REFRESHES
+            )
+            if refresh:
+                value["refresh_after"] = now + GROUP_REFRESH_SECONDS
+            self.db.execute(
+                "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, _json(value)),
+            )
+            if refresh:
+                task = asyncio.create_task(self._refresh_group(key, group_id, fetch))
+                self._group_refreshes[key] = task
+                task.add_done_callback(lambda _: self._group_refreshes.pop(key, None))
+
+    async def _refresh_group(self, key, group_id, fetch):
+        try:
+            info = await asyncio.wait_for(fetch(), 3)
+            if not isinstance(info, dict) or str(info.get("group_id")) != group_id:
+                return
+            fields = {}
+            name = info.get("group_name")
+            if isinstance(name, str):
+                name = "".join(
+                    char
+                    for char in name
+                    if ord(char) >= 32
+                    and ord(char) != 127
+                    and not 0x202A <= ord(char) <= 0x202E
+                    and not 0x2066 <= ord(char) <= 0x2069
+                ).strip()[:128]
+                if name:
+                    fields["name"] = name
+            for field in ("member_count", "max_member_count"):
+                count = info.get(field)
+                if type(count) is int and count >= 0:
+                    fields[field] = count
+            async with self.lock:
+                row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+                if row:
+                    value = json.loads(row[0])
+                    value.update(fields, updated_at=time.time())
+                    self.db.execute("UPDATE meta SET value=? WHERE key=?", (_json(value), key))
+        except Exception:
+            # Metadata failure neither erases prior values nor admits message content.
+            return
+
+    async def drain_group_refreshes(self):
+        self._group_closing = True
+        while self._group_refreshes:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(self._group_refreshes.values()))
+            )
 
     def _binding(self, connection_id: str) -> tuple | None:
         return self.db.execute(
@@ -796,6 +882,7 @@ class AdapterService:
             async with self.lock:
                 routes = {
                     PREFIX + "/observation/capabilities": self._observation_capabilities,
+                    PREFIX + "/observation/groups": self._observation_groups,
                     PREFIX + "/observation/apply": self._observation_apply,
                     PREFIX + "/observation/status": self._observation_status,
                     PREFIX + "/observation/poll": self._observation_poll,
@@ -959,7 +1046,46 @@ class AdapterService:
             "reply_policy": "platform_owned",
             "group_policy_version": 2,
             "ordinary_claim_available": bool(self.participation.claim_supported()),
+            "group_directory_version": 1,
         }
+
+    async def _observation_groups(self, request):
+        if set(request) != {"account_id", "cursor", "limit"}:
+            _bad()
+        account_id = _qq_account(request["account_id"])
+        cursor, limit = request["cursor"], request["limit"]
+        if cursor is not None:
+            _qq_account(cursor)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            _bad()
+        online = await self.accounts()
+        if not any(
+            item.get("id") == account_id and item.get("platform") == "qq" for item in online
+        ):
+            raise RpcError(503, "dependency_unavailable", True)
+        prefix = f"group-directory:{account_id}:"
+        rows = self.db.execute(
+            "SELECT value FROM meta WHERE key>? AND key<? ORDER BY key LIMIT ?",
+            (prefix + (cursor or ""), prefix + "~", limit + 1),
+        ).fetchall()
+        groups = []
+        result = dict(
+            schema_version=1,
+            instance_id=self.instance_id,
+            account_id=account_id,
+            groups=groups,
+            next_cursor=None,
+        )
+        for row in rows[:limit]:
+            group = json.loads(row[0])
+            group.pop("refresh_after")
+            candidate = {**result, "groups": [*groups, group], "next_cursor": group["group_id"]}
+            if len(_json(candidate).encode()) > MAX_RESPONSE:
+                break
+            groups.append(group)
+        if len(rows) > len(groups):
+            result["next_cursor"] = groups[-1]["group_id"]
+        return result
 
     async def _observation_apply(self, request: dict) -> dict:
         base = {

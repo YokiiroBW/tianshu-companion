@@ -17,7 +17,11 @@ def rule(mode, actor="actor:a", keywords=()):
 
 
 def group_policy(mode="observe", groups=None, keywords=()):
-    return dict(version=2, default=rule(mode, keywords=keywords), groups=groups or {})
+    return dict(
+        version=2,
+        default=rule("disabled"),
+        groups=groups if groups is not None else {"20001": rule(mode, keywords=keywords)},
+    )
 
 
 async def apply(fixture, value, revision=1, group_revisions=None, private=None, enabled=True):
@@ -40,9 +44,10 @@ async def apply(fixture, value, revision=1, group_revisions=None, private=None, 
     "old,default,override",
     [
         (policy(observe=False), "disabled", "disabled"),
-        (policy(), "observe", "observe"),
-        (policy("whitelist", ["20001"]), "observe", "reply"),
-        (policy("blacklist", ["20001"]), "reply", "observe"),
+        (policy(), "disabled", "disabled"),
+        (policy(names=["20001"]), "disabled", "observe"),
+        (policy("whitelist", ["20001"]), "disabled", "reply"),
+        (policy("blacklist", ["20001"]), "disabled", "observe"),
     ],
 )
 def test_legacy_migration_is_deterministic_and_never_active(old, default, override):
@@ -184,7 +189,9 @@ def test_unbound_actor_archives_but_cannot_reply_or_claim(tmp_path):
     f = Fixture(tmp_path / "host.sqlite")
 
     async def run():
-        await apply(f, dict(version=2, default=rule("observe", None), groups={}))
+        await apply(
+            f, dict(version=2, default=rule("disabled"), groups={"20001": rule("observe", None)})
+        )
         assert await f.service.capture_observation(
             "10001", "group:20001", "10002", "21", utc(), "archive", True
         )
@@ -201,3 +208,20 @@ def test_unbound_actor_archives_but_cannot_reply_or_claim(tmp_path):
         asyncio.run(run())
     finally:
         f.service.close()
+
+
+@pytest.mark.parametrize("mode", ["disabled", "observe", "reply", "active"])
+def test_unknown_groups_are_disabled_without_rewriting_explicit_groups_or_private(mode):
+    raw = dict(
+        version=2,
+        default=rule(mode, "actor:old", ["old"]),
+        groups={"20001": rule(mode, "actor:explicit", ["match"])},
+    )
+    original = copy.deepcopy(raw)
+    normalized = normalize(raw)
+    assert normalized["default"] == rule("disabled", "actor:old", ["old"])
+    assert normalized["groups"] == raw["groups"]
+    assert raw == original
+    assert not decision(raw, "group:99999", mentioned=True, text="old")["observe"]
+    assert decision(raw, "group:20001", mentioned=True)["observe"] is (mode != "disabled")
+    assert decision(policy("blacklist"), "private:10002")["reply_permitted"]

@@ -20,7 +20,7 @@ from nonebot.plugin import PluginMetadata
 from pydantic import BaseModel
 
 from .rpc import PREFIX, AdapterService, onebot_media, request_limit
-from .sdk import UnsupportedEvent, event_enabled, observation_event, text_event
+from .sdk import UnsupportedEvent, event_enabled, group_identity, observation_event, text_event
 from .participation_host import execution, install as install_participation_host
 from .adapter_lifecycle import AdapterLifecycle
 
@@ -147,6 +147,7 @@ for suffix in (
     "messages/send",
     "messages/status",
     "observation/capabilities",
+    "observation/groups",
     "observation/apply",
     "observation/status",
     "observation/poll",
@@ -179,6 +180,13 @@ async def _observe(bot: BaseBot, event: BaseEvent, state) -> bool:
     if not isinstance(bot, OneBotBot):
         return False
     try:
+        group = group_identity(bot, event)
+        if group is not None:
+            await service.note_group(
+                *group, fetch=lambda: bot.get_group_info(group_id=int(group[1]))
+            )
+            if not service.input_enabled(group[0], "group:" + group[1]):
+                return False
         value = observation_event(bot, event, enabled=service.input_enabled)
     except (UnsupportedEvent, ValueError, KeyError, OverflowError, OSError):
         return False

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import textwrap
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -18,7 +19,9 @@ from tianshu_nonebot.storage import read_access_key
 
 def test_completion_lease_survives_waiter_timeout_and_cancellation():
     async def run():
-        owner = AdapterLifecycle(SimpleNamespace(instance_id="synthetic-instance"))
+        owner = AdapterLifecycle(
+            SimpleNamespace(instance_id="synthetic-instance", drain_group_refreshes=AsyncMock())
+        )
         assert owner.instance_id == "synthetic-instance"
         with pytest.raises(AttributeError):
             owner.instance_id = "replacement"

@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 class AdapterLifecycle:
     def __init__(self, service):
         self._instance_id = service.instance_id
+        self._service = service
         self.accepting_events = True
         self.closing = False
         self.closed = False
@@ -43,6 +44,7 @@ class AdapterLifecycle:
                 while self.pending:
                     # Cancellation of a waiting host must not complete a lease.
                     await asyncio.gather(*(asyncio.shield(item) for item in tuple(self.pending)))
+                await self._service.drain_group_refreshes()
         except TimeoutError:
             return False
         return True

@@ -39,7 +39,7 @@ def normalize(value):
             raise ValueError("invalid group id")
         return dict(
             version=2,
-            default=rule(value["default"]),
+            default={**rule(value["default"]), "mode": "disabled"},
             groups={key: rule(item) for key, item in groups.items()},
         )
     if (
@@ -53,17 +53,14 @@ def normalize(value):
     ):
         raise ValueError("invalid legacy group policy")
     actor = value.get("actor_id")
-    default = "observe"
     override = "observe"
     if not value["observe"]:
-        default = override = "disabled"
+        override = "disabled"
     elif value["mode"] == "whitelist":
         override = "reply"
-    elif value["mode"] == "blacklist":
-        default = "reply"
     return dict(
         version=2,
-        default=rule(dict(mode=default, actor_id=actor, keywords=[])),
+        default=rule(dict(mode="disabled", actor_id=actor, keywords=[])),
         groups={
             key: rule(dict(mode=override, actor_id=actor, keywords=[])) for key in value["list"]
         },
@@ -74,14 +71,12 @@ def effective(policy, group):
     # The owner validates the full document at apply/load. Message hot paths
     # inspect only their own rule, never every unrelated group's keywords.
     if policy.get("version") == 2:
-        return policy["groups"].get(group, policy["default"])
-    mode = "observe"
-    if not policy["observe"]:
-        mode = "disabled"
-    elif policy["mode"] == "whitelist" and group in policy["list"]:
-        mode = "reply"
-    elif policy["mode"] == "blacklist" and group not in policy["list"]:
-        mode = "reply"
+        if group in policy["groups"]:
+            return policy["groups"][group]
+        return {**policy["default"], "mode": "disabled"}
+    mode = "disabled"
+    if policy["observe"] and group in policy["list"]:
+        mode = "reply" if policy["mode"] == "whitelist" else "observe"
     return dict(mode=mode, actor_id=policy.get("actor_id"), keywords=[])
 
 

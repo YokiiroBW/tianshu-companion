@@ -81,6 +81,18 @@ def conversation_id(event) -> str:
     raise UnsupportedEvent("Only OneBot v11 private and group messages are supported")
 
 
+def group_identity(bot, event):
+    """Physical group discovery needs neither a message body nor an author."""
+    from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
+
+    if not isinstance(bot, Bot) or not isinstance(event, GroupMessageEvent):
+        return None
+    self_id = qq_id(bot.self_id)
+    if qq_id(event.self_id) != self_id:
+        raise UnsupportedEvent("Bot account mismatch")
+    return self_id, qq_id(event.group_id)
+
+
 def event_enabled(bot, event, enabled, *, reply=False):
     """Typed physical routing only; do not touch or normalize the message body."""
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent

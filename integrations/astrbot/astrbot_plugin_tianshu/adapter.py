@@ -190,18 +190,7 @@ class AstrAdapter:
         if not isinstance(raw, Mapping) or raw.get("post_type") != "message":
             return False
         try:
-            author = _qq_id(event.get_sender_id())
             raw_self = _qq_id(raw.get("self_id"))
-            raw_author = _qq_id(raw.get("user_id"))
-            nested = raw.get("sender")
-            if isinstance(nested, Mapping) and nested.get("user_id") is not None:
-                if _qq_id(nested["user_id"]) != author:
-                    return False
-        except ValueError:
-            return False
-        if author == self_id:
-            return False
-        try:
             group = _qq_id(event.get_group_id()) if event.get_group_id() is not None else ""
             raw_group = _qq_id(raw.get("group_id")) if group else ""
         except ValueError:
@@ -209,9 +198,33 @@ class AstrAdapter:
         kind = "group" if group else "private"
         if raw.get("message_type") != kind or raw_self != self_id:
             return False
-        if raw_author != author or (group and raw_group != group):
+        if group and raw_group != group:
             return False
-        if not self.service.input_enabled(self_id, f"{kind}:{group or author}"):
+        if group:
+
+            async def group_info():
+                client = self._client(self_id)
+                if client is None:
+                    raise ValueError("SDK offline")
+                return await client.call_action(
+                    "get_group_info", group_id=int(group), self_id=self_id
+                )
+
+            await self.service.note_group(self_id, group, fetch=group_info)
+            if not self.service.input_enabled(self_id, f"group:{group}"):
+                return False
+        try:
+            author = _qq_id(event.get_sender_id())
+            raw_author = _qq_id(raw.get("user_id"))
+            nested = raw.get("sender")
+            if isinstance(nested, Mapping) and nested.get("user_id") is not None:
+                if _qq_id(nested["user_id"]) != author:
+                    return False
+        except ValueError:
+            return False
+        if author == self_id or raw_author != author:
+            return False
+        if not group and not self.service.input_enabled(self_id, f"private:{author}"):
             return False
         native_id = str(raw.get("message_id"))
         if native_id != str(event.message_obj.message_id) or not native_id.isdecimal():
@@ -325,4 +338,5 @@ class AstrAdapter:
         if self.runner is not None:
             await self.runner.cleanup()
             self.runner = None
+        await self.service.drain_group_refreshes()
         self.service.close()

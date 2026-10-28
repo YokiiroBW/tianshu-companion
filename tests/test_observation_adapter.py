@@ -49,7 +49,7 @@ def test_group_private_modes_and_restart(tmp_path):
             "account_id": "10001",
             "revision": 1,
             "enabled": True,
-            "group_policy": policy(),
+            "group_policy": policy(names=["20002"]),
             "private_policy": policy(),
         }
         assert (await rpc("apply", request))["revision"] == 1
@@ -68,7 +68,7 @@ def test_group_private_modes_and_restart(tmp_path):
             "group_policy": policy("whitelist"),
         }
         await rpc("apply", request)
-        assert await service.capture_observation(
+        assert not await service.capture_observation(
             "10001", "group:20002", "30003", "45", "2026-09-29T00:00:01Z", "hello", True
         )
         assert not await service.observation_claimed("10001", "group:20002", "30003", "45")
@@ -78,6 +78,17 @@ def test_group_private_modes_and_restart(tmp_path):
             "revision": 3,
             "group_policy": policy("blacklist"),
             "private_policy": policy("blacklist"),
+        }
+        await rpc("apply", request)
+        assert not await service.capture_observation(
+            "10001", "group:20002", "30003", "unknown", "2026-09-29T00:00:02Z", "hello", True
+        )
+        # An explicit group keeps its original reply/observation behavior.
+        request = {
+            **request,
+            "request_id": "explicit",
+            "revision": 4,
+            "group_policy": policy("whitelist", ["20002"]),
         }
         await rpc("apply", request)
         assert await service.capture_observation(
@@ -97,7 +108,7 @@ def test_group_private_modes_and_restart(tmp_path):
         )
         assert not await service.observation_claimed("10001", "group:20002", "30003", "49")
         queued = await rpc("poll", {"account_id": "10001", "limit": 20})
-        assert len(queued["events"]) == 6
+        assert len(queued["events"]) == 5
         assert calls == []  # Observation never invokes the SDK sender.
         assert queued["events"][0]["event"]["scope_revision"] == 1
         await rpc("ack", {"account_id": "10001", "event_ids": [queued["events"][0]["id"]]})
@@ -107,7 +118,7 @@ def test_group_private_modes_and_restart(tmp_path):
     restarted = AdapterService(path, "nonebot", accounts, send)
     service = restarted
     queued = run(rpc("poll", {"account_id": "10001", "limit": 20}))
-    assert len(queued["events"]) == 5
+    assert len(queued["events"]) == 4
     assert run(service.observation_claimed("10001", "group:20002", "30003", "47"))
     service.close()
 
@@ -140,7 +151,7 @@ def test_send_rechecks_tightened_policy(tmp_path):
         "account_id": "10001",
         "revision": 1,
         "enabled": True,
-        "group_policy": policy("blacklist"),
+        "group_policy": policy("whitelist", ["20002"]),
         "private_policy": policy(),
     }
     assert run(rpc("apply", request))[0] == 200
