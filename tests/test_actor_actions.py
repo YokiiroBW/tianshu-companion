@@ -365,3 +365,66 @@ def test_long_term_interest_is_separate_from_query_and_withdrawal_blocks_cached_
             await close(h, services)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("code", ["source_withdrawn", "source_changed"])
+@pytest.mark.parametrize("execution", ["not_started", "unknown"])
+@pytest.mark.parametrize("producer", ["reading", "action"])
+def test_real_source_rejection_settles_only_proven_unstarted_commands(code, execution, producer):
+    async def run():
+        import json
+        from tianshu_companion.clients import JsonService
+
+        h, owners, services = await setup()
+        calls = []
+
+        def reject(request):
+            body = json.loads(request.content)
+            calls.append(body)
+            return httpx.Response(
+                409,
+                json=dict(
+                    schema_version=1,
+                    request_id=body["request_id"],
+                    code=code,
+                    retryable=False,
+                    execution=execution,
+                ),
+            )
+
+        try:
+            if producer == "reading":
+                await read(h)
+            else:
+                h.core.images._save_job(image(h))
+            peer = JsonService(
+                "https://memory.fixture.invalid",
+                "memory",
+                transport=httpx.MockTransport(reject),
+                memory_dependency=True,
+            )
+            services.append(peer)
+            h.memory.client = peer
+            item = h.core.store.list("outbox")[0]
+            await h.core.actor_memory.flush(item)
+            saved = h.core.store.get("outbox", item["id"])
+            expected = (
+                "actor_memory_unknown"
+                if execution == "unknown"
+                else "actor_memory_invalidated"
+                if code == "source_withdrawn"
+                else "actor_memory_pending"
+            )
+            assert saved["state"] == expected
+            assert saved["last_error"] == code and saved["request"] == calls[0]
+            if expected == "actor_memory_invalidated":
+                assert not h.core.store.due(
+                    "outbox",
+                    ["actor_memory_pending", "actor_memory_unknown"],
+                    h.clock() + 3600,
+                    limit=1,
+                )
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())

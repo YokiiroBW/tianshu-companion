@@ -348,7 +348,18 @@ class ActorMemory:
                     raise
             item.update(state="actor_memory_delivered", receipt=receipt, last_error=None)
         except (Fault, OSError, TimeoutError) as error:
-            if (
+            unstarted = (
+                isinstance(error, Fault)
+                and getattr(error, "actor_memory_execution", None) == "not_started"
+            )
+            if unstarted and error.code == "source_withdrawn":
+                item["state"] = "actor_memory_invalidated"
+            elif unstarted and error.code == "source_changed":
+                # Memory uses this for a concurrent domain CAS as well as a
+                # changed source. Retry only the proven unstarted original key;
+                # a stable withdrawal is settled by source_withdrawn above.
+                item["state"] = "actor_memory_pending"
+            elif (
                 action_source
                 and isinstance(error, Fault)
                 and error.code in {"not_found", "scope_changed", "forbidden", "version_conflict"}
