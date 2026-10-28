@@ -62,6 +62,31 @@ class AutonomousGoals:
     def current(self, actor):
         return self.life.activities.current(actor["id"], actor.get("activity_scope"))
 
+    async def verified_records(self, records):
+        """Withdrawn derived questions are not planner input or compulsory commitments."""
+        result = []
+        for record in records:
+            if record and record.get("autonomy_basis"):
+                try:
+                    await self.core.actor_memory.check(record["autonomy_basis"])
+                except Fault as error:
+                    if error.code in {
+                        "scope_changed",
+                        "not_found",
+                        "forbidden",
+                        "version_conflict",
+                    }:
+                        continue
+                    raise
+            if record:
+                result.append(record)
+        return result
+
+    async def verify_records(self, records):
+        for record in records:
+            if record and record.get("autonomy_basis"):
+                await self.core.actor_memory.check(record["autonomy_basis"])
+
     def snapshot(self, actor, window):
         activity = self.current(actor)
         concerns = self.life.concerns.planning(
@@ -170,6 +195,11 @@ class AutonomousGoals:
         )
         self.store.put("metadata", marker)
         try:
+            visible_capture = copy.deepcopy(captured)
+            visible_capture["concerns"] = await self.verified_records(captured["concerns"])
+            active = await self.verified_records([captured["activity"]])
+            visible_capture["activity"] = active[0] if active else None
+            source_records = visible_capture["concerns"] + active
             memory = None
             if self.core.actor_memory.available:
                 previous = self.store.get(
@@ -180,7 +210,12 @@ class AutonomousGoals:
                 if hint:
                     await self.core.actor_memory.check(hint["material"])
                     memory_query += "；最近旁听形成的问题：" + hint["topic"]
-                if previous and previous["actor_id"] == actor_id:
+                if (
+                    previous
+                    and previous["actor_id"] == actor_id
+                    and await self.verified_records([previous])
+                ):
+                    source_records.append(previous)
                     memory_query += "；最近实际活动：" + previous["title"]
                 memory = await self.core.actor_memory.planning_query(
                     actor_id,
@@ -192,7 +227,7 @@ class AutonomousGoals:
             material = dict(
                 now=utc(now),
                 persona=self.life.persona_reader(actor_id),
-                **captured,
+                **visible_capture,
                 actor_self_memory=memory["items"] if memory else [],
                 capabilities=self.core.skills.result(actor_id)["skills"],
                 meaning="Intentions, receipts and failures are distinct. Today's attention is temporary, never an enduring preference or permission. Private actor material stays actor-only.",
@@ -208,6 +243,7 @@ class AutonomousGoals:
             ]
             async with self.life.model_slots:
                 self.check(actor_id, captured)
+                await self.verify_records(source_records)
                 if memory:
                     await self.core.actor_memory.check(memory)
                 if actor.get("autonomy_observation_hint"):
@@ -221,16 +257,17 @@ class AutonomousGoals:
                     self.life.gateway.generate(generation, messages), 60
                 )
             self.life.verify_generation_lease(lease)
+            await self.verify_records(source_records)
             if memory:
                 await self.core.actor_memory.check(memory)
             if actor.get("autonomy_observation_hint"):
                 await self.core.actor_memory.check(actor["autonomy_observation_hint"]["material"])
             self.check(actor_id, captured)
             choice = strict_json("\n".join(output))
-            self.validate_choice(choice, captured)
+            self.validate_choice(choice, visible_capture)
             with self.store.transaction():
                 actor = self.check(actor_id, captured)
-                self.apply(actor, choice, captured, memory)
+                self.apply(actor, choice, visible_capture, memory)
                 marker.update(
                     state="completed",
                     choice=choice,

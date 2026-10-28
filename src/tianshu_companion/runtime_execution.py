@@ -210,6 +210,7 @@ class RuntimeExecution:
                 "life_activities",
                 "life_concerns",
                 "life_events",
+                "life_diaries",
                 "image_media",
                 "write_revisions",
                 "turns",
@@ -245,6 +246,9 @@ class RuntimeExecution:
         self.current_sources(candidate["sources"])
         for source in candidate["sources"]:
             if source["owner"] == "companion":
+                diary = self.store.get("life_diaries", source["object_id"])
+                if diary:
+                    await self.core.life.diary_sources.check(diary, audience=candidate)
                 continue
             # Content refs are checked by their actual owner when materializing originals.
             if any(source in reference["sources"] for reference in candidate["content_refs"]):
@@ -314,9 +318,18 @@ class RuntimeExecution:
             raise Fault("budget_exceeded")
         if marker.get("expected_version", activity["version"]) != activity["version"]:
             raise Fault("scope_changed")
+        await self.autonomy.verify_records([activity])
         generation, lease = await self.generation(actor, operation + ":" + str(round_))
         persona = self.core.life.persona_reader(actor)
         concerns = self.core.life.concerns.page(actor, scope=activity["scope"], open_only=True)[0]
+        concerns = await self.autonomy.verified_records(concerns)
+        concern_checks = marker.get(
+            "concern_memory_checks",
+            [row["autonomy_basis"] for row in concerns if row.get("autonomy_basis")],
+        )
+        for proof in concern_checks:
+            await self.core.actor_memory.check(proof)
+        marker["concern_memory_checks"] = concern_checks
         source_inputs = copy.deepcopy(marker.get("source_inputs", activity["sources"]))
         if "source_inputs" not in marker:
             for concern in concerns:
@@ -385,6 +398,8 @@ class RuntimeExecution:
         receipts = copy.deepcopy(marker.get("receipts", []))
         reads = copy.deepcopy(marker.get("reads", []))
         async with self.core.life.model_slots:
+            for proof in concern_checks:
+                await self.core.actor_memory.check(proof)
             if memory_input is not None:
                 await self.core.actor_memory.check(memory_input)
             if activity.get("autonomy_basis") is not None:
@@ -644,6 +659,7 @@ class RuntimeExecution:
                 raise Fault("scope_changed")
             fresh.update(photo=photo, photo_state="decided")
             self.core.proactive._save("candidates", fresh)
+        await self.validate_sources(candidate, current["origin"])
         return result["text"] if result["send"] else None, receipt
 
     async def prepare_photo(self, candidate):
@@ -699,6 +715,7 @@ class RuntimeExecution:
         if media:
             envelope["segments"][0]["media"] = media
             self.core.contracts.check("bot-delivery#send_request", envelope)
+        await self.validate_sources(candidate, current["origin"])
         attempt = self.store.get("proactive_attempts", request["request_id"])
         attempt["delivery"] = envelope
         self.store.put("proactive_attempts", attempt)

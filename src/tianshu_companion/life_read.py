@@ -222,9 +222,37 @@ def _cursor(request):
 class LifeRead:
     """Persisted life reads over one narrow query port and one deployment mapping."""
 
-    def __init__(self, queries, *, readers, contracts, clock=time.time):
+    def __init__(self, queries, *, readers, contracts, clock=time.time, source_checker=None):
         self.queries, self.readers = queries, readers
         self.contracts, self.clock = contracts, clock
+        self.source_checker = source_checker
+        self.source_verified = False
+
+    async def handle_verified(self, service, operation, request):
+        if operation not in {"diaries", "revision"}:
+            return self.handle(service, operation, request)
+        import copy
+
+        reader = copy.copy(self)
+        reader.source_verified = True
+        result = reader.handle(service, operation, request)
+        ids = (
+            [row["diary_id"] for row in result["items"]]
+            if operation == "diaries"
+            else [result["diary_id"]]
+        )
+        for diary_id in ids:
+            with self.queries.reading():
+                diary = self.queries.diary(diary_id)
+            if diary and "source_capture" in diary:
+                if self.source_checker is None:
+                    raise Fault("dependency_unavailable")
+                await self.source_checker(diary, public=True)
+        # No remote await holds a SQLite read transaction. Recheck grants and pointers.
+        closing = reader.handle(service, operation, request)
+        if canonical(closing) != canonical(result):
+            raise Fault("scope_changed")
+        return closing
 
     def handle(self, service, operation, request):
         """One authenticated operation. The service came from the bearer credential."""
@@ -386,10 +414,11 @@ class LifeRead:
             rows = self.queries.diaries_page(actor_id, limit + 1, after)
             items = [self._diary_entry(actor_id, row) for row in rows[:limit]]
             more = len(rows) > limit
-        return self._emit(
+        return self._emit_diary(
+            "diaries_response",
             dict(
                 schema_version=SCHEMA_VERSION,
-                fictional=True,
+                fictional=all(row["fictional"] for row in items),
                 actor_id=actor_id,
                 items=items,
                 next_after=(
@@ -552,6 +581,11 @@ class LifeRead:
         except Fault:
             raise Fault("dependency_unavailable" if response else "invalid_input") from None
 
+    def _emit_diary(self, definition, document, budget):
+        self._emit(document, budget)
+        self._life_contract(definition, document, response=True)
+        return document
+
     def _bound_capture(self, actor_id, diary, diary_id):
         """The frozen recipe and material of one diary, proved against its content address.
 
@@ -566,6 +600,8 @@ class LifeRead:
         and nothing here rewrites a fact or falls back to the current recipe table.
         """
         recipe, material = _frozen_recipe(diary)
+        if "source_capture" in diary and not self.source_verified:
+            raise Fault("dependency_unavailable")
         if digest([actor_id, diary.get("day"), recipe, material]) != diary_id:
             _corrupt()
         return recipe, material
@@ -584,7 +620,7 @@ class LifeRead:
         diary_id = diary.get("id")
         if not isinstance(diary_id, str) or not diary_id:
             _corrupt()
-        if diary.get("conversation_id") != actor_id or diary.get("fictional") is not True:
+        if diary.get("conversation_id") != actor_id or type(diary.get("fictional")) is not bool:
             _corrupt()
         day = diary.get("day")
         if not isinstance(day, str) or not _civil_day(day):
@@ -602,7 +638,8 @@ class LifeRead:
         if (
             revision.get("conversation_id") != diary_id
             or revision.get("material_version") != material
-            or revision.get("fictional") is not True
+            or revision.get("fictional") != diary["fictional"]
+            or revision.get("provenance") != diary.get("provenance")
         ):
             _corrupt()
         return dict(
@@ -612,7 +649,8 @@ class LifeRead:
             state=state,
             version=_stored_version(diary, "version"),
             published_revision_id=published,
-            fictional=True,
+            fictional=diary["fictional"],
+            **({"provenance": diary["provenance"]} if "provenance" in diary else {}),
             captured=dict(
                 recipe_id=recipe["id"], recipe_version=recipe["version"], material_version=material
             ),
@@ -644,7 +682,11 @@ class LifeRead:
             revision = self.queries.revision(revision_id)
             if revision is None:
                 _corrupt()
-            if revision.get("conversation_id") != diary_id or revision.get("fictional") is not True:
+            if (
+                revision.get("conversation_id") != diary_id
+                or revision.get("fictional") != diary.get("fictional")
+                or revision.get("provenance") != diary.get("provenance")
+            ):
                 _corrupt()
             recipe, material = self._bound_capture(actor_id, diary, diary_id)
             if revision.get("material_version") != material:
@@ -660,10 +702,12 @@ class LifeRead:
                 material_version=material,
                 config_version=config_version,
             )
-        return self._emit(
+        return self._emit_diary(
+            "revision_response",
             dict(
                 schema_version=SCHEMA_VERSION,
-                fictional=True,
+                fictional=diary["fictional"],
+                **({"provenance": diary["provenance"]} if "provenance" in diary else {}),
                 actor_id=actor_id,
                 diary_id=diary_id,
                 diary_version=version,
@@ -727,7 +771,12 @@ class LifeRead:
         except Fault:
             _corrupt()
         if (
-            receipt.get("caller_service") != "companion"
+            receipt.get("caller_service")
+            not in (
+                {"companion", "companion_background"}
+                if "source_capture" in diary
+                else {"companion"}
+            )
             or receipt.get("outcome") != "succeeded"
             or type(receipt.get("config_version")) is not int
             or receipt["config_version"] < 1

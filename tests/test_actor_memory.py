@@ -921,6 +921,9 @@ def test_internal_plan_uses_actor_material_but_publishable_fictional_diary_does_
             if purpose == "plan":
                 await h.core.life.daily.work(actor_id="actor:a", one=True)
             else:
+                # Legacy fictional generation remains valid without the actor authority;
+                # AL13 source-backed generation is covered by test_diary_sources.
+                h.core.life.actor_memory = None
                 actor = h.core.store.get("life_actors", "actor:a")
                 world = h.core.store.get("life_worlds", actor["world_id"])
                 day = str(datetime.fromtimestamp(h.clock(), zone(world["timezone"])).date())

@@ -43,7 +43,10 @@ class ActorMemorySkill:
             "interval is not completing or understanding a whole work. With actor_memory_remember, "
             "derive a concise understanding, interest or reflection only from actual episode references "
             "returned by recall. These interpretations are not new physical experiences. Use actual "
-            "receipts; an unknown command must be reconciled rather than submitted under another key."
+            "receipts. For yesterday or a civil date use recall day; continue with its returned fixed "
+            "window and next_cursor. Omitted or incomplete results never prove no experiences. Keep "
+            "user evidence and actor evidence separate, including conflicting preferences. An unknown "
+            "command must be reconciled rather than submitted under another key."
         )
 
     def tools(self, actions, turn, definition):
@@ -71,8 +74,24 @@ class ActorMemorySkill:
                         description="Recall this actor's own sourced experiences and interpretations visible in the current real audience; user memories remain separate.",
                         parameters=dict(
                             type="object",
-                            properties={key: query[key] for key in ("text", "kinds", "limit")},
-                            required=["text"],
+                            properties={
+                                **{key: query[key] for key in ("text", "kinds", "limit")},
+                                "day": {
+                                    "type": "string",
+                                    "description": "yesterday or ISO civil date in this actor timezone",
+                                },
+                                "window": {
+                                    "type": "object",
+                                    "properties": {
+                                        "start": {"type": "string"},
+                                        "end": {"type": "string"},
+                                    },
+                                    "required": ["start", "end"],
+                                    "additionalProperties": False,
+                                },
+                                "cursor": {"type": ["string", "null"]},
+                            },
+                            required=[],
                             additionalProperties=False,
                         ),
                     ),

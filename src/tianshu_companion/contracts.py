@@ -135,7 +135,7 @@ class Contracts:
         candidates = {
             "observation-participation/candidate-v1": "1.0.0-candidate.1",
             "actor-capabilities/candidate-v1": "1.0.0-candidate.1",
-            "actor-self-memory/candidate-v1": "1.0.0-candidate.2",
+            "actor-self-memory/candidate-v1": "1.0.0-candidate.3",
             "chat-history/candidate-v1": "1.0.0-candidate.1",
             "archive-memory-check/candidate-v1": "1.0.0-candidate.1",
         }

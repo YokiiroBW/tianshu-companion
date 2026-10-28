@@ -700,6 +700,7 @@ def create_app(
                     LifeReadQueries(core.store.db),
                     readers=mapping,
                     contracts=core.contracts,
+                    source_checker=core.life.diary_sources.check,
                 )
             core.life_runtime.reader = reads
         setup.pop_all()
@@ -1170,7 +1171,7 @@ def create_app(
                 body = strict_json(content)
             except (ValueError, UnicodeError):
                 raise Fault("invalid_input") from None
-            return JSONResponse(reads.handle(service, operation, body))
+            return JSONResponse(await reads.handle_verified(service, operation, body))
         except Fault as error:
             return JSONResponse(error.wire(request_id), status_code=error.status)
 

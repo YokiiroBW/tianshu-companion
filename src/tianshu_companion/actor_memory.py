@@ -372,6 +372,10 @@ class ActorMemory:
         if readable and source_state == "current":
             try:
                 await self.core.reading.check_read(actor, row["observed"])
+                if "disclosure_version" in row:
+                    from .diary_disclosure import DiaryDisclosure
+
+                    await DiaryDisclosure(self).check(row)
             except Fault as error:
                 if error.unknown or error.code not in {
                     "forbidden",
@@ -475,11 +479,29 @@ class ActorMemory:
         self.core.contracts.check("actor-self-memory#" + operation + "_result", response)
         return response
 
-    async def query(self, actor, context, text, *, kinds=None, limit=8, budget_bytes=8192):
+    async def query(
+        self,
+        actor,
+        context,
+        text=None,
+        *,
+        kinds=None,
+        limit=8,
+        budget_bytes=8192,
+        window=None,
+        cursor=None,
+    ):
         try:
             async with asyncio.timeout(JsonService.QUERY_BUDGET_SECONDS):
                 return await self._query(
-                    actor, context, text, kinds=kinds, limit=limit, budget_bytes=budget_bytes
+                    actor,
+                    context,
+                    text,
+                    kinds=kinds,
+                    limit=limit,
+                    budget_bytes=budget_bytes,
+                    window=window,
+                    cursor=cursor,
                 )
         except TimeoutError:
             error = Fault("timeout", retryable_read=True)
@@ -513,7 +535,9 @@ class ActorMemory:
             budget_bytes=8192,
         )
 
-    async def _query(self, actor, context, text, *, kinds, limit, budget_bytes):
+    async def _query(
+        self, actor, context, text, *, kinds, limit, budget_bytes, window=None, cursor=None
+    ):
         version = await self.role_version(actor)
         response = await self._memory(
             dict(
@@ -522,11 +546,21 @@ class ActorMemory:
                 actor_id=actor,
                 role_version=version,
                 operation="query",
-                text=text,
+                **(
+                    dict(text=text)
+                    if window is None
+                    else dict(mode="timeline", window=window, cursor=cursor)
+                ),
                 context=context,
-                kinds=["episode", "understanding", "preference", "reflection"]
-                if kinds is None
-                else kinds,
+                kinds=(
+                    ["episode"]
+                    if window is not None
+                    else (
+                        ["episode", "understanding", "preference", "reflection"]
+                        if kinds is None
+                        else kinds
+                    )
+                ),
                 limit=limit,
                 budget_bytes=budget_bytes,
             )
@@ -558,6 +592,8 @@ class ActorMemory:
             whole = dict(item, basis=basis)
             if len(canonical([*items, whole]).encode()) > budget_bytes:
                 response["omitted"] = True
+                if window is not None:
+                    response["complete"] = False
                 continue
             items.append(whole)
         response["items"] = items
@@ -602,12 +638,34 @@ class ActorMemory:
     async def verify(self, check):
         await self.check(check["actor_memory_material"])
 
+    def recall_window(self, actor_id, value):
+        if not isinstance(value, dict) or set(value) - {
+            "text",
+            "kinds",
+            "limit",
+            "day",
+            "window",
+            "cursor",
+        }:
+            raise Fault("invalid_input")
+        window = value.get("window")
+        if "day" in value:
+            if window is not None or value.get("cursor") is not None:
+                raise Fault("invalid_input")
+            from .diary_materials import civil_window
+
+            actor = self.core.life._get("actors", actor_id)
+            world = self.core.life._get("worlds", actor["world_id"])
+            window = civil_window(value["day"], world["timezone"], self.core.clock())
+        if window is None and value.get("cursor") is not None:
+            raise Fault("invalid_input")
+        return window
+
     async def recall(self, turn_id, value):
         turn = self.store.get("turns", turn_id)
         if not self.core._turn_allows(turn, "memory.read"):
             raise Fault("forbidden")
-        if not isinstance(value, dict) or set(value) - {"text", "kinds", "limit"}:
-            raise Fault("invalid_input")
+        window = self.recall_window(turn["scope"]["actor_id"], value)
         await self.core._preflight(turn)
         material = await self.query(
             turn["scope"]["actor_id"],
@@ -615,6 +673,8 @@ class ActorMemory:
             value.get("text"),
             kinds=value.get("kinds"),
             limit=value.get("limit", 8),
+            window=window,
+            cursor=value.get("cursor"),
         )
         await self.core._preflight(self.store.get("turns", turn_id))
         self.core.skills.check_selected(self.store.get("turns", turn_id), "actor_memory_recall")
@@ -639,6 +699,11 @@ class ActorMemory:
             actor_id=material["actor_id"],
             items=material["items"],
             omitted=material["omitted"],
+            **(
+                {key: material[key] for key in ("mode", "window", "next_cursor", "complete")}
+                if "mode" in material
+                else {}
+            ),
         ), []
 
     async def derive(self, turn_id, call_id, value):
@@ -674,8 +739,7 @@ class ActorMemory:
         activity, marker = actions.check(context)
         if not actions.allows(context, "memory.read"):
             raise Fault("forbidden")
-        if not isinstance(value, dict) or set(value) - {"text", "kinds", "limit"}:
-            raise Fault("invalid_input")
+        window = self.recall_window(context["actor_id"], value)
         if activity["scope"] is not None:
             # A private/group activity is not an actor-only authority assertion.
             raise Fault("forbidden")
@@ -697,6 +761,8 @@ class ActorMemory:
             value.get("text"),
             kinds=value.get("kinds"),
             limit=value.get("limit", 8),
+            window=window,
+            cursor=value.get("cursor"),
         )
         actions.check(context)
         self.core.skills.check_activity_selected(context, "actor_memory_recall")
@@ -721,6 +787,11 @@ class ActorMemory:
             items=material["items"],
             omitted=material["omitted"],
             pending_experiences=pending,
+            **(
+                {key: material[key] for key in ("mode", "window", "next_cursor", "complete")}
+                if "mode" in material
+                else {}
+            ),
         ), []
 
     async def activity_derive(self, context, call_id, value):

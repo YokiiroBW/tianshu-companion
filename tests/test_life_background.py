@@ -379,7 +379,7 @@ def test_proactive_expression_waits_in_background_and_rechecks_current_authority
                         assert not calls  # foreground capacity remains available
             result, _ = await task
             assert result is None and len(calls) == 1
-            assert checks == ["current", "sources", "current", "sources"]
+            assert checks == ["current", "sources", "current", "sources", "sources"]
             assert not h.gateway.calls
         finally:
             await h.core.close()

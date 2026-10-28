@@ -100,9 +100,24 @@ class LifeRuntime:
             if operation == "image.backend.configure"
             else None
         )
+        diary_result = None
+        if operation == "diary.request" and self.life.diary_sources.available:
+            diary_result = await self.life.diary_sources.prepare(actor_id, value["day"])
+        elif operation in {"diary.revise", "diary.publish"}:
+            diary = self.life._get("diaries", value["id"])
+            if diary["conversation_id"] != actor_id:
+                raise Fault("not_found")
+            await self.life.diary_sources.check(diary, public=operation == "diary.publish")
 
         def execute():
-            if prepared is not None:
+            if diary_result is not None:
+                result = dict(
+                    id=diary_result["id"],
+                    version=diary_result["version"],
+                    state=diary_result["state"],
+                    operation_ref=request["request_id"],
+                )
+            elif prepared is not None:
                 backend = self.core.image_backend.apply(prepared, expected)
                 result = dict(
                     id=backend["id"],
@@ -217,10 +232,10 @@ class LifeRuntime:
             result = self.life.request_diary(actor_id, value["day"])
         elif operation in {"diary.revise", "diary.publish"}:
             diary = self.life._get("diaries", value["id"])
-            if diary["actor_id"] != actor_id:
+            if diary["conversation_id"] != actor_id:
                 raise Fault("not_found")
             if operation == "diary.revise":
-                self.life.revise_diary(
+                self.life._revise_diary(
                     value["id"],
                     value["content"],
                     editor=operator,
@@ -228,7 +243,7 @@ class LifeRuntime:
                     expected=expected,
                 )
             else:
-                self.life.publish_diary(value["id"], reviewer=operator, expected=expected)
+                self.life._publish_diary(value["id"], reviewer=operator, expected=expected)
             result = self.life._get("diaries", value["id"])
         elif operation == "writing.create":
             require_version(self.store.get("write_works", value["id"]), expected)
