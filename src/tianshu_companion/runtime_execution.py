@@ -243,6 +243,18 @@ class RuntimeExecution:
                 raise Fault("scope_changed")
 
     async def validate_sources(self, candidate, origin=None):
+        memory_check = candidate.get("memory_context_check")
+        if memory_check is not None:
+            if origin is None:
+                origin = (await self.current_context(candidate))["origin"]
+            await self.core.memory.select(
+                origin,
+                memory_check["scope"],
+                candidate["summary"],
+                dict(tokens=0, bytes=0),
+                memory_check["scope_version"],
+                known=memory_check,
+            )
         self.current_sources(candidate["sources"])
         for source in candidate["sources"]:
             if source["owner"] == "companion":
@@ -590,6 +602,17 @@ class RuntimeExecution:
         recall = await self.core.memory.select(
             current["origin"], current["scope"], candidate["summary"], dict(tokens=2048, bytes=8192)
         )
+        if recall["selected_units"]:
+            candidate = dict(
+                candidate,
+                memory_context_check=dict(
+                    scope=current["scope"],
+                    **{
+                        key: recall[key]
+                        for key in ("scope_version", "association_version", "scope_checks")
+                    },
+                ),
+            )
         material["current_person_context"] = recall["selected_units"]
         originals, attachments = [], []
         for reference in candidate["content_refs"]:
@@ -666,12 +689,16 @@ class RuntimeExecution:
                     assist_model=False,
                 ),
             )
+        await self.validate_sources(candidate, current["origin"])
+        if result["send"]:
             fresh = self.store.get("proactive_candidates", candidate["id"])
             if not fresh or fresh["state"] != "ready":
                 raise Fault("scope_changed")
-            fresh.update(photo=photo, photo_state="decided")
+            if "memory_context_check" in candidate:
+                fresh["memory_context_check"] = candidate["memory_context_check"]
+            if photo:
+                fresh.update(photo=photo, photo_state="decided")
             self.core.proactive._save("candidates", fresh)
-        await self.validate_sources(candidate, current["origin"])
         return result["text"] if result["send"] else None, receipt
 
     async def prepare_photo(self, candidate):

@@ -1041,6 +1041,20 @@ class Proactive:
             return "published_contract_receipt"
         return "synthetic_adapter_receipt"
 
+    def _expression_unknown(self, candidate):
+        """Settle only this expression attempt without overwriting a concurrent cancellation."""
+        fresh = self.store.get("proactive_candidates", candidate["id"])
+        if (
+            not fresh
+            or fresh.get("expression_attempts") != candidate.get("expression_attempts")
+            or fresh.get("expression_state") != "generating"
+        ):
+            return
+        fresh["expression_state"] = "unknown"
+        if fresh["state"] in OPEN_CANDIDATE and not fresh.get("cancel_requested"):
+            fresh.update(state="unknown", decision="expression_unknown")
+        self._save("candidates", fresh)
+
     async def work(self):
         """One bounded dispatch per pass, off the chat path and without model slots."""
         if self.lock.locked():
@@ -1054,6 +1068,15 @@ class Proactive:
                 if getattr(self.dispatcher, "native_delivery", False):
                     await self._reconcile_pending()
                 if not self._dispatcher_available():
+                    return
+                interrupted = self.store.db.execute(
+                    "SELECT id FROM proactive_candidates WHERE status IN ('pending','deferred','suppressed','ready') "
+                    "AND json_extract(body,'$.expression_state')='generating' ORDER BY position,id LIMIT 1"
+                ).fetchone()
+                if interrupted is not None:
+                    # This lock owns all expression generation. A persisted intent
+                    # without a live owner cannot restart generation or a photo job.
+                    self._expression_unknown(self.store.get("proactive_candidates", interrupted[0]))
                     return
                 if hasattr(self.dispatcher, "pending_photos"):
                     await self.dispatcher.pending_photos()
@@ -1077,13 +1100,11 @@ class Proactive:
                     self._save("candidates", candidate)
                     try:
                         content, receipt = await self.expression(candidate)
+                    except asyncio.CancelledError:
+                        self._expression_unknown(candidate)
+                        raise
                     except Exception:
-                        candidate.update(
-                            expression_state="unknown",
-                            state="unknown",
-                            decision="expression_unknown",
-                        )
-                        self._save("candidates", candidate)
+                        self._expression_unknown(candidate)
                         return
                     fresh = self.store.get("proactive_candidates", candidate["id"])
                     if (
