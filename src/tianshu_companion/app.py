@@ -947,8 +947,10 @@ def create_app(
                 }
                 if not isinstance(body, dict) or set(body) != fields:
                     raise Fault("invalid_input")
-                for name in ("actor_id", "job_id", "request_id", "model_request_id"):
+                for name in ("actor_id", "job_id", "request_id"):
                     core.contracts.check("common#id", body[name])
+                if body["model_request_id"] is not None:
+                    core.contracts.check("common#id", body["model_request_id"])
                 for name in ("expected_attempts", "expected_failure_count"):
                     if type(body[name]) is not int or body[name] < 0:
                         raise Fault("invalid_input")

@@ -370,14 +370,17 @@ class MemoryLearning:
         expected_failure_count,
         model_request_id,
     ):
-        """Owner-authorized single retry of a proven pre-upstream cancelled request.
+        """Owner-authorized retry after reconciling the original Memory job.
 
-        The trusted operator must first check the admission evidence. A missing
-        Gateway receipt alone is never proof of cancellation or nonexecution.
-        Memory's original job and batch remain the sole commit authority.
+        Model retries still require the operator's pre-upstream cancellation
+        evidence. A null model request is limited to blocked receipt reads with
+        no saved model request or output. The original Memory job and batch
+        remain the sole commit authority in both cases.
         """
-        for value in (actor_id, job_id, request_id, model_request_id):
+        for value in (actor_id, job_id, request_id):
             self.core.contracts.check("common#id", value)
+        if model_request_id is not None:
+            self.core.contracts.check("common#id", model_request_id)
         if any(
             type(value) is not int or value < 0
             for value in (
@@ -408,17 +411,20 @@ class MemoryLearning:
                 raise Fault("not_found")
             if item.get("extraction_schema") != 6:
                 raise Fault("unsupported_version")
+            receipt_only = model_request_id is None
+            model_request = item.get("model_request") or {}
             if (
                 (key in self.jobs and not self.jobs[key].done())
                 or item.get("job_id") != job_id
                 or item.get("state") != "blocked"
-                or item.get("stage") != "model"
+                or item.get("stage") != ("receipt" if receipt_only else "model")
                 or item.get("output") is not None
                 or item.get("attempts") != expected_attempts
                 or item.get("failure_count", 0) != expected_failure_count
                 or item.get("last_failure", {}).get("model_request_id") != model_request_id
-                or item.get("model_request", {}).get("request_id", model_request_id)
-                != model_request_id
+                or not isinstance(model_request, dict)
+                or model_request.get("request_id", model_request_id) != model_request_id
+                or (receipt_only and bool(model_request))
             ):
                 raise Fault("version_conflict")
             response = await self._candidate(item, None, reconcile=True)
