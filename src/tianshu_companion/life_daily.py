@@ -514,7 +514,7 @@ class DailyLife:
                 "('queued','unavailable','failed','interrupted') AND deadline<=? "
                 "AND json_extract(body,'$.attempt')<3 "
                 "AND (status!='interrupted' OR ("
-                "COALESCE(json_extract(body,'$.recovery_checks'),0)<3 AND "
+                "COALESCE(CAST(json_extract(body,'$.recovery_checks') AS INTEGER),0)<3 AND "
                 "(json_extract(body,'$.generation_stage')='preparing' OR "
                 "json_extract(body,'$.model_request_id') IS NOT NULL))) "
                 "AND (? IS NULL OR json_extract(body,'$.actor_id')=?) "
