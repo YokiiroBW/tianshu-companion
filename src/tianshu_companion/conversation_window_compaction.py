@@ -13,6 +13,7 @@ from .context import (
     MEMORY_CONTEXT_DOMAIN,
 )
 from .contracts import Fault, PROFILE_DOMAIN, canonical, digest
+from .context_checks import dependency_changed
 from .model_selection import SelectionRequest, pin_generation
 from .short_context import sources_current
 from .summary_windows import input_text
@@ -33,7 +34,7 @@ Stay below the supplied UTF-8 byte limit and actually shorten the supplied mater
 
 async def _capture(owner, anchor, state):
     core, p = owner.core, owner.policy
-    await core._verify_checks(anchor, state["authorities"])
+    await owner.verify_materials(anchor, state["authorities"], stage="summary_authority")
     members = owner.members(state)
     count = min(len(members), max(0, state["turns"] - p.retain_turns))
     selected, material, total = [], [], len((state["summary"] or "").encode())
@@ -49,7 +50,9 @@ async def _capture(owner, anchor, state):
         if parent and parent not in open_fragments:
             break
         if not sources_current(owner.store, turn):
-            raise Fault("scope_changed")
+            error = dependency_changed()
+            error.window_failure_stage = "local_input"
+            raise error
         group = dict(
             turn_id=turn["id"],
             turn_sequence=turn["sequence"],
@@ -62,7 +65,7 @@ async def _capture(owner, anchor, state):
             replies=[],
         )
         raw_check = scope_check(turn, input_only=True, raw_input=group)
-        await core._verify_checks(anchor, [raw_check])
+        await owner.verify_materials(anchor, [raw_check], stage="raw_input")
         replies = owner.store.replies_for_turns([turn["id"]], "sent").get(turn["id"], [])
         checks = inherited_checks(turn)
         if replies and all(
@@ -72,7 +75,7 @@ async def _capture(owner, anchor, state):
         ):
             try:
                 core.conversation_windows.verify_local(turn)
-                await core._verify_checks(anchor, checks)
+                await owner.verify_materials(anchor, checks, stage="reply_dependencies")
                 group["replies"] = [
                     dict(text=r["text"], reply_id=r["id"], state="sent")
                     for r in replies
@@ -110,17 +113,27 @@ async def _capture(owner, anchor, state):
             for domain, method in ((TEXT_DOMAIN, "history"), (TEXT_INPUT_DOMAIN, "input_history")):
                 if not hasattr(core.memory, method):
                     continue
-                snapshot = await getattr(core.memory, method)(source["origin"], source["scope"])
+                try:
+                    snapshot = await getattr(core.memory, method)(source["origin"], source["scope"])
+                except Fault as error:
+                    error.window_failure_stage = "history"
+                    raise
                 key = (digest(source["scope"]), domain)
                 old = authorities.get(key)
                 if old is not None:
                     if old["history_snapshot"] != snapshot:
-                        raise Fault("scope_changed")
+                        error = dependency_changed()
+                        error.window_failure_stage = "history_changed"
+                        raise error
                     continue
                 proof = scope_check(source)
                 proof.update(version_domain=domain, history_snapshot=snapshot)
                 authorities[key] = proof
-        await core._verify_checks(anchor, [raw_check, *checks] if group["replies"] else [raw_check])
+        await owner.verify_materials(
+            anchor,
+            [raw_check, *checks] if group["replies"] else [raw_check],
+            stage="captured_input",
+        )
         selected.append(dict(member, fingerprint=digest(item)))
         material.append(item)
         total += size
@@ -150,9 +163,10 @@ def _current(owner, anchor, pending):
 
 
 async def _commit(owner, anchor, pending):
-    await owner.core._verify_checks(anchor, pending["authorities"])
+    await owner.verify_materials(anchor, pending["authorities"], stage="commit_authority")
     state = _current(owner, anchor, pending)
     with owner.store.transaction():
+        state.pop("capture_failure", None)
         state.update(
             summary=pending["result"],
             authorities=pending["authorities"],
@@ -218,6 +232,7 @@ async def compact(owner, anchor, *, idle):
     core, p = owner.core, owner.policy
     state = owner.state(anchor)
     received = False
+    capture_signature = None
     if not core._turn_allows(anchor, "memory.read"):
         return
     gateway = core.life.gateway if idle else core.gateway
@@ -233,7 +248,29 @@ async def compact(owner, anchor, *, idle):
         reason = owner.reason(state, idle=idle)
         if reason is None or (idle and not owner.idle_ready(state)):
             return
+        capture_signature = digest(
+            [
+                state[k]
+                for k in (
+                    "generation",
+                    "version",
+                    "scan",
+                    "anchor",
+                    "turns",
+                    "messages",
+                    "text_bytes",
+                )
+            ]
+        )
+        failure = state.get("capture_failure")
+        if (
+            failure
+            and failure["signature"] == capture_signature
+            and core.clock() < failure["retry_at"]
+        ):
+            return
         members, material, authorities = await _capture(owner, anchor, state)
+        state.pop("capture_failure", None)
         if not members or (
             len(members) < p.minimum_turns
             and sum(m["text_bytes"] for m in members) < p.minimum_bytes
@@ -287,7 +324,7 @@ async def compact(owner, anchor, *, idle):
                 static_version=core.life.default_config_version if idle else core.config_version,
                 independent=caller == "companion_background",
             )
-            await core._verify_checks(anchor, authorities)
+            await owner.verify_materials(anchor, authorities, stage="generation_authority")
             if not core._turn_allows(anchor, "memory.read"):
                 raise Fault("forbidden")
             state = _current(owner, anchor, pending)
@@ -345,14 +382,29 @@ async def compact(owner, anchor, *, idle):
                 # A receipt/transport failure cannot prove nonexecution. Keep
                 # the durable identity even when a read reports forbidden/404.
                 pending.update(state="unknown", retry_at=core.clock() + max(30, p.cooldown_seconds))
-            elif isinstance(error, Fault) and error.code in {"scope_changed", "forbidden"}:
+            elif owner.invalid_material(error) and fresh["summary"] is not None:
                 owner.reset(fresh, reason=error.code)
-            elif pending and pending["state"] == "result":
+            elif pending and pending["state"] == "result" and not owner.invalid_material(error):
                 # Received text survives transient authority unavailability;
                 # only confirmed invalidity above may discard it.
                 pending["retry_at"] = core.clock() + max(30, p.cooldown_seconds)
             else:
                 fresh["pending"] = None
+                # A failed read is not a new window generation. Preserve the raw
+                # range and retry unchanged material on the existing cooldown;
+                # new input/source generations bypass this failed capture.
+                if capture_signature is not None:
+                    fresh["capture_failure"] = dict(
+                        signature=capture_signature,
+                        retry_at=core.clock() + max(30, p.cooldown_seconds),
+                        stage=getattr(error, "window_failure_stage", "capture_or_execution"),
+                        code=getattr(error, "code", "interrupted_execution"),
+                        source_invalid=bool(getattr(error, "source_invalid", False)),
+                        dependency_invalid=bool(
+                            getattr(error, "context_dependency_invalid", False)
+                        ),
+                        renewal_failed=bool(getattr(error, "context_renewal_failure", False)),
+                    )
             fresh["last_error"] = getattr(error, "code", "interrupted_execution")
             owner.store.put("metadata", fresh)
         if isinstance(error, asyncio.CancelledError):

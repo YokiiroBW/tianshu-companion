@@ -596,7 +596,7 @@ def test_idle_yields_if_front_input_arrives_during_final_preflight(checkpoint, m
 
                 h.core.life.model_selector = Selector()
             else:
-                verify = h.core._verify_checks
+                verify = owner.verify_materials
 
                 async def delayed(*args, **kwargs):
                     pending = owner.state(turn)["pending"]
@@ -605,7 +605,7 @@ def test_idle_yields_if_front_input_arrives_during_final_preflight(checkpoint, m
                         await release.wait()
                     return await verify(*args, **kwargs)
 
-                monkeypatch.setattr(h.core, "_verify_checks", delayed)
+                monkeypatch.setattr(owner, "verify_materials", delayed)
             task = asyncio.create_task(compact(owner, turn, idle=True))
             await asyncio.wait_for(entered.wait(), 5)
             h.core.policy = replace(h.core.policy, silence_ms=5000)

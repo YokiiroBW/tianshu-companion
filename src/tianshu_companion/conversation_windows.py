@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .clients import epoch
 from .contracts import Fault, digest
+from .context_checks import verify_checks
 from .short_context import current_revision, sources_current
 from .summary_windows import input_text
 
@@ -106,6 +107,7 @@ class ConversationWindows:
         return state
 
     def reset(self, state, *, revision=None, floor=None, reason):
+        state.pop("capture_failure", None)
         state.update(
             generation=state["generation"] + 1,
             version=state["version"] + 1,
@@ -270,12 +272,12 @@ class ConversationWindows:
         if not state["summary"] or not self.core._turn_allows(turn, "memory.read"):
             return []
         try:
-            await self.core._verify_checks(turn, state["authorities"])
+            await self.verify_materials(turn, state["authorities"], stage="summary_authority")
             self.verify_local(
                 turn, dict(id=state["id"], generation=state["generation"], version=state["version"])
             )
         except Fault as error:
-            if error.code in {"scope_changed", "forbidden"}:
+            if self.invalid_material(error):
                 self.reset(state, reason="authority_changed")
             return []
         context.data["conversation_summary"] = []
@@ -292,6 +294,34 @@ class ConversationWindows:
             id=state["id"], generation=state["generation"], version=state["version"]
         )
         return copy.deepcopy(state["authorities"])
+
+    @staticmethod
+    def invalid_material(error):
+        return (
+            isinstance(error, Fault)
+            and error.code in {"scope_changed", "forbidden"}
+            and not error.unknown
+            and not getattr(error, "context_renewal_failure", False)
+        )
+
+    async def verify_materials(self, anchor, checks, *, stage):
+        """Verify adopted sources, not the old chat prompt that used an older window.
+
+        The existing per-source verifier renews each author's grant and checks
+        exact input sources, history watermarks and adopted reply dependencies.
+        Revalidating the anchor's entire prepared chat would recursively require
+        the window generation that this rebuild is replacing.
+        """
+        try:
+            await verify_checks(
+                checks,
+                lambda check, checkpoint: self.core._verify_context_check(
+                    anchor, check, checkpoint
+                ),
+            )
+        except Fault as error:
+            error.window_failure_stage = stage
+            raise
 
     def verify_local(self, turn, captured=None):
         captured = captured or turn.get("conversation_window")
