@@ -1066,6 +1066,10 @@ def test_timeout_is_unknown_and_generated_projections_match_published_contract()
             assert len(model.calls) == calls
             model.timeout_stage = False
             life.retry_generation(stage["id"], expected=stage["version"])
+            archived = life.store.get("metadata", stage["id"])["attempt_history"][-1]
+            assert archived["state"] == "interrupted"
+            assert archived["generation_turn_id"] == stage["generation_turn_id"]
+            assert archived["closure_reason"] == "explicit_management_retry"
             await advance_life(life)
             before = facts(life.store)
             today = port.handle("platform", "today", {"schema_version": 1, "actor_id": "actor:0"})
@@ -1322,5 +1326,139 @@ def test_source_withdrawn_during_intention_extraction_cannot_apply_late_result()
             assert tasks[0]["state"] == "superseded"
         finally:
             await h.core.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("terminal", ["failed", "completed", "cancelled"])
+def test_daily_interrupted_terminal_receipt_starts_distinct_bounded_attempt(terminal):
+    async def scenario():
+        life, clock, model = make_life()
+        try:
+            await life.daily.work(one=True)
+            task = generation_tasks(life, "stage")[0]
+            task.update(
+                state="interrupted",
+                attempt=1,
+                request_attempt=1,
+                generation_turn_id=task["id"] + ":1",
+                generation_stage="submitted",
+                model_request_id="model:" + "a" * 32,
+                config_version=19,
+            )
+            life.daily._status(task)
+            old_id = task["model_request_id"]
+            reads = []
+
+            async def receipt(turn, request_id):
+                reads.append(request_id)
+                return {
+                    "request_id": request_id,
+                    "config_version": 19,
+                    "outcome": {
+                        "failed": "failed",
+                        "completed": "succeeded",
+                        "cancelled": "unknown",
+                    }[terminal],
+                    "execution": {"state": terminal},
+                }
+
+            original = model.generate
+
+            async def generate(turn, messages, *, request_id=None):
+                assert request_id and request_id != old_id
+                persisted = life.store.get("metadata", task["id"])
+                assert persisted["model_request_id"] == request_id
+                return await original(turn, messages)
+
+            model.receipt = receipt
+            model.generate = generate
+            await life.daily.work(one=True)
+            fresh = life.store.get("metadata", task["id"])
+            assert fresh["state"] == "completed"
+            assert fresh["attempt"] == fresh["request_attempt"] == 2
+            assert fresh["attempt_history"][0]["model_request_id"] == old_id
+            assert fresh["attempt_history"][0]["receipt"]["execution"]["state"] == terminal
+            calls = len(model.calls)
+            clock.advance(301)
+            await life.daily.work()
+            assert len(model.calls) == calls and reads == [old_id]
+        finally:
+            life.store.close()
+
+    asyncio.run(scenario())
+
+
+def test_daily_unknown_receipt_is_bounded_and_unavailability_never_requeues_it():
+    async def scenario():
+        life, clock, model = make_life()
+        try:
+            await life.daily.work(one=True)
+            task = generation_tasks(life, "stage")[0]
+            task.update(
+                state="interrupted",
+                attempt=1,
+                request_attempt=1,
+                generation_turn_id=task["id"] + ":1",
+                generation_stage="submitted",
+                model_request_id="model:" + "b" * 32,
+                config_version=19,
+            )
+            life.daily._status(task)
+            reads = []
+
+            async def receipt(turn, request_id):
+                reads.append(request_id)
+                return {
+                    "request_id": request_id,
+                    "config_version": 19,
+                    "outcome": "unknown",
+                    "execution": {"state": "running"},
+                }
+
+            model.receipt = receipt
+            model.available = False
+            await life.daily.work()
+            assert life.store.get("metadata", task["id"])["state"] == "interrupted"
+            model.available = True
+            calls = len(model.calls)
+            for _ in range(7):
+                clock.advance(301)
+                await life.daily.work()
+                await life.daily.work()
+            fresh = life.store.get("metadata", task["id"])
+            assert len(reads) == 3 and len(model.calls) == calls
+            assert fresh["state"] == "interrupted" and fresh["attempt"] == 1
+        finally:
+            life.store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stale", [None, "day", "phase"])
+def test_daily_restart_pre_submission_only_recovers_current_work(stale):
+    async def scenario():
+        life, clock, model = make_life()
+        try:
+            await life.daily.work(one=True)
+            task = generation_tasks(life, "stage")[0]
+            task.update(
+                state="generating",
+                attempt=1,
+                request_attempt=1,
+                generation_turn_id=task["id"] + ":1",
+                generation_stage="preparing",
+            )
+            life.daily._status(task)
+            if stale:
+                clock.advance(86400 if stale == "day" else 3 * 3600)
+            life.daily.recover()
+            calls = len(model.calls)
+            await life.daily.work(one=True)
+            fresh = life.store.get("metadata", task["id"])
+            assert fresh["state"] == ("superseded" if stale else "completed")
+            assert len(model.calls) == calls + (0 if stale else 1)
+        finally:
+            life.store.close()
 
     asyncio.run(scenario())

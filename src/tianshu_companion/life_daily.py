@@ -8,7 +8,9 @@ Metadata holds task intents, so this feature requires no new schema or second sc
 import asyncio
 import json
 from datetime import datetime
+from uuid import uuid4
 
+from . import observability as obs
 from .contracts import Fault, canonical, digest
 from .life import text, zone
 
@@ -270,7 +272,17 @@ class DailyLife:
         ).fetchall():
             task = json.loads(row[0])
             task.update(state="interrupted", failure="interrupted_generation")
-            self._save(task)
+            task["failure_diagnostic"] = obs.failure_diagnostic(
+                Fault(
+                    "dependency_unavailable", unknown=task.get("generation_stage") != "preparing"
+                ),
+                code="dependency_unavailable",
+                attempt=task["attempt"],
+                stage=task.get("generation_stage", "daily_generation"),
+                observed_at=self.life.clock(),
+            )
+            task.setdefault("deadline", self.life.clock() + 60)
+            self._status(task)
 
     def _current(self, task):
         actor = self.store.get("life_actors", task["actor_id"])
@@ -323,12 +335,89 @@ class DailyLife:
                         phase["generation_state"] = task["state"]
         self._save(plan)
 
+    def _archive_attempt(self, task, reason):
+        if not task.get("request_attempt", task.get("attempt", 0)):
+            return
+        history = task.setdefault("attempt_history", [])
+        history.append(
+            {
+                **{
+                    key: task[key]
+                    for key in (
+                        "attempt",
+                        "request_attempt",
+                        "generation_turn_id",
+                        "model_request_id",
+                        "config_version",
+                        "model_selection",
+                        "state",
+                        "failure",
+                        "failure_diagnostic",
+                        "receipt",
+                        "generation_stage",
+                    )
+                    if key in task
+                },
+                "closed_at": self.life.clock(),
+                "closure_reason": reason,
+            }
+        )
+
+    async def _recover_interrupted(self, task):
+        # Unknown legacy requests have no durable identity to query. They require
+        # explicit management retry; neither a missing receipt nor 404 proves closure.
+        safe = task.get("generation_stage") == "preparing"
+        lookup = getattr(self.life.gateway, "receipt", None)
+        if not safe and lookup and task.get("model_request_id") and task.get("config_version"):
+            try:
+                receipt = await asyncio.wait_for(
+                    lookup(
+                        {
+                            "id": task["generation_turn_id"],
+                            "config_version": task["config_version"],
+                        },
+                        task["model_request_id"],
+                    ),
+                    5,
+                )
+                execution = receipt.get("execution") or {}
+                safe = (
+                    receipt.get("request_id") == task["model_request_id"]
+                    and receipt.get("config_version") == task["config_version"]
+                    and (execution.get("state"), receipt.get("outcome"))
+                    in {
+                        ("failed", "failed"),
+                        ("completed", "succeeded"),
+                        ("cancelled", "unknown"),
+                    }
+                )
+                task["receipt"] = receipt
+            except (Fault, TimeoutError, OSError, ValueError) as exc:
+                task["recovery_diagnostic"] = obs.failure_diagnostic(
+                    exc,
+                    code=getattr(exc, "code", "dependency_unavailable"),
+                    attempt=task["attempt"],
+                    stage="daily_receipt",
+                    observed_at=self.life.clock(),
+                )
+        fresh = self.store.get("metadata", task["id"])
+        if fresh["version"] != task["version"] or fresh["state"] != "interrupted":
+            return False
+        task["recovery_checks"] = task.get("recovery_checks", 0) + 1
+        task["deadline"] = self.life.clock() + min(300, 60 * 2 ** task["recovery_checks"])
+        task["recovery_state"] = "closed_previous_attempt" if safe else "unresolved"
+        self._status(task)
+        return safe
+
     def retry(self, task_id, *, expected):
         task = self.store.get("metadata", task_id)
         if not task or not task_id.startswith(TASK_PREFIX) or task["version"] != expected:
             raise ValueError("Stale or unknown generation task")
         if task["state"] not in {"unavailable", "failed", "interrupted"} or not self._current(task):
             raise ValueError("Generation task is not retryable")
+        self._archive_attempt(task, "explicit_management_retry")
+        task["attempt_archived"] = True
+        task["recovery_checks"] = 0
         task.update(
             state="queued" if self.life.generation_available() else "unavailable",
             config_version=None,
@@ -422,8 +511,12 @@ class DailyLife:
         for kind in ("plan", "stage"):
             rows = self.store.db.execute(
                 "SELECT body FROM metadata WHERE conversation_id=? AND status IN "
-                "('queued','unavailable','failed') AND deadline<=? "
+                "('queued','unavailable','failed','interrupted') AND deadline<=? "
                 "AND json_extract(body,'$.attempt')<3 "
+                "AND (status!='interrupted' OR ("
+                "COALESCE(json_extract(body,'$.recovery_checks'),0)<3 AND "
+                "(json_extract(body,'$.generation_stage')='preparing' OR "
+                "json_extract(body,'$.model_request_id') IS NOT NULL))) "
                 "AND (? IS NULL OR json_extract(body,'$.actor_id')=?) "
                 "ORDER BY deadline,position,id LIMIT 1",
                 (TASK_SCOPE + ":" + kind, self.life.clock(), actor_id, actor_id),
@@ -437,13 +530,31 @@ class DailyLife:
                 self._status(task)
                 continue
             if not self.life.generation_available():
-                task.update(state="unavailable", deadline=self.life.clock() + 60)
+                task.update(
+                    state="interrupted" if task["state"] == "interrupted" else "unavailable",
+                    deadline=self.life.clock() + 60,
+                )
                 self._status(task)
                 continue
             if task["state"] == "failed" and task["attempt"] >= 3:
                 continue
+            if task["state"] == "interrupted" and not await self._recover_interrupted(task):
+                continue
+            current = self._current(task)
+            if current is None:
+                task["state"] = "superseded"
+                self._status(task)
+                continue
             actor, plan = current
+            if not task.pop("attempt_archived", False):
+                self._archive_attempt(task, "automatic_retry")
+            for key in ("model_request_id", "receipt", "failure", "failure_diagnostic"):
+                task.pop(key, None)
             task.update(
+                config_version=None,
+                model_selection=None,
+                generation_stage="preparing",
+                recovery_checks=0,
                 state="generating",
                 attempt=task["attempt"] + 1,
                 request_attempt=task.get("request_attempt", 0) + 1,
@@ -455,6 +566,7 @@ class DailyLife:
             try:
                 async with self.life.model_slots:
                     await self.life.select_generation(task)
+                    self._save(task)
                     if self._current(task) is None:
                         task["state"] = "superseded"
                         self._status(task)
@@ -500,6 +612,14 @@ class DailyLife:
                                 ),
                             )
                         )
+                    task["generation_stage"] = "submitted"
+                    # The production Gateway accepts an owned request ID; legacy
+                    # adapters retain conservative unknown handling without one.
+                    request_options = {}
+                    if callable(getattr(self.life.gateway, "receipt", None)):
+                        task["model_request_id"] = "model:" + uuid4().hex
+                        request_options["request_id"] = task["model_request_id"]
+                    self._save(task)
                     output, receipt = await asyncio.wait_for(
                         self.life.gateway.generate(
                             {
@@ -509,15 +629,20 @@ class DailyLife:
                                 "conversation_id": "life:" + digest(task["actor_id"]),
                             },
                             messages,
+                            **request_options,
                         ),
                         60,
                     )
+                task.update(receipt=receipt, generation_stage="returned")
                 content = "\n".join(output)
                 self.life.verify_generation_lease(task)
                 result = self._plan_output(task, content) if kind == "plan" else text(content, 1000)
                 with self.store.transaction():
                     fresh = self.store.get("metadata", task["id"])
-                    if fresh["state"] != "generating" or fresh["attempt"] != attempt:
+                    if (
+                        fresh["state"] != "generating"
+                        or fresh.get("request_attempt") != task["request_attempt"]
+                    ):
                         if one:
                             return True
                         continue
@@ -577,8 +702,8 @@ class DailyLife:
                         state="completed", generated_by="gateway", completed_at=self.life.clock()
                     )
                     self._status(fresh)
-            except asyncio.CancelledError:
-                self._failure(task, "interrupted", "cancelled_generation")
+            except asyncio.CancelledError as exc:
+                self._failure(task, "interrupted", exc)
                 raise
             except Exception as exc:
                 unknown = isinstance(exc, asyncio.TimeoutError) or (
@@ -591,21 +716,35 @@ class DailyLife:
                     if isinstance(exc, Fault) and exc.code == "dependency_unavailable"
                     else "failed"
                 )
-                self._failure(task, state, type(exc).__name__)
+                self._failure(task, state, exc)
             if one:
                 return True
         return False
 
-    def _failure(self, task, state, reason):
+    def _failure(self, task, state, error):
         with self.store.transaction():
             fresh = self.store.get("metadata", task["id"])
-            if fresh["state"] != "generating" or fresh["attempt"] != task["attempt"]:
+            if (
+                fresh["state"] != "generating"
+                or fresh.get("request_attempt") != task["request_attempt"]
+            ):
                 return
+            if task.get("receipt") is not None:
+                fresh["receipt"] = task["receipt"]
             fresh.update(
                 state=state,
-                failure=reason,
+                failure=type(error).__name__,
+                failure_diagnostic=obs.failure_diagnostic(
+                    error,
+                    code=getattr(error, "code", "dependency_unavailable"),
+                    attempt=task["attempt"],
+                    stage=task.get("generation_stage", "daily_generation"),
+                    observed_at=self.life.clock(),
+                ),
                 deadline=self.life.clock() + min(300, 30 * 2 ** fresh["attempt"]),
             )
+            if state == "interrupted" and task.get("generation_stage") != "preparing":
+                fresh["failure_diagnostic"]["unknown"] = True
             self._status(fresh)
 
     @staticmethod
