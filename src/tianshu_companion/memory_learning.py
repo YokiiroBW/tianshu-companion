@@ -136,6 +136,11 @@ class MemoryLearning:
         except (Fault, OSError, TimeoutError) as error:
             item["attempts"] += 1
             code = error.code if isinstance(error, Fault) else "dependency_unavailable"
+            diagnostic = self._failure_detail(
+                error, code=code, attempt=item["attempts"], stage="material"
+            )
+            item.setdefault("first_failure", diagnostic)
+            item["last_failure"] = diagnostic
             terminal = (
                 isinstance(error, Fault)
                 and not error.unknown
@@ -1222,17 +1227,28 @@ class MemoryLearning:
         core.store.put("metadata", item)
         core.counted("memory.work")
 
+    def _failure_detail(self, error, *, code, attempt, stage):
+        diagnostic = obs.failure_diagnostic(
+            error,
+            code=code,
+            attempt=attempt,
+            stage=stage,
+            observed_at=self.core.clock(),
+        )
+        peer_failure = (getattr(error, "cause", None) or {}).get("candidate_diagnostic")
+        if peer_failure:
+            diagnostic["peer_failure"] = copy.deepcopy(peer_failure)
+        if getattr(error, "diagnostics", None):
+            diagnostic["proposal_fields"] = copy.deepcopy(error.diagnostics[:16])
+        return diagnostic
+
     def _failed(self, item, code, error=None, *, failed_stage=None):
         stage = item.get("stage")
         if stage in MUTATION_WAIT:
             failed_stage = failed_stage or stage
             item["stage"] = stage = "receipt"
-        diagnostic = obs.failure_diagnostic(
-            error,
-            code=code,
-            attempt=item["attempts"],
-            stage=failed_stage or stage,
-            observed_at=self.core.clock(),
+        diagnostic = self._failure_detail(
+            error, code=code, attempt=item["attempts"], stage=failed_stage or stage
         )
         # This is a fixed machine projection, not the peer's error body or the
         # exception message. Keep the first cause and latest cause across success

@@ -746,6 +746,33 @@ class Memory:
     def __init__(self, contracts, client):
         self.contracts, self.client = contracts, client
 
+    @staticmethod
+    def _candidate_error(status, body, error):
+        """Retain only the authenticated candidate owner's bounded machine location."""
+        details = body.get("diagnostic") if isinstance(body, dict) else None
+        if not isinstance(details, dict):
+            return
+        allowed = {}
+        site = details.get("site")
+        if isinstance(site, str) and re.fullmatch(
+            r"tianshu_memory\.[a-zA-Z0-9_.]{1,100}:[a-zA-Z0-9_<>.]{1,80}:[0-9]{1,6}", site
+        ):
+            allowed["site"] = site
+        if details.get("source_owner") in {"core", "platform"}:
+            allowed["source_owner"] = details["source_owner"]
+        if details.get("source_operation") in {
+            "facts",
+            "current_access",
+            "summary_window_check",
+            "segment_frame",
+        }:
+            allowed["source_operation"] = details["source_operation"]
+        peer_status = details.get("source_http_status")
+        if type(peer_status) is int and 100 <= peer_status <= 599:
+            allowed["source_http_status"] = peer_status
+        if allowed:
+            error.cause = {**(error.cause or {}), "candidate_diagnostic": allowed}
+
     async def resolve_identity(self, origin, account):
         request = dict(query=query(origin), account=account)
         response = await self.client.call("/internal/v1/identity/resolve", request)
@@ -1173,7 +1200,10 @@ class Memory:
         if len(canonical(request).encode("utf-8")) > 262144:
             raise Fault("budget_exceeded")
         value = await self.client.call(
-            "/internal/v1/memory/candidates/materials", request, uncertain_write=True
+            "/internal/v1/memory/candidates/materials",
+            request,
+            uncertain_write=True,
+            error_response=self._candidate_error,
         )
         try:
             if not isinstance(value, dict):
@@ -1201,7 +1231,10 @@ class Memory:
         if len(canonical(request).encode("utf-8")) > 262144:
             raise Fault("budget_exceeded")
         response = await self.client.call(
-            "/internal/v1/memory/candidates/segments", request, uncertain_write=True
+            "/internal/v1/memory/candidates/segments",
+            request,
+            uncertain_write=True,
+            error_response=self._candidate_error,
         )
         try:
             self.contracts.check("memory-extraction#segment_seal_response", response)
@@ -1227,7 +1260,10 @@ class Memory:
         if len(canonical(request).encode("utf-8")) > 262144:
             raise Fault("budget_exceeded")
         response = await self.client.call(
-            "/internal/v1/memory/candidates/process", request, uncertain_write=output is not None
+            "/internal/v1/memory/candidates/process",
+            request,
+            uncertain_write=output is not None,
+            error_response=self._candidate_error,
         )
         try:
             definitions = {

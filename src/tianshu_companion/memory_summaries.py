@@ -2,6 +2,9 @@
 
 import copy
 import hashlib
+from itertools import islice
+
+from jsonschema import Draft202012Validator, FormatChecker
 
 from .contracts import Fault, canonical, digest, strict_json
 from .memory_extraction import ProposalStructureError, output_schema
@@ -135,44 +138,86 @@ def segment_messages(contracts, window):
 
 
 def check_segment_output(contracts, output, window):
-    contracts.check("memory-extraction#segment_output", output)
+    try:
+        contracts.check("memory-extraction#segment_output", output)
+    except Fault:
+        validator = Draft202012Validator(
+            {"$ref": contracts.schemas["memory-extraction"]["$id"] + "#/$defs/segment_output"},
+            registry=contracts.registry,
+            format_checker=FormatChecker(),
+        )
+        raise ProposalStructureError(
+            "invalid_input",
+            [
+                dict(path=list(error.absolute_path)[:16], keyword=error.validator)
+                for error in islice(validator.iter_errors(output), 16)
+            ],
+        ) from None
     targets = {target["scope"]["person_id"]: target for target in window["targets"]}
     results = {result["subject_person_id"]: result for result in output["results"]}
     if len(results) != len(output["results"]) or set(results) != set(targets):
-        raise Fault("invalid_input")
+        raise ProposalStructureError(
+            "invalid_input", [dict(path=["results"], keyword="target_coverage")]
+        )
     members = {member["member_id"]: member for member in window["members"]}
     people = {
         member["speaker"]["person_id"] for member in members.values() if member["role"] == "human"
     }
     topics = set()
-    for topic in output["topics"]:
+    for index, topic in enumerate(output["topics"]):
         if (
             topic["topic_id"] in topics
             or not set(topic["member_ids"]).issubset(members)
             or not set(topic["person_ids"]).issubset(people)
         ):
-            raise Fault("invalid_input")
+            raise ProposalStructureError(
+                "invalid_input", [dict(path=["topics", index], keyword="topic_references")]
+            )
         topics.add(topic["topic_id"])
     count = 0
-    for person, result in results.items():
+    for index, (person, result) in enumerate(results.items()):
         target = targets[person]
         if result["covered_member_ids"] != target["new_member_ids"]:
-            raise Fault("invalid_input")
+            raise ProposalStructureError(
+                "invalid_input",
+                [dict(path=["results", index, "covered_member_ids"], keyword="target_coverage")],
+            )
         if target["portrait_input"] is None and result["portrait"] is not None:
-            raise Fault("invalid_input")
+            raise ProposalStructureError(
+                "invalid_input",
+                [dict(path=["results", index, "portrait"], keyword="portrait_not_supplied")],
+            )
         known = {(row["record_id"], row["record_version"]) for row in target["known_memories"]}
-        for memory in result["memories"]:
+        for memory_index, memory in enumerate(result["memories"]):
             refs = set(memory["source_member_ids"])
             if not refs.issubset(members) or not refs.intersection(target["new_member_ids"]):
-                raise Fault("invalid_input")
+                raise ProposalStructureError(
+                    "invalid_input",
+                    [
+                        dict(
+                            path=["results", index, "memories", memory_index, "source_member_ids"],
+                            keyword="target_source_reference",
+                        )
+                    ],
+                )
             if any(
                 (ref["record_id"], ref["record_version"]) not in known
                 for ref in memory["prior_refs"]
             ):
-                raise Fault("invalid_input")
+                raise ProposalStructureError(
+                    "invalid_input",
+                    [
+                        dict(
+                            path=["results", index, "memories", memory_index, "prior_refs"],
+                            keyword="known_memory_reference",
+                        )
+                    ],
+                )
         count += len(result["memories"])
     if count > 32:
-        raise Fault("budget_exceeded")
+        raise ProposalStructureError(
+            "budget_exceeded", [dict(path=["results"], keyword="total_memories")]
+        )
     return output
 
 
@@ -186,6 +231,8 @@ def parse_segment(contracts, raw, window):
                 if isinstance(result, dict) and result.get("portrait") == "":
                     result["portrait"] = None
         return check_segment_output(contracts, output, window)
+    except ProposalStructureError:
+        raise
     except (ValueError, Fault, KeyError, TypeError):
         raise ProposalStructureError(
             "invalid_input", [dict(path=[], keyword="segment_output")]
