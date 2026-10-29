@@ -116,23 +116,32 @@ def check_segment_window(contracts, window):
     return window
 
 
-def segment_messages(contracts, window):
+def segment_messages(contracts, window, *, merge_candidates=()):
     check_segment_window(contracts, window)
     supplied = copy.deepcopy(window)
     for target in supplied["targets"]:
         if target["portrait_input"] is not None:
             target["portrait_input"]["current_text"] = ""
+    payload = dict(
+        extraction_schema=6, segment_window=supplied, output_schema=output_schema(contracts)
+    )
+    if merge_candidates:
+        payload["merge_candidates"] = list(merge_candidates)
     return [
-        dict(role="system", content=SEGMENT_INSTRUCTION),
+        dict(
+            role="system",
+            content=SEGMENT_INSTRUCTION
+            + (
+                "\nmerge_candidates 仅是同一归属范围内已展示记录的相似提示，不证明事实相同。"
+                "时间、否定、条件或现实/虚构不同须保留并列；只有原始材料明确更新时才提出 replace，"
+                "仍须使用白名单 prior_refs 的准确版本，不得据相似度自动删除。"
+                if merge_candidates
+                else ""
+            ),
+        ),
         dict(
             role="user",
-            content=canonical(
-                dict(
-                    extraction_schema=6,
-                    segment_window=supplied,
-                    output_schema=output_schema(contracts),
-                )
-            ),
+            content=canonical(payload),
         ),
     ]
 

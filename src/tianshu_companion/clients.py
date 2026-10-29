@@ -1250,6 +1250,47 @@ class Memory:
             raise Fault("invalid_input", unknown=True) from None
         return response
 
+    async def segment_merge_hints(self, job_id, batch_ref, window):
+        """Private diagnostic hints, constrained to the already frozen known records."""
+        value = await self.client.call(
+            "/internal/v1/memory/candidates/hints",
+            dict(job_id=job_id, batch_ref=batch_ref),
+            error_response=self._candidate_error,
+        )
+        try:
+            if (
+                set(value) != {"job_id", "batch_ref", "merge_candidates"}
+                or value["job_id"] != job_id
+                or value["batch_ref"] != batch_ref
+                or not isinstance(value["merge_candidates"], list)
+                or len(value["merge_candidates"]) > 40
+            ):
+                raise Fault("invalid_input")
+            known = {
+                target["scope"]["person_id"]: {
+                    canonical({key: record[key] for key in ("record_id", "record_version")})
+                    for record in target["known_memories"]
+                }
+                for target in window["targets"]
+            }
+            import math
+
+            for hint in value["merge_candidates"]:
+                refs = known.get(hint["subject_person_id"], set())
+                if (
+                    set(hint) != {"subject_person_id", "new", "prior", "score"}
+                    or canonical(hint["new"]) not in refs
+                    or canonical(hint["prior"]) not in refs
+                    or hint["new"] == hint["prior"]
+                    or type(hint["score"]) not in (int, float)
+                    or not math.isfinite(hint["score"])
+                    or not 0 <= hint["score"] <= 1
+                ):
+                    raise Fault("invalid_input")
+        except (KeyError, ValueError, TypeError):
+            raise Fault("invalid_input") from None
+        return value["merge_candidates"]
+
     async def process_candidate(self, job_id, output, *, extraction_schema=6, batch_ref=None):
         if type(extraction_schema) is not int or extraction_schema != 6:
             raise Fault("unsupported_version")

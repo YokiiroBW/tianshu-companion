@@ -1142,9 +1142,25 @@ class MemoryLearning:
                 self._finish_segment(item, response)
                 return None
             self._pin_segment_window(item, response)
+            hints = []
+            if any(
+                len(target["known_memories"]) > 1 for target in item["segment_window"]["targets"]
+            ):
+                method = getattr(self.core.memory, "segment_merge_hints", None)
+                if method is not None:
+                    try:
+                        hints = await method(
+                            item["job_id"], item["batch_ref"], item["segment_window"]
+                        )
+                    except Fault as error:
+                        if error.code in {"scope_changed", "forbidden"}:
+                            raise
+                        # A diagnostic hint cannot become a new model admission gate.
             if not await self.core.group_processing.start(item):
                 return None
-            supplied = segment_messages(self.core.contracts, item["segment_window"])
+            supplied = segment_messages(
+                self.core.contracts, item["segment_window"], merge_candidates=hints
+            )
             item["stage"] = "model"
             request_id = uid("model")
             if item.get("owner_recovery"):
