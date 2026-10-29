@@ -945,10 +945,14 @@ def create_app(
                     "expected_failure_count",
                     "model_request_id",
                 }
-                if not isinstance(body, dict) or set(body) != fields:
+                segment_fields = (fields - {"job_id"}) | {"segment_id"}
+                if not isinstance(body, dict) or set(body) not in (fields, segment_fields):
                     raise Fault("invalid_input")
-                for name in ("actor_id", "job_id", "request_id"):
+                selector = "segment_id" if "segment_id" in body else "job_id"
+                for name in ("actor_id", selector, "request_id"):
                     core.contracts.check("common#id", body[name])
+                if selector == "segment_id" and body["model_request_id"] is not None:
+                    raise Fault("invalid_input")
                 if body["model_request_id"] is not None:
                     core.contracts.check("common#id", body["model_request_id"])
                 for name in ("expected_attempts", "expected_failure_count"):

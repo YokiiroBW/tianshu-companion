@@ -398,6 +398,129 @@ class AutomaticMemorySchedulingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(before[name], after[name])
         self.assertGreaterEqual(after["attempts"], before["attempts"])
 
+    async def blocked_uncreated_segment_for_owner_recovery(self):
+        await self.chat()
+        await self.h.core.flush_outbox()
+        self.h.clock.advance(120)
+        self.worker.segments.seal_due()
+        item = copy.deepcopy(self.task())
+        self.assertIsNone(item.get("job_id"))
+        item.update(
+            state="blocked",
+            stage="receipt",
+            attempts=6,
+            failure_count=6,
+            first_failure=dict(stage="receipt", attempt=1),
+            last_failure=dict(stage="receipt", attempt=6),
+        )
+        self.h.core.store.put("metadata", item)
+        return item, dict(
+            segment_id=item["segment_id"],
+            request_id="recovery:original-segment",
+            expected_attempts=6,
+            expected_failure_count=6,
+            model_request_id=None,
+        )
+
+    async def test_segment_recovery_lost_seal_ack_and_http_retry_keep_original_identity(self):
+        before, command = await self.blocked_uncreated_segment_for_owner_recovery()
+        self.peer.lose_create = True
+        with self.assertRaises(Fault) as lost:
+            await self.worker.recover("actor:a", **command)
+        self.assertTrue(lost.exception.unknown)
+        self.assertIsNone(self.task().get("job_id"))
+        self.assertEqual([], self.peer.generated)
+        app = create_app(
+            self.h.core, {"platform": "synthetic-platform", "memory": "synthetic-memory"}
+        )
+        self.addCleanup(app.state.log.close)
+        body = dict(command, actor_id="actor:a")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            for request, token, expected in (
+                (body, "synthetic-memory", 403),
+                (dict(body, job_id="job:invented"), "synthetic-platform", 400),
+                (dict(body, expected_attempts=5), "synthetic-platform", 409),
+            ):
+                response = await client.post(
+                    "/internal/v1/memory/learning/recover",
+                    json=request,
+                    headers={"Authorization": "Bearer " + token},
+                )
+                self.assertEqual(expected, response.status_code, response.text)
+            results = []
+            for _ in range(2):
+                response = await client.post(
+                    "/internal/v1/memory/learning/recover",
+                    json=body,
+                    headers={"Authorization": "Bearer synthetic-platform"},
+                )
+                self.assertEqual(200, response.status_code, response.text)
+                results.append(response.json())
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(
+            (results[0]["segment_id"], results[0]["job_id"]),
+            (before["segment_id"], self.task()["job_id"]),
+        )
+        self.assertEqual(1, len(self.peer.sealed))
+        self.assertEqual([before["create_request"]] * 2, self.peer.creates)
+        await self.worker.work()
+        await self.worker.work()
+        self.assertEqual("completed", self.task()["state"])
+        self.assertEqual(1, len(self.peer.generated))
+        for name in (
+            "segment_id",
+            "failure_count",
+            "first_failure",
+            "last_failure",
+            "create_request",
+        ):
+            self.assertEqual(before[name], self.task()[name])
+
+    async def test_segment_recovery_does_not_regenerate_an_already_committed_orphan(self):
+        before, command = await self.blocked_uncreated_segment_for_owner_recovery()
+        sealed = await self.peer.create(before["create_request"])
+        window = self.peer.sealed[before["segment_id"]][1]
+        committed = receipt_for(
+            window, output_for(window), sealed["job_id"], "batch:" + before["segment_id"]
+        )
+        self.peer.receipts[before["segment_id"]] = committed
+        with self.assertRaises(Fault) as rejected:
+            await self.worker.recover("actor:a", **command)
+        self.assertTrue(rejected.exception.unknown)
+        self.assertEqual([], self.peer.generated)
+        self.assertEqual("blocked", self.task()["state"])
+        self.assertEqual(committed, self.peer.receipts[before["segment_id"]])
+
+    async def test_segment_recovery_preserves_authoritative_source_withdrawal(self):
+        before, command = await self.blocked_uncreated_segment_for_owner_recovery()
+        self.peer.invalidated = True
+        result = await self.worker.recover("actor:a", **command)
+        self.assertEqual("invalidated", result["state"])
+        self.assertEqual(before["segment_id"], result["segment_id"])
+        self.assertEqual([], self.peer.generated)
+        self.assertEqual(6, self.task()["failure_count"])
+
+    async def test_segment_recovery_rechecks_cas_after_original_receipt_read(self):
+        before, command = await self.blocked_uncreated_segment_for_owner_recovery()
+        original = self.peer.process
+
+        async def changed(*args, **kwargs):
+            response = await original(*args, **kwargs)
+            current = self.task()
+            current["failure_count"] += 1
+            self.h.core.store.put("metadata", current)
+            return response
+
+        self.h.memory.process_candidate = changed
+        with self.assertRaises(Fault) as rejected:
+            await self.worker.recover("actor:a", **command)
+        self.assertEqual("version_conflict", rejected.exception.code)
+        self.assertEqual(7, self.task()["failure_count"])
+        self.assertNotIn("owner_recovery", self.task())
+        self.assertEqual([], self.peer.generated)
+
     async def test_owner_receipt_recovery_refuses_unknown_model_or_wrong_cas(self):
         before, command = await self.blocked_receipt_for_owner_recovery()
         with self.assertRaises(Fault):

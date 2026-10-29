@@ -368,21 +368,28 @@ class MemoryLearning:
     async def recover(
         self,
         actor_id,
-        job_id,
+        job_id=None,
         *,
+        segment_id=None,
         request_id,
         expected_attempts,
         expected_failure_count,
         model_request_id,
     ):
-        """Owner-authorized retry after reconciling the original Memory job.
+        """Owner-authorized retry of the original job or unacknowledged segment.
 
         Model retries still require the operator's pre-upstream cancellation
         evidence. A null model request is limited to blocked receipt reads with
         no saved model request or output. The original Memory job and batch
         remain the sole commit authority in both cases.
+        Segment recovery repeats the stored seal unchanged, then obtains its
+        authoritative job receipt; it cannot retry an existing model/output.
         """
-        for value in (actor_id, job_id, request_id):
+        if (job_id is None) == (segment_id is None):
+            raise Fault("invalid_input")
+        if segment_id is not None and model_request_id is not None:
+            raise Fault("invalid_input")
+        for value in (actor_id, job_id if segment_id is None else segment_id, request_id):
             self.core.contracts.check("common#id", value)
         if model_request_id is not None:
             self.core.contracts.check("common#id", model_request_id)
@@ -396,11 +403,13 @@ class MemoryLearning:
             raise Fault("invalid_input")
         command = dict(
             actor_id=actor_id,
-            job_id=job_id,
             request_id=request_id,
             expected_attempts=expected_attempts,
             expected_failure_count=expected_failure_count,
             model_request_id=model_request_id,
+        )
+        command["job_id" if segment_id is None else "segment_id"] = (
+            job_id if segment_id is None else segment_id
         )
         identity = "memory-recovery:" + digest([actor_id, request_id])
         fingerprint = digest(command)
@@ -410,29 +419,54 @@ class MemoryLearning:
                 if recorded["fingerprint"] != fingerprint:
                     raise Fault("idempotency_conflict")
                 return copy.deepcopy(recorded["receipt"])
-            key = self._learning_key(job_id)
-            item = self.core.store.get("metadata", key)
-            if item is None or item.get("scope", {}).get("actor_id") != actor_id:
-                raise Fault("not_found")
-            if item.get("extraction_schema") != 6:
-                raise Fault("unsupported_version")
+            key = (
+                "memory-learn:" + digest(segment_id)
+                if segment_id is not None
+                else self._learning_key(job_id)
+            )
             receipt_only = model_request_id is None
-            model_request = item.get("model_request") or {}
-            if (
-                (key in self.jobs and not self.jobs[key].done())
-                or item.get("job_id") != job_id
-                or item.get("state") != "blocked"
-                or item.get("stage") != ("receipt" if receipt_only else "model")
-                or item.get("output") is not None
-                or item.get("attempts") != expected_attempts
-                or item.get("failure_count", 0) != expected_failure_count
-                or item.get("last_failure", {}).get("model_request_id") != model_request_id
-                or not isinstance(model_request, dict)
-                or model_request.get("request_id", model_request_id) != model_request_id
-                or (receipt_only and bool(model_request))
-            ):
-                raise Fault("version_conflict")
+
+            def checked_item():
+                current = self.core.store.get("metadata", key)
+                if current is None or current.get("scope", {}).get("actor_id") != actor_id:
+                    raise Fault("not_found")
+                if segment_id is not None and current.get("segment_id") != segment_id:
+                    raise Fault("not_found")
+                if segment_id is not None and (
+                    current.get("create_request", {}).get("segment_id") != segment_id
+                    or current["create_request"].get("frame") != current.get("scope")
+                ):
+                    raise Fault("scope_changed")
+                if current.get("extraction_schema") != 6:
+                    raise Fault("unsupported_version")
+                model_request = current.get("model_request") or {}
+                if (
+                    (key in self.jobs and not self.jobs[key].done())
+                    or (segment_id is None and current.get("job_id") != job_id)
+                    or current.get("state") != "blocked"
+                    or current.get("stage") != ("receipt" if receipt_only else "model")
+                    or current.get("output") is not None
+                    or current.get("attempts") != expected_attempts
+                    or current.get("failure_count", 0) != expected_failure_count
+                    or current.get("last_failure", {}).get("model_request_id") != model_request_id
+                    or not isinstance(model_request, dict)
+                    or model_request.get("request_id", model_request_id) != model_request_id
+                    or (receipt_only and bool(model_request))
+                ):
+                    raise Fault("version_conflict")
+                return current
+
+            item = checked_item()
             response = await self._candidate(item, None, reconcile=True)
+            if response is None and segment_id is not None and item.get("job_id"):
+                # A successful first seal records its genuine Memory job. Read
+                # that original receipt before granting any model work. If the
+                # seal acknowledgement is lost, the same segment/request is the
+                # only identity retried; never synthesize a replacement job.
+                response = await self._candidate(item, None, reconcile=True)
+            if response is None:
+                raise Fault("dependency_unavailable", unknown=True)
+            item = checked_item()
             with self.core.store.transaction():
                 if response["state"] in {"completed", "invalidated"}:
                     self._finish_segment(item, response)
@@ -453,12 +487,14 @@ class MemoryLearning:
                     state = "resumed"
                 receipt = dict(
                     request_id=request_id,
-                    job_id=job_id,
+                    job_id=item["job_id"],
                     state=state,
                     attempts=item["attempts"],
                     failure_count=item.get("failure_count", 0),
                     model_request_id=model_request_id,
                 )
+                if segment_id is not None:
+                    receipt["segment_id"] = segment_id
                 self.core.store.put(
                     "metadata",
                     dict(
