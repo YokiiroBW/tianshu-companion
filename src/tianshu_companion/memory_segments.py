@@ -9,6 +9,7 @@ import json
 
 from .clients import uid
 from .contracts import Fault, canonical, digest
+from .memory_rotation import order
 
 QUIET_SECONDS = 120
 MAX_WAIT_SECONDS = 600
@@ -90,7 +91,7 @@ class MemorySegments:
             if segment is not None and segment["deadline"] <= now:
                 self.seal(segment, "deadline")
                 segment = None
-            for material in materials:
+            for material in order(self.core, frame, materials):
                 if (
                     set(material)
                     != {"material_ref", "person_id", "text_bytes", "member_count", "source_key"}

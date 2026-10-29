@@ -1074,7 +1074,12 @@ class MemoryLearning:
                 if any(result["portrait_state"] == "committed" for result in response["results"])
                 else "not_requested"
             )
-        self.core.store.put("metadata", item)
+        with self.core.store.transaction():
+            if response["state"] == "completed":
+                from .memory_rotation import covered
+
+                covered(self.core, item, response)
+            self.core.store.put("metadata", item)
 
     async def _pin_model(self, item, generation, scope):
         life = self.core.life
