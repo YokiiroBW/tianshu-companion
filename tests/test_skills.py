@@ -182,8 +182,12 @@ def test_definition_update_new_turn_and_selected_revision_only(tmp_path):
             image = next(
                 item for item in offered if item["function"]["name"] == "life_image_request"
             )
-            assert "updated clothing capability" in image["function"]["description"]
-            assert "including modest sleepwear" in h.core.skills.instructions(fresh)
+            assert "Create an image of this actor" in image["function"]["description"]
+            guidance, contexts = h.core.skills.prompt_parts(fresh)
+            assert "updated clothing capability" in next(
+                item["description"] for item in contexts if item["skill_id"] == "image.generate"
+            )
+            assert "including modest sleepwear" in guidance
         finally:
             await h.core.close()
 

@@ -267,11 +267,16 @@ def test_native_memory_tool_rebinds_provenance_to_the_actual_refreshed_owner_and
             assert turn["phase"] == "sent"
             assert len(proposals) == 1 and proposals[0]["scope"] == turn["scope"]
             assert proposals[0]["scope"]["person_id"] not in {"person:second", "person:third"}
+            assert (
+                calls[0][0]["content"].split("\nTrusted identity projection: ", 1)[0]
+                == (calls[1][0]["content"].split("\nTrusted identity projection: ", 1)[0])
+            )
             for messages, owners, records in (
                 (calls[0], ["person:second", "person:third"], ["old-second", "old-third"]),
                 (calls[1], ["person:third", turn["scope"]["person_id"]], ["new-third", "new-own"]),
             ):
                 prompt = json.loads(messages[1]["content"])
+                assert list(prompt)[-1] == "messages"
                 timeline = json.loads(
                     messages[0]["content"].split("Human source timeline: ", 1)[1].split("\n", 1)[0]
                 )

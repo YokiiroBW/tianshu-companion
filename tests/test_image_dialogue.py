@@ -184,8 +184,8 @@ def test_ordinary_dialogue_compact_image_tool_delivers_original_once(tmp_path):
                     self.completions.append(copy.deepcopy(messages))
                     if len(self.completions) == 1:
                         assert "看看小汐今天的睡衣" in messages[1]["content"]
-                        assert '"can_request":true' in messages[0]["content"]
-                        assert '"current_outfit":null' in messages[0]["content"]
+                        assert '"can_request":true' in messages[1]["content"]
+                        assert '"current_outfit":null' in messages[1]["content"]
                         assert "modest sleepwear" in messages[0]["content"]
                         assert (
                             sum(t["function"]["name"] == "life_image_request" for t in tools) == 1
