@@ -929,6 +929,27 @@ def create_app(
                 return await core.actor_memory.source(service, body)
             if operation == "summary-window-check":
                 return core.summary_windows.check(service, body)
+            if operation == "memory-learning-recover":
+                if service != "platform":
+                    raise Fault("forbidden")
+                fields = {
+                    "actor_id",
+                    "job_id",
+                    "request_id",
+                    "expected_attempts",
+                    "expected_failure_count",
+                    "model_request_id",
+                }
+                if not isinstance(body, dict) or set(body) != fields:
+                    raise Fault("invalid_input")
+                for name in ("actor_id", "job_id", "request_id", "model_request_id"):
+                    core.contracts.check("common#id", body[name])
+                for name in ("expected_attempts", "expected_failure_count"):
+                    if type(body[name]) is not int or body[name] < 0:
+                        raise Fault("invalid_input")
+                if body["actor_id"] not in core.roles:
+                    raise Fault("not_found")
+                return await core.memory_learning.recover(**body)
             if operation == "ingest-receipt":
                 from .ingress_receipts import read
 
@@ -1071,6 +1092,10 @@ def create_app(
     @app.post("/internal/v1/memory/consolidation/window/check")
     async def summary_window_check(request: Request):
         return await dispatch(request, "summary-window-check")
+
+    @app.post("/internal/v1/memory/learning/recover")
+    async def memory_learning_recover(request: Request):
+        return await dispatch(request, "memory-learning-recover")
 
     @app.post("/internal/v1/conversation/direct-command")
     async def direct_command(request: Request):

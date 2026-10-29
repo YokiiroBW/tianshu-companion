@@ -1454,8 +1454,8 @@ class Gateway:
             return False
         return False
 
-    async def generate(self, turn, messages):
-        message, receipt = await self.complete(turn, messages)
+    async def generate(self, turn, messages, *, request_id=None):
+        message, receipt = await self.complete(turn, messages, request_id=request_id)
         if message.get("tool_calls"):
             raise Fault("invalid_input")
         text = message.get("content") or ""

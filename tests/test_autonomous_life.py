@@ -86,14 +86,24 @@ def test_unknown_goal_model_keeps_preparation_backoff():
         try:
 
             async def unavailable(generation, messages):
-                raise TimeoutError("recorded unknown model result")
+                cancelled = asyncio.CancelledError()
+                cancelled.model_request_id = "model:" + "b" * 32
+                cancelled.unknown = True
+                raise TimeoutError("private provider response must not be retained") from cancelled
 
             model.generate = unavailable
             now = h.clock()
             assert await h.core.life.autonomy.work(actor_id="actor:a")
             actor = h.core.store.get("life_actors", "actor:a")
             assert actor["autonomy_due_at"] == now + 1800
-            assert h.core.store.get("metadata", actor["autonomy_operation"])["state"] == "unknown"
+            marker = h.core.store.get("metadata", actor["autonomy_operation"])
+            assert marker["state"] == "unknown"
+            assert marker["config_version"] is not None
+            assert marker["error"] == "dependency_unavailable"
+            assert marker["first_failure"] == marker["last_failure"]
+            assert marker["last_failure"]["category"] == "timeout"
+            assert marker["last_failure"]["model_request_id"] == "model:" + "b" * 32
+            assert "private provider response" not in canonical(marker)
         finally:
             await close(h, services)
 

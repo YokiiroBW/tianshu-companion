@@ -112,10 +112,19 @@ async def pin_generation(
     """Pin one generation to its actual caller; independent callers never borrow a grant."""
     if selector is not None:
         retained = task.get("model_selection") or {}
-        if (
+        renew = (
             retained.get("turn_id") != request.turn_id
             or retained.get("caller_service", "companion") != request.caller_service
-        ):
+        )
+        if not renew:
+            try:
+                verify_lease(retained.get("expires_at"), clock())
+            except Fault:
+                renew = True
+        if renew:
+            # Only the original authorization owner may renew this exact turn.
+            # Its selector preserves the pinned provider/revision or refuses;
+            # the caller never manufactures a replacement turn to get a grant.
             chosen = await resolve_selection(selector, request, clock)
             task["config_version"] = chosen.config_version
             task["model_selection"] = {

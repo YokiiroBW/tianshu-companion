@@ -4,6 +4,7 @@ import asyncio
 import copy
 from datetime import datetime, timedelta
 
+from . import observability as obs
 from .clients import utc
 from .contracts import Fault, canonical, digest, strict_json
 from .life import text, zone
@@ -224,6 +225,11 @@ class AutonomousGoals:
                     limit=6,
                 )
             generation, lease = await self.execution.generation(actor_id, operation)
+            marker.update(
+                config_version=generation["config_version"],
+                model_selection=copy.deepcopy(lease.get("model_selection")),
+            )
+            self.store.put("metadata", marker)
             material = dict(
                 now=utc(now),
                 persona=self.life.persona_reader(actor_id),
@@ -280,11 +286,24 @@ class AutonomousGoals:
             self.store.put("metadata", marker)
             raise
         except (Fault, ValueError, KeyError, OSError, TypeError, TimeoutError) as error:
+            diagnostic = obs.failure_diagnostic(
+                error,
+                code=error.code
+                if isinstance(error, Fault)
+                else "dependency_unavailable"
+                if isinstance(error, (OSError, TimeoutError))
+                else "invalid_input",
+                attempt=1,
+                stage="model" if marker["state"] == "submitted" else "preparation",
+                observed_at=self.core.clock(),
+            )
             marker.update(
                 state="unknown"
                 if isinstance(error, TimeoutError) or isinstance(error, Fault) and error.unknown
                 else "failed",
-                error=error.code if isinstance(error, Fault) else "invalid_input",
+                error=diagnostic["code"],
+                first_failure=marker.get("first_failure", diagnostic),
+                last_failure=diagnostic,
             )
             self.store.put("metadata", marker)
         return True

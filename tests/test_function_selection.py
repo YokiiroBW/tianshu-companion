@@ -3,12 +3,59 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from test_life import setup, advance_diary
+from tianshu_companion.contracts import Fault
 from tianshu_companion.model_selection import (
     HttpDefaultModelSelector,
     ModelSelection,
     SelectionRequest,
+    pin_generation,
 )
+
+
+@pytest.mark.parametrize("remaining", [3600, 1])
+def test_expired_retained_selection_renews_exact_request_or_refuses_short_lease(remaining):
+    async def scenario():
+        request = SelectionRequest(
+            turn_id="turn:original",
+            actor_id="actor:a",
+            person_id="person:a",
+            audience="self_private",
+            conversation_id="conversation:a",
+            caller_service="companion_background",
+            function_id="memory",
+        )
+        task = dict(
+            config_version=12,
+            model_selection=dict(
+                turn_id=request.turn_id,
+                caller_service=request.caller_service,
+                expires_at=99,
+            ),
+        )
+        received = []
+
+        class Selector:
+            async def select(self, value):
+                received.append(value)
+                return ModelSelection(13, 100 + remaining, caller_service=request.caller_service)
+
+        call = pin_generation(task, request, Selector(), lambda: 100, independent=True)
+        if remaining < 65:
+            with pytest.raises(Fault):
+                await call
+            assert task["config_version"] == 12
+            assert task["model_selection"]["expires_at"] == 99
+        else:
+            await call
+            assert task["config_version"] == 13
+            assert task["model_selection"]["turn_id"] == request.turn_id
+            assert task["model_selection"]["expires_at"] == 100 + remaining
+        assert received == [request]
+
+    asyncio.run(scenario())
 
 
 def test_chat_keeps_original_wire_shape_and_writing_identifies_its_function():

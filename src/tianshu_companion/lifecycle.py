@@ -16,6 +16,7 @@ ROOT_COMMANDS = frozenset(
         "persona",
         "role-runtime",
         "life-generation-retry",
+        "memory-learning-recover",
         "life-runtime-manage",
         "life-runtime-conversation",
         "life-runtime-control",

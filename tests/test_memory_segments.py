@@ -251,7 +251,7 @@ class SegmentPeer:
             raise Fault("result_unknown", unknown=True)
         return copy.deepcopy(receipt)
 
-    async def generate(self, turn, messages):
+    async def generate(self, turn, messages, *, request_id=None):
         if not turn["id"].startswith("memory-generation:"):
             return await self.original_generate(turn, messages)
         supplied = json.loads(messages[-1]["content"])
@@ -295,6 +295,158 @@ class AutomaticMemorySchedulingTests(unittest.IsolatedAsyncioTestCase):
             await self.worker.work()
             self.assertEqual("commit", self.task()["stage"])
         return copy.deepcopy(self.task())
+
+    async def blocked_for_owner_recovery(self):
+        item = await self.prepared_segment()
+        # Existing failed attempt identities are retained, not manufactured by
+        # the recovery endpoint. Production admission proved these cancelled.
+        item.update(
+            state="blocked",
+            attempts=6,
+            failure_count=6,
+            recovery_failures={"temporary": 6},
+            last_error="dependency_unavailable",
+            first_failure=dict(category="timeout", attempt=1),
+            last_failure=dict(category="timeout", attempt=6, model_request_id="model:" + "a" * 32),
+            model_route=dict(
+                turn_id="memory-generation:" + digest(item["segment_id"]),
+                caller_service="companion",
+            ),
+        )
+        self.h.core.store.put("metadata", item)
+        return item, dict(
+            request_id="recovery:test",
+            expected_attempts=6,
+            expected_failure_count=6,
+            model_request_id="model:" + "a" * 32,
+        )
+
+    async def test_owner_recovery_preserves_job_batch_history_and_runs_one_model(self):
+        before, command = await self.blocked_for_owner_recovery()
+        result = await self.worker.recover("actor:a", before["job_id"], **command)
+        self.assertEqual("resumed", result["state"])
+        self.assertEqual(6, self.task()["attempts"])
+        calls = len(self.peer.processed)
+        self.assertEqual(result, await self.worker.recover("actor:a", before["job_id"], **command))
+        self.assertEqual(calls, len(self.peer.processed))
+        await self.worker.work()
+        self.assertEqual("commit", self.task()["stage"])
+        await self.worker.work()
+        after = self.task()
+        self.assertEqual("completed", after["state"])
+        self.assertEqual(7, after["attempts"])
+        for name in (
+            "job_id",
+            "batch_ref",
+            "segment_id",
+            "first_failure",
+            "last_failure",
+            "failure_count",
+            "recovery_failures",
+            "model_route",
+        ):
+            self.assertEqual(before[name], after[name])
+        self.assertEqual(1, len(self.peer.generated))
+        self.assertEqual("completed", after["model_request"]["state"])
+        self.assertEqual(result, await self.worker.recover("actor:a", before["job_id"], **command))
+
+    async def test_owner_recovery_second_failure_blocks_without_resetting_history(self):
+        before, command = await self.blocked_for_owner_recovery()
+        await self.worker.recover("actor:a", before["job_id"], **command)
+        calls = []
+
+        async def unavailable(turn, messages, *, request_id=None):
+            self.assertEqual(request_id, self.task()["model_request"]["request_id"])
+            calls.append(request_id)
+            error = Fault("dependency_unavailable", unknown=True)
+            error.model_request_id = request_id
+            raise error
+
+        self.h.gateway.generate = unavailable
+        await self.worker.work()
+        self.h.clock.advance(1000)
+        await self.worker.work()
+        after = self.task()
+        self.assertEqual("blocked", after["state"])
+        self.assertEqual(7, after["failure_count"])
+        self.assertEqual({"temporary": 7}, after["recovery_failures"])
+        self.assertEqual(before["first_failure"], after["first_failure"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual("spent", after["owner_recovery"]["state"])
+
+    async def test_owner_recovery_interrupted_submission_cannot_spend_same_authorization_twice(
+        self,
+    ):
+        before, command = await self.blocked_for_owner_recovery()
+        await self.worker.recover("actor:a", before["job_id"], **command)
+        retained = self.task()
+        retained["owner_recovery"]["state"] = "submitted"
+        retained["model_request"] = dict(request_id="model:" + "d" * 32, state="submitted")
+        self.h.core.store.put("metadata", retained)
+        await self.worker.work()
+        self.assertEqual("blocked", self.task()["state"])
+        self.assertEqual([], self.peer.generated)
+        with self.assertRaises(Fault) as caught:
+            await self.worker.recover(
+                "actor:a", before["job_id"], **dict(command, request_id="recovery:second")
+            )
+        self.assertEqual("version_conflict", caught.exception.code)
+
+    async def test_owner_recovery_checks_actor_cas_and_original_receipt_first(self):
+        before, command = await self.blocked_for_owner_recovery()
+        for actor, fields in (
+            ("actor:other", command),
+            ("actor:a", dict(command, expected_attempts=5)),
+            ("actor:a", dict(command, model_request_id="model:" + "c" * 32)),
+        ):
+            with self.assertRaises(Fault):
+                await self.worker.recover(actor, before["job_id"], **fields)
+        output = output_for(before["segment_window"])
+        self.peer.receipts[before["segment_id"]] = receipt_for(
+            before["segment_window"], output, before["job_id"], before["batch_ref"]
+        )
+        receipt = await self.worker.recover("actor:a", before["job_id"], **command)
+        self.assertEqual("completed", receipt["state"])
+        self.assertEqual(6, self.task()["attempts"])
+        await self.worker.work()
+        self.assertEqual([], self.peer.generated)
+        with self.assertRaises(Fault) as caught:
+            await self.worker.recover(
+                "actor:a", before["job_id"], **dict(command, expected_attempts=7)
+            )
+        self.assertEqual("idempotency_conflict", caught.exception.code)
+
+    async def test_owner_recovery_http_requires_platform_and_calls_original_owner(self):
+        before, command = await self.blocked_for_owner_recovery()
+        app = create_app(
+            self.h.core, {"platform": "synthetic-platform", "memory": "synthetic-memory"}
+        )
+        self.addCleanup(app.state.log.close)
+        body = dict(command, actor_id="actor:a", job_id=before["job_id"])
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            for token, expected in (
+                ("wrong", 401),
+                ("synthetic-memory", 403),
+                ("synthetic-platform", 200),
+            ):
+                response = await client.post(
+                    "/internal/v1/memory/learning/recover",
+                    json=body,
+                    headers={"Authorization": "Bearer " + token},
+                )
+                self.assertEqual(expected, response.status_code, response.text)
+            self.assertEqual("resumed", response.json()["state"])
+            self.assertEqual(before["job_id"], self.task()["job_id"])
+            self.assertEqual([], self.peer.generated)
+            app.state.stopping.set()
+            stopped = await client.post(
+                "/internal/v1/memory/learning/recover",
+                json=body,
+                headers={"Authorization": "Bearer synthetic-platform"},
+            )
+            self.assertEqual(503, stopped.status_code)
 
     async def queued(self, *, released=True, channel="group:new"):
         result = await self.h.core.ingest(
@@ -442,11 +594,11 @@ class AutomaticMemorySchedulingTests(unittest.IsolatedAsyncioTestCase):
         entered, release = asyncio.Event(), asyncio.Event()
         original = self.peer.generate
 
-        async def held(turn, messages):
+        async def held(turn, messages, *, request_id=None):
             if turn["id"].startswith("memory-generation:"):
                 entered.set()
                 await release.wait()
-            return await original(turn, messages)
+            return await original(turn, messages, request_id=request_id)
 
         self.h.gateway.generate = held
         await self.worker.work(wait=False)
@@ -570,9 +722,9 @@ class AutomaticMemorySchedulingTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 active -= 1
 
-        async def generated(turn, messages):
+        async def generated(turn, messages, *, request_id=None):
             calls.append("model")
-            return await generate(turn, messages)
+            return await generate(turn, messages, request_id=request_id)
 
         self.h.memory.accept_materials, self.h.memory.process_candidate = accepted, processed
         self.h.gateway.generate = generated

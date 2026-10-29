@@ -5,6 +5,7 @@ import copy
 import json
 
 from . import observability as obs
+from .clients import uid
 from .contracts import Fault, canonical, digest
 from .memory_segments import MemorySegments
 from .model_selection import SelectionRequest, pin_generation
@@ -358,6 +359,104 @@ class MemoryLearning:
         if response["state"] in {"completed", "invalidated"}:
             self._finish_segment(item, response)
         return response
+
+    async def recover(
+        self,
+        actor_id,
+        job_id,
+        *,
+        request_id,
+        expected_attempts,
+        expected_failure_count,
+        model_request_id,
+    ):
+        """Owner-authorized single retry of a proven pre-upstream cancelled request.
+
+        The trusted operator must first check the admission evidence. A missing
+        Gateway receipt alone is never proof of cancellation or nonexecution.
+        Memory's original job and batch remain the sole commit authority.
+        """
+        for value in (actor_id, job_id, request_id, model_request_id):
+            self.core.contracts.check("common#id", value)
+        if any(
+            type(value) is not int or value < 0
+            for value in (
+                expected_attempts,
+                expected_failure_count,
+            )
+        ):
+            raise Fault("invalid_input")
+        command = dict(
+            actor_id=actor_id,
+            job_id=job_id,
+            request_id=request_id,
+            expected_attempts=expected_attempts,
+            expected_failure_count=expected_failure_count,
+            model_request_id=model_request_id,
+        )
+        identity = "memory-recovery:" + digest([actor_id, request_id])
+        fingerprint = digest(command)
+        async with self.dispatch_lock:
+            recorded = self.core.store.get("metadata", identity)
+            if recorded is not None:
+                if recorded["fingerprint"] != fingerprint:
+                    raise Fault("idempotency_conflict")
+                return copy.deepcopy(recorded["receipt"])
+            key = self._learning_key(job_id)
+            item = self.core.store.get("metadata", key)
+            if item is None or item.get("scope", {}).get("actor_id") != actor_id:
+                raise Fault("not_found")
+            if item.get("extraction_schema") != 6:
+                raise Fault("unsupported_version")
+            if (
+                (key in self.jobs and not self.jobs[key].done())
+                or item.get("job_id") != job_id
+                or item.get("state") != "blocked"
+                or item.get("stage") != "model"
+                or item.get("output") is not None
+                or item.get("attempts") != expected_attempts
+                or item.get("failure_count", 0) != expected_failure_count
+                or item.get("last_failure", {}).get("model_request_id") != model_request_id
+                or item.get("model_request", {}).get("request_id", model_request_id)
+                != model_request_id
+            ):
+                raise Fault("version_conflict")
+            response = await self._candidate(item, None, reconcile=True)
+            with self.core.store.transaction():
+                if response["state"] in {"completed", "invalidated"}:
+                    self._finish_segment(item, response)
+                    state = response["state"]
+                else:
+                    self._pin_segment_window(item, response)
+                    item.update(
+                        state="pending",
+                        stage="model",
+                        deadline=0,
+                        owner_recovery=dict(
+                            request_id=request_id,
+                            state="authorized",
+                            model_request_id=model_request_id,
+                        ),
+                    )
+                    self.core.store.put("metadata", item)
+                    state = "resumed"
+                receipt = dict(
+                    request_id=request_id,
+                    job_id=job_id,
+                    state=state,
+                    attempts=item["attempts"],
+                    failure_count=item.get("failure_count", 0),
+                    model_request_id=model_request_id,
+                )
+                self.core.store.put(
+                    "metadata",
+                    dict(
+                        id=identity,
+                        fingerprint=fingerprint,
+                        receipt=receipt,
+                    ),
+                )
+            return copy.deepcopy(receipt)
 
     def _automatic_due(self):
         store, now = self.core.store, self.core.clock()
@@ -906,6 +1005,8 @@ class MemoryLearning:
             check_segment_receipt(
                 self.core.contracts, response, item["segment_window"], item["output"]
             )
+        if item.get("owner_recovery"):
+            item["owner_recovery"]["state"] = "finished"
         item.update(
             state=response["state"],
             receipt=copy.deepcopy(response) if response["state"] == "completed" else None,
@@ -993,10 +1094,21 @@ class MemoryLearning:
                 return None
             supplied = segment_messages(self.core.contracts, item["segment_window"])
             item["stage"] = "model"
+            request_id = uid("model")
+            if item.get("owner_recovery"):
+                item["owner_recovery"]["state"] = "submitted"
+            item["model_request"] = dict(
+                request_id=request_id,
+                turn_id=generation["id"],
+                config_version=generation["config_version"],
+                caller_service=item["model_route"]["caller_service"],
+                state="submitted",
+            )
             self.core.store.put("metadata", item)
             segments, _ = await asyncio.wait_for(
-                gateway.generate(generation, supplied), MODEL_TIMEOUT_SECONDS
+                gateway.generate(generation, supplied, request_id=request_id), MODEL_TIMEOUT_SECONDS
             )
+            item["model_request"]["state"] = "completed"
             return "\n".join(segments)
 
     async def _segment_work(self, item):
@@ -1060,10 +1172,18 @@ class MemoryLearning:
         # conservatively in the original temporary-failure budget, never reset it.
         failures = item.setdefault("recovery_failures", {"temporary": item["attempts"]})
         resuming_commit = item.get("stage") == "commit_wait" and item["output"] is not None
-        if not resuming_commit and (
-            item["attempts"] >= MAX_TOTAL_ATTEMPTS
-            or any(count >= MAX_RECOVERY_ATTEMPTS for count in failures.values())
-            or item.get("proposal_failures", 0) >= MAX_ATTEMPTS
+        recovery_state = item.get("owner_recovery", {}).get("state")
+        authorized = recovery_state == "authorized" or (
+            recovery_state == "submitted" and item["output"] is not None
+        )
+        if (
+            not resuming_commit
+            and not authorized
+            and (
+                item["attempts"] >= MAX_TOTAL_ATTEMPTS
+                or any(count >= MAX_RECOVERY_ATTEMPTS for count in failures.values())
+                or item.get("proposal_failures", 0) >= MAX_ATTEMPTS
+            )
         ):
             item.update(state="blocked", deadline=0)
             core.store.put("metadata", item)
@@ -1113,6 +1233,10 @@ class MemoryLearning:
         # and restart without an unbounded event history or a new ledger.
         item.setdefault("first_failure", diagnostic)
         item["last_failure"] = diagnostic
+        if item.get("owner_recovery"):
+            item["owner_recovery"]["state"] = "spent"
+        if item.get("model_request", {}).get("state") == "submitted":
+            item["model_request"]["state"] = "unknown"
         item["failure_count"] = item.get("failure_count", 0) + 1
         authorization = code in {"forbidden", "unauthorized", "scope_changed", "not_found"}
         proposal_failure = stage == "proposal" and not authorization
