@@ -233,8 +233,11 @@ class JsonService:
         try:
             yield attributes
         except BaseException as error:
-            attributes["error_code"] = obs.error_code(
-                getattr(error, "code", obs.failure_class(error))
+            cancelled = isinstance(error, (asyncio.CancelledError, GeneratorExit))
+            attributes["error_code"] = (
+                "cancelled"
+                if cancelled
+                else obs.error_code(getattr(error, "code", obs.failure_class(error)))
             )
             if isinstance(error, Fault):
                 error.cause = self._cause(
@@ -248,7 +251,7 @@ class JsonService:
                 "unknown"
                 if getattr(error, "unknown", False)
                 else "cancelled"
-                if isinstance(error, asyncio.CancelledError)
+                if cancelled
                 else "failed"
             )
             port.emit(

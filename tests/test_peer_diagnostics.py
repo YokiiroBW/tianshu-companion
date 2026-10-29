@@ -127,3 +127,30 @@ class PeerDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 obs.validate_peer_attributes({**attributes, key: value})
         with self.assertRaises(ValueError):
             obs.validate_peer_attributes({**attributes, "body": "secret-canary"})
+
+    async def test_consumer_closing_a_stream_is_cancellation_not_peer_failure(self):
+        events = []
+
+        class Port:
+            def emit(self, event, outcome, **fields):
+                events.append((event, outcome, fields))
+
+        client = JsonService(
+            "https://synthetic.invalid",
+            "synthetic",
+            label="gateway",
+            log_adapter=Port(),
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, text='data: {"tool":1}\n\ndata: [DONE]\n\n')
+            ),
+        )
+        try:
+            stream = client.stream("/v1/chat/completions", {})
+            self.assertEqual(await anext(stream), {"tool": 1})
+            await stream.aclose()
+            finished = [row for row in events if row[0] == "peer.call.finished"]
+            self.assertEqual(len(finished), 1)
+            self.assertEqual(finished[0][1], "cancelled")
+            self.assertEqual(finished[0][2]["error_code"], "cancelled")
+        finally:
+            await client.close()
