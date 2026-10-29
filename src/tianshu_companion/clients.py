@@ -570,7 +570,10 @@ class JsonService:
                     error.origin_response_unavailable = True
                 if uncertain_write and sent and not not_started:
                     failure = Fault(
-                        error.code, unknown=True, current_version=error.current_version, cause=cause
+                        error.code,
+                        unknown=True,
+                        current_version=error.current_version,
+                        cause=error.cause,
                     )
                     failure.retry_after_seconds = getattr(error, "retry_after_seconds", None)
                     raise failure from None

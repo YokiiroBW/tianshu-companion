@@ -17,3 +17,7 @@ R29已部署。原16 job恢复中10有resumed回执，Gateway核实10个原自�
 本增量复用JsonService现有error_response钩子，在Memory候选语义客户端只接固定代码位置/原source owner、operation和HTTP状态，写回原材料/整理job的first_failure与last_failure。原schema/引用关系校验给ProposalStructureError具体字段路径，原接受谓词、预算和拒绝标准均保持；没有保留模型正文或把未应用输出写成记忆。旧丢失正文不能倒推出具体失败字段。
 
 新增2定向、4个原协议节点及15 subtests、1个原恢复历史节点均通过（7个不同节点，复用未变成功结果），无真实模型/QQ测试。R30仅M/C wheels，其他产品、前端、root运行文件与配置保持。
+
+### 结果未知写入的诊断保留
+
+R30 的错误钩子会替换 `Fault.cause`，而 JsonService 的未知写入包装仍引用钩子执行前的局部字典，导致材料提交和分段创建丢失已返回的机器位置。改为沿用处理后的 `error.cause`，保持 unknown、原请求及不重放行为。隔离子用例先复现写入丢失，再修复通过；诊断文件 2 节点/2 子用例及原传输原因、不重放 2 节点/20 子用例通过。无真实模型或 QQ 测试；此修复只恢复诊断，不能据此宣布上游 503 根因已解决。

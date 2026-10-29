@@ -37,12 +37,22 @@ class CandidateDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addAsyncCleanup(peer.close)
         memory = Memory(contracts(), peer)
-        with self.assertRaises(Fault) as caught:
-            await memory.process_candidate("job:original", None)
-        details = caught.exception.cause["candidate_diagnostic"]
-        self.assertEqual(403, details["source_http_status"])
-        self.assertNotIn("text", details)
-        self.assertFalse(caught.exception.unknown)
+        for write in (False, True):
+            with self.subTest(write=write):
+                with self.assertRaises(Fault) as caught:
+                    if write:
+                        await peer.call(
+                            "/internal/v1/memory/candidates/materials",
+                            {"request_id": "material:original"},
+                            uncertain_write=True,
+                            error_response=memory._candidate_error,
+                        )
+                    else:
+                        await memory.process_candidate("job:original", None)
+                details = caught.exception.cause["candidate_diagnostic"]
+                self.assertEqual(403, details["source_http_status"])
+                self.assertNotIn("text", details)
+                self.assertEqual(write, caught.exception.unknown)
 
     async def test_schema_and_owner_reference_failures_retain_only_field_paths(self):
         current = contracts()
