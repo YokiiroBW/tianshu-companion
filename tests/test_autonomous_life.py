@@ -111,6 +111,179 @@ def test_unknown_goal_model_keeps_preparation_backoff():
     asyncio.run(run())
 
 
+def test_legacy_role_permission_denial_requires_configuration_without_model_call():
+    async def run():
+        h, _, services, model = await autonomy_setup()
+        try:
+            assert getattr(h.core, "role_runtime", None) is None
+
+            async def denied(*args, **kwargs):
+                raise Fault("forbidden", cause=dict(http_status=403, operation="query", peer="memory"))
+
+            h.core.actor_memory.planning_query = denied
+            assert await h.core.life.autonomy.work(actor_id="actor:a")
+            actor = h.core.store.get("life_actors", "actor:a")
+            marker = h.core.store.get("metadata", actor["autonomy_operation"])
+            assert marker["state"] == "failed" and marker["error"] == "forbidden"
+            assert marker["recovery_state"] == "configuration_required"
+            assert marker["configuration_reason"] == "legacy_role_authorization_denied"
+            assert marker["last_failure"]["http_status"] == 403
+            assert marker["last_failure"]["stage"] == "preparation"
+            assert model.goals == model.rounds == []
+            assert not h.core.life.activities.current("actor:a")
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("decision", "unused"),
+    [
+        ("rest", {}),
+        ("continue", {"title": "", "goal": ""}),
+        ("defer", {"title": None, "goal": None}),
+    ],
+)
+def test_existing_goal_or_rest_needs_no_new_intention(decision, unused):
+    async def run():
+        h, _, services, model = await autonomy_setup()
+        try:
+            if decision != "rest":
+                await h.core.life.autonomy.work(actor_id="actor:a")
+            current = copy.deepcopy(h.core.life.activities.current("actor:a"))
+            actor = h.core.store.get("life_actors", "actor:a")
+            actor["autonomy_due_at"] = h.clock()
+            h.core.life._save("actors", actor)
+
+            async def choose(generation, messages):
+                return [
+                    canonical(
+                        dict(
+                            decision=decision,
+                            concern_id=None if decision == "rest" else current["autonomous_goal_id"],
+                            reason="保留既有进度，按当前时间安排",
+                            delay_seconds=60,
+                            **unused,
+                        )
+                    )
+                ], dict(recorded=True)
+
+            model.generate = choose
+            assert await h.core.life.autonomy.work(actor_id="actor:a")
+            actor = h.core.store.get("life_actors", "actor:a")
+            marker = h.core.store.get("metadata", actor["autonomy_operation"])
+            assert marker["state"] == "completed"
+            assert marker["choice"]["decision"] == decision
+            assert actor["autonomy_due_at"] == h.clock() + 60
+            activity = h.core.life.activities.current("actor:a")
+            if current is None:
+                assert activity is None
+                projection = await h.core.life_runtime.autonomy_projection(actor, None)
+                assert projection["title"] is None and projection["state"] == "completed"
+            else:
+                assert activity["id"] == current["id"]
+                assert activity["checkpoint"] == current["checkpoint"]
+                assert activity["state"] == ("running" if decision == "continue" else "paused")
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("choice", "field"),
+    [
+        (
+            dict(decision="new", concern_id=None, reason="missing intention", delay_seconds=60),
+            "title",
+        ),
+        (
+            dict(decision="rest", concern_id=None, reason="invalid delay", delay_seconds=60.0),
+            "delay_seconds",
+        ),
+        (
+            dict(decision="continue", concern_id="unknown-goal", reason="unknown goal", delay_seconds=60),
+            "concern_id",
+        ),
+    ],
+)
+def test_rejected_goal_keeps_owned_model_receipt_and_validation_reason(choice, field):
+    async def run():
+        h, _, services, model = await autonomy_setup()
+        try:
+            calls = []
+
+            async def receipt(*args):
+                raise AssertionError("No receipt lookup or replay for a returned model")
+
+            async def choose(generation, messages, *, request_id):
+                actor = h.core.store.get("life_actors", "actor:a")
+                marker = h.core.store.get("metadata", actor["autonomy_operation"])
+                assert marker["model_request_id"] == request_id
+                assert marker["generation_stage"] == "submitted"
+                calls.append(request_id)
+                return [canonical(choice)], dict(request_id=request_id, outcome="succeeded")
+
+            model.receipt = receipt
+            model.generate = choose
+            assert await h.core.life.autonomy.work(actor_id="actor:a")
+            actor = h.core.store.get("life_actors", "actor:a")
+            marker = h.core.store.get("metadata", actor["autonomy_operation"])
+            assert marker["state"] == "failed" and marker["error"] == "invalid_input"
+            assert marker["receipt"] == dict(request_id=calls[0], outcome="succeeded")
+            assert marker["last_failure"]["stage"] == "choice_validation"
+            assert marker["last_failure"]["field"] == field
+            assert marker["last_failure"]["model_request_id"] == calls[0]
+            assert not h.core.life.activities.current("actor:a")
+            assert not await h.core.life.autonomy.work(actor_id="actor:a")
+            assert len(calls) == 1
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+def test_returned_goal_model_survives_later_verification_timeout_and_restart():
+    async def run():
+        h, _, services, model = await autonomy_setup()
+        try:
+            original = model.generate
+            received = False
+            verify = h.core.life.verify_generation_lease
+
+            async def choose(generation, messages):
+                nonlocal received
+                result = await original(generation, messages)
+                received = True
+                return result
+
+            def unavailable(lease):
+                if received:
+                    raise TimeoutError("synthetic context verification timeout")
+                return verify(lease)
+
+            model.generate = choose
+            h.core.life.verify_generation_lease = unavailable
+            assert await h.core.life.autonomy.work(actor_id="actor:a")
+            actor = h.core.store.get("life_actors", "actor:a")
+            marker = h.core.store.get("metadata", actor["autonomy_operation"])
+            assert marker["state"] == "failed"
+            assert marker["generation_stage"] == "returned" and marker["receipt"]
+            assert marker["last_failure"]["stage"] == "verification"
+            assert not h.core.life.activities.current("actor:a")
+            marker["state"] = "submitted"
+            h.core.store.put("metadata", marker)
+            h.core.life.autonomy.recover()
+            recovered = h.core.store.get("metadata", marker["id"])
+            assert recovered["state"] == "interrupted"
+            assert recovered["receipt"] == marker["receipt"]
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
 def test_planner_selects_open_due_and_exact_current_after_historical_pages():
     async def run():
         h, _, services, _ = await autonomy_setup()

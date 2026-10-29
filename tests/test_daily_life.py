@@ -1435,6 +1435,47 @@ def test_daily_unknown_receipt_is_bounded_and_unavailability_never_requeues_it()
     asyncio.run(scenario())
 
 
+def test_legacy_interrupted_daily_reports_manual_recovery_without_replaying():
+    async def scenario():
+        life, clock, model = make_life()
+        try:
+            task = generation_tasks(life, "plan")[0]
+            task.update(state="interrupted", attempt=1, request_attempt=1, failure="Fault")
+            life.daily._status(task)
+            original = copy.deepcopy(task)
+            life.daily.recover()
+            fresh = life.store.get("metadata", task["id"])
+            assert fresh["state"] == "interrupted" and fresh["attempt"] == 1
+            assert fresh["request_attempt"] == 1 and not fresh.get("model_request_id")
+            assert fresh["failure"] == original["failure"]
+            assert fresh["recovery_state"] == "manual_retry_required"
+            assert fresh["recovery_diagnostic"]["unknown"]
+            assert fresh["recovery_diagnostic"]["stage"] == "legacy_request_identity_missing"
+            assert not fresh.get("attempt_history")
+            life.daily.recover()
+            assert life.store.get("metadata", task["id"]) == fresh
+            calls = [call for call in model.calls if call[0] == "plan"]
+            for _ in range(3):
+                clock.advance(301)
+                await life.daily.work(one=True)
+            assert [call for call in model.calls if call[0] == "plan"] == calls
+            assert life.store.get("metadata", task["id"]) == fresh
+            life.daily.retry(task["id"], expected=fresh["version"])
+            assert not life.store.get("metadata", task["id"]).get("recovery_state")
+            await life.daily.work(one=True)
+            completed = life.store.get("metadata", task["id"])
+            assert completed["state"] == "completed"
+            assert completed["request_attempt"] == 2
+            assert completed["attempt_history"][0]["state"] == "interrupted"
+            assert completed["attempt_history"][0]["failure"] == "Fault"
+            assert completed["attempt_history"][0]["recovery_state"] == "manual_retry_required"
+            assert not completed.get("recovery_state")
+        finally:
+            life.store.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("stale", [None, "day", "phase"])
 def test_daily_restart_pre_submission_only_recovers_current_work(stale):
     async def scenario():

@@ -3,6 +3,7 @@
 import asyncio
 import copy
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 from . import observability as obs
 from .clients import utc
@@ -20,7 +21,15 @@ class AutonomousGoals:
         for actor in self.store.list("life_actors"):
             marker = self.store.get("metadata", actor.get("autonomy_operation", ""))
             if marker and marker["state"] in {"preparing", "submitted"}:
-                marker["state"] = "unknown" if marker["state"] == "submitted" else "interrupted"
+                marker["state"] = (
+                    "unknown"
+                    if marker["state"] == "submitted"
+                    and not (
+                        marker.get("generation_stage") == "returned"
+                        and marker.get("receipt") is not None
+                    )
+                    else "interrupted"
+                )
                 self.store.put("metadata", marker)
 
     def window(self, actor):
@@ -195,6 +204,8 @@ class AutonomousGoals:
             id=operation, actor_id=actor_id, state="preparing", captured=captured, created_at=now
         )
         self.store.put("metadata", marker)
+        stage = "preparation"
+        model_returned = False
         try:
             visible_capture = copy.deepcopy(captured)
             visible_capture["concerns"] = await self.verified_records(captured["concerns"])
@@ -242,7 +253,25 @@ class AutonomousGoals:
                 dict(
                     role="system",
                     content=(
-                        "Choose one concrete next personal goal from persona, actual long-term interests, today's temporary attention, unfinished concerns, actual reading and available time. The routine is a boundary; preserve meals/sleep and explicit promises. You can continue, defer, abandon/reconsider or start a new goal. Never invent offline progress or user actions. Actual reading occurs later through tools. Return only JSON {decision:new|continue|defer|abandon|rest, concern_id:null|string, title:string, goal:string, reason:string, delay_seconds:integer}. Optionally include observation_inspired:boolean, true only when decision=new actually chooses the current observation_hint topic; otherwise false or omit. This hint is a one-time opportunity, not a standing instruction for unrelated goals. New requires a specific attainable title/goal. Continue/defer/abandon names an existing concern_id. Delay is 60..86400 seconds; rest is a valid choice. A new question from actual reading can become a goal; preferences require grounded actor-memory receipts, not this choice."
+                        "Choose one concrete next personal goal from persona, actual long-term "
+                        "interests, today's temporary attention, unfinished concerns, actual reading "
+                        "and available time. The routine is a boundary; preserve meals/sleep and "
+                        "explicit promises. You can continue, defer, abandon/reconsider or start "
+                        "a new goal. Never invent offline progress or user actions. Actual reading "
+                        "occurs later through tools. Return only JSON "
+                        "{decision:new|continue|defer|abandon|rest, concern_id:null|string, "
+                        "reason:string, delay_seconds:integer}. For new, also supply a nonempty "
+                        "title (at most 120 characters) and goal (at most 4000 characters). Other "
+                        "decisions reuse an existing goal or rest, so title/goal may be omitted, "
+                        "null or empty. Reason must be nonempty and at most 1000 characters. "
+                        "Continue/defer/abandon must use an exact id from concerns, never an "
+                        "activity id; new/rest require concern_id:null. Delay must be an integer "
+                        "in 60..86400 seconds. Optionally include observation_inspired:boolean, "
+                        "true only when decision=new actually chooses the current observation_hint "
+                        "topic; otherwise false or omit. This hint is a one-time opportunity, "
+                        "not a standing instruction for unrelated goals. Rest is a valid choice. "
+                        "A new question from actual reading can become a goal; preferences require "
+                        "grounded actor-memory receipts, not this choice."
                     ),
                 ),
                 dict(role="user", content=canonical(material)),
@@ -257,11 +286,22 @@ class AutonomousGoals:
                         actor["autonomy_observation_hint"]["material"]
                     )
                 self.life.verify_generation_lease(lease)
-                marker.update(state="submitted", messages=messages, memory=memory)
-                self.store.put("metadata", marker)
-                output, receipt = await asyncio.wait_for(
-                    self.life.gateway.generate(generation, messages), 60
+                request_options = {}
+                if callable(getattr(self.life.gateway, "receipt", None)):
+                    marker["model_request_id"] = "model:" + uuid4().hex
+                    request_options["request_id"] = marker["model_request_id"]
+                marker.update(
+                    state="submitted", generation_stage="submitted", messages=messages, memory=memory
                 )
+                self.store.put("metadata", marker)
+                stage = "model"
+                output, receipt = await asyncio.wait_for(
+                    self.life.gateway.generate(generation, messages, **request_options), 60
+                )
+                model_returned = True
+                marker.update(receipt=receipt, generation_stage="returned")
+                self.store.put("metadata", marker)
+            stage = "verification"
             self.life.verify_generation_lease(lease)
             await self.verify_records(source_records)
             if memory:
@@ -269,8 +309,13 @@ class AutonomousGoals:
             if actor.get("autonomy_observation_hint"):
                 await self.core.actor_memory.check(actor["autonomy_observation_hint"]["material"])
             self.check(actor_id, captured)
+            stage = "choice_decoding"
             choice = strict_json("\n".join(output))
+            stage = "choice_validation"
             self.validate_choice(choice, visible_capture)
+            marker["validated_choice"] = choice
+            self.store.put("metadata", marker)
+            stage = "application"
             with self.store.transaction():
                 actor = self.check(actor_id, captured)
                 self.apply(actor, choice, visible_capture, memory)
@@ -282,7 +327,11 @@ class AutonomousGoals:
                 )
                 self.store.put("metadata", marker)
         except asyncio.CancelledError:
-            marker.update(state="unknown" if marker["state"] == "submitted" else "cancelled")
+            marker.update(
+                state="unknown"
+                if marker["state"] == "submitted" and not model_returned
+                else "cancelled"
+            )
             self.store.put("metadata", marker)
             raise
         except (Fault, ValueError, KeyError, OSError, TypeError, TimeoutError) as error:
@@ -294,12 +343,29 @@ class AutonomousGoals:
                 if isinstance(error, (OSError, TimeoutError))
                 else "invalid_input",
                 attempt=1,
-                stage="model" if marker["state"] == "submitted" else "preparation",
+                stage=stage,
                 observed_at=self.core.clock(),
             )
+            if marker.get("model_request_id"):
+                diagnostic["model_request_id"] = marker["model_request_id"]
+            if getattr(error, "goal_choice_field", None):
+                diagnostic["field"] = error.goal_choice_field
+            registration = getattr(self.core, "role_runtime", None)
+            if (
+                isinstance(error, Fault)
+                and error.code == "forbidden"
+                and stage == "preparation"
+                and actor_id in self.core.roles
+                and (registration is None or registration.get(actor_id) is None)
+            ):
+                marker.update(
+                    recovery_state="configuration_required",
+                    configuration_reason="legacy_role_authorization_denied",
+                )
             marker.update(
                 state="unknown"
-                if isinstance(error, TimeoutError) or isinstance(error, Fault) and error.unknown
+                if not model_returned
+                and (isinstance(error, TimeoutError) or isinstance(error, Fault) and error.unknown)
                 else "failed",
                 error=diagnostic["code"],
                 first_failure=marker.get("first_failure", diagnostic),
@@ -310,40 +376,56 @@ class AutonomousGoals:
 
     @staticmethod
     def validate_choice(choice, captured):
+        def invalid(field):
+            error = Fault("invalid_input")
+            error.goal_choice_field = field
+            raise error
+
         required = {
             "decision",
             "concern_id",
-            "title",
-            "goal",
             "reason",
             "delay_seconds",
         }
         if (
             not isinstance(choice, dict)
             or not required <= set(choice)
-            or set(choice) - required - {"observation_inspired"}
+            or set(choice) - required - {"title", "goal", "observation_inspired"}
         ):
-            raise Fault("invalid_input")
+            invalid("fields")
         if "observation_inspired" in choice and (
             type(choice["observation_inspired"]) is not bool
             or choice["observation_inspired"]
             and (choice["decision"] != "new" or not captured.get("observation_hint"))
         ):
-            raise Fault("invalid_input")
+            invalid("observation_inspired")
         if (
-            choice["decision"] not in {"new", "continue", "defer", "abandon", "rest"}
-            or type(choice["delay_seconds"]) is not int
-            or not 60 <= choice["delay_seconds"] <= 86400
+            not isinstance(choice["decision"], str)
+            or choice["decision"] not in {"new", "continue", "defer", "abandon", "rest"}
         ):
-            raise Fault("invalid_input")
-        for field, maximum in (("title", 120), ("goal", 4000), ("reason", 1000)):
-            text(choice[field], maximum)
-        if choice["decision"] in {"continue", "defer", "abandon"} and choice["concern_id"] not in {
-            item["id"] for item in captured["concerns"]
-        }:
-            raise Fault("invalid_input")
+            invalid("decision")
+        if type(choice["delay_seconds"]) is not int or not 60 <= choice["delay_seconds"] <= 86400:
+            invalid("delay_seconds")
+        for field, maximum in (("title", 120), ("goal", 4000)):
+            value = choice.get(field)
+            if choice["decision"] == "new":
+                try:
+                    text(value, maximum)
+                except ValueError:
+                    invalid(field)
+            elif value is not None and (not isinstance(value, str) or len(value) > maximum):
+                invalid(field)
+        try:
+            text(choice["reason"], 1000)
+        except ValueError:
+            invalid("reason")
+        if choice["decision"] in {"continue", "defer", "abandon"} and (
+            not isinstance(choice["concern_id"], str)
+            or choice["concern_id"] not in {item["id"] for item in captured["concerns"]}
+        ):
+            invalid("concern_id")
         if choice["decision"] in {"new", "rest"} and choice["concern_id"] is not None:
-            raise Fault("invalid_input")
+            invalid("concern_id")
         if choice["decision"] in {"defer", "abandon"} and not choice["concern_id"].startswith(
             "autonomy:"
         ):
