@@ -899,7 +899,12 @@ def create_app(
                 except Fault:
                     pass
             elif isinstance(body, dict):
-                candidate = body.get("request_id")
+                envelope = body.get("query")
+                candidate = (
+                    envelope.get("request_id")
+                    if isinstance(envelope, dict)
+                    else body.get("request_id")
+                )
                 try:
                     core.contracts.check("common#id", candidate)
                     request_id = candidate

@@ -61,6 +61,100 @@ def platform_query(h, account="a", actor="actor:a", channel="private:a"):
     return query
 
 
+def test_life_read_http_fault_preserves_valid_query_request_id():
+    async def run():
+        h = Harness()
+        h.core.recover()
+        try:
+            h.core.life.set_diary_access("actor:a", readers=["reader:household"])
+            app = create_app(
+                h.core,
+                {"platform": "test-token"},
+                life_readers={"platform": dict(reader_id="reader:manager", actor_ids=["actor:a"])},
+            )
+            query = platform_query(h)
+            body = dict(
+                schema_version=2,
+                query=query,
+                actor_id="actor:a",
+                scope=None,
+                resource="autonomy",
+                object_id=None,
+                expected_version=None,
+                limit=20,
+                after=None,
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                denied = await client.post("/internal/v2/life/read", json=body)
+                assert denied.status_code == 401
+                assert denied.json()["request_id"] != query["request_id"]
+                response = await client.post(
+                    "/internal/v2/life/read",
+                    json=body,
+                    headers={"Authorization": "Bearer test-token"},
+                )
+                assert response.status_code == 404, response.text
+                assert response.json()["request_id"] == query["request_id"]
+                assert response.json()["code"] == "not_found"
+                body["query"]["request_id"] = " invalid id "
+                invalid = await client.post(
+                    "/internal/v2/life/read",
+                    json=body,
+                    headers={"Authorization": "Bearer test-token"},
+                )
+                assert invalid.status_code == 400
+                assert invalid.json()["request_id"].startswith("req:")
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("paused_pending", [False, True])
+def test_activity_known_failure_diagnostic_backoff_and_attempt_limit(paused_pending):
+    async def run():
+        h = Harness()
+        h.clock.now = START
+        h.core.recover()
+        try:
+            await member(h)
+            item = activity()
+            item["next_due_at"] = h.clock()
+            saved = h.core.life.activities.save("actor:a", item, expected=0)
+            if paused_pending:
+                saved.update(state="paused", step_operation="activity-step:existing")
+                h.core.store.put("life_activities", saved)
+                h.core.store.put("metadata", dict(id="activity-step:existing", state="pending"))
+            calls = []
+
+            async def fail(item, operation):
+                calls.append(operation)
+                raise Fault("scope_changed")
+
+            h.core.life.activities.executor = fail
+            h.core.life.generation_available = lambda: True
+            for attempt in range(1, 4):
+                await h.core.life.activities.work(actor_id="actor:a")
+                current = h.core.life.activities.current("actor:a")
+                assert current["resume_condition"] == "scope_changed"
+                assert current["last_failure"]["code"] == "scope_changed"
+                assert current["failure_attempts"] == attempt
+                assert current["checkpoint"] == item["checkpoint"]
+                await h.core.life.activities.work(actor_id="actor:a")
+                assert len(calls) == attempt
+                if attempt < 3:
+                    assert current["next_due_at"] == h.clock() + 60 * 2 ** (attempt - 1)
+                    h.clock.now = current["next_due_at"]
+                else:
+                    assert current["next_due_at"] is None
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
 def test_event_fanout_reaches_subscription_49_after_restart(tmp_path):
     async def run():
         h = Harness(tmp_path / "core.db")

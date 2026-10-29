@@ -3,6 +3,7 @@
 import asyncio
 import json
 
+from . import observability as obs
 from .contracts import Fault, digest
 from .life import text, timestamp
 from .life_work import require_version, source_refs, visible
@@ -75,6 +76,9 @@ class Activities:
                 "actor_only",
                 "autonomy_basis",
                 "public_exploration_topic",
+                "failure_attempts",
+                "first_failure",
+                "last_failure",
             ):
                 if old and field in old:
                     item[field] = old[field]
@@ -250,44 +254,78 @@ class Activities:
                     self.store.put("life_activities", current)
                 if self.life.actor_memory is not None:
                     self.life.actor_memory.actions.activity(current)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             marker = self.store.get("metadata", operation)
             if marker and marker["state"] != "pending":
-                self._interrupt(item, "interrupted_step")
+                self._interrupt(item, "interrupted_step", error=error)
             raise
-        except (Fault, ValueError, KeyError, OSError):
-            self._interrupt(item, "step_unavailable")
+        except (Fault, ValueError, KeyError, OSError, TypeError) as error:
+            code = error.code if isinstance(error, Fault) else "dependency_unavailable"
+            self._interrupt(item, code, error=error)
         finally:
             self._active.remove(operation)
         return True
 
-    def _interrupt(self, item, reason):
+    def _interrupt(self, item, reason, *, error=None):
         current = self.get(item["actor_id"], item["id"])
         operation = item.get("step_operation") or "activity-step:" + digest(
             [item["id"], item["version"]]
         )
         marker = self.store.get("metadata", operation)
-        uncertain = bool(marker and marker["state"] in {"submitted", "tools_pending", "unknown"})
+        uncertain = bool(
+            marker
+            and marker["state"] in {"submitted", "tools_pending", "unknown"}
+            and not marker.get("model_closed_without_tools")
+        )
+        attempts = current.get("failure_attempts", 0) + 1
+        diagnostic = obs.failure_diagnostic(
+            error or Fault(reason, unknown=uncertain),
+            code=reason,
+            attempt=attempts,
+            stage=(marker or {}).get("stage", "preparation"),
+            observed_at=self.life.clock(),
+        )
         with self.store.transaction():
             if marker:
                 marker.update(
-                    state="unknown" if uncertain else "failed",
+                    state="unknown"
+                    if uncertain or marker.get("model_closed_without_tools")
+                    else "failed",
+                    first_failure=marker.get("first_failure", diagnostic),
+                    last_failure=diagnostic,
                     error=reason,
                     settled_at=self.life.clock(),
                 )
                 self.store.put("metadata", marker)
-            if current["state"] == "running" and current["version"] == item["version"]:
+            if current["state"] in {"running", "paused"} and current["version"] == item["version"]:
+                current.update(
+                    failure_attempts=attempts,
+                    first_failure=current.get("first_failure", diagnostic),
+                    last_failure=diagnostic,
+                )
+                self.store.put("life_activities", current)
                 if uncertain:
                     current["step_operation"] = operation
                     self.store.put("life_activities", current)
-                paused = self.transition(
-                    item["actor_id"], item["id"], "paused", expected=item["version"], reason=reason
-                )
-                if not uncertain:
-                    # No submitted model/tool exists. Retry from the real checkpoint
-                    # after a bounded delay, leaving other actors free to proceed.
-                    paused.update(
-                        next_due_at=self.life.clock() + 60, deadline=self.life.clock() + 60
+                if current["state"] == "running":
+                    paused = self.transition(
+                        item["actor_id"],
+                        item["id"],
+                        "paused",
+                        expected=item["version"],
+                        reason=reason,
                     )
+                else:
+                    paused = dict(current, next_due_at=None, deadline=None, resume_condition=reason)
+                    self.store.put("life_activities", paused)
+                if not uncertain:
+                    # No unresolved tool or live model remains. Exhausted reasoning
+                    # budgets require a new explicit decision, not another full loop.
+                    due = (
+                        self.life.clock() + 60 * 2 ** (attempts - 1)
+                        if attempts < 3 and reason != "budget_exceeded"
+                        else None
+                    )
+                    paused.update(next_due_at=due, deadline=due)
                     paused.pop("step_operation", None)
                     self.store.put("life_activities", paused)

@@ -1,8 +1,10 @@
 """Actual background actor work and outbound envelopes using the existing owners."""
 
+import asyncio
 import copy
 import json
 
+from . import observability as obs
 from .clients import epoch, query, utc
 from .contracts import Fault, canonical, digest, strict_json
 from .life_work import visible
@@ -308,6 +310,9 @@ class RuntimeExecution:
 
     async def activity_step(self, activity, operation):
         """Resume a real persisted checkpoint. Tools, original reads and receipts share chat owners."""
+        marker = self.store.get("metadata", operation)
+        marker["stage"] = "preparation"
+        self.store.put("metadata", marker)
         actor = activity["actor_id"]
         self.core.reading.actor_operation(actor, activity["id"])
         if (
@@ -326,8 +331,20 @@ class RuntimeExecution:
         tools = self.core.skills.activity_tools(context)
         marker = self.store.get("metadata", operation)
         round_ = marker.get("round", 0)
-        if round_ >= 8:
-            raise Fault("budget_exceeded")
+        if round_ - marker.get("round_budget_start", 0) >= 8:
+            if marker.get("budget_yields", 0) >= 3:
+                raise Fault("budget_exceeded")
+            # Yield at a durable round boundary with the same operation and receipts.
+            marker.update(
+                round_budget_start=round_, budget_yields=marker.get("budget_yields", 0) + 1
+            )
+            current = self.core.life.activities.get(actor, activity["id"])
+            due = self.core.clock() + 60
+            current.update(next_due_at=due, deadline=due, step_operation=operation)
+            with self.store.transaction():
+                self.store.put("metadata", marker)
+                self.store.put("life_activities", current)
+            return False
         if marker.get("expected_version", activity["version"]) != activity["version"]:
             raise Fault("scope_changed")
         await self.autonomy.verify_records([activity])
@@ -450,11 +467,50 @@ class RuntimeExecution:
             self.core.life.verify_generation_lease(lease)
             if any(deadline <= self.core.clock() for deadline in deadlines):
                 raise Fault("scope_changed")
-            marker.update(state="submitted", round=round_, source_inputs=source_inputs)
-            self.store.put("metadata", marker)
-            message, receipt = await self.core.life.gateway.complete(
-                generation, messages, tools=tools
+            marker.update(
+                state="submitted",
+                stage="model",
+                round=round_,
+                source_inputs=source_inputs,
+                generation=generation,
             )
+            with self.store.transaction():
+                self.store.put("metadata", marker)
+                current = self.core.life.activities.get(actor, activity["id"])
+                current["step_operation"] = operation
+                self.store.put("life_activities", current)
+            try:
+                message, receipt = await self.core.life.gateway.complete(
+                    generation, messages, tools=tools
+                )
+            except Fault as error:
+                request_id = getattr(error, "model_request_id", None)
+                if request_id:
+                    marker["model_request_id"] = request_id
+                # No tool in this round has run. Only the original owner's terminal
+                # execution evidence permits abandoning an unknown model output.
+                if error.unknown and request_id and hasattr(self.core.life.gateway, "receipt"):
+                    try:
+                        async with asyncio.timeout(2):
+                            evidence = await self.core.life.gateway.receipt(generation, request_id)
+                        execution = evidence.get("execution") or {}
+                        terminal = (
+                            execution.get("state") == "cancelled"
+                            and execution.get("cancel_requested") is True
+                            and evidence.get("outcome") == "unknown"
+                        ) or (execution.get("state"), evidence.get("outcome")) in {
+                            ("failed", "failed"),
+                            ("completed", "succeeded"),
+                        }
+                        marker.update(model_receipt=evidence, model_closed_without_tools=terminal)
+                    except (Fault, OSError, TimeoutError):
+                        pass
+                elif not error.unknown:
+                    marker["state"] = "pending"
+                self.store.put("metadata", marker)
+                raise
+            marker.update(state="pending", stage="validation", model_receipt=receipt)
+            self.store.put("metadata", marker)
             self.core.life.verify_generation_lease(lease)
             self.core.reading.actor_operation(actor, activity["id"])
             if (
@@ -465,7 +521,9 @@ class RuntimeExecution:
             receipts.append(receipt)
             messages.append(message)
             calls = message.get("tool_calls") or []
-            marker.update(messages=messages, receipts=receipts, state="tools_pending")
+            marker.update(
+                messages=messages, receipts=receipts, state="tools_pending", stage="tools"
+            )
             self.store.put("metadata", marker)
             for call in calls:
                 unknown_tool = False
@@ -478,6 +536,16 @@ class RuntimeExecution:
                     result = dict(state="completed", result=result)
                 except (Fault, ValueError, KeyError, StopIteration) as error:
                     unknown_tool = isinstance(error, Fault) and error.unknown
+                    marker = self.store.get("metadata", operation)
+                    marker["last_tool_failure"] = obs.failure_diagnostic(
+                        error,
+                        code=error.code if isinstance(error, Fault) else "invalid_input",
+                        attempt=round_ + 1,
+                        stage="tools",
+                        observed_at=self.core.clock(),
+                    )
+                    marker["last_tool_failure"]["call_id"] = call["id"]
+                    self.store.put("metadata", marker)
                     result = dict(
                         state="unknown" if unknown_tool else "rejected",
                         error_code=error.code if isinstance(error, Fault) else "invalid_input",
@@ -504,6 +572,8 @@ class RuntimeExecution:
                             reason="unknown_step",
                         )
                     raise Fault("result_unknown", unknown=True)
+            marker.update(state="pending", stage="checkpoint")
+            self.store.put("metadata", marker)
             if len(canonical(messages).encode()) > 4_000_000:
                 raise Fault("budget_exceeded")
             if calls:

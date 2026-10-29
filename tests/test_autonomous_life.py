@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 import httpx
 import pytest
+from tianshu_companion.contracts import Fault
 from test_actor_memory import Owners, close, setup
 
 from tianshu_companion.actor_memory import ActorMemory
@@ -686,6 +687,132 @@ async def autonomy_setup(path=":memory:"):
     h.core.store.db.execute("DELETE FROM life_content_refs")
     h.core.store.db.execute("DELETE FROM life_reading")
     return h, owners, services, model
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_activity_model_unknown_requires_original_terminal_receipt(monkeypatch, terminal):
+    async def run():
+        h, owners, services, model = await autonomy_setup()
+        try:
+            await h.core.life.autonomy.work(actor_id="actor:a")
+            calls, receipts = [], []
+            request_id = "model:" + "a" * 32
+
+            async def fail(*args, **kwargs):
+                calls.append(args)
+                error = Fault("result_unknown", unknown=True)
+                error.model_request_id = request_id
+                raise error
+
+            async def receipt(generation, actual_id):
+                receipts.append(actual_id)
+                return dict(
+                    request_id=actual_id,
+                    outcome="unknown",
+                    execution=dict(
+                        state="cancelled" if terminal else "unknown", cancel_requested=terminal
+                    ),
+                )
+
+            monkeypatch.setattr(model, "complete", fail)
+            monkeypatch.setattr(model, "receipt", receipt, raising=False)
+            await h.core.life.activities.work(actor_id="actor:a")
+            current = h.core.life.activities.current("actor:a")
+            marker = next(
+                row
+                for row in h.core.store.list("metadata")
+                if row["id"].startswith("activity-step:")
+            )
+            assert marker["state"] == "unknown"
+            assert marker["last_failure"]["model_request_id"] == request_id
+            assert marker["last_failure"]["stage"] == "model"
+            assert marker["model_closed_without_tools"] is terminal
+            assert receipts == [request_id]
+            assert (current["next_due_at"] is not None) is terminal
+            h.clock.advance(120)
+            await h.core.life.activities.work(actor_id="actor:a")
+            assert len(calls) == (2 if terminal else 1)
+            assert not [call for call in owners.platform_calls if call["operation"] == "invoke"]
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+def test_activity_round_budget_yields_same_checkpoint_and_operation():
+    async def run():
+        h, owners, services, model = await autonomy_setup()
+        try:
+            await h.core.life.autonomy.work(actor_id="actor:a")
+            await h.core.life.activities.work(actor_id="actor:a")
+            current = h.core.life.activities.current("actor:a")
+            operation = current["step_operation"]
+            marker = h.core.store.get("metadata", operation)
+            marker["round"] = 8
+            h.core.store.put("metadata", marker)
+            count = len(model.rounds)
+            await h.core.life.activities.work(actor_id="actor:a")
+            yielded = h.core.life.activities.current("actor:a")
+            saved = h.core.store.get("metadata", operation)
+            assert yielded["checkpoint"] == current["checkpoint"]
+            assert yielded["step_operation"] == operation
+            assert saved["state"] == "pending" and saved["round_budget_start"] == 8
+            assert (
+                saved["messages"] == marker["messages"] and saved["receipts"] == marker["receipts"]
+            )
+            assert yielded["next_due_at"] == h.clock() + 60
+            await h.core.life.activities.work(actor_id="actor:a")
+            assert len(model.rounds) == count
+            h.clock.advance(60)
+            await h.core.life.activities.work(actor_id="actor:a")
+            assert len(model.rounds) == count + 1
+            assert h.core.life.activities.current("actor:a")["step_operation"] == operation
+            marker = h.core.store.get("metadata", operation)
+            marker.update(round=32, round_budget_start=24, budget_yields=3)
+            h.core.store.put("metadata", marker)
+            checkpoint = h.core.life.activities.current("actor:a")["checkpoint"]
+            await h.core.life.activities.work(actor_id="actor:a")
+            stopped = h.core.life.activities.current("actor:a")
+            assert stopped["state"] == "paused" and stopped["next_due_at"] is None
+            assert stopped["resume_condition"] == "budget_exceeded"
+            assert stopped["checkpoint"] == checkpoint
+            assert len(model.rounds) == count + 1
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
+def test_first_activity_tool_unknown_survives_explicit_resume(monkeypatch):
+    async def run():
+        h, owners, services, model = await autonomy_setup()
+        try:
+            await h.core.life.autonomy.work(actor_id="actor:a")
+            calls = []
+
+            async def unknown(context, call, **kwargs):
+                calls.append(call["id"])
+                raise Fault("result_unknown", unknown=True)
+
+            monkeypatch.setattr(h.core.skills, "execute_activity", unknown)
+            await h.core.life.activities.work(actor_id="actor:a")
+            current = h.core.life.activities.current("actor:a")
+            operation = current["step_operation"]
+            assert current["state"] == "paused"
+            marker = h.core.store.get("metadata", operation)
+            assert marker["state"] == "unknown"
+            assert marker["last_failure"]["stage"] == "tools"
+            h.core.life.activities.transition(
+                "actor:a", current["id"], "running", expected=current["version"]
+            )
+            h.clock.advance(120)
+            await h.core.life.activities.work(actor_id="actor:a")
+            assert len(calls) == 1
+            assert h.core.life.activities.current("actor:a")["step_operation"] == operation
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
 
 
 def test_zero_user_input_goal_discover_actual_read_episode_understanding_and_next_goal():
