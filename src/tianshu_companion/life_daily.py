@@ -267,10 +267,30 @@ class DailyLife:
 
     def recover(self):
         for row in self.store.db.execute(
-            "SELECT body FROM metadata WHERE conversation_id IN (?,?) AND status='generating'",
+            "SELECT body FROM metadata WHERE conversation_id IN (?,?) "
+            "AND status IN ('generating','interrupted')",
             (TASK_SCOPE + ":plan", TASK_SCOPE + ":stage"),
         ).fetchall():
             task = json.loads(row[0])
+            if task["state"] == "interrupted":
+                if (
+                    task.get("generation_stage") != "preparing"
+                    and not task.get("model_request_id")
+                    and task.get("recovery_state") != "manual_retry_required"
+                    and self._current(task) is not None
+                ):
+                    # An old unknown request is not proof of a failed execution.
+                    # Make the required management recovery explicit without replaying it.
+                    task["recovery_state"] = "manual_retry_required"
+                    task["recovery_diagnostic"] = obs.failure_diagnostic(
+                        Fault("result_unknown", unknown=True),
+                        code="result_unknown",
+                        attempt=task["attempt"],
+                        stage="legacy_request_identity_missing",
+                        observed_at=self.life.clock(),
+                    )
+                    self._save(task)
+                continue
             task.update(state="interrupted", failure="interrupted_generation")
             task["failure_diagnostic"] = obs.failure_diagnostic(
                 Fault(
@@ -355,6 +375,8 @@ class DailyLife:
                         "failure_diagnostic",
                         "receipt",
                         "generation_stage",
+                        "recovery_state",
+                        "recovery_diagnostic",
                     )
                     if key in task
                 },
@@ -416,6 +438,8 @@ class DailyLife:
         if task["state"] not in {"unavailable", "failed", "interrupted"} or not self._current(task):
             raise ValueError("Generation task is not retryable")
         self._archive_attempt(task, "explicit_management_retry")
+        task.pop("recovery_state", None)
+        task.pop("recovery_diagnostic", None)
         task["attempt_archived"] = True
         task["recovery_checks"] = 0
         task.update(
@@ -548,7 +572,14 @@ class DailyLife:
             actor, plan = current
             if not task.pop("attempt_archived", False):
                 self._archive_attempt(task, "automatic_retry")
-            for key in ("model_request_id", "receipt", "failure", "failure_diagnostic"):
+            for key in (
+                "model_request_id",
+                "receipt",
+                "failure",
+                "failure_diagnostic",
+                "recovery_state",
+                "recovery_diagnostic",
+            ):
                 task.pop(key, None)
             task.update(
                 config_version=None,
