@@ -318,7 +318,12 @@ async def compact(owner, anchor, *, idle):
             caller = core.life.generation_caller_service if idle else "companion"
             await pin_generation(
                 task,
-                SelectionRequest(turn_id=task["id"], **anchor["scope"], caller_service=caller),
+                SelectionRequest(
+                    turn_id=task["id"],
+                    **anchor["scope"],
+                    caller_service=caller,
+                    function_id="memory",
+                ),
                 selector,
                 core.clock,
                 static_version=core.life.default_config_version if idle else core.config_version,

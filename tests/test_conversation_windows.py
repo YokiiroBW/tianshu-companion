@@ -104,6 +104,54 @@ def test_real_chat_compacts_then_injects_summary_and_preserves_raw_and_counts():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("idle", [False, True])
+def test_window_summary_uses_memory_binding_and_chat_keeps_its_binding(idle):
+    async def run():
+        from tianshu_companion.model_selection import ModelSelection
+
+        h, model = setup()
+        requests = []
+
+        class Selector:
+            async def select(self, request):
+                requests.append(request)
+                return ModelSelection(
+                    77 if request.function_id == "memory" else 11,
+                    h.clock() + 3600,
+                    caller_service=request.caller_service,
+                    workload=request.workload,
+                )
+
+        h.core.default_model_selector = h.core.life.model_selector = Selector()
+        h.core.life.generation_caller_service = "companion_background"
+        try:
+            turn = await seed(h)
+            assert len(requests) == 7
+            assert all(request.function_id == "chat" for request in requests)
+            assert all(t["config_version"] == 11 for t in h.turns())
+            owner = h.core.conversation_windows
+            small(owner)
+            if idle:
+                h.clock.advance(181)
+            await compact(owner, turn, idle=idle)
+
+            assert len(requests) == 8 and len(model.summaries) == 1
+            request = requests[-1]
+            task, _, request_id = model.summaries[0]
+            assert request.function_id == "memory"
+            assert request.caller_service == ("companion_background" if idle else "companion")
+            assert request.turn_id == task["id"]
+            assert task["config_version"] == 77
+            execution = owner.state(turn)["last_execution"]
+            assert execution["request_id"] == request_id
+            assert execution["task_id"] == task["id"]
+            assert execution["config_version"] == 77
+        finally:
+            await h.core.close()
+
+    asyncio.run(run())
+
+
 def test_group_authors_share_window_but_other_groups_private_and_actor_do_not():
     async def run():
         h, _ = setup()
