@@ -193,7 +193,8 @@ async def run_loop(
                 "runtime.background_failed",
                 "failed",
                 level="ERROR",
-                error_code=obs.failure_class(error),
+                error_code=obs.error_code(getattr(error, "code", obs.failure_class(error))),
+                attributes=obs.failure_attributes(error),
             )
         # An idle pass is deliberately not reported. Nothing happened, so a record would be a
         # false account of the pass - and at these intervals idle records would outnumber real
@@ -383,6 +384,7 @@ def build_runtime(config, *, internal_clients=None, environ=None, log_adapter=No
             **injected,
             ca_file=entry.get("ca_file"),
             label=label,
+            target="channel" if label == "origins" and target is None else target,
             memory_dependency=name == "memory",
             log_adapter=log_adapter,
         )

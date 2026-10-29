@@ -5,11 +5,13 @@ things:
 
 1. **The closed record.** One UTF-8 JSON document plus one LF per event, at most 4096
    bytes, with the twelve fields `contracts/diagnostics/v1/event.schema.json` freezes.
-   There is no place to put a message, an extra, a stack trace, a URL, a header, a token,
+   Peer events optionally use v1.1 with one closed, validated attributes object.
+   There is no place to put a message, an arbitrary extra, a stack trace, a URL, a header, a token,
    an account or any request/response body, so a secret cannot be logged by accident: the
    only free-form values the port accepts are a registered event name, a registered error
    code, an outcome from the frozen enumeration and a correlation ID that is strictly 32
-   lowercase hex characters.
+   lowercase hex characters. Peer attributes allow fixed service/route labels,
+   a service-credential fingerprint and bounded transport metadata.
 2. **The registered event and error-code enums.** `EVENTS` is the complete static registry of
    runtime events this product emits; an event name that is not in it is refused, so a caller
    string can never become an event name. `ERROR_CODES` does the same for codes.
@@ -359,8 +361,154 @@ RECOVERY_INTERVAL_SECONDS = 1.0
 # The fixed labels an outbound peer call may carry. These are code-level interface names,
 # never a configured URL, host, account or channel identifier.
 PEER_LABELS = frozenset(
-    {"origins", "identity", "memory", "profiles", "gateway", "channel", "images"}
+    {
+        "origins",
+        "identity",
+        "memory",
+        "profiles",
+        "gateway",
+        "channel",
+        "images",
+        "platform",
+        "knowledge",
+        "chat",
+    }
 )
+
+# A separate minor event shape keeps the frozen v1 envelope readable. The host
+# snapshots these exact rules when generating its collector configuration.
+PEER_ATTRIBUTE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "target",
+        "route",
+        "principal",
+        "operation",
+        "http_status",
+        "error_code",
+        "attempt",
+    ],
+    "properties": {
+        "target": {
+            "type": "string",
+            "enum": [
+                "platform",
+                "memory",
+                "knowledge",
+                "gateway",
+                "chat",
+                "channel",
+                "images",
+                "unknown",
+            ],
+        },
+        "route": {
+            "type": "string",
+            "enum": [
+                "unknown",
+                "/internal/v1/actor-capabilities/operate",
+                "/internal/v1/actor-self-memory/authority",
+                "/internal/v1/actor-self-memory/operate",
+                "/internal/v1/books/reading",
+                "/internal/v1/conversation/reply-status",
+                "/internal/v1/conversation/send",
+                "/internal/v1/identity/register",
+                "/internal/v1/identity/resolve",
+                "/internal/v1/knowledge/content/disclosure",
+                "/internal/v1/knowledge/content/original",
+                "/internal/v1/memory/browser/archive-check",
+                "/internal/v1/memory/candidates/materials",
+                "/internal/v1/memory/candidates/process",
+                "/internal/v1/memory/candidates/segments",
+                "/internal/v1/memory/context/query",
+                "/internal/v1/memory/context/receipt",
+                "/internal/v1/memory/context/history",
+                "/internal/v1/memory/context/input-history",
+                "/internal/v1/memory/profiles/select",
+                "/internal/v1/memory/source-sync/check",
+                "/internal/v1/model-capabilities",
+                "/internal/v1/model-requests/{request_id}",
+                "/internal/v1/model-requests/{request_id}/cancel",
+                "/internal/v1/origins/resolve",
+                "/internal/v1/provider-self-service/select",
+                "/internal/v1/qq-admin/check",
+                "/internal/v1/relationships/read",
+                "/internal/v1/relationships/check",
+                "/internal/v1/service-credentials/resolve",
+                "/internal/v1/source-access/read",
+                "/internal/v2/bot-delivery/cancel",
+                "/internal/v2/bot-delivery/context",
+                "/internal/v2/bot-delivery/finalize",
+                "/internal/v2/bot-delivery/query",
+                "/internal/v2/bot-delivery/send",
+                "/internal/v2/memory/context/prepare",
+                "/internal/v2/memory/context/profiles",
+                "/internal/v2/memory/context/query",
+                "/internal/v2/memory/context/verify",
+                "/internal/v2/memory/observations",
+                "/internal/v2/memory/observations/query",
+                "/internal/evidence/search",
+                "/internal/evidence/read-locator",
+                "/internal/evidence/check",
+                "/v1/chat/completions",
+            ],
+        },
+        "principal": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "operation": {"type": "string", "enum": ["query", "command", "stream", "binary"]},
+        "http_status": {"type": ["integer", "null"], "minimum": 100, "maximum": 599},
+        "error_code": {"type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+        "attempt": {"type": "integer", "minimum": 0, "maximum": 8},
+    },
+}
+
+
+def peer_route(path):
+    if isinstance(path, str) and re.fullmatch(
+        r"/internal/v1/model-requests/model:[a-f0-9]{32}(/cancel)?", path
+    ):
+        return "/internal/v1/model-requests/{request_id}" + (
+            "/cancel" if path.endswith("/cancel") else ""
+        )
+    return path if path in PEER_ATTRIBUTE_SCHEMA["properties"]["route"]["enum"] else "unknown"
+
+
+def validate_peer_attributes(attributes):
+    if not isinstance(attributes, dict) or set(attributes) != set(
+        PEER_ATTRIBUTE_SCHEMA["required"]
+    ):
+        raise ValueError("Invalid peer attributes")
+    for key, rule in PEER_ATTRIBUTE_SCHEMA["properties"].items():
+        value = attributes[key]
+        kinds = rule["type"] if isinstance(rule["type"], list) else [rule["type"]]
+        if value is None and "null" in kinds:
+            continue
+        if ("integer" in kinds and type(value) is not int) or (
+            "string" in kinds and not isinstance(value, str)
+        ):
+            raise ValueError("Invalid peer attribute type")
+        if "enum" in rule and value not in rule["enum"]:
+            raise ValueError("Unregistered peer attribute")
+        if "pattern" in rule and not re.fullmatch(rule["pattern"], value):
+            raise ValueError("Invalid peer attribute")
+        if "minimum" in rule and not rule["minimum"] <= value <= rule["maximum"]:
+            raise ValueError("Invalid peer attribute bound")
+    if attributes["error_code"] is not None and attributes["error_code"] not in ERROR_CODES:
+        raise ValueError("Unregistered peer error code")
+    return attributes
+
+
+def failure_attributes(error):
+    cause = getattr(error, "cause", None) or {}
+    fields = {key: cause[key] for key in PEER_ATTRIBUTE_SCHEMA["required"] if key in cause}
+    fields["target"] = cause.get("peer", "unknown")
+    fields["error_code"] = error_code(getattr(error, "code", failure_class(error)))
+    fields.setdefault("http_status", None)
+    try:
+        return validate_peer_attributes(fields)
+    except (ValueError, TypeError):
+        return None
+
 
 # How many outbound transport attempts one logical peer call may report. A transport retry
 # is still one call in business terms, so the count is reported as an attribute rather than
@@ -481,6 +629,10 @@ def failure_diagnostic(error, *, code, attempt, stage, observed_at):
         diagnostic["operation"] = cause["operation"]
     if type(cause.get("http_status")) is int and 100 <= cause["http_status"] <= 599:
         diagnostic["http_status"] = cause["http_status"]
+    attributes = failure_attributes(error)
+    if attributes is not None:
+        diagnostic.update({key: attributes[key] for key in ("route", "principal")})
+        diagnostic["transport_attempt"] = attributes["attempt"]
     request_id = getattr(error, "model_request_id", None) or getattr(
         request_error, "model_request_id", None
     )
@@ -555,10 +707,22 @@ def encode_record(record):
     outcome, or is longer than the contract's 4096-byte line is refused rather than
     truncated or quietly grown.
     """
-    if tuple(sorted(record)) != tuple(sorted(RECORD_FIELDS)):
+    attributed = record.get("schema_version") == "1.1.0"
+    fields = (*RECORD_FIELDS, "attributes") if attributed else RECORD_FIELDS
+    if tuple(sorted(record)) != tuple(sorted(fields)):
         raise ValueError("Runtime event must carry exactly the frozen field set")
-    if record["schema_version"] != SCHEMA_VERSION:
+    if record["schema_version"] not in (SCHEMA_VERSION, "1.1.0"):
         raise ValueError("Unsupported diagnostics schema version")
+    if attributed:
+        if record["event"] not in {
+            "peer.call.started",
+            "peer.call.finished",
+            "runtime.background_failed",
+        }:
+            raise ValueError("Attributes require a peer event")
+        validate_peer_attributes(record["attributes"])
+        if record["error_code"] != record["attributes"]["error_code"]:
+            raise ValueError("Peer error code mismatch")
     if record["service"] != SERVICE:
         raise ValueError("Unsupported diagnostics service name")
     if record["level"] not in LEVELS:
@@ -785,6 +949,7 @@ class LogAdapter:
         error_code=None,
         duration_ms=None,
         fsync=False,
+        attributes=None,
     ):
         """Enqueue one record without touching a disk.
 
@@ -816,6 +981,8 @@ class LogAdapter:
                 "duration_ms": duration_ms,
                 "error_code": error_code,
             }
+            if attributes is not None:
+                record.update(schema_version="1.1.0", attributes=attributes)
             try:
                 line = encode_record(record)
             except (ValueError, UnicodeError):

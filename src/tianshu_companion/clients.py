@@ -1,12 +1,13 @@
 """Fixed service endpoints, bounded calls, and published wire documents."""
 
 import asyncio
+import hashlib
 import math
 import re
 import ssl
 import time
 import uuid
-from contextlib import AsyncExitStack, aclosing, asynccontextmanager
+from contextlib import AsyncExitStack, aclosing, asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -152,6 +153,7 @@ class JsonService:
         transport=None,
         ca_file=None,
         label=None,
+        target=None,
         memory_dependency=False,
         log_adapter=None,
     ):
@@ -174,6 +176,17 @@ class JsonService:
         # A registered interface label for the runtime event stream. It is never the
         # configured URL, host or any other deployment value.
         self.label = _label(label, obs.PEER_LABELS)
+        inferred = {"origins": "platform", "identity": "memory", "profiles": "memory"}.get(
+            self.label, self.label
+        )
+        self.target = _label(
+            target or inferred, obs.PEER_ATTRIBUTE_SCHEMA["properties"]["target"]["enum"]
+        )
+        # The fingerprint identifies the presented credential across peers, without
+        # claiming which actor or registered principal that peer will authorize.
+        self.principal = (
+            "sha256:" + hashlib.sha256(("companion-peer:" + (token or "")).encode()).hexdigest()
+        )
         if ca_file is not None and (not Path(ca_file).is_absolute() or not Path(ca_file).is_file()):
             raise ValueError("CA file must be an existing absolute deployment path")
         verify = ssl.create_default_context(cafile=ca_file) if ca_file else True
@@ -181,17 +194,80 @@ class JsonService:
             timeout=15, follow_redirects=False, trust_env=False, transport=transport, verify=verify
         )
 
-    def _cause(self, error, operation, status=None):
+    def _cause(self, error, operation, status=None, *, path="unknown", attempts=1):
         # Never copy exception text, URLs, headers or peer response fields.
         if isinstance(error, Fault) and error.cause is not None:
             return error.cause
-        cause = dict(category=obs.failure_class(error), peer=self.label, operation=operation)
+        cause = dict(
+            category=obs.failure_class(error),
+            peer=self.target,
+            operation=operation,
+            route=obs.peer_route(path),
+            principal=self.principal,
+            attempt=attempts,
+        )
         exception_type = obs.failure_type(error)
         if exception_type is not None:
             cause["exception_type"] = exception_type
         if status is not None:
             cause["http_status"] = status
         return cause
+
+    @contextmanager
+    def _observe(self, path, operation, correlation=None):
+        correlation = correlation or obs.current_correlation_id() or obs.new_correlation_id()
+        started = time.perf_counter()
+        attributes = dict(
+            target=self.target,
+            route=obs.peer_route(path),
+            principal=self.principal,
+            operation=operation,
+            http_status=None,
+            error_code=None,
+            attempt=0,
+        )
+        port = self.log_adapter if self.log_adapter is not None else LOG_PORT
+        port.emit(
+            "peer.call.started", "started", correlation_id=correlation, attributes=attributes.copy()
+        )
+        try:
+            yield attributes
+        except BaseException as error:
+            attributes["error_code"] = obs.error_code(
+                getattr(error, "code", obs.failure_class(error))
+            )
+            if isinstance(error, Fault):
+                error.cause = self._cause(
+                    error,
+                    operation,
+                    attributes["http_status"],
+                    path=path,
+                    attempts=attributes["attempt"],
+                )
+            outcome = (
+                "unknown"
+                if getattr(error, "unknown", False)
+                else "cancelled"
+                if isinstance(error, asyncio.CancelledError)
+                else "failed"
+            )
+            port.emit(
+                "peer.call.finished",
+                outcome,
+                correlation_id=correlation,
+                error_code=attributes["error_code"],
+                duration_ms=_duration_ms(started),
+                attributes=attributes,
+            )
+            raise
+        else:
+            port.emit(
+                "peer.call.finished",
+                "succeeded",
+                correlation_id=correlation,
+                duration_ms=_duration_ms(started),
+                attributes=attributes,
+            )
 
     async def stream(self, path, body, headers=None):
         if not self.url or not self.token:
@@ -219,96 +295,110 @@ class JsonService:
             finally:
                 remaining -= loop.time() - started
 
-        try:
-            async with AsyncExitStack() as stack:
-                response = await receive(
-                    stack.enter_async_context,
-                    self.client.stream(
-                        "POST",
-                        self.url.rstrip("/") + path,
-                        json=body,
-                        headers=request_headers,
-                        timeout=httpx.Timeout(30),
-                    ),
-                )
-                if response.status_code != 200:
-                    # No completion stream has begun. Only transient service
-                    # statuses permit the dialogue owner to retry generation;
-                    # authorization, quota and invalid requests do not.
-                    failure = _retry_hint(
-                        Fault(
-                            "dependency_unavailable",
-                            unknown=True,
-                            retryable_model=response.status_code in {502, 503, 504},
+        with self._observe(path, "stream", request_headers[obs.CORRELATION_HEADER]) as attributes:
+            attributes["attempt"] = 1
+            try:
+                async with AsyncExitStack() as stack:
+                    response = await receive(
+                        stack.enter_async_context,
+                        self.client.stream(
+                            "POST",
+                            self.url.rstrip("/") + path,
+                            json=body,
+                            headers=request_headers,
+                            timeout=httpx.Timeout(30),
                         ),
-                        response,
                     )
-                    failure.rate_limited = response.status_code == 429
-                    raise failure
-                if response.headers.get("content-encoding", "identity") != "identity":
-                    raise Fault("dependency_unavailable")
-                chunks = response.aiter_bytes().__aiter__()
-                while True:
-                    try:
-                        # No timeout context may survive the yield below: its
-                        # consumer can be awaiting a local delivery callback.
-                        chunk = await receive(anext, chunks)
-                    except StopAsyncIteration:
-                        break
-                    total += len(chunk)
-                    if total > self.MAX_RESPONSE_BYTES:
-                        raise Fault("budget_exceeded", unknown=True)
-                    pending.extend(chunk)
-                    while b"\n" in pending:
-                        line, _, rest = pending.partition(b"\n")
-                        pending = bytearray(rest)
-                        line = line.rstrip(b"\r")
-                        if len(line) > 200000:
+                    attributes["http_status"] = response.status_code
+                    if response.status_code != 200:
+                        # No completion stream has begun. Only transient service
+                        # statuses permit the dialogue owner to retry generation;
+                        # authorization, quota and invalid requests do not.
+                        failure = _retry_hint(
+                            Fault(
+                                "dependency_unavailable",
+                                unknown=True,
+                                retryable_model=response.status_code in {502, 503, 504},
+                            ),
+                            response,
+                        )
+                        failure.rate_limited = response.status_code == 429
+                        raise failure
+                    if response.headers.get("content-encoding", "identity") != "identity":
+                        raise Fault("dependency_unavailable")
+                    chunks = response.aiter_bytes().__aiter__()
+                    while True:
+                        try:
+                            # No timeout context may survive the yield below: its
+                            # consumer can be awaiting a local delivery callback.
+                            chunk = await receive(anext, chunks)
+                        except StopAsyncIteration:
+                            break
+                        total += len(chunk)
+                        if total > self.MAX_RESPONSE_BYTES:
                             raise Fault("budget_exceeded", unknown=True)
-                        if line.startswith(b"data:"):
-                            event_data.append(line[5:].lstrip(b" "))
-                        elif not line and event_data:
-                            data = b"\n".join(event_data)
-                            event_data.clear()
-                            if data == b"[DONE]":
-                                return
-                            yield strict_json(data)
-                    if len(pending) > 200000:
-                        raise Fault("budget_exceeded", unknown=True)
-            raise Fault("result_unknown", unknown=True, retryable_model=True)
-        except Fault as error:
-            error.cause = self._cause(
-                error, "stream", response.status_code if response is not None else None
-            )
-            raise
-        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
-            raise Fault(
-                "dependency_unavailable", retryable_model=True, cause=self._cause(error, "stream")
-            ) from None
-        except (
-            httpx.ReadError,
-            httpx.ReadTimeout,
-            httpx.RemoteProtocolError,
-            TimeoutError,
-        ) as error:
-            # The completion owner decides whether any answer/tool output was
-            # observed. A truncated reasoning-only stream has no delivered result.
-            raise Fault(
-                "dependency_unavailable",
-                unknown=True,
-                retryable_model=True,
-                cause=self._cause(
-                    error, "stream", response.status_code if response is not None else None
-                ),
-            ) from None
-        except (httpx.HTTPError, ValueError, UnicodeError) as error:
-            raise Fault(
-                "dependency_unavailable",
-                unknown=True,
-                cause=self._cause(
-                    error, "stream", response.status_code if response is not None else None
-                ),
-            ) from None
+                        pending.extend(chunk)
+                        while b"\n" in pending:
+                            line, _, rest = pending.partition(b"\n")
+                            pending = bytearray(rest)
+                            line = line.rstrip(b"\r")
+                            if len(line) > 200000:
+                                raise Fault("budget_exceeded", unknown=True)
+                            if line.startswith(b"data:"):
+                                event_data.append(line[5:].lstrip(b" "))
+                            elif not line and event_data:
+                                data = b"\n".join(event_data)
+                                event_data.clear()
+                                if data == b"[DONE]":
+                                    return
+                                yield strict_json(data)
+                        if len(pending) > 200000:
+                            raise Fault("budget_exceeded", unknown=True)
+                raise Fault("result_unknown", unknown=True, retryable_model=True)
+            except Fault as error:
+                error.cause = self._cause(
+                    error,
+                    "stream",
+                    response.status_code if response is not None else None,
+                    path=path,
+                )
+                raise
+            except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+                raise Fault(
+                    "dependency_unavailable",
+                    retryable_model=True,
+                    cause=self._cause(error, "stream", path=path),
+                ) from None
+            except (
+                httpx.ReadError,
+                httpx.ReadTimeout,
+                httpx.RemoteProtocolError,
+                TimeoutError,
+            ) as error:
+                # The completion owner decides whether any answer/tool output was
+                # observed. A truncated reasoning-only stream has no delivered result.
+                raise Fault(
+                    "dependency_unavailable",
+                    unknown=True,
+                    retryable_model=True,
+                    cause=self._cause(
+                        error,
+                        "stream",
+                        response.status_code if response is not None else None,
+                        path=path,
+                    ),
+                ) from None
+            except (httpx.HTTPError, ValueError, UnicodeError) as error:
+                raise Fault(
+                    "dependency_unavailable",
+                    unknown=True,
+                    cause=self._cause(
+                        error,
+                        "stream",
+                        response.status_code if response is not None else None,
+                        path=path,
+                    ),
+                ) from None
 
     async def call(
         self, path, body=None, headers=None, *, uncertain_write=False, error_response=None
@@ -451,182 +541,166 @@ class JsonService:
             "Accept-Encoding": "identity",
             **(headers or {}),
         }
-        started, attempts = time.perf_counter(), 0
+        attempts = 0
         sent, not_started = False, False
         response = None
         body_complete = False
         value = None
-        (self.log_adapter if self.log_adapter is not None else LOG_PORT).emit(
-            "peer.call.started",
-            "started",
-            correlation_id=correlation,
-            duration_ms=None,
-        )
-        try:
-            budget = self.QUERY_BUDGET_SECONDS if retry_query else self.COMMAND_BUDGET_SECONDS
-            async with AsyncExitStack() as owner:
-                if admission is not None:
-                    # One owner/budget covers waiting, serialization, both safe
-                    # read attempts and the body. A waiting write is still unsent.
-                    await owner.enter_async_context(asyncio.timeout(budget))
-                    await owner.enter_async_context(self._query_capacity(admission))
-                request = self.client.build_request(
-                    "GET" if body is None else "POST",
-                    self.url.rstrip("/") + path,
-                    json=body,
-                    headers=request_headers,
-                )
-                if admission is None:
-                    # Non-Memory commands retain their original HTTP-only budget.
-                    await owner.enter_async_context(asyncio.timeout(budget))
-                # Reuse serialized bytes/IDs/headers; acquire only once even when
-                # an explicitly safe read needs its existing transport retry.
-                for attempt in range(2 if retry_query else 1):
-                    attempts = attempt + 1
+        with self._observe(path, "query" if retry_query else "command", correlation) as attributes:
+            try:
+                budget = self.QUERY_BUDGET_SECONDS if retry_query else self.COMMAND_BUDGET_SECONDS
+                async with AsyncExitStack() as owner:
+                    if admission is not None:
+                        # One owner/budget covers waiting, serialization, both safe
+                        # read attempts and the body. A waiting write is still unsent.
+                        await owner.enter_async_context(asyncio.timeout(budget))
+                        await owner.enter_async_context(self._query_capacity(admission))
+                    request = self.client.build_request(
+                        "GET" if body is None else "POST",
+                        self.url.rstrip("/") + path,
+                        json=body,
+                        headers=request_headers,
+                    )
+                    if admission is None:
+                        # Non-Memory commands retain their original HTTP-only budget.
+                        await owner.enter_async_context(asyncio.timeout(budget))
+                    # Reuse serialized bytes/IDs/headers; acquire only once even when
+                    # an explicitly safe read needs its existing transport retry.
+                    for attempt in range(2 if retry_query else 1):
+                        attempts = attempt + 1
+                        attributes["attempt"] = attempts
+                        try:
+                            sent = True
+                            response = await self.client.send(request, stream=True)
+                            attributes["http_status"] = response.status_code
+                            break
+                        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError):
+                            # HTTPX/httpcore releases the failed connection. Only retry
+                            # before response headers; this does NOT prove nonexecution.
+                            if not retry_query or attempt:
+                                raise
                     try:
-                        sent = True
-                        response = await self.client.send(request, stream=True)
-                        break
-                    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError):
-                        # HTTPX/httpcore releases the failed connection. Only retry
-                        # before response headers; this does NOT prove nonexecution.
-                        if not retry_query or attempt:
-                            raise
-                try:
-                    # The internal JSON port negotiates identity. Reject an encoded body
-                    # before HTTPX can inflate one compressed chunk without a byte bound.
-                    if response.headers.get("content-encoding", "identity").lower() != "identity":
-                        raise Fault("dependency_unavailable")
-                    content = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        if len(content) + len(chunk) > self.MAX_RESPONSE_BYTES:
+                        # The internal JSON port negotiates identity. Reject an encoded body
+                        # before HTTPX can inflate one compressed chunk without a byte bound.
+                        if (
+                            response.headers.get("content-encoding", "identity").lower()
+                            != "identity"
+                        ):
                             raise Fault("dependency_unavailable")
-                        content.extend(chunk)
-                finally:
-                    await response.aclose()
-                body_complete = True
-            value = strict_json(content)
-            if response.status_code >= 300:
-                not_started = (
-                    isinstance(value, dict) and value.get("execution_state") == "not_started"
-                )
-                code = value.get("code") if isinstance(value, dict) else None
-                if (
-                    retry_query
-                    and (
-                        response.status_code in {429, 503}
-                        and code in {"queue_full", "dependency_unavailable"}
-                        or response.status_code == 408
-                        and code == "timeout"
+                        content = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            if len(content) + len(chunk) > self.MAX_RESPONSE_BYTES:
+                                raise Fault("dependency_unavailable")
+                            content.extend(chunk)
+                    finally:
+                        await response.aclose()
+                    body_complete = True
+                value = strict_json(content)
+                if response.status_code >= 300:
+                    not_started = (
+                        isinstance(value, dict) and value.get("execution_state") == "not_started"
                     )
-                    and not_started
-                    and value.get("retryable") is True
-                ):
-                    failure = _retry_hint(Fault(code, retryable_read=True), response)
-                    failure.read_execution = "not_started"
-                    raise failure
-                if code in {
-                    "scope_changed",
-                    "forbidden",
-                    "unauthorized",
-                    "version_conflict",
-                    "budget_exceeded",
-                    "queue_full",
-                    "timeout",
-                    "result_unknown",
-                }:
-                    failure = _retry_hint(
-                        Fault(code, unknown=value.get("execution_state") == "unknown"), response
-                    )
-                    # Preserve the peer's explicit read outcome for its semantic
-                    # owner. This alone does not make another HTTP error retryable.
-                    if retry_query and not_started:
+                    code = value.get("code") if isinstance(value, dict) else None
+                    if (
+                        retry_query
+                        and (
+                            response.status_code in {429, 503}
+                            and code in {"queue_full", "dependency_unavailable"}
+                            or response.status_code == 408
+                            and code == "timeout"
+                        )
+                        and not_started
+                        and value.get("retryable") is True
+                    ):
+                        failure = _retry_hint(Fault(code, retryable_read=True), response)
                         failure.read_execution = "not_started"
-                    raise failure
-                raise _retry_hint(Fault("dependency_unavailable"), response)
-            self._report("succeeded", correlation, started, attempts)
-            return value
-        except (httpx.HTTPError, ValueError, TimeoutError, Fault) as error:
-            # Third-party exception text is never logged; only a fixed failure class.
-            self._report("failed", correlation, started, attempts, error)
-            cause = self._cause(
-                error,
-                "query" if retry_query else "command",
-                response.status_code if response is not None else None,
-            )
-            if isinstance(error, Fault):
-                error.cause = cause
-                if error_response is not None and body_complete and response.status_code >= 300:
-                    # The semantic client owns schema/request binding. Inspect the
-                    # bounded complete body here; never attach peer text to faults
-                    # or logs, and never classify transport/partial responses.
-                    error_response(response.status_code, value, error)
+                        raise failure
+                    if code in {
+                        "scope_changed",
+                        "forbidden",
+                        "unauthorized",
+                        "version_conflict",
+                        "budget_exceeded",
+                        "queue_full",
+                        "timeout",
+                        "result_unknown",
+                    }:
+                        failure = _retry_hint(
+                            Fault(code, unknown=value.get("execution_state") == "unknown"), response
+                        )
+                        # Preserve the peer's explicit read outcome for its semantic
+                        # owner. This alone does not make another HTTP error retryable.
+                        if retry_query and not_started:
+                            failure.read_execution = "not_started"
+                        raise failure
+                    raise _retry_hint(Fault("dependency_unavailable"), response)
+                return value
+            except (httpx.HTTPError, ValueError, TimeoutError, Fault) as error:
+                # Third-party exception text is never logged; only a fixed failure class.
+                cause = self._cause(
+                    error,
+                    "query" if retry_query else "command",
+                    response.status_code if response is not None else None,
+                    path=path,
+                    attempts=attempts,
+                )
+                if isinstance(error, Fault):
+                    error.cause = cause
+                    if error_response is not None and body_complete and response.status_code >= 300:
+                        # The semantic client owns schema/request binding. Inspect the
+                        # bounded complete body here; never attach peer text to faults
+                        # or logs, and never classify transport/partial responses.
+                        error_response(response.status_code, value, error)
+                    if (
+                        path == "/internal/v1/origins/resolve"
+                        and body_complete
+                        and response.status_code in {403, 404}
+                        and not error.unknown
+                    ):
+                        error.origin_response_unavailable = True
+                    if uncertain_write and sent and not not_started:
+                        failure = Fault(
+                            error.code,
+                            unknown=True,
+                            current_version=error.current_version,
+                            cause=error.cause,
+                        )
+                        failure.retry_after_seconds = getattr(error, "retry_after_seconds", None)
+                        raise failure from None
+                    raise
+                recover_read = retry_query and isinstance(
+                    error,
+                    (
+                        httpx.TimeoutException,
+                        httpx.NetworkError,
+                        httpx.RemoteProtocolError,
+                        TimeoutError,
+                    ),
+                )
+                failure = Fault(
+                    "dependency_unavailable",
+                    unknown=uncertain_write and sent,
+                    retryable_read=recover_read,
+                    cause=cause,
+                )
+                if recover_read:
+                    failure.read_execution = "unconfirmed" if sent else "waiting"
+                    if sent:
+                        failure.optional_read_unavailable = self._optional_transport_failure(error)
                 if (
                     path == "/internal/v1/origins/resolve"
                     and body_complete
-                    and response.status_code in {403, 404}
-                    and not error.unknown
-                ):
-                    error.origin_response_unavailable = True
-                if uncertain_write and sent and not not_started:
-                    failure = Fault(
-                        error.code,
-                        unknown=True,
-                        current_version=error.current_version,
-                        cause=error.cause,
+                    and not isinstance(error, UnicodeError)
+                    and (
+                        response.status_code in {403, 404}
+                        or response.status_code == 200
+                        and isinstance(error, ValueError)
                     )
-                    failure.retry_after_seconds = getattr(error, "retry_after_seconds", None)
-                    raise failure from None
-                raise
-            recover_read = retry_query and isinstance(
-                error,
-                (
-                    httpx.TimeoutException,
-                    httpx.NetworkError,
-                    httpx.RemoteProtocolError,
-                    TimeoutError,
-                ),
-            )
-            failure = Fault(
-                "dependency_unavailable",
-                unknown=uncertain_write and sent,
-                retryable_read=recover_read,
-                cause=cause,
-            )
-            if recover_read:
-                failure.read_execution = "unconfirmed" if sent else "waiting"
-                if sent:
-                    failure.optional_read_unavailable = self._optional_transport_failure(error)
-            if (
-                path == "/internal/v1/origins/resolve"
-                and body_complete
-                and not isinstance(error, UnicodeError)
-                and (
-                    response.status_code in {403, 404}
-                    or response.status_code == 200
-                    and isinstance(error, ValueError)
-                )
-            ):
-                # Only a complete bounded origin response can be discarded here.
-                # TLS, HTTP framing, body encoding/size and shared auth stay faults.
-                failure.origin_response_unavailable = True
-            raise failure from None
-
-    def _report(self, outcome, correlation, started, attempts, error=None):
-        (self.log_adapter if self.log_adapter is not None else LOG_PORT).emit(
-            "peer.call.finished",
-            outcome,
-            level="INFO" if outcome == "succeeded" else "WARNING",
-            correlation_id=correlation,
-            error_code=(
-                error.code
-                if isinstance(error, Fault)
-                else obs.failure_class(error)
-                if error is not None
-                else None
-            ),
-            duration_ms=_duration_ms(started),
-        )
+                ):
+                    # Only a complete bounded origin response can be discarded here.
+                    # TLS, HTTP framing, body encoding/size and shared auth stay faults.
+                    failure.origin_response_unavailable = True
+                raise failure from None
 
     async def close(self):
         await self.client.aclose()
@@ -640,24 +714,27 @@ class JsonService:
             "Accept-Encoding": "identity",
             obs.CORRELATION_HEADER: obs.current_correlation_id() or obs.new_correlation_id(),
         }
-        try:
-            async with asyncio.timeout(60):
-                async with self.client.stream(
-                    "POST", self.url.rstrip("/") + path, json=body, headers=headers
-                ) as response:
-                    if response.headers.get("content-encoding", "identity") != "identity":
-                        raise Fault("dependency_unavailable")
-                    data = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        if len(data) + len(chunk) > max_bytes:
-                            raise Fault("budget_exceeded")
-                        data.extend(chunk)
-                    if response.status_code >= 300:
-                        error = strict_json(data)
-                        raise Fault(error.get("code", "dependency_unavailable"))
-                    return bytes(data), dict(response.headers)
-        except (httpx.HTTPError, TimeoutError, ValueError):
-            raise Fault("dependency_unavailable") from None
+        with self._observe(path, "binary", headers[obs.CORRELATION_HEADER]) as attributes:
+            attributes["attempt"] = 1
+            try:
+                async with asyncio.timeout(60):
+                    async with self.client.stream(
+                        "POST", self.url.rstrip("/") + path, json=body, headers=headers
+                    ) as response:
+                        attributes["http_status"] = response.status_code
+                        if response.headers.get("content-encoding", "identity") != "identity":
+                            raise Fault("dependency_unavailable")
+                        data = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            if len(data) + len(chunk) > max_bytes:
+                                raise Fault("budget_exceeded")
+                            data.extend(chunk)
+                        if response.status_code >= 300:
+                            error = strict_json(data)
+                            raise Fault(error.get("code", "dependency_unavailable"))
+                        return bytes(data), dict(response.headers)
+            except (httpx.HTTPError, TimeoutError, ValueError):
+                raise Fault("dependency_unavailable") from None
 
 
 class Origins:
