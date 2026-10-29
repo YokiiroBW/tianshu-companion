@@ -578,6 +578,15 @@ class RuntimeExecution:
                 raise Fault("budget_exceeded")
             if calls:
                 current = self.core.life.activities.get(actor, activity["id"])
+                previous, checkpoint = activity["checkpoint"], current["checkpoint"]
+                advanced = checkpoint["step"] > previous["step"] or (
+                    checkpoint["unit"] == previous["unit"]
+                    and checkpoint["position"] > previous["position"]
+                )
+                if advanced or current["state"] == "completed":
+                    # Successful persisted progress ends consecutive failure backoff;
+                    # discovery/thinking alone never earns a fresh retry allowance.
+                    current["failure_attempts"] = 0
                 # The complete model/tool round is durable before yielding. An
                 # interrupted submitted round is never silently reissued.
                 marker.update(

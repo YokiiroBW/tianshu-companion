@@ -815,6 +815,29 @@ def test_first_activity_tool_unknown_survives_explicit_resume(monkeypatch):
     asyncio.run(run())
 
 
+def test_actual_activity_progress_resets_consecutive_failures_keeps_diagnostics():
+    async def run():
+        h, owners, services, model = await autonomy_setup()
+        try:
+            await h.core.life.autonomy.work(actor_id="actor:a")
+            current = h.core.life.activities.current("actor:a")
+            failure = dict(code="dependency_unavailable", attempt=2, stage="preparation")
+            current.update(failure_attempts=2, first_failure=failure, last_failure=failure)
+            h.core.store.put("life_activities", current)
+            await h.core.life.activities.work(actor_id="actor:a")
+            assert h.core.life.activities.current("actor:a")["failure_attempts"] == 2
+            for _ in range(7):
+                await h.core.life.activities.work(actor_id="actor:a")
+            finished = h.core.life.activities.get("actor:a", current["id"])
+            assert finished["state"] == "completed"
+            assert finished["failure_attempts"] == 0
+            assert finished["first_failure"] == failure and finished["last_failure"] == failure
+        finally:
+            await close(h, services)
+
+    asyncio.run(run())
+
+
 def test_zero_user_input_goal_discover_actual_read_episode_understanding_and_next_goal():
     async def run():
         h, owners, services, model = await autonomy_setup()
