@@ -8,7 +8,15 @@ from .contracts import Fault, digest
 from .life import text, timestamp
 from .life_work import require_version, source_refs, visible
 
-STATES = {"planned", "running", "paused", "completed", "cancelled"}
+STATES = {"planned", "running", "paused", "dormant", "completed", "cancelled"}
+TRANSITIONS = {
+    "planned": {"running", "cancelled", "dormant"},
+    "running": {"paused", "dormant", "completed", "cancelled"},
+    "paused": {"running", "dormant", "completed", "cancelled"},
+    "dormant": {"running", "cancelled"},
+    "completed": set(),
+    "cancelled": set(),
+}
 
 
 class Activities:
@@ -16,6 +24,7 @@ class Activities:
         self.life, self.store = life, life.store
         self.executor = None
         self._active = set()
+        self.retry_seconds = 6 * 60 * 60
 
     def get(self, actor_id, activity_id):
         item = self.store.get("life_activities", activity_id)
@@ -28,7 +37,29 @@ class Activities:
         item = self.store.get("life_activities", (actor or {}).get("activity_id", ""))
         return item if item and visible(item, scope) else None
 
-    def save(self, actor_id, value, *, expected):
+    def unresolved(self, actor_id, *, except_activity=None):
+        """Releasing a dormant pointer cannot erase an uncertain external operation."""
+        return (
+            self.store.db.execute(
+                "SELECT 1 FROM life_activities a JOIN metadata m "
+                "ON m.id=json_extract(a.body,'$.step_operation') "
+                "WHERE a.conversation_id=? AND a.id<>? AND a.status<>'cancelled' "
+                "AND m.status IN ('submitted','tools_pending','unknown') "
+                "LIMIT 1",
+                (actor_id, except_activity or ""),
+            ).fetchone()
+            is not None
+        )
+
+    def dormant(self, actor_id):
+        rows = self.store.db.execute(
+            "SELECT body FROM life_activities WHERE conversation_id=? AND status='dormant' "
+            "ORDER BY position DESC,id LIMIT 20",
+            (actor_id,),
+        )
+        return [item for row in rows if visible(item := json.loads(row[0]), None)]
+
+    def save(self, actor_id, value, *, expected, explicit_resume=False):
         text(value["id"], 128)
         text(value["title"], 4000)
         if value["state"] not in STATES:
@@ -38,6 +69,12 @@ class Activities:
             raise Fault("forbidden")
         if value["next_due_at"] is not None:
             timestamp(value["next_due_at"])
+        if value["state"] == "paused" and value["next_due_at"] is None:
+            raise Fault("invalid_input")
+        if value["state"] == "dormant":
+            text(value["resume_condition"], 4000)
+            if not value["resume_condition"].strip():
+                raise Fault("invalid_input")
         checkpoint = value["checkpoint"]
         if (
             type(checkpoint["step"]) is not int
@@ -52,6 +89,27 @@ class Activities:
             if old and old["actor_id"] != actor_id:
                 raise Fault("not_found")
             require_version(old, expected)
+            if old and old["state"] != value["state"]:
+                if value["state"] not in TRANSITIONS[old["state"]]:
+                    raise Fault("invalid_input")
+                if (
+                    old["state"] == "dormant"
+                    and value["state"] == "running"
+                    and not explicit_resume
+                ):
+                    raise Fault("invalid_input")
+            if value["state"] == "running" and (not old or old["state"] != "running"):
+                same_checkpoint = bool(
+                    old
+                    and explicit_resume
+                    and old.get("step_operation")
+                    and value["checkpoint"] == old["checkpoint"]
+                    and value["result_refs"] == old["result_refs"]
+                )
+                if self.unresolved(
+                    actor_id, except_activity=old["id"] if same_checkpoint else None
+                ):
+                    raise Fault("result_unknown", unknown=True)
             current = self.current(actor_id, actor.get("activity_scope"))
             if (
                 value["state"] == "running"
@@ -82,6 +140,14 @@ class Activities:
             ):
                 if old and field in old:
                     item[field] = old[field]
+            if item["state"] == "dormant":
+                item["dormant_since"] = (
+                    old.get("dormant_since", self.life.clock())
+                    if old and old["state"] == "dormant"
+                    else self.life.clock()
+                )
+                if old and item["result_refs"] != old["result_refs"]:
+                    raise Fault("invalid_input")
             if old and old.get("step_operation"):
                 uncertain = self.store.get("metadata", old["step_operation"])
                 if uncertain and uncertain["state"] in {"unknown", "submitted", "tools_pending"}:
@@ -110,6 +176,7 @@ class Activities:
                     summary={
                         "running": "开始",
                         "paused": "暂时暂停",
+                        "dormant": "暂未继续",
                         "completed": "完成",
                         "cancelled": "取消",
                     }[item["state"]]
@@ -127,13 +194,7 @@ class Activities:
 
     def transition(self, actor_id, activity_id, state, *, expected, reason=None):
         item = self.get(actor_id, activity_id)
-        allowed = {
-            "paused": {"running"},
-            "running": {"paused", "planned"},
-            "cancelled": {"running", "paused", "planned"},
-            "completed": {"running", "paused"},
-        }
-        if item["state"] not in allowed[state]:
+        if state not in TRANSITIONS[item["state"]]:
             raise Fault("invalid_input")
         value = {
             key: item[key]
@@ -150,14 +211,16 @@ class Activities:
             )
         }
         value["state"] = state
-        if state != "running":
+        if state in {"completed", "cancelled", "dormant"}:
             value["next_due_at"] = None
+        elif state == "paused":
+            value["next_due_at"] = self.life.clock() + min(60, self.retry_seconds)
         elif value["next_due_at"] is None:
             value["next_due_at"] = self.life.clock()
         if reason:
             text(reason, 4000)
             value["resume_condition"] = reason
-        return self.save(actor_id, value, expected=expected)
+        return self.save(actor_id, value, expected=expected, explicit_resume=state == "running")
 
     def page(self, actor_id, *, scope=None, after=None, limit=20, object_id=None):
         rows = self.store.db.execute(
@@ -199,7 +262,11 @@ class Activities:
                 return
         else:
             row = self.store.db.execute(
-                "SELECT body FROM life_activities WHERE status IN ('running','paused') AND deadline<=? ORDER BY deadline,id LIMIT 1",
+                "SELECT a.body FROM life_activities a JOIN life_actors r "
+                "ON r.id=a.conversation_id AND json_extract(r.body,'$.activity_id')=a.id "
+                "WHERE a.status IN ('running','paused') AND a.deadline<=? "
+                "AND COALESCE(json_extract(r.body,'$.life_enabled'),1)=1 "
+                "ORDER BY a.deadline,a.id LIMIT 1",
                 (self.life.clock(),),
             ).fetchone()
             if row is None:
@@ -307,6 +374,15 @@ class Activities:
                 if uncertain:
                     current["step_operation"] = operation
                     self.store.put("life_activities", current)
+                if uncertain or reason == "budget_exceeded":
+                    self.transition(
+                        item["actor_id"],
+                        item["id"],
+                        "dormant",
+                        expected=item["version"],
+                        reason=reason,
+                    )
+                    return
                 if current["state"] == "running":
                     paused = self.transition(
                         item["actor_id"],
@@ -316,15 +392,15 @@ class Activities:
                         reason=reason,
                     )
                 else:
-                    paused = dict(current, next_due_at=None, deadline=None, resume_condition=reason)
+                    paused = dict(current, resume_condition=reason)
                     self.store.put("life_activities", paused)
                 if not uncertain:
                     # No unresolved tool or live model remains. Exhausted reasoning
                     # budgets require a new explicit decision, not another full loop.
                     due = (
-                        self.life.clock() + 60 * 2 ** (attempts - 1)
-                        if attempts < 3 and reason != "budget_exceeded"
-                        else None
+                        self.life.clock() + min(60 * 2 ** min(attempts - 1, 9), self.retry_seconds)
+                        if attempts < 3
+                        else self.life.clock() + self.retry_seconds
                     )
                     paused.update(next_due_at=due, deadline=due)
                     paused.pop("step_operation", None)

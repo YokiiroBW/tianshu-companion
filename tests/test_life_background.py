@@ -431,7 +431,7 @@ def test_unknown_activity_model_is_not_replayed_on_restart(tmp_path):
                 await h.core.life.activities.work(actor_id="actor:a")
             assert len(model.calls) == 1
             current = h.core.life.activities.get("actor:a", saved["id"])
-            assert current["state"] == "paused" and current["next_due_at"] is None
+            assert current["state"] == "dormant" and current["next_due_at"] is None
             assert current["checkpoint"] == saved["checkpoint"]
             assert (
                 h.core.store.get(

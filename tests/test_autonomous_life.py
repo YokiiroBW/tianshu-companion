@@ -118,7 +118,9 @@ def test_legacy_role_permission_denial_requires_configuration_without_model_call
             assert getattr(h.core, "role_runtime", None) is None
 
             async def denied(*args, **kwargs):
-                raise Fault("forbidden", cause=dict(http_status=403, operation="query", peer="memory"))
+                raise Fault(
+                    "forbidden", cause=dict(http_status=403, operation="query", peer="memory")
+                )
 
             h.core.actor_memory.planning_query = denied
             assert await h.core.life.autonomy.work(actor_id="actor:a")
@@ -161,7 +163,9 @@ def test_existing_goal_or_rest_needs_no_new_intention(decision, unused):
                     canonical(
                         dict(
                             decision=decision,
-                            concern_id=None if decision == "rest" else current["autonomous_goal_id"],
+                            concern_id=None
+                            if decision == "rest"
+                            else current["autonomous_goal_id"],
                             reason="保留既有进度，按当前时间安排",
                             delay_seconds=60,
                             **unused,
@@ -203,7 +207,12 @@ def test_existing_goal_or_rest_needs_no_new_intention(decision, unused):
             "delay_seconds",
         ),
         (
-            dict(decision="continue", concern_id="unknown-goal", reason="unknown goal", delay_seconds=60),
+            dict(
+                decision="continue",
+                concern_id="unknown-goal",
+                reason="unknown goal",
+                delay_seconds=60,
+            ),
             "concern_id",
         ),
     ],
@@ -335,7 +344,7 @@ def test_abandoning_other_goal_keeps_current_activity_resumable_in_same_epoch():
                 reason="当下不需要",
                 delay_seconds=60,
             )
-            h.core.life.autonomy.apply(actor, choice, {}, None)
+            h.core.life.autonomy.apply(actor, choice, {"dormant": []}, None)
             assert h.core.life.activities.current("actor:a") == current
             assert h.core.life.concerns.get("actor:a", "autonomy:other")["state"] == "cancelled"
             actor = h.core.store.get("life_actors", "actor:a")
@@ -901,6 +910,10 @@ def test_activity_model_unknown_requires_original_terminal_receipt(monkeypatch, 
             assert marker["last_failure"]["stage"] == "model"
             assert marker["model_closed_without_tools"] is terminal
             assert receipts == [request_id]
+            if not terminal:
+                assert current is None
+                current = h.core.life.activities.get("actor:a", marker["activity_id"])
+                assert current["state"] == "dormant"
             assert (current["next_due_at"] is not None) is terminal
             h.clock.advance(120)
             await h.core.life.activities.work(actor_id="actor:a")
@@ -945,8 +958,9 @@ def test_activity_round_budget_yields_same_checkpoint_and_operation():
             h.core.store.put("metadata", marker)
             checkpoint = h.core.life.activities.current("actor:a")["checkpoint"]
             await h.core.life.activities.work(actor_id="actor:a")
-            stopped = h.core.life.activities.current("actor:a")
-            assert stopped["state"] == "paused" and stopped["next_due_at"] is None
+            assert h.core.life.activities.current("actor:a") is None
+            stopped = h.core.life.activities.get("actor:a", current["id"])
+            assert stopped["state"] == "dormant" and stopped["next_due_at"] is None
             assert stopped["resume_condition"] == "budget_exceeded"
             assert stopped["checkpoint"] == checkpoint
             assert len(model.rounds) == count + 1
@@ -1238,7 +1252,7 @@ def test_defer_continue_abandon_persist_in_existing_owners_across_day_and_epoch(
                 delay_seconds=86400,
             )
             h.core.life.autonomy.apply(actor, choice, captured, None)
-            assert h.core.life.activities.get("actor:a", activity["id"])["state"] == "paused"
+            assert h.core.life.activities.get("actor:a", activity["id"])["state"] == "dormant"
             assert h.core.life.concerns.get("actor:a", goal_id)["next_due_at"] == h.clock() + 86400
             h.clock.advance(86401)
             actor = h.core.store.get("life_actors", "actor:a")
@@ -1247,6 +1261,7 @@ def test_defer_continue_abandon_persist_in_existing_owners_across_day_and_epoch(
             assert h.core.life.activities.get("actor:a", activity["id"])["checkpoint"]["step"] == 0
             assert h.core.life.activities.get("actor:a", activity["id"])["state"] == "running"
             actor = h.core.store.get("life_actors", "actor:a")
+            captured = h.core.life.autonomy.snapshot(actor, h.core.life.autonomy.window(actor))
             h.core.life.autonomy.apply(actor, dict(choice, decision="abandon"), captured, None)
             assert h.core.life.concerns.get("actor:a", goal_id)["state"] == "cancelled"
             assert h.core.life.activities.get("actor:a", activity["id"])["state"] == "cancelled"

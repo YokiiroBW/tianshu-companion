@@ -23,6 +23,9 @@ def read_capabilities(core):
     return {
         "schema_version": 1,
         "service": "companion",
+        "background_peer_circuits": core.background_peers.snapshot()
+        if getattr(core, "background_peers", None) is not None
+        else [],
         "participation": core.participation.status(),
         "group_processing": core.group_processing.status(),
         "automatic_memory_candidates": {

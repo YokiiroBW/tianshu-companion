@@ -648,7 +648,13 @@ class LifeRuntime:
                 "updated_at",
             )
             items = await self.core.runtime_execution.autonomy.verified_records(items)
-            items = [{key: item[key] for key in keys} for item in items]
+            items = [
+                dict(
+                    {key: item[key] for key in keys},
+                    **({"dormant_since": item["dormant_since"]} if "dormant_since" in item else {}),
+                )
+                for item in items
+            ]
         elif resource == "open_work":
             items, next_cursor = self.life.concerns.page(
                 actor_id, scope=scope, after=after, limit=limit, object_id=request["object_id"]

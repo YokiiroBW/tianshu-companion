@@ -42,6 +42,7 @@ from .model_selection import HttpDefaultModelSelector
 from .worker_health import WorkerHealth
 from . import runtime_capabilities
 from .lifecycle import RuntimeLifecycle
+from .background_peers import BackgroundPeers, background_calls
 
 LOG = logging.getLogger(__name__)
 
@@ -171,7 +172,11 @@ async def run_loop(
         # cannot inherit the previous pass's progress and report work it did not do.
         before = counter(clock) if counter is not None else None
         try:
-            await work()
+            if name in {"life.work", "proactive.work"}:
+                with background_calls():
+                    await work()
+            else:
+                await work()
             outcome = "worked" if counter is None or counter(clock) != before else "idle"
         except asyncio.CancelledError:
             # A cancelled pass is a shutdown, not a failure: it is not reported as one, it is
@@ -369,6 +374,7 @@ def build_runtime(config, *, internal_clients=None, environ=None, log_adapter=No
     )
     contracts = Contracts(config["contracts_path"])
     clients = []
+    background_peers = BackgroundPeers()
     service_role = object()
 
     def client(name, label=None, *, target=service_role):
@@ -387,6 +393,7 @@ def build_runtime(config, *, internal_clients=None, environ=None, log_adapter=No
             target="channel" if label == "origins" and target is None else target,
             memory_dependency=name == "memory",
             log_adapter=log_adapter,
+            background_peers=background_peers,
         )
         clients.append(value)
         return value
@@ -585,7 +592,12 @@ def build_runtime(config, *, internal_clients=None, environ=None, log_adapter=No
             persona_import=config if persona_config else None,
         )
         core.storage_runtime = storage
+        core.background_peers = background_peers
         core.storage_temporary = storage_temporary
+        activity_retry = config.get("activity_retry_seconds", 21600)
+        if type(activity_retry) is not int or not 1 <= activity_retry <= 21600:
+            raise ValueError("activity_retry_seconds must be in 1..21600")
+        core.life.activities.retry_seconds = activity_retry
         core.image_backend.credentials = (
             client("image_credentials", "platform")
             if "image_credentials" in config.get("services", {})

@@ -110,6 +110,7 @@ class AutonomousGoals:
             schedule_version=actor["schedule_version"],
             manual=actor.get("manual"),
             activity=activity,
+            dormant=self.life.activities.dormant(actor["id"]),
             concerns=concerns,
             routine=window,
             ephemeral_attention=actor.get("life_interests", []),
@@ -134,6 +135,7 @@ class AutonomousGoals:
             "schedule_version",
             "manual",
             "activity",
+            "dormant",
             "concerns",
             "ephemeral_attention",
             "observation_hint",
@@ -183,7 +185,7 @@ class AutonomousGoals:
                 return False  # Replanning cannot turn an uncertain side effect into a new call.
         if (
             current
-            and current["state"] in {"running", "paused"}
+            and current["state"] == "running"
             and not current.get("autonomous_goal_id")
             and not current["id"].startswith("routine:")
         ):
@@ -211,7 +213,8 @@ class AutonomousGoals:
             visible_capture["concerns"] = await self.verified_records(captured["concerns"])
             active = await self.verified_records([captured["activity"]])
             visible_capture["activity"] = active[0] if active else None
-            source_records = visible_capture["concerns"] + active
+            visible_capture["dormant"] = await self.verified_records(captured["dormant"])
+            source_records = visible_capture["concerns"] + active + visible_capture["dormant"]
             memory = None
             if self.core.actor_memory.available:
                 previous = self.store.get(
@@ -291,7 +294,10 @@ class AutonomousGoals:
                     marker["model_request_id"] = "model:" + uuid4().hex
                     request_options["request_id"] = marker["model_request_id"]
                 marker.update(
-                    state="submitted", generation_stage="submitted", messages=messages, memory=memory
+                    state="submitted",
+                    generation_stage="submitted",
+                    messages=messages,
+                    memory=memory,
                 )
                 self.store.put("metadata", marker)
                 stage = "model"
@@ -399,10 +405,13 @@ class AutonomousGoals:
             and (choice["decision"] != "new" or not captured.get("observation_hint"))
         ):
             invalid("observation_inspired")
-        if (
-            not isinstance(choice["decision"], str)
-            or choice["decision"] not in {"new", "continue", "defer", "abandon", "rest"}
-        ):
+        if not isinstance(choice["decision"], str) or choice["decision"] not in {
+            "new",
+            "continue",
+            "defer",
+            "abandon",
+            "rest",
+        }:
             invalid("decision")
         if type(choice["delay_seconds"]) is not int or not 60 <= choice["delay_seconds"] <= 86400:
             invalid("delay_seconds")
@@ -471,7 +480,7 @@ class AutonomousGoals:
                 or decision == "continue"
                 and current.get("autonomous_goal_id") != goal_id
             ):
-                state = "cancelled" if decision == "abandon" else "paused"
+                state = "cancelled" if decision == "abandon" else "dormant"
                 if current["state"] != state:
                     self.life.activities.transition(
                         actor["id"],
@@ -482,6 +491,16 @@ class AutonomousGoals:
                     )
         if decision in {"rest", "abandon", "defer"}:
             if goal_id:
+                if decision == "abandon":
+                    for dormant in captured["dormant"]:
+                        if dormant.get("autonomous_goal_id") == goal_id:
+                            self.life.activities.transition(
+                                actor["id"],
+                                dormant["id"],
+                                "cancelled",
+                                expected=dormant["version"],
+                                reason=choice["reason"],
+                            )
                 old = self.life.concerns.get(actor["id"], goal_id)
                 value = {
                     key: old[key]
@@ -567,6 +586,7 @@ class AutonomousGoals:
                 autonomy_basis=memory,
             ),
             expected=(prior or {}).get("version", 0),
+            explicit_resume=decision == "continue",
         )
         activity.update(autonomous_goal_id=goal_id, actor_only=True, autonomy_basis=memory)
         if concern.get("public_exploration_topic"):

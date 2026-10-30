@@ -218,7 +218,7 @@ class DailyLife:
                 # Older runtime rows confused actual activity state with plan generation.
                 entry["generation_state"] = task["state"]
         process = self.life.activities.current(actor["id"], actor.get("activity_scope"))
-        if current and not (process and process["state"] in {"running", "paused"}):
+        if current and not (process and process["state"] == "running"):
             if self.life.autonomy is not None and hasattr(self.life.gateway, "complete"):
                 # Routine entries remain intentions. The existing activity owner starts
                 # actual work only after the rolling goal decision, within this window.

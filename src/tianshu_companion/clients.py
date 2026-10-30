@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import observability as obs
+from .background_peers import BackgroundPeers, is_background
 from .contracts import Fault, canonical, digest, strict_json
 from .memory_context import group_context_owners
 
@@ -156,6 +157,7 @@ class JsonService:
         target=None,
         memory_dependency=False,
         log_adapter=None,
+        background_peers=None,
     ):
         if url and (
             urlsplit(url).scheme != "https"
@@ -167,6 +169,7 @@ class JsonService:
             raise ValueError("Internal service URL must be an explicitly configured HTTPS URL")
         self.url, self.token = url, token
         self.log_adapter = log_adapter
+        self.background_peers = background_peers or BackgroundPeers()
         # Fixed by application dependency assembly, never by URL or event label.
         self._memory_dependency = memory_dependency
         self.query_slots = asyncio.Semaphore(4)
@@ -214,7 +217,7 @@ class JsonService:
         return cause
 
     @contextmanager
-    def _observe(self, path, operation, correlation=None):
+    def _observe(self, path, operation, correlation=None, *, circuit_key=None):
         correlation = correlation or obs.current_correlation_id() or obs.new_correlation_id()
         started = time.perf_counter()
         attributes = dict(
@@ -239,6 +242,7 @@ class JsonService:
                 if cancelled
                 else obs.error_code(getattr(error, "code", obs.failure_class(error)))
             )
+            self.background_peers.finished(circuit_key, attributes["error_code"])
             if isinstance(error, Fault):
                 error.cause = self._cause(
                     error,
@@ -264,6 +268,9 @@ class JsonService:
             )
             raise
         else:
+            self.background_peers.finished(
+                circuit_key or (self.target, obs.peer_route(path), self.principal), None
+            )
             port.emit(
                 "peer.call.finished",
                 "succeeded",
@@ -275,6 +282,9 @@ class JsonService:
     async def stream(self, path, body, headers=None):
         if not self.url or not self.token:
             raise Fault("dependency_unavailable")
+        circuit_key = await self.background_peers.admit(
+            (self.target, obs.peer_route(path), self.principal)
+        )
         request_headers = {
             "Authorization": "Bearer " + self.token,
             "Accept": "text/event-stream",
@@ -298,7 +308,9 @@ class JsonService:
             finally:
                 remaining -= loop.time() - started
 
-        with self._observe(path, "stream", request_headers[obs.CORRELATION_HEADER]) as attributes:
+        with self._observe(
+            path, "stream", request_headers[obs.CORRELATION_HEADER], circuit_key=circuit_key
+        ) as attributes:
             attributes["attempt"] = 1
             try:
                 async with AsyncExitStack() as stack:
@@ -549,7 +561,12 @@ class JsonService:
         response = None
         body_complete = False
         value = None
-        with self._observe(path, "query" if retry_query else "command", correlation) as attributes:
+        circuit_key = await self.background_peers.admit(
+            (self.target, obs.peer_route(path), self.principal)
+        )
+        with self._observe(
+            path, "query" if retry_query else "command", correlation, circuit_key=circuit_key
+        ) as attributes:
             try:
                 budget = self.QUERY_BUDGET_SECONDS if retry_query else self.COMMAND_BUDGET_SECONDS
                 async with AsyncExitStack() as owner:
@@ -569,7 +586,7 @@ class JsonService:
                         await owner.enter_async_context(asyncio.timeout(budget))
                     # Reuse serialized bytes/IDs/headers; acquire only once even when
                     # an explicitly safe read needs its existing transport retry.
-                    for attempt in range(2 if retry_query else 1):
+                    for attempt in range(2 if retry_query and not is_background() else 1):
                         attempts = attempt + 1
                         attributes["attempt"] = attempts
                         try:
@@ -580,7 +597,7 @@ class JsonService:
                         except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError):
                             # HTTPX/httpcore releases the failed connection. Only retry
                             # before response headers; this does NOT prove nonexecution.
-                            if not retry_query or attempt:
+                            if not retry_query or attempt or is_background():
                                 raise
                     try:
                         # The internal JSON port negotiates identity. Reject an encoded body
@@ -712,12 +729,17 @@ class JsonService:
         """Authenticated original POST. No redirects, retry or public URL conversion."""
         if not self.url or not self.token:
             raise Fault("dependency_unavailable")
+        circuit_key = await self.background_peers.admit(
+            (self.target, obs.peer_route(path), self.principal)
+        )
         headers = {
             "Authorization": "Bearer " + self.token,
             "Accept-Encoding": "identity",
             obs.CORRELATION_HEADER: obs.current_correlation_id() or obs.new_correlation_id(),
         }
-        with self._observe(path, "binary", headers[obs.CORRELATION_HEADER]) as attributes:
+        with self._observe(
+            path, "binary", headers[obs.CORRELATION_HEADER], circuit_key=circuit_key
+        ) as attributes:
             attributes["attempt"] = 1
             try:
                 async with asyncio.timeout(60):

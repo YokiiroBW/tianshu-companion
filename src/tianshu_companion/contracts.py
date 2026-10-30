@@ -120,7 +120,8 @@ class Contracts:
             "archive-memory-check/candidate-v1": "archive-memory-check",
             "profile-memory/v1": "profiles",
             "life-read/v1": "life-read",
-            "life-runtime/v2": "life-runtime",
+            "life-runtime/v2": "life-runtime-legacy",
+            "life-runtime/v2.2": "life-runtime",
             "bot-delivery/v2.1": "bot-delivery",
             "web-conversation/v1": "web-conversation",
             "memory-context/v1": "memory-context",
@@ -150,6 +151,7 @@ class Contracts:
             "memory-context/v2",
             "context-history/v1",
             "life-runtime/v2",
+            "life-runtime/v2.2",
             "bot-delivery/v2.1",
             "knowledge-content/v1",
             "image-backend/v1",
@@ -171,7 +173,9 @@ class Contracts:
                 raise ValueError("Unrecognized contract release: " + package)
             release = json.loads(manifest)
             expected_version = (
-                "1.1.0"
+                "2.2.0"
+                if package == "life-runtime/v2.2"
+                else "1.1.0"
                 if package in {"memory-context/v1", "context-history/v1"}
                 else "2.1.0"
                 if package.endswith("/v2.1") or package == "life-runtime/v2"

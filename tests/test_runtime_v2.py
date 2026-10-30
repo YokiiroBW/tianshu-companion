@@ -148,7 +148,7 @@ def test_activity_known_failure_diagnostic_backoff_and_attempt_limit(paused_pend
                     assert current["next_due_at"] == h.clock() + 60 * 2 ** (attempt - 1)
                     h.clock.now = current["next_due_at"]
                 else:
-                    assert current["next_due_at"] is None
+                    assert current["next_due_at"] == h.clock() + 21600
         finally:
             await h.core.close()
 
