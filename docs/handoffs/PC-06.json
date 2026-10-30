@@ -1,0 +1,14 @@
+{
+  "card": "PC-06",
+  "status": "in_progress",
+  "code_deployed": true,
+  "version": "2026.10.30-unified-linux-r39",
+  "image": "sha256:c7b0e50c9ae3d415121b4ffe96eb9c75324c5b66dcbf4272c39d0365b8f95b21",
+  "companion_commit": "c9754029a32eb63134ffca18879de4d90a04e366",
+  "memory_commit": "7bf1200dad37dc894576fe63ca1292d297163275",
+  "business_acceptance": false,
+  "three_real_days_verified": false,
+  "new_real_drafts": 0,
+  "requires_current_source_proofs": true,
+  "full_suite_run": false
+}

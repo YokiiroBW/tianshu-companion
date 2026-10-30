@@ -1,1 +1,16 @@
-{"card":"PC-03","status":"local_verified","code_commit":"57879c62d5549dfde6043c3a06d1e68beaec4655","checks":{"synthetic_http":2,"ten_minute_403_calls_at_most":20,"foreground_unchanged":true,"same_pass_query_retry_disabled":true,"static_and_diff":"passed"},"deployed":false,"production_fault_injection":false,"new_queue":false}
+{
+  "card": "PC-03",
+  "status": "deployed",
+  "code_commit": "57879c62d5549dfde6043c3a06d1e68beaec4655",
+  "checks": {
+    "synthetic_http": 2,
+    "ten_minute_403_calls_at_most": 20,
+    "foreground_unchanged": true,
+    "same_pass_query_retry_disabled": true,
+    "static_and_diff": "passed"
+  },
+  "deployed": true,
+  "production_fault_injection": false,
+  "new_queue": false,
+  "latest_release": "2026.10.30-unified-linux-r39"
+}

@@ -1,1 +1,27 @@
-{"card":"PC-05","status":"local_verified","code_commit":"57879c62d5549dfde6043c3a06d1e68beaec4655","production_dry_run":{"activities":10,"activities_to_dormant":7,"actor_rows":3,"historical_activity_deletions":0,"placeholder_actor_deletions":1},"checks":{"idempotence":"passed","postgresql_temp_tables":2,"postgresql_copy_and_scoped_rollback":"passed","permanent_probe_objects":0},"production_apply":false,"user_override":"Delete installation placeholder instead of household decision/cursor acceptance","forbidden_tables_unchanged":["life_events","life_known","life_diaries"]}
+{
+  "card": "PC-05",
+  "status": "verified_production",
+  "code_commit": "57879c62d5549dfde6043c3a06d1e68beaec4655",
+  "production_dry_run": {
+    "activities": 10,
+    "activities_to_dormant": 7,
+    "actor_rows": 3,
+    "historical_activity_deletions": 0,
+    "placeholder_actor_deletions": 1
+  },
+  "checks": {
+    "idempotence": "passed",
+    "postgresql_temp_tables": 2,
+    "postgresql_copy_and_scoped_rollback": "passed",
+    "permanent_probe_objects": 0
+  },
+  "production_apply": true,
+  "user_override": "Delete installation placeholder instead of household decision/cursor acceptance",
+  "forbidden_tables_unchanged": [
+    "life_events",
+    "life_known",
+    "life_diaries"
+  ],
+  "deployed": true,
+  "latest_release": "2026.10.30-unified-linux-r39"
+}
