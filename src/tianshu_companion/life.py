@@ -657,11 +657,12 @@ class Life:
         if old:
             return self.diary_metadata(key)
         state = "queued"
+        reason = None
         if material is None:
-            state = "material_overflow"
+            state, reason = "material_overflow", "material_budget_exceeded"
         elif len(material) < recipe["min_events"]:
-            state = "skipped"
-        elif not self._available():
+            state, reason = "skipped", "insufficient_material"
+        elif reason := self.diary_unavailability():
             state = "unavailable"
         with self.store.transaction():
             self.store.put("life_materials", dict(id=key, material=material))
@@ -675,6 +676,11 @@ class Life:
                     recipe=recipe,
                     material_version=material_version,
                     state=state,
+                    **(
+                        {"status_reason": dict(code=reason, stage="material_selection")}
+                        if reason
+                        else {}
+                    ),
                     config_version=self.config_version,
                     current_revision=None,
                     published_revision=None,
@@ -685,11 +691,16 @@ class Life:
         return self.diary_metadata(key)
 
     def _available(self):
-        return (
-            self.writing
-            and (self.model_selector is not None or self.config_version is not None)
-            and self.gateway.available
-        )
+        return self.diary_unavailability() is None
+
+    def diary_unavailability(self):
+        if not self.writing:
+            return "writing_disabled"
+        if self.model_selector is None and self.config_version is None:
+            return "generation_route_missing"
+        if not self.gateway.available:
+            return "gateway_unavailable"
+        return None
 
     def writing_available(self):
         """Long-form writing retains its explicit static configuration."""
@@ -717,6 +728,11 @@ class Life:
             raise ValueError("Not retryable")
         item["state"] = "queued" if self._available() else "unavailable"
         item["config_version"] = self.config_version
+        item.pop("failure", None)
+        item.pop("last_failure", None)
+        item.pop("status_reason", None)
+        if reason := self.diary_unavailability():
+            item["status_reason"] = dict(code=reason, stage="availability")
         self._save("diaries", item, expected)
         return self.diary_metadata(diary_id)
 
@@ -820,23 +836,41 @@ class Life:
         if row is None:
             return False
         item = self._get("diaries", row[0])
+        if (
+            "source_capture" in item
+            and not item["source_capture"]["provenance"]["selection_complete"]
+        ):
+            item["state"] = "material_incomplete"
+            item["status_reason"] = dict(
+                code=item["source_capture"].get("selection_reason") or "source_omitted",
+                stage="material_selection",
+            )
+            self._save("diaries", item)
+            return True
         if item["state"] == "postprocessing":
             await self.diary_sources.finish(item)
             return True
-        if not self._available():
+        if reason := self.diary_unavailability():
             item["state"] = "unavailable"
+            item["status_reason"] = dict(code=reason, stage="availability")
             self._save("diaries", item)
             return True
         item["state"] = "generating"
+        item.pop("status_reason", None)
+        item.pop("failure", None)
+        item.pop("last_failure", None)
         self._save("diaries", item)
+        stage = "source_validation"
         try:
             await self.diary_sources.check(item)
+            stage = "persona"
             persona = self.persona_reader(actor) if self.persona_reader else None
             generation = {
                 "actor_id": item["conversation_id"],
                 "generation_turn_id": "diary:" + digest([item["id"], item["version"]]),
                 "config_version": item["config_version"],
             }
+            stage = "model_selection"
             await self.select_generation(generation)
             item["config_version"] = generation["config_version"]
             self._save("diaries", item)
@@ -873,10 +907,12 @@ class Life:
                 ),
             ]
             async with self.model_slots:
+                stage = "pre_generation_validation"
                 await self.diary_sources.check(item)
                 if persona and self.persona_verifier:
                     self.persona_verifier(persona)
                 self.verify_generation_lease(generation)
+                stage = "generation"
                 output, receipt = await asyncio.wait_for(
                     self.gateway.generate(
                         dict(
@@ -889,6 +925,7 @@ class Life:
                     ),
                     60,
                 )
+            stage = "result_validation"
             content = "\n".join(output)
             derived = None
             if "source_capture" in item:
@@ -898,9 +935,11 @@ class Life:
                 self.diary_sources.validate_result(item, derived)
                 content = derived["content"]
             text(content, item["recipe"]["max_chars"])
+            stage = "source_revalidation"
             await self.diary_sources.check(item)
             if persona and self.persona_verifier:
                 self.persona_verifier(persona)
+            stage = "revision"
             with self.store.transaction():
                 if derived is not None:
                     item["postprocess_result"] = {
@@ -911,6 +950,7 @@ class Life:
                     item["state"] = "postprocessing"
                     self._save("diaries", item)
             if derived is not None:
+                stage = "postprocessing"
                 await self.diary_sources.finish(item)
         except asyncio.CancelledError:
             item["state"] = "postprocessing" if item.get("postprocess_result") else "interrupted"
@@ -919,7 +959,19 @@ class Life:
         except Exception as exc:
             unavailable = isinstance(exc, Fault) and exc.code == "dependency_unavailable"
             item.update(
-                state="unavailable" if unavailable else "failed", failure=type(exc).__name__
+                state="unavailable" if unavailable else "failed",
+                failure=type(exc).__name__,
+                last_failure=obs.failure_diagnostic(
+                    exc,
+                    code=exc.code
+                    if isinstance(exc, Fault)
+                    else "dependency_unavailable"
+                    if isinstance(exc, (OSError, TimeoutError))
+                    else "invalid_input",
+                    attempt=1,
+                    stage=stage,
+                    observed_at=self.clock(),
+                ),
             )
             self._save("diaries", item)
 
@@ -1023,6 +1075,9 @@ class Life:
         metadata["fictional"] = item.get("fictional", True)
         if "provenance" in item:
             metadata["provenance"] = item["provenance"]
+        for field in ("status_reason", "last_failure", "postprocess_failure"):
+            if field in item:
+                metadata[field] = item[field]
         metadata["recipe_id"] = item["recipe"]["id"]
         metadata["recipe_version"] = item["recipe"]["version"]
         return metadata

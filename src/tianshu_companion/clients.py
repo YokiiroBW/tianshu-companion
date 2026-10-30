@@ -242,7 +242,10 @@ class JsonService:
                 if cancelled
                 else obs.error_code(getattr(error, "code", obs.failure_class(error)))
             )
-            self.background_peers.finished(circuit_key, attributes["error_code"])
+            self.background_peers.finished(
+                circuit_key,
+                None if getattr(error, "peer_available", False) else attributes["error_code"],
+            )
             if isinstance(error, Fault):
                 error.cause = self._cause(
                     error,

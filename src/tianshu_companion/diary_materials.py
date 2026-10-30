@@ -3,9 +3,27 @@
 import copy
 from datetime import date, datetime, time, timedelta
 
+from . import observability as obs
 from .clients import utc
 from .contracts import Fault, canonical, digest
 from .life import zone
+
+MATERIAL_BUDGET_BYTES = 65536
+PAGE_BUDGET_BYTES = 32768
+MAX_PAGES = 4
+
+
+def provenance(material, timezone_name, window, complete):
+    kinds = sorted({row["kind"] for row in material})
+    real = any(kind != "fictional" for kind in kinds)
+    return dict(
+        kind="mixed" if real and "fictional" in kinds else "digital" if real else "fictional",
+        source_kinds=kinds or ["fictional"],
+        selection_complete=complete,
+        timezone=timezone_name,
+        occurred_from=window["start"],
+        occurred_before=window["end"],
+    )
 
 
 def civil_window(day, timezone_name, now):
@@ -38,9 +56,15 @@ class DiaryMaterials:
         window = civil_window(day, world["timezone"], self.life.clock())
         pages, material, cursor = [], [], None
         complete, omitted = False, False
-        for _ in range(4):
+        reason = "page_limit"
+        for _ in range(MAX_PAGES):
             page = await self.life.actor_memory.query(
-                actor_id, context, window=window, cursor=cursor, limit=16, budget_bytes=32768
+                actor_id,
+                context,
+                window=window,
+                cursor=cursor,
+                limit=16,
+                budget_bytes=PAGE_BUDGET_BYTES,
             )
             pages.append(page)
             omitted = omitted or page["omitted"]
@@ -54,21 +78,32 @@ class DiaryMaterials:
                 )
                 if fact["provenance"] == "fictional":
                     kind = "fictional"
-                material.append(
-                    dict(
-                        episode_refs=copy.deepcopy(row["episode_refs"]),
-                        kind=kind,
-                        provenance=fact["provenance"],
-                        relation=fact["relation"],
-                        outcome=fact["outcome"],
-                        summary=fact["summary"],
-                        occurred_at=fact["occurred_at"],
-                        learned_at=fact["learned_at"],
-                        coverage=copy.deepcopy(fact["content_reads"]),
-                    )
+                entry = dict(
+                    episode_refs=copy.deepcopy(row["episode_refs"]),
+                    kind=kind,
+                    provenance=fact["provenance"],
+                    relation=fact["relation"],
+                    outcome=fact["outcome"],
+                    summary=fact["summary"],
+                    occurred_at=fact["occurred_at"],
+                    learned_at=fact["learned_at"],
+                    coverage=copy.deepcopy(fact["content_reads"]),
                 )
+                entries = [*material, entry]
+                prospective = dict(
+                    context=context,
+                    entries=entries,
+                    provenance=provenance(entries, world["timezone"], window, False),
+                )
+                if len(canonical(prospective).encode()) > MATERIAL_BUDGET_BYTES:
+                    reason = "material_budget_exceeded"
+                    break
+                material.append(entry)
+            if reason == "material_budget_exceeded":
+                break
             complete = page["complete"]
             if complete or page["next_cursor"] is None or page["next_cursor"] == cursor:
+                reason = "source_omitted" if omitted else "cursor_stalled"
                 break
             cursor = page["next_cursor"]
         # Revalidate every earlier page after later remote reads; no cached text is trusted.
@@ -80,17 +115,18 @@ class DiaryMaterials:
             (actor_id,),
         ).fetchone()
         omitted = omitted or pending is not None
-        kinds = sorted({row["kind"] for row in material})
-        real = any(kind != "fictional" for kind in kinds)
-        provenance = dict(
-            kind="mixed" if real and "fictional" in kinds else "digital" if real else "fictional",
-            source_kinds=kinds or ["fictional"],
-            selection_complete=complete and not omitted,
-            timezone=world["timezone"],
-            occurred_from=window["start"],
-            occurred_before=window["end"],
+        source = provenance(material, world["timezone"], window, complete and not omitted)
+        if pending is not None:
+            reason = "memory_delivery_pending"
+        elif omitted:
+            reason = "source_omitted"
+        return dict(
+            material=material,
+            proofs=pages,
+            context=context,
+            provenance=source,
+            selection_reason=None if source["selection_complete"] else reason,
         )
-        return dict(material=material, proofs=pages, context=context, provenance=provenance)
 
     async def check(self, diary, *, public=False, audience=None):
         if "source_capture" not in diary:
@@ -166,17 +202,18 @@ class DiaryMaterials:
         old = self.store.get("life_diaries", key)
         if old:
             return self.life.diary_metadata(key)
-        state = (
-            "queued"
-            if capture["material"]
-            else "skipped"
-            if capture["provenance"]["selection_complete"]
-            else "material_incomplete"
-        )
-        if state == "queued" and not self.life._available():
+        reason = None
+        if not capture["provenance"]["selection_complete"]:
+            state, reason = "material_incomplete", capture["selection_reason"]
+        elif not capture["material"]:
+            state, reason = "skipped", "no_source_material"
+        else:
+            state = "queued"
+        if state == "queued" and (reason := self.life.diary_unavailability()):
             state = "unavailable"
-        if len(canonical(material).encode()) > 65536:
-            state = "material_overflow"
+        if len(canonical(material).encode()) > MATERIAL_BUDGET_BYTES:
+            # Never label a truncated selection complete or increase the ceiling.
+            raise Fault("budget_exceeded")
         await self.check(dict(source_capture=capture))
         with self.store.transaction():
             self.store.put("life_materials", dict(id=key, material=material))
@@ -193,6 +230,11 @@ class DiaryMaterials:
                     recipe=recipe,
                     material_version=material_version,
                     state=state,
+                    **(
+                        {"status_reason": dict(code=reason, stage="material_selection")}
+                        if reason
+                        else {}
+                    ),
                     config_version=self.life.config_version,
                     current_revision=None,
                     published_revision=None,
@@ -257,6 +299,13 @@ class DiaryMaterials:
         except (Fault, OSError, TimeoutError) as error:
             current = self.life._get("diaries", diary["id"])
             current["postprocess_error"] = getattr(error, "code", "dependency_unavailable")
+            current["postprocess_failure"] = obs.failure_diagnostic(
+                error,
+                code=current["postprocess_error"],
+                attempt=1,
+                stage="postprocessing",
+                observed_at=self.life.clock(),
+            )
             # Already-published share sources must retain their registered version.
             if not current["published_revision"]:
                 current["state"] = "postprocessing"
@@ -268,6 +317,7 @@ class DiaryMaterials:
         if not current["published_revision"]:
             current.pop("postprocess_result", None)
             current.pop("postprocess_error", None)
+            current.pop("postprocess_failure", None)
             current["state"] = "draft"
             self.life._save("diaries", current)
 

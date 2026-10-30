@@ -53,11 +53,17 @@ class Activities:
 
     def dormant(self, actor_id):
         rows = self.store.db.execute(
-            "SELECT body FROM life_activities WHERE conversation_id=? AND status='dormant' "
-            "ORDER BY position DESC,id LIMIT 20",
+            "SELECT a.body,m.status FROM life_activities a LEFT JOIN metadata m "
+            "ON m.id=json_extract(a.body,'$.step_operation') "
+            "WHERE a.conversation_id=? AND a.status='dormant' "
+            "ORDER BY a.position DESC,a.id LIMIT 20",
             (actor_id,),
         )
-        return [item for row in rows if visible(item := json.loads(row[0]), None)]
+        return [
+            dict(item, step_state=row[1])
+            for row in rows
+            if visible(item := json.loads(row[0]), None)
+        ]
 
     def save(self, actor_id, value, *, expected, explicit_resume=False):
         text(value["id"], 128)

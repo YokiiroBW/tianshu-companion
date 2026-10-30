@@ -273,6 +273,12 @@ class AutonomousGoals:
                         "true only when decision=new actually chooses the current observation_hint "
                         "topic; otherwise false or omit. This hint is a one-time opportunity, "
                         "not a standing instruction for unrelated goals. Rest is a valid choice. "
+                        "Dormant activities retain their original checkpoint, results and step_state. "
+                        "A step_state of unknown/submitted/tools_pending blocks starting other work. "
+                        "Do not infer whether its external operation succeeded or repeat it. "
+                        "If you decide to stop waiting for that autonomous goal, explicitly abandon "
+                        "its exact autonomous_goal_id from concerns; this cancels future work while "
+                        "preserving the unresolved execution record. Otherwise defer or rest. "
                         "A new question from actual reading can become a goal; preferences require "
                         "grounded actor-memory receipts, not this choice."
                     ),

@@ -113,6 +113,21 @@ class ActorMemory:
                     unknown=body["operation"] in {"append_episode", "append_derived", "maintain"},
                 )
             observed.update(value)
+            # This owner has validated the AL01 execution field and request
+            # binding. Let transport observation see the actual semantic result,
+            # before the older common-error decoder can misclassify a normal
+            # missing receipt as an unavailable service or uncertain write.
+            settled = Fault(
+                value["code"], unknown=value["execution"] == "unknown", cause=error.cause
+            )
+            if (
+                body["operation"] == "get_receipt"
+                and status == 404
+                and value["code"] == "not_found"
+                and value["execution"] == "not_started"
+            ):
+                settled.peer_available = True
+            raise settled from None
 
         try:
             value = await self.core.memory.client.call(
@@ -696,6 +711,13 @@ class ActorMemory:
             or len(response["items"]) > limit
         ):
             raise Fault("invalid_input")
+        if window is not None:
+            # Timeline results already contain the original episode fact. Adding
+            # the same fact again as a hydrated basis can silently drop rows
+            # after the owner's cursor has advanced past them. Recheck the
+            # owner's references and retain its complete bounded page instead.
+            await self.check(response)
+            return response
         return await self._hydrate(response, budget_bytes)
 
     async def _hydrate(self, response, budget_bytes):

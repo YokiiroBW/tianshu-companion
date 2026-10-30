@@ -131,6 +131,8 @@ def test_unknown_operation_stays_guarded_after_dormancy_and_direct_save_cannot_b
             owner._interrupt(saved, "result_unknown")
             dormant = owner.get("actor:a", saved["id"])
             assert dormant["state"] == "dormant" and dormant["step_operation"] == operation
+            captured = owner.dormant("actor:a")[0]
+            assert captured["step_operation"] == operation and captured["step_state"] == "unknown"
             assert owner.current("actor:a") is None
             with pytest.raises(Fault):
                 owner.save("actor:a", activity("activity:other"), expected=0)
