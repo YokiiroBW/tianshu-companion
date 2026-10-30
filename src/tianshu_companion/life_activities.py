@@ -37,16 +37,16 @@ class Activities:
         item = self.store.get("life_activities", (actor or {}).get("activity_id", ""))
         return item if item and visible(item, scope) else None
 
-    def unresolved(self, actor_id, *, except_activity=None):
+    def unresolved(self, actor_id):
         """Releasing a dormant pointer cannot erase an uncertain external operation."""
         return (
             self.store.db.execute(
                 "SELECT 1 FROM life_activities a JOIN metadata m "
                 "ON m.id=json_extract(a.body,'$.step_operation') "
-                "WHERE a.conversation_id=? AND a.id<>? AND a.status<>'cancelled' "
+                "WHERE a.conversation_id=? AND a.status<>'cancelled' "
                 "AND m.status IN ('submitted','tools_pending','unknown') "
                 "LIMIT 1",
-                (actor_id, except_activity or ""),
+                (actor_id,),
             ).fetchone()
             is not None
         )
@@ -105,16 +105,7 @@ class Activities:
                 ):
                     raise Fault("invalid_input")
             if value["state"] == "running" and (not old or old["state"] != "running"):
-                same_checkpoint = bool(
-                    old
-                    and explicit_resume
-                    and old.get("step_operation")
-                    and value["checkpoint"] == old["checkpoint"]
-                    and value["result_refs"] == old["result_refs"]
-                )
-                if self.unresolved(
-                    actor_id, except_activity=old["id"] if same_checkpoint else None
-                ):
+                if self.unresolved(actor_id):
                     raise Fault("result_unknown", unknown=True)
             current = self.current(actor_id, actor.get("activity_scope"))
             if (
@@ -293,7 +284,10 @@ class Activities:
         existing = self.store.get("metadata", operation)
         if existing and existing["state"] != "pending":
             # A submitted model/tool call might have executed. A new operation is not
-            # proof that it did not; only an explicit checkpoint change can restart it.
+            # proof that it did not. Legacy explicit resumes must not leave an
+            # immovable running pointer outside the planner's dormant projection.
+            if existing["state"] in {"submitted", "tools_pending", "unknown"}:
+                self._interrupt(item, "result_unknown")
             return
         if item["state"] == "paused" and not existing:
             item = self.transition(

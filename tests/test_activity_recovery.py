@@ -134,6 +134,20 @@ def test_unknown_operation_stays_guarded_after_dormancy_and_direct_save_cannot_b
             captured = owner.dormant("actor:a")[0]
             assert captured["step_operation"] == operation and captured["step_state"] == "unknown"
             assert owner.current("actor:a") is None
+            with pytest.raises(Fault) as resumed:
+                owner.transition("actor:a", dormant["id"], "running", expected=dormant["version"])
+            assert resumed.value.code == "result_unknown"
+            # R38 could retain the same operation while making this row running.
+            # Reconcile that legacy pointer without replaying or settling its call.
+            legacy = dict(dormant, state="running", next_due_at=h.clock())
+            h.core.store.put("life_activities", legacy)
+            actor = h.core.store.get("life_actors", "actor:a")
+            actor["activity_id"] = legacy["id"]
+            h.core.store.put("life_actors", actor)
+            await owner.work(actor_id="actor:a")
+            dormant = owner.get("actor:a", dormant["id"])
+            assert dormant["state"] == "dormant" and owner.current("actor:a") is None
+            assert h.core.store.get("metadata", operation)["state"] == "unknown"
             with pytest.raises(Fault):
                 owner.save("actor:a", activity("activity:other"), expected=0)
             assert h.core.store.get("metadata", operation)["state"] == "unknown"
